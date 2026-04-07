@@ -1,0 +1,6 @@
+VCD info: dumpfile wave.vcd opened for output.
+Hint: Output 'z' has no mismatches.
+Hint: Total mismatched samples is 0 out of 2000 samples
+
+Simulation finished at 10001 ps
+Mismatches: 0 in 2000 samples

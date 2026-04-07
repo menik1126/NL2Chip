@@ -1,0 +1,12 @@
+{
+  "total": 5,
+  "passed": 3,
+  "failed": 2,
+  "errors": 0,
+  "pass_rate": "60.0%",
+  "first_attempt_pass": 3,
+  "retry_fixed": 0,
+  "total_tokens_in": 66115,
+  "total_tokens_out": 2567,
+  "wall_time_s": 67.9
+}

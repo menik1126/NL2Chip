@@ -1,0 +1,10 @@
+[project]
+name = "sparkle"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic>=0.89.0",
+    "rich>=13.0",
+    "fastapi[standard]>=0.115",
+]

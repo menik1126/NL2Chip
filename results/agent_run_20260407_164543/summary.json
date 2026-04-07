@@ -1,0 +1,19 @@
+{
+  "total": 3,
+  "attempted": 3,
+  "skipped": 0,
+  "compile_pass": 3,
+  "compile_rate": "100.0%",
+  "sim_pass": 3,
+  "sim_fail": 0,
+  "sim_error": 0,
+  "sim_rate": "100.0%",
+  "synth_pass": 3,
+  "agent_tokens": {
+    "input": 107942,
+    "output": 3264
+  },
+  "elapsed_seconds": 120,
+  "model": "claude-sonnet-4-20250514",
+  "synth_enabled": true
+}

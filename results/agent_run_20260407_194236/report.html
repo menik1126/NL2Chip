@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sparkle Agent Report — agent_run_20260407_194236</title>
+<style>
+:root { --bg: #0d1117; --surface: #161b22; --surface2: #21262d; --border: #30363d;
+  --text: #e6edf3; --muted: #8b949e; --green: #3fb950; --red: #f85149;
+  --yellow: #d29922; --blue: #58a6ff; --purple: #bc8cff; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg); color: var(--text); line-height: 1.5; padding: 24px; }
+.container { max-width: 1400px; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin-bottom: 4px; }
+.subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 24px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.card-value { font-size: 1.8rem; font-weight: 700; }
+.card-value small { font-size: 1rem; color: var(--muted); font-weight: 400; }
+.card-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.card-bar { height: 4px; background: var(--surface2); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+.bar { height: 100%; border-radius: 2px; }
+.bar.compile { background: var(--blue); }
+.bar.sim { background: var(--green); }
+.bar.synth { background: var(--purple); }
+.section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.section h2 { font-size: 1rem; margin-bottom: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+th { text-align: left; padding: 8px 10px; background: var(--surface2); color: var(--muted);
+  font-weight: 600; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em;
+  position: sticky; top: 0; cursor: pointer; user-select: none; border-bottom: 1px solid var(--border); }
+th:hover { color: var(--text); }
+td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+tr:hover { background: var(--surface2); }
+.pid { font-family: monospace; font-weight: 600; color: var(--blue); }
+.num { text-align: right; font-family: monospace; }
+.detail { color: var(--muted); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.72rem; font-weight: 600; }
+.badge.ok { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge.fail { background: rgba(248,81,73,0.15); color: var(--red); }
+.badge.warn { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.badge.na { background: var(--surface2); color: var(--muted); }
+.ppa-chart { display: flex; flex-direction: column; gap: 3px; }
+.ppa-bar { height: 14px; background: var(--purple); border-radius: 3px; min-width: 2px; opacity: 0.8; transition: opacity 0.2s; }
+.ppa-bar:hover { opacity: 1; }
+.ppa-stats { color: var(--muted); font-size: 0.78rem; margin-top: 6px; font-family: monospace; }
+.filter { margin-bottom: 12px; }
+.filter input { background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 12px; border-radius: 6px; font-size: 0.85rem; width: 260px; }
+.filter input::placeholder { color: var(--muted); }
+footer { color: var(--muted); font-size: 0.75rem; margin-top: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Sparkle Agent Report</h1>
+<div class="subtitle">agent_run_20260407_194236 &middot; claude-sonnet-4-20250514 &middot; 0:20:18 &middot; 1.9M+45.2K tokens</div>
+
+<div class="cards">
+    <div class="card">
+        <div class="card-value">20</div>
+        <div class="card-label">Problems</div>
+    </div>
+    <div class="card">
+        <div class="card-value">20<small>/20</small></div>
+        <div class="card-label">Compile Pass</div>
+        <div class="card-bar"><div class="bar compile" style="width:100%"></div></div>
+    </div>
+    <div class="card">
+        <div class="card-value">19<small>/20</small></div>
+        <div class="card-label">Sim Pass</div>
+        <div class="card-bar"><div class="bar sim" style="width:95%"></div></div>
+    </div>
+    
+    
+    <div class="card">
+        <div class="card-value">1.9M</div>
+        <div class="card-label">Total Tokens</div>
+    </div>
+</div>
+
+
+
+<div class="section">
+    <h2>Results</h2>
+    <div class="filter"><input type="text" id="filter" placeholder="Filter by problem ID..." oninput="filterTable()"></div>
+    <div style="overflow-x:auto;">
+    <table id="results">
+    <thead><tr>
+        <th onclick="sortTable(0)">Problem</th>
+        <th onclick="sortTable(1)">Compile</th>
+        <th onclick="sortTable(2)">Lint</th>
+        <th onclick="sortTable(3)">Sim</th>
+        <th onclick="sortTable(4)">Turns</th>
+        <th>Detail</th>
+    </tr></thead>
+    <tbody>
+    <tr>
+            <td class="pid">Prob001_zero</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">11</td>
+            <td class="detail" title="0 mismatches in 20 samples">0 mismatches in 20 samples</td>
+        </tr><tr>
+            <td class="pid">Prob002_m2014_q4i</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">7</td>
+            <td class="detail" title="0 mismatches in 100 samples">0 mismatches in 100 samples</td>
+        </tr><tr>
+            <td class="pid">Prob003_step_one</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">6</td>
+            <td class="detail" title="0 mismatches in 20 samples">0 mismatches in 20 samples</td>
+        </tr><tr>
+            <td class="pid">Prob004_vector2</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">30</td>
+            <td class="detail" title="0 mismatches in 110 samples">0 mismatches in 110 samples</td>
+        </tr><tr>
+            <td class="pid">Prob005_notgate</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">7</td>
+            <td class="detail" title="0 mismatches in 239 samples">0 mismatches in 239 samples</td>
+        </tr><tr>
+            <td class="pid">Prob006_vectorr</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">18</td>
+            <td class="detail" title="0 mismatches in 218 samples">0 mismatches in 218 samples</td>
+        </tr><tr>
+            <td class="pid">Prob007_wire</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">5</td>
+            <td class="detail" title="0 mismatches in 120 samples">0 mismatches in 120 samples</td>
+        </tr><tr>
+            <td class="pid">Prob008_m2014_q4h</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">5</td>
+            <td class="detail" title="0 mismatches in 100 samples">0 mismatches in 100 samples</td>
+        </tr><tr>
+            <td class="pid">Prob009_popcount3</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">14</td>
+            <td class="detail" title="0 mismatches in 220 samples">0 mismatches in 220 samples</td>
+        </tr><tr>
+            <td class="pid">Prob010_mt2015_q4a</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">7</td>
+            <td class="detail" title="0 mismatches in 202 samples">0 mismatches in 202 samples</td>
+        </tr><tr>
+            <td class="pid">Prob011_norgate</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">7</td>
+            <td class="detail" title="0 mismatches in 219 samples">0 mismatches in 219 samples</td>
+        </tr><tr>
+            <td class="pid">Prob012_xnorgate</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">10</td>
+            <td class="detail" title="0 mismatches in 219 samples">0 mismatches in 219 samples</td>
+        </tr><tr>
+            <td class="pid">Prob013_m2014_q4e</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">8</td>
+            <td class="detail" title="0 mismatches in 100 samples">0 mismatches in 100 samples</td>
+        </tr><tr>
+            <td class="pid">Prob014_andgate</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">7</td>
+            <td class="detail" title="0 mismatches in 219 samples">0 mismatches in 219 samples</td>
+        </tr><tr>
+            <td class="pid">Prob015_vector1</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge fail">Fail (217)</span></td>
+            <td class="num">28</td>
+            <td class="detail" title="217 mismatches in 218 samples">217 mismatches in 218 samples</td>
+        </tr><tr>
+            <td class="pid">Prob016_m2014_q4j</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">7</td>
+            <td class="detail" title="0 mismatches in 100 samples">0 mismatches in 100 samples</td>
+        </tr><tr>
+            <td class="pid">Prob017_mux2to1v</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">9</td>
+            <td class="detail" title="0 mismatches in 114 samples">0 mismatches in 114 samples</td>
+        </tr><tr>
+            <td class="pid">Prob018_mux256to1</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">33</td>
+            <td class="detail" title="0 mismatches in 2000 samples">0 mismatches in 2000 samples</td>
+        </tr><tr>
+            <td class="pid">Prob019_m2014_q4f</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">7</td>
+            <td class="detail" title="0 mismatches in 100 samples">0 mismatches in 100 samples</td>
+        </tr><tr>
+            <td class="pid">Prob020_mt2015_eq2</td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td><span class="badge ok">Pass</span></td>
+            <td class="num">16</td>
+            <td class="detail" title="0 mismatches in 2000 samples">0 mismatches in 2000 samples</td>
+        </tr>
+    </tbody>
+    </table>
+    </div>
+</div>
+
+<footer>Generated by Sparkle Agent &middot; 2026-04-07 20:02:54</footer>
+</div>
+
+<script>
+function filterTable() {
+    const q = document.getElementById('filter').value.toLowerCase();
+    document.querySelectorAll('#results tbody tr').forEach(tr => {
+        tr.style.display = tr.cells[0].textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+}
+function sortTable(col) {
+    const tb = document.querySelector('#results tbody');
+    const rows = Array.from(tb.rows);
+    const asc = tb.dataset.sortCol == col && tb.dataset.sortDir == 'asc' ? 'desc' : 'asc';
+    tb.dataset.sortCol = col; tb.dataset.sortDir = asc;
+    rows.sort((a, b) => {
+        let va = a.cells[col].textContent.trim(), vb = b.cells[col].textContent.trim();
+        const na = parseFloat(va), nb = parseFloat(vb);
+        if (!isNaN(na) && !isNaN(nb)) return asc == 'asc' ? na - nb : nb - na;
+        return asc == 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+    rows.forEach(r => tb.appendChild(r));
+}
+</script>
+</body>
+</html>

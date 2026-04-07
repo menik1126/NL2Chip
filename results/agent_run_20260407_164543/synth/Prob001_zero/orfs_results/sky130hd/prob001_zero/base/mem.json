@@ -1,0 +1,29 @@
+{
+  "creator": "Yosys 0.63+post (git sha1 UNKNOWN-dirty, g++ 11.4.0-1ubuntu1~22.04.3 -fPIC -O3)",
+  "modules": {
+    "prob001_zero": {
+      "attributes": {
+        "hdlname": "prob001_zero",
+        "top": "00000000000000000000000000000001",
+        "src": "/workspace/Prob001_zero.sv:4.1-15.10"
+      },
+      "ports": {
+        "out": {
+          "direction": "output",
+          "bits": [ "0" ]
+        }
+      },
+      "cells": {
+      },
+      "netnames": {
+        "out": {
+          "hide_name": 0,
+          "bits": [ "0" ],
+          "attributes": {
+            "src": "/workspace/Prob001_zero.sv:5.18-5.21"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "creator": "Yosys 0.63+post (git sha1 UNKNOWN-dirty, g++ 11.4.0-1ubuntu1~22.04.3 -fPIC -O3)",
+  "modules": {
+    "prob002_m2014_q4i": {
+      "attributes": {
+        "hdlname": "prob002_m2014_q4i",
+        "top": "00000000000000000000000000000001",
+        "src": "/workspace/Prob002_m2014_q4i.sv:4.1-15.10"
+      },
+      "ports": {
+        "out": {
+          "direction": "output",
+          "bits": [ "0" ]
+        }
+      },
+      "cells": {
+      },
+      "netnames": {
+        "out": {
+          "hide_name": 0,
+          "bits": [ "0" ],
+          "attributes": {
+            "src": "/workspace/Prob002_m2014_q4i.sv:5.18-5.21"
+          }
+        }
+      }
+    }
+  }
+}

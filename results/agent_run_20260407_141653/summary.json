@@ -1,0 +1,17 @@
+{
+  "total": 5,
+  "attempted": 5,
+  "skipped": 0,
+  "compile_pass": 5,
+  "compile_rate": "100.0%",
+  "sim_pass": 5,
+  "sim_fail": 0,
+  "sim_error": 0,
+  "sim_rate": "100.0%",
+  "agent_tokens": {
+    "input": 592835,
+    "output": 8570
+  },
+  "elapsed_seconds": 255,
+  "model": "claude-sonnet-4-20250514"
+}

@@ -51,6 +51,12 @@ lean_lib «IP.Bus» where
 lean_lib «Tools.SVParser» where
   roots := #[`Tools.SVParser]
 
+lean_lib «Benchmark» where
+  roots := #[`Benchmark]
+
+lean_lib «Generated» where
+  roots := #[`Generated]
+
 lean_lib «Tests» where
   -- Test circuits library
 

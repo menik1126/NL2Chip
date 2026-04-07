@@ -594,6 +594,17 @@ mutual
                  CompilerM.emitAssign resWire (.op op [.ref wireS])
                  return resWire
 
+           -- Generic lambda fallback: translate arbitrary lambda body as combinational logic
+           if let .lam binderName binderType body _ := f then
+             trace[sparkle.compiler] "→ Signal.map generic lambda fallback"
+             let wireS ← translateExprToWire s "map_in" (isTopLevel := false)
+             let resWire ← CompilerM.withLocalDecl binderName binderType fun fvar => do
+               let fvarId := fvar.fvarId!
+               CompilerM.withVarMapping fvarId wireS do
+                 let bodyInst := body.instantiate1 fvar
+                 translateExprToWire bodyInst hint (isNamed := isNamed)
+             return resWire
+
         -- Detect if-then-else and match expressions that cannot be synthesized
         if name == ``ite || name == ``dite then
           let exprStr ← CompilerM.liftMetaM (ppExpr e)
@@ -1033,10 +1044,13 @@ mutual
       CompilerM.emitAssign resWire (.slice (.ref wireS) (width - 1) 0)
       return some resWire
 
-    -- Signal.map Prod.fst/snd (legacy syntax)
+    -- Signal.map f s: apply pure function f combinationally to signal s
     if name == ``Sparkle.Core.Signal.Signal.map && args.size >= 2 then
       let f := args[args.size-2]!
       let s := args[args.size-1]!
+      trace[sparkle.compiler] "→ Signal.map handler: f.ctorName={f.ctorName}"
+
+      -- Fast path: Prod.fst/snd projections
       if f.isConstOf ``Prod.fst then
         trace[sparkle.compiler] "→ tuple projection (map fst)"
         let wireS ← translateExprToWire s "s" (isTopLevel := false)
@@ -1056,6 +1070,27 @@ mutual
         let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
         CompilerM.emitAssign resWire (.slice (.ref wireS) (width - 1) 0)
         return some resWire
+
+      -- Generic fallback: translate f applied to the signal's wire value
+      -- Works for both lambdas (fun b => ...) and partial applications (BitVec.extractLsb' 0 1)
+      trace[sparkle.compiler] "→ Signal.map generic fallback"
+      let wireS ← translateExprToWire s "map_in" (isTopLevel := false)
+      -- Infer the inner type of the signal (the pure type that f operates on)
+      let sType ← CompilerM.liftMetaM (Lean.Meta.inferType s)
+      let innerType ← CompilerM.liftMetaM do
+        let sType ← whnf sType
+        match sType with
+        | .app (.app _ _dom) inner => return inner
+        | _ => throwError s!"Signal.map: cannot infer inner type from {sType}"
+      let resWire ← CompilerM.withLocalDecl `map_arg innerType fun fvar => do
+        let fvarId := fvar.fvarId!
+        CompilerM.withVarMapping fvarId wireS do
+          -- Apply f to the fvar: this handles both lambdas and partial applications
+          let applied := Lean.mkApp f fvar
+          -- Beta-reduce if f is a lambda (use reducible to avoid over-unfolding)
+          let applied ← CompilerM.liftMetaM (Lean.Meta.withTransparency .reducible $ Lean.Meta.whnf applied)
+          translateExprToWire applied hint (isNamed := isNamed)
+      return some resWire
 
     return none
 
@@ -1136,6 +1171,23 @@ mutual
       let hwType ← inferHWTypeFromSignal exprType
       let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
       CompilerM.emitAssign resWire (.concat [.ref hiWire, .ref loWire])
+      return some resWire
+
+    -- BitVec.zeroExtend / BitVec.setWidth: zero-extend to wider width
+    if (name == ``BitVec.zeroExtend || name == ``BitVec.setWidth) && args.size >= 2 then
+      trace[sparkle.compiler] "→ zeroExtend"
+      let targetWidth ← extractNat args[args.size - 2]!
+      let srcWire ← translateExprToWire args[args.size - 1]! "zext_src"
+      let srcWidth ← CompilerM.getWireWidth srcWire
+      let resWire ← CompilerM.makeWire hint (.bitVector targetWidth) (named := isNamed)
+      if targetWidth > srcWidth then
+        let padWidth := targetWidth - srcWidth
+        let padWire ← CompilerM.makeWire "zext_pad" (.bitVector padWidth)
+        CompilerM.emitAssign padWire (.const 0 padWidth)
+        CompilerM.emitAssign resWire (.concat [.ref padWire, .ref srcWire])
+      else
+        -- Same width or narrower: just slice (truncate)
+        CompilerM.emitAssign resWire (.slice (.ref srcWire) (targetWidth - 1) 0)
       return some resWire
 
     -- isPrimitive dispatch
@@ -1310,11 +1362,11 @@ mutual
         let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
         let hwType ← inferHWTypeFromSignal exprType
         let loopWire ← CompilerM.makeWire "loop" hwType
-        let (fvarId, bodyInst) ← CompilerM.liftMetaM do
-          withLocalDeclD binderName binderType fun fvar => do
-            return (fvar.fvarId!, body.instantiate1 fvar)
-        let resultWire ← CompilerM.withVarMapping fvarId loopWire do
-          translateExprToWire bodyInst "loop_body"
+        let resultWire ← CompilerM.withLocalDecl binderName binderType fun fvar => do
+          let fvarId := fvar.fvarId!
+          CompilerM.withVarMapping fvarId loopWire do
+            let bodyInst := body.instantiate1 fvar
+            translateExprToWire bodyInst "loop_body"
         CompilerM.emitAssign loopWire (.ref resultWire)
         return some resultWire
       | _ => CompilerM.liftMetaM $ throwError "Signal.loop argument must be a lambda"

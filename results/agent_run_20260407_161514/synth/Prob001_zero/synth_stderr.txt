@@ -1,0 +1,73 @@
+Unable to find image 'openroad/orfs:latest' locally
+latest: Pulling from openroad/orfs
+96c832531c38: Pulling fs layer
+aa827ad51bbc: Pulling fs layer
+afd8e6934a1f: Pulling fs layer
+5195ff0cc001: Pulling fs layer
+29b7b676371f: Pulling fs layer
+9736939adbd5: Pulling fs layer
+ecd663e0c796: Pulling fs layer
+edd6cb82a9b4: Pulling fs layer
+e5c9666aca2b: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+8a30bb4624d2: Pulling fs layer
+5fd160dcebbe: Pulling fs layer
+6f48243fd93c: Pulling fs layer
+121c98f69eef: Pulling fs layer
+a82954ee071c: Pulling fs layer
+e41b19073ef9: Pulling fs layer
+fc4f8cde01aa: Pulling fs layer
+07b34d1e8cc8: Pulling fs layer
+b907a651462d: Pulling fs layer
+9dda809713f1: Pulling fs layer
+d4d519c348d3: Pulling fs layer
+f9b73f04a1df: Pulling fs layer
+4f4fb700ef54: Already exists
+afd8e6934a1f: Download complete
+5195ff0cc001: Download complete
+29b7b676371f: Download complete
+edd6cb82a9b4: Download complete
+aa827ad51bbc: Download complete
+e5c9666aca2b: Download complete
+5fd160dcebbe: Download complete
+121c98f69eef: Download complete
+9736939adbd5: Download complete
+07b34d1e8cc8: Download complete
+ecd663e0c796: Download complete
+b907a651462d: Download complete
+a82954ee071c: Download complete
+9dda809713f1: Download complete
+f9b73f04a1df: Download complete
+75941278163f: Download complete
+96c832531c38: Download complete
+d4d519c348d3: Download complete
+96c832531c38: Pull complete
+a82954ee071c: Pull complete
+5195ff0cc001: Pull complete
+29b7b676371f: Pull complete
+e5c9666aca2b: Pull complete
+fc4f8cde01aa: Download complete
+8a30bb4624d2: Download complete
+6f48243fd93c: Download complete
+e41b19073ef9: Download complete
+e41b19073ef9: Pull complete
+aa827ad51bbc: Pull complete
+ecd663e0c796: Pull complete
+9dda809713f1: Pull complete
+4f4fb700ef54: Pull complete
+afd8e6934a1f: Pull complete
+edd6cb82a9b4: Pull complete
+9736939adbd5: Pull complete
+f9b73f04a1df: Pull complete
+d4d519c348d3: Pull complete
+6f48243fd93c: Pull complete
+5fd160dcebbe: Pull complete
+121c98f69eef: Pull complete
+07b34d1e8cc8: Pull complete
+8a30bb4624d2: Pull complete
+fc4f8cde01aa: Pull complete
+b907a651462d: Pull complete
+Digest: sha256:067cf54b9bb5d8b4cef913c07ac7e3fac38d05215c616f58b76461f4dedf67c3
+Status: Downloaded newer image for openroad/orfs:latest
+make[1]: *** [Makefile:406: do-1_synth] Error 1
+make: *** [Makefile:406: results/sky130hd/prob001_zero/base/1_synth.odb] Error 2

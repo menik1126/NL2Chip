@@ -1,0 +1,15 @@
+{
+  "total": 1,
+  "passed": 1,
+  "failed": 0,
+  "errors": 0,
+  "pass_rate": "100.0%",
+  "first_attempt_pass": 1,
+  "retry_fixed": 0,
+  "sim_pass": 1,
+  "sim_fail": 0,
+  "sim_error": 0,
+  "total_tokens_in": 6637,
+  "total_tokens_out": 104,
+  "wall_time_s": 4.8
+}

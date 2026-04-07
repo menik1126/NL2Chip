@@ -46,3 +46,17 @@ plans/
 Sparkle/Verification/Generated/
 Examples/CDC/gen/
 verilator/generated_soc_jit.cpp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
+key.env
+
+# Generated
+wave.vcd
+
+# Subprojects
+siliconcrew/
