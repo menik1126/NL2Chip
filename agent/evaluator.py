@@ -53,6 +53,14 @@ def parse_module_ports(sv_code: str) -> tuple[str, list[tuple[str, str, str]]]:
     return mod_name, ports
 
 
+def _port_width(typ: str) -> int:
+    """Extract bit width from a type like 'logic [7:0]' or 'logic'."""
+    m = re.search(r"\[(\d+):(\d+)\]", typ)
+    if m:
+        return abs(int(m.group(1)) - int(m.group(2))) + 1
+    return 1
+
+
 def parse_ref_ports(ref_sv: str) -> list[tuple[str, str, str]]:
     """Parse RefModule ports from reference Verilog."""
     ports = []
@@ -93,14 +101,22 @@ def generate_top_wrapper(
                     break
 
     output_map: dict[str, str] = {}
-    for i, (_, _, rn) in enumerate(ref_outputs):
-        if i < len(sp_outputs):
-            output_map[rn] = sp_outputs[i][2]
-        else:
-            for _, _, sn in sp_outputs:
-                if sn == rn or sn == f"_gen_{rn}":
-                    output_map[rn] = sn
-                    break
+    bundled_output = False
+    if len(ref_outputs) > len(sp_outputs) == 1:
+        # Sparkle bundled multiple outputs into one port — check widths match
+        sp_width = _port_width(sp_outputs[0][1])
+        ref_total = sum(_port_width(t) for _, t, _ in ref_outputs)
+        if sp_width == ref_total:
+            bundled_output = True
+    if not bundled_output:
+        for i, (_, _, rn) in enumerate(ref_outputs):
+            if i < len(sp_outputs):
+                output_map[rn] = sp_outputs[i][2]
+            else:
+                for _, _, sn in sp_outputs:
+                    if sn == rn or sn == f"_gen_{rn}":
+                        output_map[rn] = sn
+                        break
 
     lines = ["module TopModule ("]
     all_ref_ports = ref_inputs + ref_outputs
@@ -147,8 +163,22 @@ def generate_top_wrapper(
     lines.append(",\n".join(inst_conns))
     lines.append("    );")
 
-    for rn, sn in output_map.items():
-        lines.append(f"    assign {rn} = {sn}_wire;")
+    if bundled_output:
+        # Bit-slice the single bundled output: first ref output = MSB
+        sp_out_name = sp_outputs[0][2]
+        offset = _port_width(sp_outputs[0][1])
+        for _, rt, rn in ref_outputs:
+            w = _port_width(rt)
+            high = offset - 1
+            low = offset - w
+            if w == 1:
+                lines.append(f"    assign {rn} = {sp_out_name}_wire[{low}];")
+            else:
+                lines.append(f"    assign {rn} = {sp_out_name}_wire[{high}:{low}];")
+            offset -= w
+    else:
+        for rn, sn in output_map.items():
+            lines.append(f"    assign {rn} = {sn}_wire;")
 
     lines.append("endmodule")
     return "\n".join(lines)
@@ -664,13 +694,23 @@ class Evaluator:
 
     @staticmethod
     def _run_lvs(synth_dir: Path, volumes: list[str]) -> dict:
-        """Run KLayout LVS (best-effort — sky130hd CDL parsing may fail)."""
+        """Run KLayout LVS, fixing sky130hd CDL 'short' keyword that KLayout can't parse."""
         from tools.run_docker import run_docker_command
 
         result: dict = {"lvs_pass": None, "lvs_error": None}
+
+        # sky130 CDL has two issues KLayout 0.30.x can't handle:
+        # 1. "rXX ... short" resistor lines (zero-ohm connections) — delete them
+        # 2. "/" separator between pins and subcircuit name — remove it
+        lvs_cmd = (
+            "sed -i -e '/ short$/d' -e 's| / | |g' "
+            "/OpenROAD-flow-scripts/flow/platforms/sky130hd/cdl/sky130hd.cdl && "
+            "make DESIGN_CONFIG=/workspace/config.mk lvs"
+        )
+
         try:
             lvs_result = run_docker_command(
-                command="make DESIGN_CONFIG=/workspace/config.mk lvs",
+                command=lvs_cmd,
                 workspace_path=str(synth_dir),
                 volumes=volumes,
                 timeout=LVS_TIMEOUT,
@@ -683,7 +723,6 @@ class Evaluator:
             result["lvs_pass"] = True
         else:
             stderr = lvs_result.get("stderr", "")
-            # Known KLayout/sky130hd CDL parsing issue — not a design error
             if "Can't find a value for a R, C or L device" in stderr:
                 result["lvs_error"] = "KLayout CDL parse error (platform issue)"
             else:

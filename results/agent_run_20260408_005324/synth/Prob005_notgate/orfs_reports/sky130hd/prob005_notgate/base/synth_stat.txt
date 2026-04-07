@@ -1,0 +1,20 @@
+
+20. Printing statistics.
+
+=== prob005_notgate ===
+
+        +----------Local Count, excluding submodules.
+        |        +-Local Area, excluding submodules.
+        |        | 
+        2        - wires
+        2        - wire bits
+        2        - public wires
+        2        - public wire bits
+        2        - ports
+        2        - port bits
+        1    3.754 cells
+        1    3.754   sky130_fd_sc_hd__inv_1
+
+   Chip area for module '\prob005_notgate': 3.753600
+     of which used for sequential elements: 0.000000 (0.00%)
+

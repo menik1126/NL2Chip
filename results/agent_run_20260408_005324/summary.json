@@ -1,0 +1,25 @@
+{
+  "total": 5,
+  "attempted": 5,
+  "skipped": 0,
+  "compile_pass": 5,
+  "compile_rate": "100.0%",
+  "sim_pass": 5,
+  "sim_fail": 0,
+  "sim_error": 0,
+  "sim_rate": "100.0%",
+  "synth_pass": 0,
+  "pnr_pass": 5,
+  "drc_pass": 5,
+  "lvs_pass": 5,
+  "agent_tokens": {
+    "input": 854990,
+    "output": 14861
+  },
+  "elapsed_seconds": 599,
+  "model": "claude-sonnet-4-20250514",
+  "synth_enabled": false,
+  "pnr_enabled": true,
+  "drc_enabled": true,
+  "lvs_enabled": true
+}

@@ -1,0 +1,60 @@
+{
+  "creator": "Yosys 0.63+post (git sha1 UNKNOWN-dirty, g++ 11.4.0-1ubuntu1~22.04.3 -fPIC -O3)",
+  "modules": {
+    "prob005_notgate": {
+      "attributes": {
+        "hdlname": "prob005_notgate",
+        "top": "00000000000000000000000000000001",
+        "src": "/workspace/Prob005_notgate.sv:4.1-16.10"
+      },
+      "ports": {
+        "_gen_input": {
+          "direction": "input",
+          "bits": [ 2 ]
+        },
+        "out": {
+          "direction": "output",
+          "bits": [ 3 ]
+        }
+      },
+      "cells": {
+        "$not$/workspace/Prob005_notgate.sv:12$5470": {
+          "hide_name": 1,
+          "type": "$not",
+          "parameters": {
+            "A_SIGNED": "00000000000000000000000000000000",
+            "A_WIDTH": "00000000000000000000000000000001",
+            "Y_WIDTH": "00000000000000000000000000000001"
+          },
+          "attributes": {
+            "src": "/workspace/Prob005_notgate.sv:12.28-12.39"
+          },
+          "port_directions": {
+            "A": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 2 ],
+            "Y": [ 3 ]
+          }
+        }
+      },
+      "netnames": {
+        "_gen_input": {
+          "hide_name": 0,
+          "bits": [ 2 ],
+          "attributes": {
+            "src": "/workspace/Prob005_notgate.sv:5.17-5.27"
+          }
+        },
+        "out": {
+          "hide_name": 0,
+          "bits": [ 3 ],
+          "attributes": {
+            "src": "/workspace/Prob005_notgate.sv:6.18-6.21"
+          }
+        }
+      }
+    }
+  }
+}
