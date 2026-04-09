@@ -1,0 +1,119 @@
+\section{Method}
+\label{sec:method}
+
+We present \textsc{Sparkle}, an end-to-end framework that translates natural language hardware specifications into formally verifiable, synthesizable hardware designs. The key insight is that by targeting a dependently-typed hardware description language embedded in Lean~4 rather than generating Verilog directly, the LLM agent receives rich compile-time feedback---type errors, width mismatches, and formal verification failures---that guides iterative refinement toward correct-by-construction hardware.
+
+\subsection{Overview}
+\label{sec:overview}
+
+Figure~\ref{fig:pipeline} illustrates the complete pipeline. Given a natural language specification $\mathcal{S}$ and an optional reference Verilog implementation $\mathcal{V}_{\text{ref}}$, our system produces a formally described hardware design through the following stages:
+
+\begin{enumerate}[leftmargin=*,itemsep=1pt,topsep=2pt]
+    \item \textbf{LLM Code Generation.} A coding agent $\mathcal{A}$ translates $\mathcal{S}$ into Sparkle HDL (Lean~4) code $\mathcal{L}$, using few-shot examples from a verified benchmark library and iterative error correction.
+    \item \textbf{Compilation \& Extraction.} The Lean~4 compiler type-checks $\mathcal{L}$ and extracts synthesizable SystemVerilog $\mathcal{V}$ via the \texttt{\#synthesizeVerilog} metaprogram.
+    \item \textbf{Functional Verification.} $\mathcal{V}$ is simulated against reference testbenches to verify functional correctness.
+    \item \textbf{Physical Synthesis.} $\mathcal{V}$ is synthesized and placed-and-routed using OpenROAD with the SkyWater 130nm PDK, yielding PPA (Power, Performance, Area) metrics.
+    \item \textbf{PPA Optimization.} The agent receives PPA feedback and iteratively optimizes the architecture while preserving functional correctness.
+\end{enumerate}
+
+\subsection{Sparkle HDL: Hardware in Lean~4}
+\label{sec:sparkle_hdl}
+
+Sparkle HDL is a domain-specific language embedded in Lean~4 that describes hardware using \texttt{Signal} combinators. A signal \texttt{Signal dom $\alpha$} represents a synchronous stream of values of type $\alpha$ under clock domain \texttt{dom}. The embedding in Lean~4 provides three properties that make it an ideal LLM target:
+
+\paragraph{Type-Safe Bit Widths.}
+Lean~4's dependent type system encodes bit widths at the type level via \texttt{BitVec $N$}. Width mismatches---a pervasive source of silent bugs in Verilog---become compile-time errors. For example, adding a 4-bit and an 8-bit signal without explicit extension is rejected by the type checker, providing immediate feedback to the LLM agent.
+
+\paragraph{Structural Safety.}
+Combinational logic forms a directed acyclic graph enforced by the \texttt{Signal} monad; state feedback is only possible through explicit registers (\texttt{Signal.register}, \texttt{Signal.loop}), making combinational loops impossible by construction. Lean's exhaustive pattern matching prevents unintended latches---a common synthesis hazard in Verilog's \texttt{always} blocks.
+
+\paragraph{Formal Verification.}
+Designers (or the LLM agent) can state and prove theorems about the hardware directly in Lean~4. For instance, an equivalence proof between a specification and an optimized implementation:
+\begin{small}
+\begin{verbatim}
+theorem equiv (input : Signal dom (BitVec 3)) :
+    optimized input = spec input := by
+  unfold optimized spec; rfl
+\end{verbatim}
+\end{small}
+This enables the agent to not only generate hardware but also produce machine-checked correctness certificates.
+
+\paragraph{Verilog Extraction.}
+The \texttt{\#synthesizeVerilog} metaprogram compiles the Lean~4 hardware description through Sparkle's intermediate representation (IR) into clean, human-readable SystemVerilog. A built-in Design Rule Check (DRC) pass enforces backend-friendly RTL conventions (e.g., registered outputs) before emission, reducing physical design iterations.
+
+\subsection{LLM Coding Agent}
+\label{sec:agent}
+
+The coding agent $\mathcal{A}$ is an LLM equipped with tool-use capabilities that iteratively writes, compiles, and debugs Sparkle HDL code. We instantiate $\mathcal{A}$ using Claude with the following components:
+
+\paragraph{System Prompt.}
+The agent receives a structured system prompt containing: (1)~the Sparkle HDL syntax reference, including the \texttt{Signal} API, type system, and core operators; (2)~design patterns for combinational logic, sequential circuits, and finite state machines; (3)~critical rules encoding common pitfalls (e.g., ``use \texttt{Signal.mux} instead of \texttt{if-then-else}''); and (4)~a prescribed workflow for iterative development.
+
+\paragraph{Tool Suite.}
+The agent has access to seven tools: \texttt{bash} (execute shell commands with 120s timeout), \texttt{read\_file}, \texttt{write\_file}, \texttt{edit\_file} (surgical string replacement), \texttt{grep}, \texttt{glob}, and \texttt{list\_directory}. These tools enable the agent to explore the codebase, read benchmark examples, write Lean code, invoke the compiler, and analyze error messages.
+
+\paragraph{Few-Shot Retrieval.}
+Before generating code, the agent reads from a library of 10 verified benchmark implementations spanning combinational circuits, sequential logic, and FSMs. These serve as in-context examples that demonstrate correct Sparkle HDL patterns and naming conventions.
+
+\paragraph{Iterative Compile-Fix Loop.}
+The agent follows a multi-turn conversation protocol:
+\begin{enumerate}[leftmargin=*,itemsep=0pt,topsep=2pt]
+    \item Read the natural language specification and reference Verilog.
+    \item Identify similar benchmark examples via \texttt{grep}/\texttt{glob}.
+    \item Write an initial Lean~4 implementation to \texttt{Generated/\{prob\_id\}.lean}.
+    \item Invoke \texttt{lake build} and parse compiler diagnostics.
+    \item If compilation fails, analyze the error (type mismatch, unknown identifier, syntax error), apply a targeted fix via \texttt{edit\_file}, and retry.
+    \item Once compilation succeeds, verify the extracted SystemVerilog.
+\end{enumerate}
+The agent is allowed up to $T$ turns (default $T{=}40$) per problem. Each turn consists of one LLM inference followed by zero or more tool invocations.
+
+\subsection{Automated Evaluation Pipeline}
+\label{sec:eval_pipeline}
+
+Once the agent produces a candidate Lean~4 file, the evaluation pipeline assesses it through a sequence of increasingly stringent checks:
+
+\begin{enumerate}[leftmargin=*,itemsep=1pt,topsep=2pt]
+    \item \textbf{Lean Compilation.} \texttt{lake build Generated.\{prob\_id\}} verifies type correctness and triggers Verilog extraction.
+    \item \textbf{SystemVerilog Extraction.} The build output is parsed to extract the generated \texttt{.sv} file. A \texttt{TopModule} wrapper is automatically generated to map Sparkle's port naming conventions to the reference testbench interface.
+    \item \textbf{Lint Check.} Verilator or Icarus Verilog performs static analysis to catch synthesis-incompatible constructs.
+    \item \textbf{Functional Simulation.} The design is simulated against the VerilogEval reference testbench using Icarus Verilog. The testbench applies input vectors and compares outputs cycle-by-cycle, reporting the number of mismatches out of total samples.
+    \item \textbf{Logic Synthesis.} Designs passing simulation are synthesized using Yosys targeting the SkyWater 130nm HD standard cell library (\texttt{sky130\_fd\_sc\_hd}) via the OpenROAD Flow Scripts (ORFS) Docker environment. This yields gate-level netlists and initial PPA estimates.
+    \item \textbf{Place \& Route.} The synthesized netlist undergoes floorplanning, placement, clock tree synthesis, routing, and finishing in OpenROAD, producing a GDSII layout. Static timing analysis (STA) reports worst negative slack (WNS) across multiple PVT corners (SS/TT/FF).
+\end{enumerate}
+
+The pipeline is fully automated and containerized: synthesis and P\&R run inside a Docker container with pre-installed ORFS and the sky130 PDK, ensuring reproducibility.
+
+\subsection{PPA Optimization Loop}
+\label{sec:ppa_opt}
+
+For designs that pass functional simulation and synthesis, we employ a closed-loop PPA optimization strategy. The agent receives quantitative feedback on the physical characteristics of its design and iteratively refines the architecture.
+
+Let $\mathbf{p}_i = (\text{area}_i, \text{power}_i, \text{WNS}_i, \text{cells}_i)$ denote the PPA vector after iteration $i$. The optimization proceeds for $K$ iterations (default $K{=}3$):
+
+\begin{enumerate}[leftmargin=*,itemsep=1pt,topsep=2pt]
+    \item \textbf{Feedback Construction.} A structured message is constructed containing the current PPA metrics $\mathbf{p}_i$, the optimization history $\{\mathbf{p}_0, \ldots, \mathbf{p}_i\}$, and guidance on potential optimization strategies (e.g., reducing intermediate signals, merging operations, restructuring mux chains).
+    \item \textbf{Agent Resume.} The agent resumes from its prior conversation state with the PPA feedback appended, preserving full context of the design decisions made so far. It modifies the Lean~4 source to produce an optimized variant.
+    \item \textbf{Re-evaluation.} The modified design is re-evaluated through the full pipeline (compilation $\to$ simulation $\to$ synthesis $\to$ P\&R).
+    \item \textbf{Best Selection.} We track the global best PPA vector $\mathbf{p}^*$ across all iterations. An iteration is considered an improvement if any metric improves by ${>}5\%$ without any metric degrading by ${>}20\%$:
+    \begin{equation}
+        \text{improved}(\mathbf{p}^*, \mathbf{p}_{i+1}) = \exists\, m: \frac{p^*_m - p_{i+1,m}}{|p^*_m|} > 0.05 \;\wedge\; \forall\, m: \frac{p_{i+1,m} - p^*_m}{|p^*_m|} < 0.20
+    \end{equation}
+    \item \textbf{Rollback.} If simulation fails after an optimization attempt, the Lean source is rolled back to the pre-iteration version and the loop continues with the next iteration, rather than terminating early.
+\end{enumerate}
+
+After all $K$ iterations complete, the globally best design (by PPA) is restored. This exhaustive strategy ensures the agent explores the full optimization budget rather than converging prematurely after a single non-improving iteration.
+
+\subsection{Architecture Exploration}
+\label{sec:arch_explore}
+
+For designs where the optimization space is large, we support an architecture exploration mode. The agent generates $C$ distinct architectural candidates (default $C{=}3$), each implementing the same specification with different micro-architectural choices (e.g., parallel vs.\ serial datapaths, different encoding schemes, tree vs.\ chain reduction). Each candidate is independently evaluated through the full pipeline, and the best is selected by PPA metrics.
+
+When formal verification is enabled, the agent additionally produces equivalence proofs between the original specification and each optimized architecture:
+\begin{small}
+\begin{verbatim}
+theorem arch_equiv (input : Signal dom (BitVec N)) :
+    arch_optimized input = spec input := by
+  unfold arch_optimized spec; simp [Signal.mux, ...]
+\end{verbatim}
+\end{small}
+This provides machine-checked guarantees that architectural optimizations preserve functional correctness---a property that simulation alone cannot ensure for all possible inputs.

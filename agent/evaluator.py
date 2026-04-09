@@ -30,7 +30,28 @@ SYNTH_TIMEOUT = 600
 PNR_TIMEOUT = 900
 DRC_TIMEOUT = 300
 LVS_TIMEOUT = 300
+STA_TIMEOUT = 120
 MIN_DIE_SIDE_UM = 50  # minimum die side for sky130hd PDN straps
+
+# ── PVT Corner definitions (sky130hd) ──────────────────────────────
+
+PVT_CORNERS = [
+    {
+        "name": "ss_100C_1v60",
+        "lib": "sky130_fd_sc_hd__ss_100C_1v60.lib",
+        "label": "SS (100°C, 1.60V)",
+    },
+    {
+        "name": "tt_025C_1v80",
+        "lib": "sky130_fd_sc_hd__tt_025C_1v80.lib",
+        "label": "TT (25°C, 1.80V)",
+    },
+    {
+        "name": "ff_n40C_1v95",
+        "lib": "sky130_fd_sc_hd__ff_n40C_1v95.lib",
+        "label": "FF (-40°C, 1.95V)",
+    },
+]
 
 
 # ── Port parsing (from autoformalize.py) ─────────────────────────
@@ -190,13 +211,14 @@ def generate_top_wrapper(
 class Evaluator:
     """Evaluate a Sparkle-generated .lean file: compile → extract SV → lint → sim → (synth+PPA) → (P&R+DRC+LVS)."""
 
-    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False):
+    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False):
         self.project_root = project_root.resolve()
         self.dataset_dir = self.project_root / "verilog-eval" / "dataset_spec-to-rtl"
         self.enable_pnr = enable_pnr or enable_drc or enable_lvs  # drc/lvs imply pnr
         self.enable_synth = enable_synth or self.enable_pnr  # pnr implies synth
         self.enable_drc = enable_drc
         self.enable_lvs = enable_lvs
+        self.enable_corners = enable_corners and self.enable_pnr  # corners require pnr
 
         if self.enable_synth:
             # Add siliconcrew/src to path for synthesis tools
@@ -232,6 +254,7 @@ class Evaluator:
             "drc_violations": None,
             "lvs_pass": None,        # None = not run, True/False = result
             "lvs_error": None,
+            "has_sorry": True,       # True = unverified (default), False = formally verified
             "detail": "",
         }
 
@@ -259,6 +282,7 @@ class Evaluator:
             return result
 
         result["compile_pass"] = True
+        result["has_sorry"] = bool(re.search(r"declaration uses `sorry`", build_output))
 
         # 2. Extract SystemVerilog
         sv_code = self._extract_sv(build_output)
@@ -455,11 +479,13 @@ class Evaluator:
         )
         (synth_dir / "config.mk").write_text(config_content)
 
-        # Set up output directories
+        # Set up output directories (clean first to avoid stale results from prior iterations)
         results_dir = synth_dir / "orfs_results"
         logs_dir = synth_dir / "orfs_logs"
         reports_dir = synth_dir / "orfs_reports"
         for d in [results_dir, logs_dir, reports_dir]:
+            if d.exists():
+                shutil.rmtree(d)
             d.mkdir(parents=True, exist_ok=True)
 
         volumes = [
@@ -618,11 +644,18 @@ class Evaluator:
         # ── Parse finish report for timing/power ──
         self._parse_finish_report(synth_dir, result)
 
-        # ── Phase 2: DRC ──
+        # ── Phase 2: Multi-corner STA ──
+        if self.enable_corners:
+            corner_result = self._run_multi_corner_sta(
+                prob_id, sv_code, top_module, synth_dir, volumes
+            )
+            result.update(corner_result)
+
+        # ── Phase 3: DRC ──
         if self.enable_drc:
             result.update(self._run_drc(synth_dir, volumes))
 
-        # ── Phase 3: LVS (best-effort) ──
+        # ── Phase 4: LVS (best-effort) ──
         if self.enable_lvs:
             result.update(self._run_lvs(synth_dir, volumes))
 
@@ -657,6 +690,108 @@ class Evaluator:
                 break
         except Exception:
             pass
+
+    def _run_multi_corner_sta(
+        self, prob_id: str, sv_code: str, top_module: str,
+        synth_dir: Path, volumes: list[str],
+    ) -> dict:
+        """Run STA at each PVT corner on the post-route netlist."""
+        from tools.run_docker import run_docker_command
+
+        has_clk = bool(re.search(r'\binput\b.*\bclk\b', sv_code))
+        corners_data: list[dict] = []
+        platform_dir = "/OpenROAD-flow-scripts/flow/platforms/sky130hd"
+        results_base = f"/OpenROAD-flow-scripts/flow/results/sky130hd/{top_module}/base"
+
+        for corner in PVT_CORNERS:
+            cname = corner["name"]
+            lib_path = f"{platform_dir}/lib/{corner['lib']}"
+
+            # TCL script for this corner
+            tcl_lines = [
+                f"read_liberty {lib_path}",
+                f"read_verilog {results_base}/6_final.v",
+                f"link_design {top_module}",
+                "read_sdc /workspace/constraints.sdc",
+                f"catch {{ read_spef {results_base}/6_final.spef }}",
+            ]
+            if has_clk:
+                tcl_lines += [
+                    "report_checks -path_delay max -digits 4",
+                    "report_checks -path_delay min -digits 4",
+                ]
+            tcl_lines += [
+                "report_power",
+                "exit",
+            ]
+
+            tcl_file = synth_dir / f"sta_{cname}.tcl"
+            tcl_file.write_text("\n".join(tcl_lines) + "\n")
+
+            try:
+                sta_result = run_docker_command(
+                    command=f"/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/sta /workspace/sta_{cname}.tcl",
+                    workspace_path=str(synth_dir),
+                    volumes=volumes,
+                    timeout=STA_TIMEOUT,
+                )
+            except Exception as e:
+                corners_data.append({
+                    "corner": cname, "label": corner["label"],
+                    "error": str(e),
+                })
+                continue
+
+            stdout = sta_result.get("stdout", "")
+            (synth_dir / f"sta_{cname}_out.txt").write_text(stdout)
+
+            cdata: dict = {
+                "corner": cname,
+                "label": corner["label"],
+                "wns_ns": None,
+                "whs_ns": None,
+                "power_uw": None,
+            }
+
+            # Parse setup WNS and hold WHS from slack lines
+            setup_slacks = re.findall(
+                r"slack\s+\((?:MET|VIOLATED)\)\s+([0-9.eE+-]+)", stdout
+            )
+            if setup_slacks:
+                cdata["wns_ns"] = float(setup_slacks[0])
+            if len(setup_slacks) >= 2:
+                cdata["whs_ns"] = float(setup_slacks[1])
+
+            # Parse power: "Total  <int> <switch> <leak> <total>"
+            for line in stdout.splitlines():
+                if line.strip().startswith("Total"):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        try:
+                            cdata["power_uw"] = float(parts[-2]) * 1e6
+                        except (ValueError, IndexError):
+                            pass
+
+            corners_data.append(cdata)
+
+        # Compute worst-case across corners
+        worst: dict = {
+            "pvt_corners": corners_data,
+            "pvt_worst_wns_ns": None,
+            "pvt_worst_whs_ns": None,
+            "pvt_worst_power_uw": None,
+        }
+        wns_vals = [c["wns_ns"] for c in corners_data if c.get("wns_ns") is not None]
+        whs_vals = [c["whs_ns"] for c in corners_data if c.get("whs_ns") is not None]
+        pwr_vals = [c["power_uw"] for c in corners_data if c.get("power_uw") is not None]
+        if wns_vals:
+            worst["pvt_worst_wns_ns"] = min(wns_vals)
+        if whs_vals:
+            worst["pvt_worst_whs_ns"] = min(whs_vals)
+        if pwr_vals:
+            worst["pvt_worst_power_uw"] = max(pwr_vals)
+
+        return worst
 
     @staticmethod
     def _run_drc(synth_dir: Path, volumes: list[str]) -> dict:

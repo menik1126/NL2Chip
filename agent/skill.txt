@@ -176,3 +176,169 @@ Write a single file `Generated/<prob_id>.lean` that:
 1. Follows the file template exactly
 2. Compiles with `lake build Generated.<prob_id>`
 3. Generates correct SystemVerilog via `#synthesizeVerilog`
+
+## Architecture Exploration (when feedback is provided)
+
+When you receive architecture exploration feedback, your goal is to write a COMPLETELY DIFFERENT
+implementation of the same spec — not tweak the existing one. The feedback includes a table of
+all candidate architectures tried so far with their PPA (area, cells, WNS, power). Your job is
+to explore a new point in the design space.
+
+### Architectural Dimensions to Explore
+- **Parallelism**: How many operations execute simultaneously
+  - Fully parallel: all at once (max throughput, max area)
+  - Partially parallel: N units shared across M operations
+  - Sequential: 1 unit, iterate (min area, max latency)
+- **Pipeline depth**: How many register stages break the critical path
+  - Deep pipeline: high clock frequency, more registers, more area
+  - Shallow/combinational: lower frequency, less area
+- **Data flow**: How data moves through the computation
+  - Systolic: data flows through a grid of PEs
+  - Broadcast: one input fans out to all PEs
+  - Streaming: data flows through pipeline stages
+- **Resource sharing**: Time-multiplex expensive units
+  - Dedicated: each operation has its own hardware
+  - Shared: one unit serves multiple operations via FSM
+
+### Sparkle Patterns for Architecture Variants
+
+**Fully parallel (combinational):**
+```lean
+-- All N operations computed in one cycle
+def compute_parallel {dom : DomainConfig}
+    (inputs : Signal dom (BitVec (N*W))) : Signal dom (BitVec (N*W)) :=
+  Signal.map (fun x => /* all N results at once */) inputs
+```
+
+**Pipelined (register stages):**
+```lean
+-- Break computation into K stages with registers between them
+def compute_pipelined {dom : DomainConfig}
+    (input : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  let stage1 := Signal.register 0#W (Signal.map step1 input)
+  let stage2 := Signal.register 0#W (Signal.map step2 stage1)
+  Signal.map step3 stage2
+```
+
+**Time-multiplexed (FSM + shared unit):**
+```lean
+-- One compute unit, iterate N times via FSM
+def compute_sequential {dom : DomainConfig}
+    (input : Signal dom (BitVec (N*W))) : Signal dom (BitVec W) :=
+  Signal.loop fun state =>
+    let counter := Signal.map (fun s => extractCounter s) state
+    let result := Signal.map (fun s => extractResult s) state
+    let next := Signal.mux (counter === Signal.pure maxCount)
+      (/* done */) (/* compute next iteration */)
+    Signal.register initState next
+```
+
+**Tiled (process sub-blocks):**
+```lean
+-- Process data in tiles of size T
+def compute_tiled {dom : DomainConfig}
+    (input : Signal dom (BitVec (N*W))) : Signal dom (BitVec (N*W)) :=
+  let tile0 := processTile (extractTile 0 input)
+  let tile1 := processTile (extractTile 1 input)
+  combineTiles tile0 tile1
+```
+
+### Architecture Exploration Workflow
+1. Read the feedback — understand what architectures have been tried and their PPA
+2. Choose a DIFFERENT architectural approach (don't repeat what's been tried)
+3. Write a complete new implementation in `Generated/<prob_id>.lean`
+4. Compile with `lake build` to verify correctness
+5. The evaluator will measure PPA — you'll get feedback in the next round
+
+### Important Rules
+- Each iteration must be a genuinely different architecture, not a minor tweak
+- Maintain functional correctness — the circuit must still pass simulation
+- You can reference existing examples in `IP/`, `Examples/`, `Benchmark/` for patterns
+- Name your function the same (`<prob_id>`) so `#synthesizeVerilog` works
+
+## Verified Architecture Exploration
+
+When exploring architectures, you SHOULD prove functional equivalence using Lean's theorem prover.
+This gives the strongest correctness guarantee — stronger than simulation alone.
+
+### File Structure for Verified Architecture
+
+```lean
+import Sparkle
+import Sparkle.Compiler.Elab
+
+open Sparkle.Core.Domain
+open Sparkle.Core.Signal
+
+/-- Original spec (preserved, do not modify) -/
+def <func_name>_spec {dom : DomainConfig} (<inputs>) : <output_type> :=
+  <original implementation — copy verbatim from your first working version>
+
+/-- Architecture variant: <describe the architectural approach> -/
+def <func_name> {dom : DomainConfig} (<inputs>) : <output_type> :=
+  <new architecture implementation>
+
+/-- Equivalence proof: new architecture = original spec -/
+theorem <func_name>_equiv {dom : DomainConfig} (<inputs>) :
+    <func_name> <args> = <func_name>_spec <args> := by
+  unfold <func_name> <func_name>_spec
+  <proof tactics>
+
+#synthesizeVerilog <func_name>
+```
+
+### Proof Tactics for Signal Equivalence
+
+Sparkle provides @[simp] lemmas (in Sparkle.Verification.SignalDSLProps) that reduce Signal operations to pure computations:
+- `signal_mux_val`: `(Signal.mux c a b).val t = if c.val t then a.val t else b.val t`
+- `signal_bv_add_val`, `signal_bv_sub_val`: arithmetic reduces to BitVec ops
+- `signal_bv_and_val`, `signal_bv_or_val`, `signal_bv_xor_val`: bitwise ops
+- `signal_register_val_zero`: `(Signal.register init input).val 0 = init`
+- `signal_register_val_succ`: `(Signal.register init input).val (n+1) = input.val n`
+- `signal_pure_val`: `(Signal.pure v).val t = v`
+
+### Common Proof Patterns
+
+**Combinational logic (no registers) — easiest to prove:**
+```lean
+theorem f_equiv ... : f args = f_spec args := by
+  unfold f f_spec
+  rfl  -- or: ext t; simp
+```
+
+**With Signal.map:**
+```lean
+theorem f_equiv ... : f args = f_spec args := by
+  unfold f f_spec
+  congr 1; ext t; simp [Signal.map]
+```
+
+**Sequential logic (with registers):**
+```lean
+theorem f_equiv ... : f args = f_spec args := by
+  unfold f f_spec
+  ext t; induction t <;> simp [*]
+```
+
+**BitVec arithmetic:**
+Use `omega`, `bv_omega`, `decide`, or `native_decide` for concrete computations.
+
+### Equivalence Across Architecture Types
+
+- **Combinational ↔ Combinational**: Direct equivalence, usually provable with `rfl` or `simp`
+- **Same-latency variants** (e.g., different mux tree structures): Provable — same cycle behavior
+- **Different-latency variants** (e.g., combinational vs pipelined): Harder — the pipelined version has register delays. You may need to prove steady-state equivalence or per-stage correctness instead of direct `=`
+
+When architectures have different latency, focus on proving the combinational logic is correct:
+```lean
+/-- Prove the combinational core is equivalent, ignoring pipeline registers -/
+theorem f_core_equiv ... : f_core args = f_spec_core args := by ...
+```
+
+### Critical Rules
+- Try to prove equivalence WITHOUT `sorry` — a proof without `sorry` means the architecture is formally verified
+- If you cannot prove full equivalence, you may use `sorry` — the architecture will still be evaluated via simulation but marked as "unverified"
+- Do NOT skip writing the architecture just because you can't prove it — an unverified but sim-passing candidate is still valuable
+- `#synthesizeVerilog` must reference the new `<func_name>`, not `<func_name>_spec`
+- The `_spec` function is only for verification — it will not be synthesized
+- Keep `_spec` identical across all architecture iterations — it is the fixed reference

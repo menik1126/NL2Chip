@@ -147,7 +147,7 @@ class CodingAgent:
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-haiku-4-5-20251001",
         max_tokens: int = 16384,
         project_root: Path = Path("."),
         log_dir: Path | None = None,
@@ -247,9 +247,119 @@ class CodingAgent:
                 break
             messages.append({"role": "user", "content": tool_results})
 
-        stats = {"input_tokens": total_input, "output_tokens": total_output, "turns": turn + 1}
+        stats = {
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "turns": turn + 1,
+            "messages": messages,
+        }
         if log_file:
-            self._log_event(log_file, {"type": "session_end", **stats})
+            self._log_event(log_file, {"type": "session_end",
+                                       "input_tokens": total_input,
+                                       "output_tokens": total_output,
+                                       "turns": turn + 1})
+        return stats
+
+    def resume(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        feedback_message: str,
+        *,
+        max_turns: int = MAX_TURNS,
+    ) -> dict:
+        """Resume an existing agent conversation with a new feedback message.
+
+        Args:
+            system_prompt: The system prompt (same as original run).
+            messages: Previous conversation messages (from run()'s returned stats).
+            feedback_message: New user message with PPA feedback.
+            max_turns: Max additional turns for this optimization round.
+
+        Returns dict with: {input_tokens, output_tokens, turns, messages}.
+        """
+        # Append the feedback as a new user turn
+        messages = list(messages)  # shallow copy to avoid mutating caller's list
+        messages.append({"role": "user", "content": feedback_message})
+
+        total_input = 0
+        total_output = 0
+
+        log_file = None
+        if self.log_dir:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = self.log_dir / "agent_session.jsonl"
+            self._log_event(log_file, {
+                "type": "resume_start",
+                "model": self.model,
+                "feedback_preview": feedback_message[:500],
+            })
+
+        for turn in range(max_turns):
+            for attempt in range(API_MAX_RETRIES):
+                try:
+                    response = self.client.messages.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        system=system_prompt,
+                        tools=CODING_TOOLS,
+                        messages=messages,
+                    )
+                    break
+                except (anthropic.RateLimitError, anthropic.APIStatusError) as e:
+                    if isinstance(e, anthropic.APIStatusError) and e.status_code < 500 and e.status_code != 429:
+                        raise
+                    if attempt == API_MAX_RETRIES - 1:
+                        raise
+                    delay = min(API_BASE_DELAY * (2 ** attempt), 300)
+                    print(f"  [Agent] {getattr(e, 'status_code', '?')} error, retrying in {delay}s...")
+                    time.sleep(delay)
+
+            total_input += response.usage.input_tokens
+            total_output += response.usage.output_tokens
+            messages.append({"role": "assistant", "content": response.content})
+
+            if log_file:
+                self._log_assistant_turn(log_file, turn, response)
+
+            if response.stop_reason == "end_turn":
+                break
+
+            # Process tool calls
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                result = self._execute_tool(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+                if log_file:
+                    self._log_event(log_file, {
+                        "type": "tool_execution",
+                        "turn": turn,
+                        "tool_name": block.name,
+                        "tool_input": block.input,
+                        "tool_result_preview": result[:2000],
+                    })
+
+            if not tool_results:
+                break
+            messages.append({"role": "user", "content": tool_results})
+
+        stats = {
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "turns": turn + 1,
+            "messages": messages,
+        }
+        if log_file:
+            self._log_event(log_file, {"type": "resume_end",
+                                       "input_tokens": total_input,
+                                       "output_tokens": total_output,
+                                       "turns": turn + 1})
         return stats
 
     # ── Logging helpers ──────────────────────────────────────────

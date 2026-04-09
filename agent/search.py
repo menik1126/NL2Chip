@@ -18,6 +18,7 @@ import json
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -61,6 +62,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pnr", action="store_true", help="Full P&R (implies --synth)")
     p.add_argument("--drc", action="store_true", help="Run DRC after P&R (implies --pnr --synth)")
     p.add_argument("--lvs", action="store_true", help="Run LVS after P&R (implies --pnr --synth)")
+    p.add_argument("--ppa-opt", action="store_true", help="[DEPRECATED] Use --arch-explore instead. Enable PPA optimization feedback loop (implies --synth)")
+    p.add_argument("--ppa-iters", type=int, default=3, help="Max PPA optimization iterations (default: 3)")
+    p.add_argument("--ppa-turns", type=int, default=30, help="Max agent turns per PPA iteration (default: 30)")
+    p.add_argument("--arch-explore", action="store_true", help="Enable architecture exploration mode (implies --synth)")
+    p.add_argument("--arch-candidates", type=int, default=3, help="Max architecture candidates to explore (default: 3)")
+    p.add_argument("--arch-turns", type=int, default=40, help="Max agent turns per architecture candidate (default: 40)")
+    p.add_argument("--area-budget", type=float, default=None, help="Area constraint in μm² (optional)")
+    p.add_argument("--latency-budget", type=int, default=None, help="Latency constraint in cycles (optional)")
+    p.add_argument("--corners", action="store_true", help="Run multi-corner PVT STA after P&R (implies --pnr --synth)")
     p.add_argument("--quiet", "-q", action="store_true", help="Minimal output (progress bar only)")
     return p.parse_args()
 
@@ -134,7 +144,213 @@ def log_event(run_dir: Path, event: dict) -> None:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def print_summary_table(stats: dict, elapsed: float, synth_enabled: bool = False, pnr_enabled: bool = False, drc_enabled: bool = False, lvs_enabled: bool = False) -> None:
+# ── PPA optimization helpers ────────────────────────────────────
+
+
+def extract_ppa(result: dict) -> dict:
+    """Extract PPA metrics from an evaluator result."""
+    return {
+        "area_um2": result.get("area_um2"),
+        "cell_count": result.get("cell_count"),
+        "wns_ns": result.get("wns_ns"),
+        "power_uw": result.get("power_uw"),
+    }
+
+
+def ppa_improved(old: dict, new: dict) -> bool:
+    """Check if PPA improved: any metric >5% better, none >20% worse."""
+    dominated_metrics = {"area_um2": -1, "cell_count": -1, "wns_ns": -1, "power_uw": -1}
+    any_improved = False
+    for key, direction in dominated_metrics.items():
+        ov, nv = old.get(key), new.get(key)
+        if ov is None or nv is None or ov == 0:
+            continue
+        # direction=-1 means lower is better
+        change = (nv - ov) / abs(ov) * direction
+        if change > 0.05:
+            any_improved = True
+        if change < -0.20:
+            return False  # regressed too much
+    return any_improved
+
+
+def build_ppa_feedback(prob_id: str, result: dict, iteration: int, history: list[dict]) -> str:
+    """Build a PPA feedback message for the agent."""
+    ppa = extract_ppa(result)
+    lines = [
+        f"## PPA Optimization Feedback — Iteration {iteration + 1}",
+        "",
+        f"Your implementation for `{prob_id}` passed functional simulation and synthesis.",
+        "Now optimize the design for better PPA (Power, Performance, Area).",
+        "",
+        "### Current PPA Metrics",
+        f"- Area: {ppa['area_um2']:.2f} μm²" if ppa["area_um2"] is not None else "- Area: N/A",
+        f"- Cell count: {ppa['cell_count']}" if ppa["cell_count"] is not None else "- Cell count: N/A",
+        f"- WNS (worst negative slack): {ppa['wns_ns']:.2f} ns" if ppa["wns_ns"] is not None else "- WNS: N/A",
+        f"- Power: {ppa['power_uw']:.4f} μW" if ppa["power_uw"] is not None else "- Power: N/A",
+    ]
+
+    if len(history) > 1:
+        lines.append("")
+        lines.append("### PPA History")
+        lines.append("| Iter | Area (μm²) | Cells | WNS (ns) | Power (μW) |")
+        lines.append("|------|-----------|-------|----------|------------|")
+        for idx, h in enumerate(history):
+            a = f"{h['area_um2']:.2f}" if h["area_um2"] is not None else "N/A"
+            c = str(h["cell_count"]) if h["cell_count"] is not None else "N/A"
+            w = f"{h['wns_ns']:.2f}" if h["wns_ns"] is not None else "N/A"
+            p = f"{h['power_uw']:.4f}" if h["power_uw"] is not None else "N/A"
+            label = "baseline" if idx == 0 else str(idx)
+            lines.append(f"| {label} | {a} | {c} | {w} | {p} |")
+
+    # Suggest focus area
+    lines.append("")
+    lines.append("### Optimization Focus")
+    if ppa["wns_ns"] is not None and ppa["wns_ns"] < 0:
+        lines.append("- **CRITICAL**: WNS is negative — timing violation. Focus on breaking the critical path.")
+    elif ppa["area_um2"] is not None and ppa["cell_count"] is not None:
+        lines.append("- Focus on reducing area and cell count through logic simplification.")
+    lines.append("")
+    lines.append("### Instructions (Verified Optimization)")
+    lines.append(f"You MUST prove functional equivalence when optimizing. Follow these steps:")
+    lines.append(f"1. Read your current `Generated/{prob_id}.lean`")
+    lines.append(f"2. Rename your current working implementation to `{prob_id.lower()}_spec` (copy it verbatim)")
+    lines.append(f"3. Write the optimized version as `{prob_id.lower()}`")
+    lines.append(f"4. Write a theorem `{prob_id.lower()}_equiv` proving the optimized version equals `_spec`")
+    lines.append(f"5. The proof MUST compile without `sorry` — use `unfold`/`rfl`/`simp`/`ext t` tactics")
+    lines.append(f"6. If you cannot prove equivalence, do NOT optimize — keep the original unchanged")
+    lines.append(f"7. Re-compile with `lake build Generated.{prob_id}` — check no errors AND no sorry warnings")
+    lines.append(f"8. `#synthesizeVerilog` must reference the optimized `{prob_id.lower()}`, not `_spec`")
+
+    return "\n".join(lines)
+
+
+# ── Architecture exploration helpers ─────────────────────────────
+
+
+@dataclass
+class ArchCandidate:
+    index: int
+    code: str
+    ppa: dict
+    sim_pass: bool
+    verified: bool
+    description: str
+
+
+def pareto_dominant(a: dict, b: dict) -> bool:
+    """Return True if a Pareto-dominates b (all metrics no worse, at least one better)."""
+    keys = ["area_um2", "cell_count", "power_uw"]
+    any_better = False
+    for k in keys:
+        av, bv = a.get(k), b.get(k)
+        if av is None or bv is None:
+            continue
+        if av > bv:
+            return False
+        if av < bv:
+            any_better = True
+    # WNS: closer to 0 is better (less negative = better)
+    aw, bw = a.get("wns_ns"), b.get("wns_ns")
+    if aw is not None and bw is not None:
+        if aw < bw:
+            return False
+        if aw > bw:
+            any_better = True
+    return any_better
+
+
+def select_best_candidate(
+    candidates: list[ArchCandidate],
+    constraints: dict,
+) -> ArchCandidate:
+    """Select best candidate: must pass sim, prefer verified, then smallest area."""
+    valid = [c for c in candidates if c.sim_pass]
+    if not valid:
+        return candidates[0]  # fallback to initial
+
+    # Filter by constraints if specified
+    budget = constraints.get("area_budget")
+    if budget is not None:
+        within = [c for c in valid if c.ppa.get("area_um2") is not None and c.ppa["area_um2"] <= budget]
+        if within:
+            valid = within
+
+    # Sort: verified first, then by area (smallest), then by cell count
+    valid.sort(key=lambda c: (
+        not c.verified,  # verified=True → 0 (first)
+        c.ppa.get("area_um2") or float("inf"),
+        c.ppa.get("cell_count") or float("inf"),
+    ))
+    return valid[0]
+
+
+def build_arch_feedback(
+    prob_id: str,
+    candidates: list[ArchCandidate],
+    iteration: int,
+    constraints: dict,
+) -> str:
+    """Build architecture exploration feedback with PPA comparison table."""
+    func_name = prob_id.lower()
+    lines = [
+        f"## Architecture Exploration — Candidate {iteration + 2}",
+        "",
+        f"Your task: write a COMPLETELY DIFFERENT architecture for `{prob_id}`.",
+        "Do NOT tweak the existing implementation — write a new one from scratch.",
+        "",
+        "### Candidates So Far",
+        "| # | Description | Sim | Verified | Area (μm²) | Cells | WNS (ns) | Power (μW) |",
+        "|---|-------------|-----|----------|-----------|-------|----------|------------|",
+    ]
+    for c in candidates:
+        sim = "Pass" if c.sim_pass else "FAIL"
+        v = "Yes" if c.verified else "No"
+        a = f"{c.ppa['area_um2']:.1f}" if c.ppa.get("area_um2") is not None else "N/A"
+        cells = str(c.ppa["cell_count"]) if c.ppa.get("cell_count") is not None else "N/A"
+        w = f"{c.ppa['wns_ns']:.3f}" if c.ppa.get("wns_ns") is not None else "N/A"
+        p = f"{c.ppa['power_uw']:.4f}" if c.ppa.get("power_uw") is not None else "N/A"
+        lines.append(f"| v{c.index} | {c.description} | {sim} | {v} | {a} | {cells} | {w} | {p} |")
+
+    lines.append("")
+
+    # Constraints
+    budget = constraints.get("area_budget")
+    latency = constraints.get("latency_budget")
+    if budget or latency:
+        lines.append("### Constraints")
+        if budget:
+            lines.append(f"- Area budget: {budget:.1f} μm²")
+        if latency:
+            lines.append(f"- Latency budget: {latency} cycles")
+        lines.append("")
+
+    # Suggestions based on what's been tried
+    lines.append("### Suggestions")
+    lines.append("Try a fundamentally different approach:")
+    if len(candidates) == 1:
+        lines.append("- If the initial design is combinational, try a pipelined or sequential version")
+        lines.append("- If it uses a flat mux tree, try a hierarchical or encoded approach")
+    else:
+        tried = ", ".join(f"v{c.index} ({c.description})" for c in candidates)
+        lines.append(f"- Already tried: {tried}")
+        lines.append("- Explore a different point in the parallelism/pipeline/resource-sharing space")
+
+    lines.append("")
+    lines.append("### Instructions (Verified Architecture)")
+    lines.append(f"1. Read your current `Generated/{prob_id}.lean`")
+    lines.append(f"2. Keep the `{func_name}_spec` function as-is (or copy your original working implementation into `{func_name}_spec` if it doesn't exist yet)")
+    lines.append(f"3. Write a completely new architecture as `{func_name}`")
+    lines.append(f"4. Write a theorem `{func_name}_equiv` proving `{func_name} = {func_name}_spec`")
+    lines.append(f"5. Use `unfold`/`rfl`/`simp`/`ext t`/`bv_omega` tactics — see `Sparkle.Verification.SignalDSLProps` for available @[simp] lemmas")
+    lines.append(f"6. If you CANNOT prove equivalence, still write the new architecture — use `sorry` as a placeholder. It will be marked as unverified but still evaluated via simulation")
+    lines.append(f"7. Compile with `lake build Generated.{prob_id}` — check for errors")
+    lines.append(f"8. `#synthesizeVerilog` must reference `{func_name}`, not `{func_name}_spec`")
+
+    return "\n".join(lines)
+
+
+def print_summary_table(stats: dict, elapsed: float, synth_enabled: bool = False, pnr_enabled: bool = False, drc_enabled: bool = False, lvs_enabled: bool = False, ppa_opt_enabled: bool = False, arch_explore_enabled: bool = False) -> None:
     """Print a rich summary table."""
     attempted = stats["total"] - stats["skipped"]
     sim_rate = f"{stats['sim_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
@@ -167,6 +383,10 @@ def print_summary_table(stats: dict, elapsed: float, synth_enabled: bool = False
     if lvs_enabled:
         lvs_rate = f"{stats['lvs_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
         table.add_row("LVS pass", f"[green]{stats['lvs_pass']}[/green] ({lvs_rate})")
+    if ppa_opt_enabled:
+        table.add_row("PPA optimized", f"[yellow]{stats['ppa_optimized']}[/yellow] ({stats['ppa_iterations_total']} iters)")
+    if arch_explore_enabled:
+        table.add_row("Arch explored", f"[blue]{stats['arch_explored']}[/blue] ({stats['arch_candidates_total']} candidates)")
     table.add_row("Tokens", f"{stats['agent_tokens']['input']}+{stats['agent_tokens']['output']}")
     table.add_row("Time", elapsed_str)
     table.add_row("Model", stats.get("model", ""))
@@ -179,6 +399,10 @@ def main():
     args = parse_args()
     t0 = time.monotonic()
 
+    # --ppa-opt / --arch-explore implies --synth
+    if args.ppa_opt or args.arch_explore:
+        args.synth = True
+
     # Discover problems
     problems = discover_problems(limit=args.limit, filter_re=args.filter)
     if not problems:
@@ -186,6 +410,8 @@ def main():
         sys.exit(1)
 
     synth_str = ", [magenta]synth+PPA[/magenta]" if args.synth else ""
+    ppa_opt_str = f", [yellow]PPA-opt({args.ppa_iters}x)[/yellow]" if args.ppa_opt else ""
+    arch_str = f", [blue]arch-explore({args.arch_candidates}x)[/blue]" if args.arch_explore else ""
     pnr_str = ""
     if args.pnr or args.drc or args.lvs:
         parts = ["P&R"]
@@ -194,7 +420,7 @@ def main():
         if args.lvs:
             parts.append("LVS")
         pnr_str = f", [cyan]{'+'.join(parts)}[/cyan]"
-    console.print(f"Found [cyan]{len(problems)}[/cyan] problems, model: [cyan]{args.model}[/cyan]{synth_str}{pnr_str}\n")
+    console.print(f"Found [cyan]{len(problems)}[/cyan] problems, model: [cyan]{args.model}[/cyan]{synth_str}{ppa_opt_str}{arch_str}{pnr_str}\n")
 
     # Set up results directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -208,7 +434,7 @@ def main():
     skill = load_skill()
 
     # Create evaluator
-    evaluator = Evaluator(project_root=PROJECT_ROOT, enable_synth=args.synth, enable_pnr=args.pnr, enable_drc=args.drc, enable_lvs=args.lvs)
+    evaluator = Evaluator(project_root=PROJECT_ROOT, enable_synth=args.synth, enable_pnr=args.pnr, enable_drc=args.drc, enable_lvs=args.lvs, enable_corners=args.corners)
 
     # Track stats
     stats = {
@@ -221,6 +447,10 @@ def main():
         "pnr_pass": 0,
         "drc_pass": 0,
         "lvs_pass": 0,
+        "ppa_optimized": 0,
+        "ppa_iterations_total": 0,
+        "arch_explored": 0,
+        "arch_candidates_total": 0,
         "skipped": 0,
         "agent_tokens": {"input": 0, "output": 0},
         "model": args.model,
@@ -331,6 +561,182 @@ def main():
             # Phase 2: Evaluate
             result = evaluator.evaluate(prob_id, run_dir)
 
+            # Phase 3: PPA optimization loop (only with --ppa-opt)
+            ppa_history = []
+            if (
+                args.ppa_opt
+                and result["sim_status"] == "sim_pass"
+                and result.get("synth_pass")
+            ):
+                ppa_history.append(extract_ppa(result))
+                lean_file = GENERATED_DIR / f"{prob_id}.lean"
+                messages = agent_stats.get("messages", [])
+                best_code = lean_file.read_text()
+                best_ppa = ppa_history[0]
+                best_result = result
+
+                for ppa_iter in range(args.ppa_iters):
+                    current_progress.update(
+                        agent_task,
+                        description=(
+                            f"[cyan]{prob_id}[/cyan]  "
+                            f"[yellow]PPA opt {ppa_iter + 1}/{args.ppa_iters}[/yellow]..."
+                        ),
+                    )
+
+                    # Backup current Lean file for rollback
+                    backup_code = lean_file.read_text()
+
+                    # Build feedback and resume agent
+                    feedback = build_ppa_feedback(prob_id, result, ppa_iter, ppa_history)
+                    try:
+                        opt_stats = agent.resume(
+                            system_prompt=skill,
+                            messages=messages,
+                            feedback_message=feedback,
+                            max_turns=args.ppa_turns,
+                        )
+                        messages = opt_stats["messages"]
+                        stats["agent_tokens"]["input"] += opt_stats["input_tokens"]
+                        stats["agent_tokens"]["output"] += opt_stats["output_tokens"]
+                    except Exception as e:
+                        log_event(run_dir, {
+                            "prob_id": prob_id,
+                            "ppa_iteration": ppa_iter + 1,
+                            "ppa_error": str(e),
+                        })
+                        break
+
+                    # Re-evaluate
+                    new_result = evaluator.evaluate(prob_id, run_dir)
+
+                    # Check verification status (no sorry = formally verified)
+                    verified = not new_result.get("has_sorry", True)
+
+                    # Check: functional correctness preserved?
+                    if new_result["sim_status"] != "sim_pass":
+                        # Rollback to pre-iteration code and continue
+                        lean_file.write_text(backup_code)
+                        log_event(run_dir, {
+                            "prob_id": prob_id,
+                            "ppa_iteration": ppa_iter + 1,
+                            "ppa_verified": verified,
+                            "ppa_status": "rollback_sim_fail",
+                            **extract_ppa(new_result),
+                        })
+                        continue
+
+                    # Check: PPA improved vs global best?
+                    new_ppa = extract_ppa(new_result)
+                    improved = ppa_improved(best_ppa, new_ppa)
+                    status = "verified_improved" if verified and improved else \
+                             "unverified_improved" if improved else \
+                             "verified_converged" if verified else "converged"
+                    log_event(run_dir, {
+                        "prob_id": prob_id,
+                        "ppa_iteration": ppa_iter + 1,
+                        "ppa_verified": verified,
+                        "ppa_status": status,
+                        **new_ppa,
+                    })
+
+                    ppa_history.append(new_ppa)
+                    stats["ppa_iterations_total"] += 1
+                    if improved:
+                        best_ppa = new_ppa
+                        best_code = lean_file.read_text()
+                        best_result = new_result
+
+                # Restore global best code at the end
+                lean_file.write_text(best_code)
+                result = best_result
+
+                if len(ppa_history) > 1:
+                    stats["ppa_optimized"] += 1
+
+            # Phase 3b: Architecture exploration loop (only with --arch-explore)
+            arch_candidates = []
+            if (
+                args.arch_explore
+                and not args.ppa_opt  # don't run both
+                and result["sim_status"] == "sim_pass"
+                and result.get("synth_pass")
+            ):
+                lean_file = GENERATED_DIR / f"{prob_id}.lean"
+                messages = agent_stats.get("messages", [])
+                constraints = {
+                    "area_budget": args.area_budget,
+                    "latency_budget": args.latency_budget,
+                }
+
+                # Baseline candidate
+                arch_candidates.append(ArchCandidate(
+                    index=0,
+                    code=lean_file.read_text(),
+                    ppa=extract_ppa(result),
+                    sim_pass=True,
+                    verified=not result.get("has_sorry", True),
+                    description="initial",
+                ))
+
+                for arch_iter in range(args.arch_candidates):
+                    current_progress.update(
+                        agent_task,
+                        description=(
+                            f"[cyan]{prob_id}[/cyan]  "
+                            f"[blue]Arch {arch_iter + 1}/{args.arch_candidates}[/blue]..."
+                        ),
+                    )
+
+                    feedback = build_arch_feedback(prob_id, arch_candidates, arch_iter, constraints)
+                    try:
+                        opt_stats = agent.resume(
+                            system_prompt=skill,
+                            messages=messages,
+                            feedback_message=feedback,
+                            max_turns=args.arch_turns,
+                        )
+                        messages = opt_stats["messages"]
+                        stats["agent_tokens"]["input"] += opt_stats["input_tokens"]
+                        stats["agent_tokens"]["output"] += opt_stats["output_tokens"]
+                    except Exception as e:
+                        log_event(run_dir, {
+                            "prob_id": prob_id,
+                            "arch_iteration": arch_iter + 1,
+                            "arch_error": str(e),
+                        })
+                        break
+
+                    new_result = evaluator.evaluate(prob_id, run_dir)
+                    new_candidate = ArchCandidate(
+                        index=arch_iter + 1,
+                        code=lean_file.read_text(),
+                        ppa=extract_ppa(new_result),
+                        sim_pass=new_result["sim_status"] == "sim_pass",
+                        verified=not new_result.get("has_sorry", True),
+                        description=f"candidate_{arch_iter + 1}",
+                    )
+                    arch_candidates.append(new_candidate)
+
+                    log_event(run_dir, {
+                        "prob_id": prob_id,
+                        "arch_iteration": arch_iter + 1,
+                        "arch_sim_pass": new_candidate.sim_pass,
+                        "arch_verified": new_candidate.verified,
+                        **new_candidate.ppa,
+                    })
+
+                # Select best and restore
+                best = select_best_candidate(arch_candidates, constraints)
+                if best.index != arch_candidates[-1].index:
+                    lean_file.write_text(best.code)
+                    result = evaluator.evaluate(prob_id, run_dir)
+                else:
+                    result = new_result  # already the latest
+
+                stats["arch_explored"] += 1
+                stats["arch_candidates_total"] += len(arch_candidates)
+
             status_icon = {
                 "sim_pass": "[green]✓[/green]",
                 "sim_fail": "[red]✗[/red]",
@@ -400,11 +806,34 @@ def main():
                 stats["sim_error"] += 1
 
             # Log result
+            arch_history = None
+            if arch_candidates:
+                arch_history = [
+                    {
+                        "index": c.index,
+                        "description": c.description,
+                        "sim_pass": c.sim_pass,
+                        "verified": c.verified,
+                        **c.ppa,
+                    }
+                    for c in arch_candidates
+                ]
+                # Mark which candidate was selected
+                best = select_best_candidate(arch_candidates, {
+                    "area_budget": args.area_budget,
+                    "latency_budget": args.latency_budget,
+                })
+                arch_history_with_best = {
+                    "candidates": arch_history,
+                    "selected": best.index,
+                }
             log_event(run_dir, {
                 "prob_id": prob_id,
                 "agent_turns": agent_stats.get("turns", 0) if agent_stats else 0,
                 "agent_input_tokens": agent_stats.get("input_tokens", 0) if agent_stats else 0,
                 "agent_output_tokens": agent_stats.get("output_tokens", 0) if agent_stats else 0,
+                "ppa_history": ppa_history if ppa_history else None,
+                "arch_history": arch_history_with_best if arch_candidates else None,
                 **result,
             })
 
@@ -430,6 +859,8 @@ def main():
         "pnr_pass": stats["pnr_pass"],
         "drc_pass": stats["drc_pass"],
         "lvs_pass": stats["lvs_pass"],
+        "ppa_optimized": stats["ppa_optimized"],
+        "ppa_iterations_total": stats["ppa_iterations_total"],
         "agent_tokens": stats["agent_tokens"],
         "elapsed_seconds": int(elapsed),
         "model": args.model,
@@ -437,10 +868,14 @@ def main():
         "pnr_enabled": args.pnr or args.drc or args.lvs,
         "drc_enabled": args.drc,
         "lvs_enabled": args.lvs,
+        "ppa_opt_enabled": args.ppa_opt,
+        "arch_explore_enabled": args.arch_explore,
+        "arch_explored": stats["arch_explored"],
+        "arch_candidates_total": stats["arch_candidates_total"],
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print_summary_table(stats, elapsed, synth_enabled=args.synth, pnr_enabled=args.pnr or args.drc or args.lvs, drc_enabled=args.drc, lvs_enabled=args.lvs)
+    print_summary_table(stats, elapsed, synth_enabled=args.synth, pnr_enabled=args.pnr or args.drc or args.lvs, drc_enabled=args.drc, lvs_enabled=args.lvs, ppa_opt_enabled=args.ppa_opt, arch_explore_enabled=args.arch_explore)
 
     # Auto-generate HTML report
     report_path = generate_report(run_dir)

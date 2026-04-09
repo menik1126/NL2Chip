@@ -12,6 +12,12 @@
 #   ./agent/run_agent.sh -l 5 --drc          # 跑 5 题 + 综合 + P&R + DRC
 #   ./agent/run_agent.sh -l 5 --lvs          # 跑 5 题 + 综合 + P&R + LVS
 #   ./agent/run_agent.sh -l 5 --drc --lvs    # 跑 5 题 + 综合 + P&R + DRC + LVS
+#   ./agent/run_agent.sh -l 5 --ppa-opt      # 跑 5 题 + 综合 + PPA 优化循环 (默认 3 轮)
+#   ./agent/run_agent.sh -l 5 --ppa-opt --ppa-iters 5  # PPA 优化 5 轮
+#   ./agent/run_agent.sh -l 5 --arch-explore              # 架构探索（默认 3 候选）
+#   ./agent/run_agent.sh -l 5 --arch-explore --arch-candidates 5  # 5 个候选架构
+#   ./agent/run_agent.sh -f "mux256" --arch-explore --area-budget 1000  # 面积约束
+#   ./agent/run_agent.sh -l 5 --pnr --corners              # P&R + 多角 PVT STA
 
 set -euo pipefail
 
@@ -52,7 +58,7 @@ if ! python3 -c "import anthropic" &>/dev/null; then
 fi
 
 # Docker check (only when --synth, --pnr, --drc, or --lvs is used)
-if echo "$@" | grep -qE -- "--(synth|pnr|drc|lvs)"; then
+if echo "$@" | grep -qE -- "--(synth|pnr|drc|lvs|arch-explore|corners)"; then
     if ! docker info >/dev/null 2>&1; then
         echo "错误: --synth/--pnr 需要 Docker，但 Docker 未运行"
         exit 1

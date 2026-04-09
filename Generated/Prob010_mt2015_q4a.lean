@@ -7,6 +7,7 @@ open Sparkle.Core.Signal
 /-- Boolean function z = (x^y) & x: XOR then AND with x. -/
 def prob010_mt2015_q4a {dom : DomainConfig}
     (x y : Signal dom (BitVec 1)) : Signal dom (BitVec 1) :=
-  (x ^^^ y) &&& x
+  let xor_xy := x ^^^ y
+  xor_xy &&& x
 
 #synthesizeVerilog prob010_mt2015_q4a

@@ -200,6 +200,184 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
                 <div class="ppa-stats">min={min(areas):.1f} / avg={sum(areas)/len(areas):.1f} / max={max_area:.1f}</div>
             </div>"""
 
+    # ── PPA optimization history (only if any problem has ppa_history) ──
+    ppa_opt_section = ""
+    ppa_opt_results = [r for r in results if r.get("ppa_history") and len(r["ppa_history"]) > 1]
+    ppa_opt_enabled = summary.get("ppa_opt_enabled", False)
+    if ppa_opt_enabled:
+        ppa_optimized = summary.get("ppa_optimized", len(ppa_opt_results))
+        ppa_iters_total = summary.get("ppa_iterations_total", 0)
+        synth_card += f"""
+        <div class="card">
+            <div class="card-value">{ppa_optimized}<small> ({ppa_iters_total} iters)</small></div>
+            <div class="card-label">PPA Optimized</div>
+            <div class="card-bar"><div class="bar" style="width:{ppa_optimized/max(attempted,1)*100:.0f}%;background:var(--yellow)"></div></div>
+        </div>"""
+
+    # ── Architecture exploration summary card ──
+    arch_explore_enabled = summary.get("arch_explore_enabled", False)
+    if arch_explore_enabled:
+        arch_explored = summary.get("arch_explored", 0)
+        arch_candidates_total = summary.get("arch_candidates_total", 0)
+        synth_card += f"""
+        <div class="card">
+            <div class="card-value">{arch_explored}<small> ({arch_candidates_total} candidates)</small></div>
+            <div class="card-label">Arch Explored</div>
+            <div class="card-bar"><div class="bar" style="width:{arch_explored/max(attempted,1)*100:.0f}%;background:var(--blue)"></div></div>
+        </div>"""
+
+    if ppa_opt_results:
+        # Build verification status lookup from ppa_iteration events
+        ppa_verified_lookup: dict[tuple[str, int], bool] = {}
+        for r in results:
+            if "ppa_iteration" in r:
+                key = (r.get("prob_id", ""), r["ppa_iteration"])
+                ppa_verified_lookup[key] = r.get("ppa_verified", False)
+
+        opt_rows = []
+        for r in ppa_opt_results:
+            pid = escape(r.get("prob_id", "?"))
+            history = r["ppa_history"]
+            for idx, h in enumerate(history):
+                a = f"{h['area_um2']:.2f}" if h.get("area_um2") is not None else "-"
+                c = str(h["cell_count"]) if h.get("cell_count") is not None else "-"
+                w = f"{h['wns_ns']:.3f}" if h.get("wns_ns") is not None else "-"
+                p = f"{h['power_uw']:.4f}" if h.get("power_uw") is not None else "-"
+                label = "baseline" if idx == 0 else f"iter {idx}"
+                # Verification badge
+                if idx == 0:
+                    v_badge = '<span class="badge na">N/A</span>'
+                else:
+                    is_verified = ppa_verified_lookup.get((r.get("prob_id", ""), idx), False)
+                    v_badge = '<span class="badge ok">Verified</span>' if is_verified else '<span class="badge warn">Unverified</span>'
+                # Show improvement delta for non-baseline
+                delta = ""
+                if idx > 0 and history[0].get("area_um2") and h.get("area_um2"):
+                    pct = (h["area_um2"] - history[0]["area_um2"]) / history[0]["area_um2"] * 100
+                    color = "var(--green)" if pct < 0 else "var(--red)"
+                    delta = f' <span style="color:{color};font-size:0.75rem">({pct:+.1f}%)</span>'
+                opt_rows.append(f"""<tr>
+                    <td class="pid">{pid}</td>
+                    <td>{label}</td>
+                    <td>{v_badge}</td>
+                    <td class="num">{a}{delta}</td>
+                    <td class="num">{c}</td>
+                    <td class="num">{w}</td>
+                    <td class="num">{p}</td>
+                </tr>""")
+        ppa_opt_section = f"""
+        <div class="section">
+            <h2>PPA Optimization History</h2>
+            <table>
+            <thead><tr>
+                <th>Problem</th><th>Iteration</th><th>Proof</th><th>Area (um2)</th><th>Cells</th><th>WNS (ns)</th><th>Power (uW)</th>
+            </tr></thead>
+            <tbody>{"".join(opt_rows)}</tbody>
+            </table>
+        </div>"""
+
+    # ── Architecture exploration comparison (only if any problem has arch_history) ──
+    arch_section = ""
+    arch_results = [r for r in results if r.get("arch_history") and r["arch_history"].get("candidates")]
+    if arch_results:
+        arch_rows = []
+        for r in arch_results:
+            pid = escape(r.get("prob_id", "?"))
+            ah = r["arch_history"]
+            selected_idx = ah.get("selected", 0)
+            for c in ah["candidates"]:
+                idx = c.get("index", 0)
+                desc = escape(c.get("description", f"v{idx}"))
+                sim_cls = "ok" if c.get("sim_pass") else "fail"
+                sim_label = "Pass" if c.get("sim_pass") else "Fail"
+                a = f"{c['area_um2']:.1f}" if c.get("area_um2") is not None else "-"
+                cells = str(c["cell_count"]) if c.get("cell_count") is not None else "-"
+                w = f"{c['wns_ns']:.3f}" if c.get("wns_ns") is not None else "-"
+                p = f"{c['power_uw']:.4f}" if c.get("power_uw") is not None else "-"
+                star = "&#9733;" if idx == selected_idx else ""
+                # Area delta vs baseline
+                delta = ""
+                baseline_area = ah["candidates"][0].get("area_um2")
+                if idx > 0 and baseline_area and c.get("area_um2") is not None and baseline_area > 0:
+                    pct = (c["area_um2"] - baseline_area) / baseline_area * 100
+                    color = "var(--green)" if pct < 0 else "var(--red)"
+                    delta = f' <span style="color:{color};font-size:0.75rem">({pct:+.1f}%)</span>'
+                arch_rows.append(f"""<tr>
+                    <td class="pid">{pid}</td>
+                    <td>v{idx} ({desc})</td>
+                    <td><span class="badge {sim_cls}">{sim_label}</span></td>
+                    <td class="num">{a}{delta}</td>
+                    <td class="num">{cells}</td>
+                    <td class="num">{w}</td>
+                    <td class="num">{p}</td>
+                    <td style="text-align:center;color:var(--yellow);font-size:1.1rem">{star}</td>
+                </tr>""")
+        arch_section = f"""
+        <div class="section">
+            <h2>Architecture Comparison</h2>
+            <table>
+            <thead><tr>
+                <th>Problem</th><th>Candidate</th><th>Sim</th><th>Area (um2)</th><th>Cells</th><th>WNS (ns)</th><th>Power (uW)</th><th>Selected</th>
+            </tr></thead>
+            <tbody>{"".join(arch_rows)}</tbody>
+            </table>
+        </div>"""
+
+    # ── PVT Corner comparison (only if any problem has pvt_corners) ──
+    pvt_section = ""
+    pvt_results = [r for r in results if r.get("pvt_corners")]
+    if pvt_results:
+        pvt_rows = []
+        for r in pvt_results:
+            pid = escape(r.get("prob_id", "?"))
+            for c in r["pvt_corners"]:
+                label = escape(c.get("label", c.get("corner", "?")))
+                if c.get("error"):
+                    pvt_rows.append(f"""<tr>
+                        <td class="pid">{pid}</td>
+                        <td>{label}</td>
+                        <td colspan="3"><span class="badge warn">{escape(c['error'][:40])}</span></td>
+                    </tr>""")
+                    continue
+                wns = f"{c['wns_ns']:.3f}" if c.get("wns_ns") is not None else "-"
+                whs = f"{c['whs_ns']:.3f}" if c.get("whs_ns") is not None else "-"
+                pwr = f"{c['power_uw']:.4f}" if c.get("power_uw") is not None else "-"
+                # Color WNS/WHS: green if >= 0 (MET), red if < 0 (VIOLATED)
+                wns_cls = "color:var(--green)" if c.get("wns_ns") is not None and c["wns_ns"] >= 0 else "color:var(--red)" if c.get("wns_ns") is not None else ""
+                whs_cls = "color:var(--green)" if c.get("whs_ns") is not None and c["whs_ns"] >= 0 else "color:var(--red)" if c.get("whs_ns") is not None else ""
+                pvt_rows.append(f"""<tr>
+                    <td class="pid">{pid}</td>
+                    <td>{label}</td>
+                    <td class="num" style="{wns_cls}">{wns}</td>
+                    <td class="num" style="{whs_cls}">{whs}</td>
+                    <td class="num">{pwr}</td>
+                </tr>""")
+            # Worst-case row
+            worst_wns = r.get("pvt_worst_wns_ns")
+            worst_whs = r.get("pvt_worst_whs_ns")
+            worst_pwr = r.get("pvt_worst_power_uw")
+            wns_s = f"{worst_wns:.3f}" if worst_wns is not None else "-"
+            whs_s = f"{worst_whs:.3f}" if worst_whs is not None else "-"
+            pwr_s = f"{worst_pwr:.4f}" if worst_pwr is not None else "-"
+            pvt_rows.append(f"""<tr style="background:var(--surface2);font-weight:600">
+                <td class="pid">{pid}</td>
+                <td>Worst-case</td>
+                <td class="num">{wns_s}</td>
+                <td class="num">{whs_s}</td>
+                <td class="num">{pwr_s}</td>
+            </tr>""")
+
+        pvt_section = f"""
+        <div class="section">
+            <h2>PVT Corner Analysis</h2>
+            <table>
+            <thead><tr>
+                <th>Problem</th><th>Corner</th><th>Setup WNS (ns)</th><th>Hold WHS (ns)</th><th>Power (uW)</th>
+            </tr></thead>
+            <tbody>{"".join(pvt_rows)}</tbody>
+            </table>
+        </div>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -283,6 +461,12 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 24px; text-align:
 </div>
 
 {ppa_section}
+
+{ppa_opt_section}
+
+{arch_section}
+
+{pvt_section}
 
 <div class="section">
     <h2>Results</h2>
