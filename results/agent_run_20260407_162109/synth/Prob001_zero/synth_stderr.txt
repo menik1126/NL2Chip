@@ -1,2 +1,0 @@
-make[1]: *** [Makefile:406: do-1_synth] Error 1
-make: *** [Makefile:406: results/sky130hd/prob001_zero/base/1_synth.odb] Error 2

@@ -9,6 +9,9 @@ require «doc-gen4» from git
 require LSpec from git
   "https://github.com/argumentcomputer/LSpec" @ "main"
 
+require REPL from git
+  "https://github.com/leanprover-community/repl" @ "08ef67a"
+
 -- C FFI library for Signal memoization barriers (defeats Lean 4.28 LICM)
 extern_lib «sparkle_barrier» pkg := do
   let srcFile := pkg.dir / "c_src" / "sparkle_barrier.c"

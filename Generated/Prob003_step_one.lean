@@ -4,7 +4,7 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- Module that always drives logic high (1). -/
+/-- Constant one output: always drives logic HIGH (1). -/
 def prob003_step_one {dom : DomainConfig}
     : Signal dom (BitVec 1) :=
   Signal.pure 1#1

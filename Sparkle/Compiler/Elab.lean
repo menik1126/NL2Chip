@@ -504,6 +504,13 @@ mutual
             let payload := if name == ``Fin.mk && args.size >= 2 then args[args.size-2]! else args.back!
             return ← translateExprToWire payload hint (isNamed := isNamed)
 
+        -- Signal.clock: expose the implicit clock as a data signal (compiles to 'clk' wire reference)
+        if name == ``Sparkle.Core.Signal.Signal.clock then
+          -- Create a wire that references the 'clk' input directly
+          let resWire ← CompilerM.makeWire hint .bit (named := isNamed)
+          CompilerM.emitAssign resWire (.ref "clk")
+          return resWire
+
         -- Signal.pure / Signal.lit (constant signals)
         if (name == ``Sparkle.Core.Signal.Signal.pure || name == ``Sparkle.Core.Signal.Signal.lit) && args.size >= 1 then
            let constValue := args[args.size-1]!
@@ -1218,7 +1225,7 @@ mutual
 
     return none
 
-  /-- Handle Signal.register, Signal.registerWithEnable -/
+  /-- Handle Signal.register, Signal.registerNeg, Signal.registerWithEnable -/
   partial def handleRegister (e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
     if name.toString.endsWith ".register" && args.size >= 2 then
       trace[sparkle.compiler] "→ register"
@@ -1229,6 +1236,19 @@ mutual
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
       let w ← CompilerM.emitRegister hint "clk" "rst" (.ref inputWire) initVal hwType (named := isNamed)
+      return some w
+
+    -- Signal.registerNeg: negedge-triggered register
+    if name.toString.endsWith ".registerNeg" && args.size >= 2 then
+      trace[sparkle.compiler] "→ registerNeg"
+      let init := args[args.size-2]!
+      let input := args[args.size-1]!
+      let (initVal, _) ← extractBitVecLiteral init
+      let inputWire ← translateExprToWire input "reg_input"
+      let exprType ← CompilerM.liftMetaM (inferType e)
+      let hwType ← inferHWTypeFromSignal exprType
+      -- Use "clk__neg" as clock name; backend detects suffix and emits @(negedge clk)
+      let w ← CompilerM.emitRegister hint "clk__neg" "rst" (.ref inputWire) initVal hwType (named := isNamed)
       return some w
 
     -- Signal.registerWithEnable: register with conditional update

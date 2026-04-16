@@ -114,6 +114,63 @@ CODING_TOOLS = [
             "required": ["path"],
         },
     },
+    {
+        "name": "lean_check",
+        "description": (
+            "Instantly verify Lean 4 code using the persistent REPL. "
+            "Much faster than `lake build` (~0.1s vs ~10s). "
+            "The Sparkle prelude (import Sparkle, open Signal/Domain) is already loaded. "
+            "Send ONLY the def/theorem/#synthesizeVerilog code — do NOT include import/open lines. "
+            "Returns compilation result: errors, warnings, and generated Verilog (if any). "
+            "Use this INSTEAD of `bash lake build` for checking Lean code during development."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": (
+                        "Lean 4 code to verify. Do NOT include 'import Sparkle' or 'open' lines — "
+                        "those are pre-loaded. Just the definitions and #synthesizeVerilog command."
+                    ),
+                },
+            },
+            "required": ["code"],
+        },
+    },
+    {
+        "name": "lean_proof_step",
+        "description": (
+            "Interactive tactic proof mode using the persistent REPL. "
+            "Send Lean code incrementally — each call builds on a previous env. "
+            "Workflow: (1) send defs with lean_proof_step → get env=N, "
+            "(2) send theorem with `sorry` using env=N → see proof goals, "
+            "(3) replace sorry with tactics → see updated goals, "
+            "(4) repeat until no sorry remains (COMPLETE). "
+            "Each proof attempt should reuse the env from step 1 (the defs), not from a failed proof. "
+            "Returns: errors, proof goal states for each sorry, and the env ID."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": (
+                        "Lean 4 code to send. Do NOT include import/open lines. "
+                        "Can be definitions, theorems, or theorem with sorry placeholders."
+                    ),
+                },
+                "env": {
+                    "type": "integer",
+                    "description": (
+                        "Environment ID from a previous lean_proof_step call. "
+                        "Omit to start from the Sparkle prelude env."
+                    ),
+                },
+            },
+            "required": ["code"],
+        },
+    },
 ]
 
 MAX_FILE_SIZE = 100_000
@@ -143,7 +200,7 @@ def load_env(path: Path) -> dict[str, str]:
 
 
 class CodingAgent:
-    """Full coding agent with bash, read, write, edit, grep, glob tools."""
+    """Full coding agent with bash, read, write, edit, grep, glob, lean_check tools."""
 
     def __init__(
         self,
@@ -151,11 +208,13 @@ class CodingAgent:
         max_tokens: int = 16384,
         project_root: Path = Path("."),
         log_dir: Path | None = None,
+        lean_repl=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
         self.project_root = project_root.resolve()
         self.log_dir = log_dir
+        self.lean_repl = lean_repl  # Optional LeanREPL instance for fast compilation
 
         # Load API config from key.env
         env = load_env(self.project_root / "key.env")
@@ -182,6 +241,9 @@ class CodingAgent:
         total_input = 0
         total_output = 0
 
+        # Select tools: include lean_check only if REPL is available
+        tools = self._get_tools()
+
         log_file = None
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -200,11 +262,11 @@ class CodingAgent:
                         model=self.model,
                         max_tokens=self.max_tokens,
                         system=system_prompt,
-                        tools=CODING_TOOLS,
+                        tools=tools,
                         messages=messages,
                     )
                     break
-                except (anthropic.RateLimitError, anthropic.APIStatusError) as e:
+                except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError) as e:
                     if isinstance(e, anthropic.APIStatusError) and e.status_code < 500 and e.status_code != 429:
                         raise
                     if attempt == API_MAX_RETRIES - 1:
@@ -285,6 +347,9 @@ class CodingAgent:
         total_input = 0
         total_output = 0
 
+        # Select tools: include lean_check only if REPL is available
+        tools = self._get_tools()
+
         log_file = None
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -302,11 +367,11 @@ class CodingAgent:
                         model=self.model,
                         max_tokens=self.max_tokens,
                         system=system_prompt,
-                        tools=CODING_TOOLS,
+                        tools=tools,
                         messages=messages,
                     )
                     break
-                except (anthropic.RateLimitError, anthropic.APIStatusError) as e:
+                except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError) as e:
                     if isinstance(e, anthropic.APIStatusError) and e.status_code < 500 and e.status_code != 429:
                         raise
                     if attempt == API_MAX_RETRIES - 1:
@@ -393,6 +458,14 @@ class CodingAgent:
         with open(log_file, "a") as f:
             f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
 
+    # ── Tool selection ──────────────────────────────────────────────
+
+    def _get_tools(self) -> list[dict]:
+        """Return tool list, excluding lean_check/lean_proof_step if no REPL is available."""
+        if self.lean_repl is not None:
+            return CODING_TOOLS
+        return [t for t in CODING_TOOLS if t["name"] not in ("lean_check", "lean_proof_step")]
+
     # ── Tool dispatch ─────────────────────────────────────────────
 
     def _execute_tool(self, name: str, inputs: dict) -> str:
@@ -411,6 +484,10 @@ class CodingAgent:
                 return self._tool_glob(inputs["pattern"])
             elif name == "list_directory":
                 return self._tool_list_directory(inputs["path"])
+            elif name == "lean_check":
+                return self._tool_lean_check(inputs["code"])
+            elif name == "lean_proof_step":
+                return self._tool_lean_proof_step(inputs["code"], inputs.get("env"))
             else:
                 return f"Error: unknown tool '{name}'"
         except Exception as e:
@@ -564,3 +641,95 @@ class CodingAgent:
                     size_str = f"{size // (1024 * 1024)}MB"
                 entries.append(f"  {entry.name}  ({size_str})")
         return "\n".join(entries) if entries else "(empty directory)"
+
+    def _tool_lean_check(self, code: str) -> str:
+        """Verify Lean code via the persistent REPL."""
+        if self.lean_repl is None:
+            return "Error: Lean REPL not available. Use `bash lake build` instead."
+
+        try:
+            result = self.lean_repl.check_code(code)
+        except Exception as e:
+            return f"Error: REPL failed: {e}"
+
+        lines = []
+
+        if result.passed:
+            tag = "COMPLETE" if result.complete else "OK (has sorry)"
+            lines.append(f"✓ {tag} ({result.elapsed:.2f}s)")
+        else:
+            lines.append(f"✗ FAILED ({result.elapsed:.2f}s, {len(result.errors)} errors)")
+
+        # Show errors
+        for err in result.errors:
+            pos = err.get("pos", {})
+            loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
+            lines.append(f"  [error {loc}] {err.get('data', '')}")
+
+        # Show warnings (useful for DRC, sorry, etc.)
+        for w in result.warnings:
+            pos = w.get("pos", {})
+            loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
+            lines.append(f"  [warning {loc}] {w.get('data', '')}")
+
+        # Show generated Verilog
+        if result.verilog:
+            lines.append("")
+            lines.append("=== Generated Verilog ===")
+            lines.append(result.verilog)
+
+        return "\n".join(lines)
+
+    def _tool_lean_proof_step(self, code: str, env: int | None = None) -> str:
+        """Interactive proof step via the persistent REPL with incremental env."""
+        if self.lean_repl is None:
+            return "Error: Lean REPL not available."
+
+        try:
+            result = self.lean_repl.check_code_incremental(code, env=env)
+        except Exception as e:
+            return f"Error: REPL failed: {e}"
+
+        lines = []
+
+        if result.passed:
+            tag = "COMPLETE" if result.complete else "OK (has sorry)"
+            lines.append(f"✓ {tag} ({result.elapsed:.2f}s)")
+        else:
+            lines.append(f"✗ FAILED ({result.elapsed:.2f}s, {len(result.errors)} errors)")
+
+        # Show errors
+        for err in result.errors:
+            pos = err.get("pos", {})
+            loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
+            lines.append(f"  [error {loc}] {err.get('data', '')}")
+
+        # Show warnings
+        for w in result.warnings:
+            pos = w.get("pos", {})
+            loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
+            lines.append(f"  [warning {loc}] {w.get('data', '')}")
+
+        # Show proof goals from sorry placeholders
+        if result.sorries:
+            lines.append("")
+            lines.append("=== Proof Goals ===")
+            for i, s in enumerate(result.sorries):
+                pos = s.get("pos", {})
+                loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
+                goal = s.get("goal", "(no goal)")
+                lines.append(f"Goal {i} ({loc}):")
+                for gl in goal.splitlines():
+                    lines.append(f"  {gl}")
+
+        # Show generated Verilog
+        if result.verilog:
+            lines.append("")
+            lines.append("=== Generated Verilog ===")
+            lines.append(result.verilog)
+
+        # Always show env for chaining
+        lines.append("")
+        lines.append(f"env: {result.env}")
+
+        return "\n".join(lines)

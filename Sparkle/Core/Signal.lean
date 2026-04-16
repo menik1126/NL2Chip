@@ -106,6 +106,19 @@ def atTime (s : Signal dom α) (t : Nat) : α := s.val t
 def pure (x : α) : Signal dom α :=
   ⟨fun _ => x⟩
 
+/--
+  Expose the implicit clock as a data signal.
+
+  In simulation, the clock alternates: false, true, false, true, ...
+  (rising edge at t=1, 3, 5, ...; falling edge at t=0, 2, 4, ...).
+
+  In synthesis, this compiles to a reference to the `clk` input wire,
+  enabling combinational logic that depends on the clock level (e.g.,
+  for dual-edge flip-flop output muxing: `Signal.mux Signal.clock qp qn`).
+-/
+def clock {dom : DomainConfig} : Signal dom Bool :=
+  ⟨fun t => t % 2 == 1⟩
+
 /-- Map a function over a signal (combinational logic) -/
 def map (f : α → β) (s : Signal dom α) : Signal dom β :=
   ⟨fun t => f (s.val t)⟩
@@ -132,6 +145,20 @@ def bind (s : Signal dom α) (f : α → Signal dom β) : Signal dom β :=
   of sequential logic.
 -/
 def register (init : α) (input : Signal dom α) : Signal dom α :=
+  ⟨fun t => match t with
+    | 0 => init
+    | n + 1 => input.val n⟩
+
+/--
+  Negative-edge-triggered D flip-flop.
+
+  Semantically identical to `register` (same single-cycle delay model),
+  but the compiler emits `always_ff @(negedge clk)` instead of
+  `always_ff @(posedge clk)` in the generated SystemVerilog.
+
+  Use this to model negedge-triggered registers (e.g., for dual-edge FFs).
+-/
+def registerNeg (init : α) (input : Signal dom α) : Signal dom α :=
   ⟨fun t => match t with
     | 0 => init
     | n + 1 => input.val n⟩

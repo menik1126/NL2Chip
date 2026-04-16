@@ -579,8 +579,25 @@ def generate_top_wrapper(
     lines.append("    );")
 
     # Assign outputs
-    for rn, sn in output_map.items():
-        lines.append(f"    assign {rn} = {sn}_wire;")
+    # Special case: if we have N ref outputs but only 1 sparkle output that's a bundle,
+    # split the bundle bits
+    if len(ref_outputs) > 1 and len(sp_outputs) == 1:
+        sp_out_name = sp_outputs[0][2]
+        sp_out_type = sp_outputs[0][1]
+        # Check if it's a multi-bit output (bundle)
+        wm = re.search(r"\[(\d+):0\]", sp_out_type)
+        if wm and int(wm.group(1)) + 1 >= len(ref_outputs):
+            # It's a bundle! Split it
+            for i, (_, _, rn) in enumerate(ref_outputs):
+                lines.append(f"    assign {rn} = {sp_out_name}_wire[{len(ref_outputs) - 1 - i}];")
+        else:
+            # Not a bundle, fall back to normal mapping
+            for rn, sn in output_map.items():
+                lines.append(f"    assign {rn} = {sn}_wire;")
+    else:
+        # Normal case: direct mapping
+        for rn, sn in output_map.items():
+            lines.append(f"    assign {rn} = {sn}_wire;")
 
     lines.append("endmodule")
     return "\n".join(lines)

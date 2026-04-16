@@ -1,0 +1,227 @@
+$date
+	Sun Apr 12 09:08:49 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1s
+$end
+$scope module FullTest $end
+$var wire 1 ! q_ref $end
+$var wire 1 " q_dut $end
+$var reg 1 # d $end
+$var reg 1 $ sys_clk $end
+$var reg 1 % test_clk $end
+$scope module dut $end
+$var wire 1 % _gen_clk $end
+$var wire 1 & _gen_clk_changed $end
+$var wire 1 # _gen_d $end
+$var wire 1 ' _tmp_b_1 $end
+$var wire 1 ( _tmp_b_3 $end
+$var wire 1 ) _tmp_loop_0 $end
+$var wire 1 * _tmp_op_a_2 $end
+$var wire 1 + _tmp_op_b_4 $end
+$var wire 1 $ clk $end
+$var wire 1 " out $end
+$var wire 1 , rst $end
+$var wire 1 - _gen_next_q $end
+$var reg 1 . _gen_clk_prev $end
+$var reg 1 / _tmp_loop_body_5 $end
+$upscope $end
+$scope module ref $end
+$var wire 1 % clk $end
+$var wire 1 # d $end
+$var reg 1 ! q $end
+$var reg 1 0 qn $end
+$var reg 1 1 qp $end
+$upscope $end
+$upscope $end
+$scope module TestDualEdgeV2 $end
+$var wire 1 2 q_ref $end
+$var wire 1 3 q_dut $end
+$var reg 1 4 d $end
+$var reg 1 5 sys_clk $end
+$var reg 1 6 test_clk $end
+$var integer 32 7 error_count [31:0] $end
+$scope module dut $end
+$var wire 1 6 _gen_clk $end
+$var wire 1 8 _gen_clk_changed $end
+$var wire 1 4 _gen_d $end
+$var wire 1 9 _tmp_b_1 $end
+$var wire 1 : _tmp_b_3 $end
+$var wire 1 ; _tmp_loop_0 $end
+$var wire 1 < _tmp_op_a_2 $end
+$var wire 1 = _tmp_op_b_4 $end
+$var wire 1 5 clk $end
+$var wire 1 3 out $end
+$var wire 1 > rst $end
+$var wire 1 ? _gen_next_q $end
+$var reg 1 @ _gen_clk_prev $end
+$var reg 1 A _tmp_loop_body_5 $end
+$upscope $end
+$scope module ref $end
+$var wire 1 6 clk $end
+$var wire 1 4 d $end
+$var reg 1 2 q $end
+$var reg 1 B qn $end
+$var reg 1 C qp $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+xC
+0B
+xA
+x@
+x?
+0>
+x=
+0<
+x;
+1:
+19
+x8
+b0 7
+06
+05
+04
+x3
+02
+x1
+00
+x/
+x.
+x-
+0,
+x+
+0*
+x)
+1(
+1'
+x&
+0%
+0$
+0#
+x"
+0!
+$end
+#1
+08
+0&
+0=
+0+
+0@
+0.
+15
+1$
+#2
+05
+0$
+#3
+15
+1$
+#4
+05
+0$
+#5
+15
+1$
+1#
+#6
+05
+0$
+#7
+1+
+1.
+1!
+11
+x-
+0&
+14
+1*
+15
+1$
+1%
+#8
+05
+0$
+#9
+15
+1$
+#10
+05
+0$
+#11
+1=
+12
+1C
+1@
+x?
+08
+1<
+16
+15
+1$
+0#
+#12
+05
+0$
+#13
+0+
+0.
+0!
+x-
+0&
+0*
+15
+1$
+0%
+#14
+05
+0$
+#15
+15
+1$
+#16
+05
+0$
+#17
+04
+b1 7
+15
+1$
+1#
+#18
+05
+0$
+#19
+1+
+1.
+1!
+x-
+0&
+1*
+15
+1$
+1%
+#20
+05
+0$
+#21
+0=
+02
+0@
+x?
+08
+0<
+06
+15
+1$
+#22
+05
+0$
+#23
+15
+1$

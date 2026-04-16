@@ -127,12 +127,19 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
         | .bit => 1
         | _ => 8
       | none => 8
-    s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge {sanitizeName reset}) begin\n" ++
-    s!"{indent}    if ({sanitizeName reset})\n" ++
-    s!"{indent}        {sanitizeName output} <= {emitExpr (.const initValue resetWidth)};\n" ++
-    s!"{indent}    else\n" ++
-    s!"{indent}        {sanitizeName output} <= {emitExpr input};\n" ++
-    s!"{indent}end"
+    -- If clock name ends with "__neg", emit negedge trigger (no reset for negedge regs)
+    if clock.endsWith "__neg" then
+      let baseClock := clock.dropRight 5
+      s!"{indent}always_ff @(negedge {sanitizeName baseClock}) begin\n" ++
+      s!"{indent}    {sanitizeName output} <= {emitExpr input};\n" ++
+      s!"{indent}end"
+    else
+      s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge {sanitizeName reset}) begin\n" ++
+      s!"{indent}    if ({sanitizeName reset})\n" ++
+      s!"{indent}        {sanitizeName output} <= {emitExpr (.const initValue resetWidth)};\n" ++
+      s!"{indent}    else\n" ++
+      s!"{indent}        {sanitizeName output} <= {emitExpr input};\n" ++
+      s!"{indent}end"
 
   | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
     -- Generate memory array and always_ff block

@@ -1,2 +1,0 @@
-make[1]: *** [Makefile:424: do-2_4_floorplan_pdn] Error 1
-make: *** [Makefile:424: results/sky130hd/prob001_zero/base/2_4_floorplan_pdn.odb] Error 2

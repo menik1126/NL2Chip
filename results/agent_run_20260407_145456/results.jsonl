@@ -1,1 +1,0 @@
-{"prob_id": "Prob001_zero", "agent_turns": 7, "agent_input_tokens": 31622, "agent_output_tokens": 1043, "compile_pass": true, "sv_extracted": true, "lint_pass": true, "sim_status": "sim_pass", "sim_mismatches": 0, "detail": "0 mismatches in 20 samples", "timestamp": "2026-04-07T14:55:23.659935"}

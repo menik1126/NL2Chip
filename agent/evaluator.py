@@ -101,6 +101,7 @@ def generate_top_wrapper(
     sparkle_mod_name: str,
     sparkle_ports: list[tuple[str, str, str]],
     ref_ports: list[tuple[str, str, str]],
+    sv_code: str = "",
 ) -> str | None:
     """Generate a TopModule wrapper mapping ref ports to sparkle ports."""
     ref_inputs = [(d, t, n) for d, t, n in ref_ports if d == "input"]
@@ -112,14 +113,19 @@ def generate_top_wrapper(
     ref_user_inputs = [(d, t, n) for d, t, n in ref_inputs if n != "clk"]
 
     input_map: dict[str, str] = {}
-    for i, (_, _, rn) in enumerate(ref_user_inputs):
-        if i < len(sp_user_inputs):
-            input_map[rn] = sp_user_inputs[i][2]
-        else:
-            for _, _, sn in sp_user_inputs:
-                if sn == rn or sn == f"_gen_{rn}":
-                    input_map[rn] = sn
-                    break
+    # First pass: match by name (_gen_{ref_name} or exact match)
+    matched_sp = set()
+    for _, _, rn in ref_user_inputs:
+        for _, _, sn in sp_user_inputs:
+            if sn not in matched_sp and (sn == rn or sn == f"_gen_{rn}"):
+                input_map[rn] = sn
+                matched_sp.add(sn)
+                break
+    # Second pass: fall back to positional for any unmatched
+    unmatched_ref = [rn for _, _, rn in ref_user_inputs if rn not in input_map]
+    unmatched_sp = [sn for _, _, sn in sp_user_inputs if sn not in matched_sp]
+    for rn, sn in zip(unmatched_ref, unmatched_sp):
+        input_map[rn] = sn
 
     output_map: dict[str, str] = {}
     bundled_output = False
@@ -130,14 +136,19 @@ def generate_top_wrapper(
         if sp_width == ref_total:
             bundled_output = True
     if not bundled_output:
-        for i, (_, _, rn) in enumerate(ref_outputs):
-            if i < len(sp_outputs):
-                output_map[rn] = sp_outputs[i][2]
-            else:
-                for _, _, sn in sp_outputs:
-                    if sn == rn or sn == f"_gen_{rn}":
-                        output_map[rn] = sn
-                        break
+        # First pass: match by name
+        matched_sp_out = set()
+        for _, _, rn in ref_outputs:
+            for _, _, sn in sp_outputs:
+                if sn not in matched_sp_out and (sn == rn or sn == f"_gen_{rn}"):
+                    output_map[rn] = sn
+                    matched_sp_out.add(sn)
+                    break
+        # Second pass: positional fallback
+        unmatched_ref_out = [rn for _, _, rn in ref_outputs if rn not in output_map]
+        unmatched_sp_out = [sn for _, _, sn in sp_outputs if sn not in matched_sp_out]
+        for rn, sn in zip(unmatched_ref_out, unmatched_sp_out):
+            output_map[rn] = sn
 
     lines = ["module TopModule ("]
     all_ref_ports = ref_inputs + ref_outputs
@@ -185,18 +196,79 @@ def generate_top_wrapper(
     lines.append("    );")
 
     if bundled_output:
-        # Bit-slice the single bundled output: first ref output = MSB
+        # Bit-slice the single bundled output.
+        # Sparkle packs via concat: {field_a, field_b} where field_a = MSB.
+        # Try to infer correct mapping by matching field names in the concat
+        # against ref output names. Fall back to positional MSB-first.
         sp_out_name = sp_outputs[0][2]
-        offset = _port_width(sp_outputs[0][1])
-        for _, rt, rn in ref_outputs:
-            w = _port_width(rt)
-            high = offset - 1
-            low = offset - w
-            if w == 1:
-                lines.append(f"    assign {rn} = {sp_out_name}_wire[{low}];")
-            else:
-                lines.append(f"    assign {rn} = {sp_out_name}_wire[{high}:{low}];")
-            offset -= w
+        sp_width = _port_width(sp_outputs[0][1])
+
+        # Try to find the concat that feeds the output port (may be indirect)
+        concat_order = None
+        # Direct: assign out = {a, b}
+        concat_pat = re.search(
+            rf"assign\s+{re.escape(sp_out_name)}\s*=\s*\{{([^}}]+)\}}",
+            sv_code,
+        )
+        if not concat_pat:
+            # Indirect: assign out = _tmp; assign _tmp = {a, b}
+            indirect = re.search(
+                rf"assign\s+{re.escape(sp_out_name)}\s*=\s*(\w+)\s*;",
+                sv_code,
+            )
+            if indirect:
+                tmp_name = indirect.group(1)
+                concat_pat = re.search(
+                    rf"assign\s+{re.escape(tmp_name)}\s*=\s*\{{([^}}]+)\}}",
+                    sv_code,
+                )
+        if concat_pat:
+            fields = [f.strip() for f in concat_pat.group(1).split(",")]
+            # Map _gen_X fields to ref names: _gen_sum -> sum
+            concat_order = []
+            for f in fields:
+                base = f.replace("_gen_", "") if f.startswith("_gen_") else f
+                concat_order.append(base)
+
+        # Check if concat field names actually match ref output names
+        use_concat = False
+        if concat_order and len(concat_order) == len(ref_outputs):
+            ref_names = {rn for _, _, rn in ref_outputs}
+            if all(f in ref_names for f in concat_order):
+                use_concat = True
+
+        if use_concat:
+            # Use concat field order: first field = MSB
+            offset = sp_width
+            for field_name in concat_order:
+                # Find matching ref output
+                matched_ref = None
+                for _, rt, rn in ref_outputs:
+                    if rn == field_name:
+                        matched_ref = (rt, rn)
+                        break
+                if matched_ref:
+                    rt, rn = matched_ref
+                    w = _port_width(rt)
+                    high = offset - 1
+                    low = offset - w
+                    if w == 1:
+                        lines.append(f"    assign {rn} = {sp_out_name}_wire[{low}];")
+                    else:
+                        lines.append(f"    assign {rn} = {sp_out_name}_wire[{high}:{low}];")
+                    offset -= w
+        else:
+            # Fallback: positional, first ref output = MSB
+            offset = sp_width
+            for _, rt, rn in ref_outputs:
+                w = _port_width(rt)
+                high = offset - 1
+                low = offset - w
+                if w == 1:
+                    lines.append(f"    assign {rn} = {sp_out_name}_wire[{low}];")
+                else:
+                    lines.append(f"    assign {rn} = {sp_out_name}_wire[{high}:{low}];")
+                offset -= w
     else:
         for rn, sn in output_map.items():
             lines.append(f"    assign {rn} = {sn}_wire;")
@@ -211,7 +283,7 @@ def generate_top_wrapper(
 class Evaluator:
     """Evaluate a Sparkle-generated .lean file: compile → extract SV → lint → sim → (synth+PPA) → (P&R+DRC+LVS)."""
 
-    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False):
+    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False, lean_repl=None):
         self.project_root = project_root.resolve()
         self.dataset_dir = self.project_root / "verilog-eval" / "dataset_spec-to-rtl"
         self.enable_pnr = enable_pnr or enable_drc or enable_lvs  # drc/lvs imply pnr
@@ -219,6 +291,7 @@ class Evaluator:
         self.enable_drc = enable_drc
         self.enable_lvs = enable_lvs
         self.enable_corners = enable_corners and self.enable_pnr  # corners require pnr
+        self.lean_repl = lean_repl  # Optional LeanREPL instance for fast compilation
 
         if self.enable_synth:
             # Add siliconcrew/src to path for synthesis tools
@@ -264,28 +337,41 @@ class Evaluator:
             result["detail"] = f"Lean file not found: Generated/{prob_id}.lean"
             return result
 
-        try:
-            comp = subprocess.run(
-                ["lake", "build", f"Generated.{prob_id}"],
-                capture_output=True, text=True,
-                timeout=BASH_TIMEOUT,
-                cwd=str(self.project_root),
-            )
-        except subprocess.TimeoutExpired:
-            result["detail"] = "lake build timeout"
-            return result
+        sv_code = None
 
-        build_output = comp.stdout + "\n" + comp.stderr
-        has_error = comp.returncode != 0 or re.search(r"error:", build_output)
-        if has_error:
-            result["detail"] = f"Compile failed:\n{build_output[:1000]}"
-            return result
+        if self.lean_repl is not None:
+            # ── Fast path: use persistent REPL (~0.1s) ──
+            repl_result = self.lean_repl.check_file(lean_file)
+            if not repl_result.passed:
+                result["detail"] = f"Compile failed:\n{repl_result.error_text[:1000]}"
+                return result
+            result["compile_pass"] = True
+            result["has_sorry"] = not repl_result.complete
+            sv_code = repl_result.verilog
+        else:
+            # ── Fallback: lake build (~10s) ──
+            try:
+                comp = subprocess.run(
+                    ["lake", "build", f"Generated.{prob_id}"],
+                    capture_output=True, text=True,
+                    timeout=BASH_TIMEOUT,
+                    cwd=str(self.project_root),
+                )
+            except subprocess.TimeoutExpired:
+                result["detail"] = "lake build timeout"
+                return result
 
-        result["compile_pass"] = True
-        result["has_sorry"] = bool(re.search(r"declaration uses `sorry`", build_output))
+            build_output = comp.stdout + "\n" + comp.stderr
+            has_error = comp.returncode != 0 or re.search(r"error:", build_output)
+            if has_error:
+                result["detail"] = f"Compile failed:\n{build_output[:1000]}"
+                return result
+
+            result["compile_pass"] = True
+            result["has_sorry"] = bool(re.search(r"declaration uses `sorry`", build_output))
+            sv_code = self._extract_sv(build_output)
 
         # 2. Extract SystemVerilog
-        sv_code = self._extract_sv(build_output)
         if not sv_code:
             result["detail"] = "Compiled but could not extract SystemVerilog"
             return result
@@ -375,7 +461,7 @@ class Evaluator:
         if not sparkle_mod_name:
             return "sim_error", -1, "Could not parse Sparkle module name"
 
-        wrapper = generate_top_wrapper(sparkle_mod_name, sparkle_ports, ref_ports)
+        wrapper = generate_top_wrapper(sparkle_mod_name, sparkle_ports, ref_ports, sv_code)
         if not wrapper:
             return "sim_error", -1, "Could not generate TopModule wrapper"
 

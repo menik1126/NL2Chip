@@ -1,0 +1,270 @@
+$date
+	Sun Apr 12 04:11:06 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1s
+$end
+$scope module test $end
+$var wire 1 ! start_shifting $end
+$var reg 1 " clk $end
+$var reg 1 # data $end
+$var reg 1 $ reset $end
+$scope module dut $end
+$var wire 1 # _gen_data $end
+$var wire 3 % _gen_nextFromDone [2:0] $end
+$var wire 1 $ _gen_reset $end
+$var wire 3 & _tmp_b_1 [2:0] $end
+$var wire 3 ' _tmp_b_18 [2:0] $end
+$var wire 3 ( _tmp_b_2 [2:0] $end
+$var wire 3 ) _tmp_b_3 [2:0] $end
+$var wire 3 * _tmp_b_4 [2:0] $end
+$var wire 3 + _tmp_loop_0 [2:0] $end
+$var wire 3 , _tmp_mux_else_10 [2:0] $end
+$var wire 3 - _tmp_mux_else_12 [2:0] $end
+$var wire 1 . _tmp_mux_else_20 $end
+$var wire 3 / _tmp_mux_else_6 [2:0] $end
+$var wire 3 0 _tmp_mux_else_8 [2:0] $end
+$var wire 3 1 _tmp_mux_then_11 [2:0] $end
+$var wire 3 2 _tmp_mux_then_16 [2:0] $end
+$var wire 1 3 _tmp_mux_then_19 $end
+$var wire 3 4 _tmp_mux_then_5 [2:0] $end
+$var wire 3 5 _tmp_mux_then_7 [2:0] $end
+$var wire 3 6 _tmp_mux_then_9 [2:0] $end
+$var wire 1 " clk $end
+$var wire 1 ! out $end
+$var wire 1 7 rst $end
+$var wire 1 8 _tmp_result_21 $end
+$var wire 3 9 _tmp_mux_else_15 [2:0] $end
+$var wire 3 : _tmp_mux_else_14 [2:0] $end
+$var wire 3 ; _tmp_mux_else_13 [2:0] $end
+$var wire 1 < _gen_start_shifting_bool $end
+$var wire 3 = _gen_nextWithReset [2:0] $end
+$var wire 3 > _gen_nextState [2:0] $end
+$var wire 3 ? _gen_nextFromS110 [2:0] $end
+$var wire 3 @ _gen_nextFromS11 [2:0] $end
+$var wire 3 A _gen_nextFromS1 [2:0] $end
+$var wire 3 B _gen_nextFromS [2:0] $end
+$var wire 1 C _gen_isS110 $end
+$var wire 1 D _gen_isS11 $end
+$var wire 1 E _gen_isS1 $end
+$var wire 1 F _gen_isS $end
+$var reg 3 G _tmp_loop_body_17 [2:0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+bx G
+xF
+xE
+xD
+xC
+b0 B
+b0 A
+b11 @
+b0 ?
+bx >
+b0 =
+x<
+bx00 ;
+bx :
+bx 9
+x8
+07
+b10 6
+b10 5
+b1 4
+13
+b0 2
+b100 1
+b0 0
+b0 /
+0.
+b0 -
+b11 ,
+bx +
+b11 *
+b10 )
+b1 (
+b100 '
+b0 &
+b100 %
+1$
+0#
+0"
+x!
+$end
+#5
+0!
+08
+b1 >
+0<
+1F
+0E
+0D
+0C
+b0 +
+b0 G
+b100 9
+b100 :
+b100 ;
+b1 B
+b10 A
+b10 @
+b100 ?
+b1 =
+1#
+0$
+1"
+#10
+0"
+#15
+b10 =
+b10 >
+b10 9
+0F
+1E
+b1 +
+b1 G
+1"
+#20
+0"
+#25
+b11 :
+0E
+1D
+b10 +
+b10 G
+b11 =
+b11 >
+b11 9
+b0 B
+b0 A
+b11 @
+b0 ?
+0#
+1"
+#30
+0"
+#35
+0D
+1C
+b11 +
+b11 G
+b100 =
+b100 >
+b100 9
+b100 :
+b1 B
+b10 A
+b10 @
+b100 ?
+1#
+1"
+#40
+0"
+#45
+1!
+18
+1<
+0C
+b100 +
+b100 G
+1"
+#50
+0"
+#55
+b0 B
+b0 A
+b11 @
+b0 ?
+0#
+1"
+#60
+0"
+#65
+b1 B
+b10 A
+b10 @
+b100 ?
+1#
+1"
+#70
+0"
+#75
+b0 =
+1$
+1"
+#80
+0"
+#85
+0!
+08
+b1 >
+0<
+1F
+b0 +
+b0 G
+b1 =
+0$
+1"
+#90
+0"
+#95
+b10 =
+b10 >
+b10 9
+0F
+1E
+b1 +
+b1 G
+1"
+#100
+0"
+#105
+b10 :
+0E
+1D
+b10 +
+b10 G
+1"
+#110
+0"
+#115
+b11 =
+b11 >
+b11 9
+b11 :
+b0 B
+b0 A
+b11 @
+b0 ?
+0#
+1"
+#120
+0"
+#125
+b0 =
+b0 >
+b0 9
+b0 :
+b0 ;
+0D
+1C
+b11 +
+b11 G
+1"
+#130
+0"
+#135
+b100 9
+b100 :
+b100 ;
+1F
+0C
+b0 +
+b0 G
+1"
