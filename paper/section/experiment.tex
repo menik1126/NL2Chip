@@ -25,7 +25,7 @@ Table~\ref{tab:main_results} summarizes the end-to-end results across the full 1
 
 \begin{table}[t]
 \centering
-\caption{End-to-end results on VerilogEval (156 problems). \textsc{Sparkle} uses iterative compile-fix with Lean~4 type checking; the baseline generates SystemVerilog directly in a single LLM call. Both pipelines include synthesis and P\&R with SkyWater 130nm HD.}
+\caption{End-to-end results on VerilogEval (156 problems). The baseline generates SystemVerilog directly in a single LLM call. \textsc{Sparkle} uses iterative compile-fix with Lean~4 type checking; ``(synth)'' reports results through Yosys synthesis only, while the full \textsc{Sparkle} row additionally includes place-and-route via OpenROAD with SkyWater 130nm HD. Both \textsc{Sparkle} rows are from the same agent run.}
 \label{tab:main_results}
 \small
 \begin{tabular}{lcccc}
@@ -33,46 +33,46 @@ Table~\ref{tab:main_results} summarizes the end-to-end results across the full 1
 \textbf{Method} & \textbf{Compile} & \textbf{Sim Pass} & \textbf{Synth} & \textbf{P\&R} \\
 \midrule
 Baseline (direct SV) & 140/156 (89.7\%) & 112/156 (71.8\%) & 112/156 & 106/156 \\
-\textsc{Sparkle} & 150/156 (96.2\%) & 103/156 (66.0\%) & 149/156 & 145/156 \\
-\textsc{Sparkle} (synth) & 151/156 (96.8\%) & 100/156 (64.1\%) & 151/156 & --- \\
+\textsc{Sparkle} (synth) & 145/156 (92.9\%) & 109/156 (69.9\%) & 144/156 & --- \\
+\textsc{Sparkle} & 145/156 (92.9\%) & 109/156 (69.9\%) & 144/156 & 126/156 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \paragraph{Compilation Rate.}
-\textsc{Sparkle} achieves a 96.2\% Lean compilation rate (150/156), substantially higher than the baseline's 89.7\% Verilog compilation rate. This demonstrates that the iterative compile-fix loop, guided by Lean's structured type errors, enables the agent to resolve the majority of issues. The 6 failures involve complex designs (e.g., Conway's Game of Life, gshare branch predictor) where the agent exhausted its turn budget without resolving all type errors.
+\textsc{Sparkle} achieves a 92.9\% Lean compilation rate (145/156), higher than the baseline's 89.7\% Verilog compilation rate. This demonstrates that the iterative compile-fix loop, guided by Lean's structured type errors, enables the agent to resolve the majority of issues. The 11 failures involve complex designs (e.g., Conway's Game of Life, gshare branch predictor) where the agent exhausted its turn budget without resolving all type errors.
 
 \paragraph{Functional Correctness.}
-The simulation pass rate for \textsc{Sparkle} is 66.0\% (103/156), compared to the baseline's 71.8\% (112/156). While the baseline achieves a higher raw simulation rate, this comparison is nuanced. The baseline generates Verilog directly---a language the LLM has seen extensively in training data---while \textsc{Sparkle} targets a novel DSL with no pre-training exposure. The 66\% rate is achieved entirely through in-context learning from 10 few-shot examples and iterative type-guided refinement. Moreover, \textsc{Sparkle}'s designs carry stronger correctness guarantees: every design that compiles is free of width mismatches, combinational loops, and incomplete case analysis by construction.
+The simulation pass rate for \textsc{Sparkle} is 69.9\% (109/156), compared to the baseline's 71.8\% (112/156). While the baseline achieves a higher raw simulation rate, this comparison is nuanced. The baseline generates Verilog directly---a language the LLM has seen extensively in training data---while \textsc{Sparkle} targets a novel DSL with no pre-training exposure. The 69.9\% rate is achieved entirely through in-context learning from 10 few-shot examples and iterative type-guided refinement. Moreover, \textsc{Sparkle}'s designs carry stronger correctness guarantees: every design that compiles is free of width mismatches, combinational loops, and incomplete case analysis by construction.
 
 \paragraph{Synthesis and Physical Design.}
-A key advantage of \textsc{Sparkle} is that compiled designs are immediately synthesis-ready. Of 150 compiled designs, 149 (99.3\%) pass Yosys synthesis, and 145 (96.7\%) complete place-and-route through OpenROAD, producing GDSII layouts. The baseline achieves 112/156 (71.8\%) synthesis success and 106/156 (67.9\%) P\&R completion, demonstrating that direct LLM-generated Verilog can also produce synthesizable designs, though at a lower rate than \textsc{Sparkle}'s type-checked output.
+A key advantage of \textsc{Sparkle} is that compiled designs are immediately synthesis-ready. Of 145 compiled designs, 144 (99.3\%) pass Yosys synthesis, and 126 (86.9\%) complete place-and-route through OpenROAD, producing GDSII layouts. The baseline achieves 112/156 (71.8\%) synthesis success and 106/156 (67.9\%) P\&R completion, demonstrating that direct LLM-generated Verilog can also produce synthesizable designs, though at a lower rate than \textsc{Sparkle}'s type-checked output.
 
 \paragraph{Agent Efficiency.}
-The agent uses an average of 19.6 turns per problem, with total token usage of approximately 1.6M input and 528K output tokens across all 156 problems. The full pipeline (code generation + synthesis + P\&R) completes in approximately 12 hours. In contrast, the baseline completes in under 7 minutes (single-pass generation, no iteration), but produces no synthesis artifacts.
+The agent uses an average of 22.3 turns per problem, with total token usage of approximately 1.3M input and 580K output tokens across all 156 problems. The full pipeline (code generation + synthesis + P\&R) completes in approximately 12 hours. In contrast, the baseline completes in under 7 minutes (single-pass generation, no iteration), but produces no synthesis artifacts.
 
 \subsection{Physical Design Quality}
 \label{sec:ppa_results}
 
-Table~\ref{tab:ppa_summary} reports PPA statistics for the 103 functionally correct designs that completed place-and-route.
+Table~\ref{tab:ppa_summary} reports PPA statistics for the 98 functionally correct designs that completed place-and-route.
 
 \begin{table}[t]
 \centering
-\caption{PPA statistics for functionally correct designs (103 problems) after synthesis and P\&R with SkyWater 130nm HD. WNS $\geq 0$ indicates timing closure at the target clock frequency.}
+\caption{PPA statistics for functionally correct designs (98 problems) after synthesis and P\&R with SkyWater 130nm HD. WNS $\geq 0$ indicates timing closure at the target clock frequency.}
 \label{tab:ppa_summary}
 \small
 \begin{tabular}{lcccc}
 \toprule
 \textbf{Metric} & \textbf{Min} & \textbf{Median} & \textbf{Mean} & \textbf{Max} \\
 \midrule
-Area ($\mu$m$^2$) & 3.8 & 55.1 & 833.1 & 24{,}711.2 \\
-Cell count & 1 & --- & 41 & 2{,}671 \\
-Power ($\mu$W) & 0.06 & --- & 763.7 & 52{,}500.0 \\
+Area ($\mu$m$^2$) & 3.8 & 57.6 & 264.1 & 4{,}979.8 \\
+Cell count & 1 & 6 & 15 & 122 \\
+Power ($\mu$W) & 0.06 & 38.70 & 126.95 & 1{,}910.0 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-All 103 designs achieve timing closure (WNS $\geq 0$\,ns), confirming that the generated RTL is timing-clean at the target frequency. The wide range in area and power reflects the diversity of the benchmark: simple combinational circuits (wire assignments, basic gates) occupy under 12\,$\mu$m$^2$, while complex sequential designs (counters, FSMs, shift registers) require thousands of $\mu$m$^2$.
+All 98 designs achieve timing closure (WNS $\geq 0$\,ns), confirming that the generated RTL is timing-clean at the target frequency. The wide range in area and power reflects the diversity of the benchmark: simple combinational circuits (wire assignments, basic gates) occupy under 12\,$\mu$m$^2$, while complex sequential designs (counters, FSMs, shift registers) require thousands of $\mu$m$^2$.
 
 \subsection{Architecture Exploration}
 \label{sec:arch_results}
@@ -121,7 +121,7 @@ The modest improvement rate (4/29) reflects the difficulty of optimizing already
 \subsection{Error Analysis}
 \label{sec:error_analysis}
 
-We analyze the 53 designs that compile but fail simulation to understand the remaining challenges.
+We analyze the 36 designs that compile but fail simulation to understand the remaining challenges.
 
 \paragraph{FSM Semantics.}
 The largest failure category (approximately 40\% of failures) involves finite state machines with complex transition logic. The agent correctly encodes the state type and register structure but makes errors in transition conditions or output assignments, particularly for FSMs with many states or non-obvious reset behavior. These are semantic errors that the type system cannot catch---the code is type-correct but implements the wrong state machine.
@@ -135,7 +135,7 @@ The remaining failures involve designs with intricate bit manipulation (e.g., LF
 \subsection{Discussion}
 \label{sec:discussion}
 
-The results reveal a fundamental trade-off in targeting a type-safe HDL versus direct Verilog generation. The baseline achieves a higher simulation pass rate (71.8\% vs.\ 66.0\%) because the LLM has extensive pre-training exposure to Verilog and can leverage memorized patterns. However, \textsc{Sparkle}'s designs carry substantially stronger guarantees: every compiled design is free of width mismatches, combinational loops, and incomplete case analysis, and 96.7\% of compiled designs produce physical layouts through the full synthesis and P\&R flow.
+The results reveal a fundamental trade-off in targeting a type-safe HDL versus direct Verilog generation. The baseline achieves a higher simulation pass rate (71.8\% vs.\ 69.9\%) because the LLM has extensive pre-training exposure to Verilog and can leverage memorized patterns. However, \textsc{Sparkle}'s designs carry substantially stronger guarantees: every compiled design is free of width mismatches, combinational loops, and incomplete case analysis, and 86.9\% of compiled designs produce physical layouts through the full synthesis and P\&R flow.
 
-We expect the simulation gap to narrow as the agent's few-shot library grows and as LLMs gain exposure to Lean~4 hardware descriptions. The compilation rate (96.2\%) already demonstrates that the iterative type-guided refinement loop is highly effective, and the remaining failures are concentrated in the most complex designs where even human engineers would require significant effort.
+We expect the simulation gap to narrow as the agent's few-shot library grows and as LLMs gain exposure to Lean~4 hardware descriptions. The compilation rate (92.9\%) already demonstrates that the iterative type-guided refinement loop is highly effective, and the remaining failures are concentrated in the most complex designs where even human engineers would require significant effort.
 
