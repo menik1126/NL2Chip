@@ -25,16 +25,16 @@ Table~\ref{tab:main_results} summarizes the end-to-end results across the full 1
 
 \begin{table}[t]
 \centering
-\caption{End-to-end results on VerilogEval (156 problems). The baseline generates SystemVerilog directly in a single LLM call. \textsc{Sparkle} uses iterative compile-fix with Lean~4 type checking; ``(synth)'' reports results through Yosys synthesis only, while the full \textsc{Sparkle} row additionally includes place-and-route via OpenROAD with SkyWater 130nm HD. Both \textsc{Sparkle} rows are from the same agent run.}
+\caption{End-to-end results on VerilogEval (156 problems). The baseline generates SystemVerilog directly in a single LLM call. \textsc{Sparkle} uses iterative compile-fix with Lean~4 type checking; ``(synth)'' reports results through Yosys synthesis only, while the full \textsc{Sparkle} row additionally includes place-and-route via OpenROAD with SkyWater 130nm HD. Both \textsc{Sparkle} rows are from the same agent run. Sim\,|\,Comp denotes the simulation pass rate conditioned on successful compilation.}
 \label{tab:main_results}
 \small
-\begin{tabular}{lcccc}
+\begin{tabular}{lcccccc}
 \toprule
-\textbf{Method} & \textbf{Compile} & \textbf{Sim Pass} & \textbf{Synth} & \textbf{P\&R} \\
+\textbf{Method} & \textbf{Compile} & \textbf{Sim Pass} & \textbf{Sim\,|\,Comp} & \textbf{Synth} & \textbf{P\&R} & \textbf{Avg Turns} \\
 \midrule
-Baseline (direct SV) & 140/156 (89.7\%) & 112/156 (71.8\%) & 112/156 & 106/156 \\
-\textsc{Sparkle} (synth) & 145/156 (92.9\%) & 109/156 (69.9\%) & 144/156 & --- \\
-\textsc{Sparkle} & 145/156 (92.9\%) & 109/156 (69.9\%) & 144/156 & 126/156 \\
+Baseline (direct SV) & 140/156 (89.7\%) & 112/156 (71.8\%) & 80.0\% & 112/156 & 106/156 & 1 \\
+\textsc{Sparkle} (synth) & 145/156 (92.9\%) & 109/156 (69.9\%) & 75.2\% & 144/156 & --- & 22.3 \\
+\textsc{Sparkle} & 145/156 (92.9\%) & 109/156 (69.9\%) & 75.2\% & 144/156 & 126/156 & 22.3 \\
 \bottomrule
 \end{tabular}
 \end{table}
