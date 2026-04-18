@@ -4,28 +4,38 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- Priority encoder: given an 8-bit input, outputs the position (0-7) of the least significant '1' bit.
-    Reports 0 if no bits are high. -/
+/-- Priority encoder: finds the position of the least significant bit that is 1 in an 8-bit input. -/
 def prob071_always_casez {dom : DomainConfig}
-    (in_ : Signal dom (BitVec 8)) : Signal dom (BitVec 3) :=
-  -- Extract each individual bit as a signal
-  let b0 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 0 1 v) in_
-  let b1 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 1 1 v) in_
-  let b2 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 2 1 v) in_
-  let b3 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 3 1 v) in_
-  let b4 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 4 1 v) in_
-  let b5 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 5 1 v) in_
-  let b6 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 6 1 v) in_
-  let b7 : Signal dom (BitVec 1) := Signal.map (fun v => BitVec.extractLsb' 7 1 v) in_
-  -- Priority: bit 0 has highest priority (LSB first)
-  hw_cond (Signal.pure 0#3)
-    | (b0 === Signal.pure 1#1) => Signal.pure 0#3
-    | (b1 === Signal.pure 1#1) => Signal.pure 1#3
-    | (b2 === Signal.pure 1#1) => Signal.pure 2#3
-    | (b3 === Signal.pure 1#1) => Signal.pure 3#3
-    | (b4 === Signal.pure 1#1) => Signal.pure 4#3
-    | (b5 === Signal.pure 1#1) => Signal.pure 5#3
-    | (b6 === Signal.pure 1#1) => Signal.pure 6#3
-    | (b7 === Signal.pure 1#1) => Signal.pure 7#3
+    (input : Signal dom (BitVec 8)) : Signal dom (BitVec 3) :=
+  -- Extract each bit by masking and comparing
+  let bit0 : Signal dom Bool := (input &&& 1#8) === 1#8
+  let bit1 : Signal dom Bool := (input &&& 2#8) === 2#8
+  let bit2 : Signal dom Bool := (input &&& 4#8) === 4#8
+  let bit3 : Signal dom Bool := (input &&& 8#8) === 8#8
+  let bit4 : Signal dom Bool := (input &&& 16#8) === 16#8
+  let bit5 : Signal dom Bool := (input &&& 32#8) === 32#8
+  let bit6 : Signal dom Bool := (input &&& 64#8) === 64#8
+  let bit7 : Signal dom Bool := (input &&& 128#8) === 128#8
+  
+  -- Extract lower 3 bits and use arithmetic to create other constants
+  let lower3 : Signal dom (BitVec 3) := Signal.map (fun x => x.extractLsb 2 0) input
+  let zero : Signal dom (BitVec 3) := lower3 - lower3  -- 0
+  let one : Signal dom (BitVec 3) := zero + 1#3
+  let two : Signal dom (BitVec 3) := one + 1#3
+  let three : Signal dom (BitVec 3) := two + 1#3
+  let four : Signal dom (BitVec 3) := three + 1#3
+  let five : Signal dom (BitVec 3) := four + 1#3
+  let six : Signal dom (BitVec 3) := five + 1#3
+  let seven : Signal dom (BitVec 3) := six + 1#3
+  
+  -- Priority mux: check from LSB to MSB
+  Signal.mux bit0 zero
+    (Signal.mux bit1 one
+      (Signal.mux bit2 two
+        (Signal.mux bit3 three
+          (Signal.mux bit4 four
+            (Signal.mux bit5 five
+              (Signal.mux bit6 six
+                (Signal.mux bit7 seven zero)))))))
 
 #synthesizeVerilog prob071_always_casez

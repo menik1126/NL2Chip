@@ -4,8 +4,7 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- Adder-subtractor with zero flag (bug fix): computes out = a+b or a-b based on do_sub,
-    and result_is_zero = (out == 0). The original bug was using bitwise NOT instead of equality. -/
+/-- Adder-subtractor with zero flag (bug fixed) -/
 def prob123_bugs_addsubz {dom : DomainConfig}
     (do_sub : Signal dom Bool)
     (a b : Signal dom (BitVec 8))

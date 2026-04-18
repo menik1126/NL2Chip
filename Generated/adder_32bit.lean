@@ -8,20 +8,19 @@ open Sparkle.Core.Signal
 def adder_32bit {dom : DomainConfig}
     (a b : Signal dom (BitVec 32))
     : Signal dom (BitVec 32 × BitVec 1) :=
-  let sum : Signal dom (BitVec 32) := a + b
+  -- Compute the full 33-bit result using Signal operations
+  let sum_extended := Signal.map (fun ab => 
+    let a := ab.1
+    let b := ab.2
+    -- Extend to 33 bits to capture carry
+    let a_ext := BitVec.zeroExtend 33 a
+    let b_ext := BitVec.zeroExtend 33 b
+    a_ext + b_ext
+  ) (bundle2 a b)
   
-  -- Compute carry: extend to 33 bits, add
-  let a_ext : Signal dom (BitVec 33) := Signal.map (·.zeroExtend 33) a
-  let b_ext : Signal dom (BitVec 33) := Signal.map (·.zeroExtend 33) b
-  let sum_ext : Signal dom (BitVec 33) := a_ext + b_ext
-  
-  -- Extract carry by shifting right 32 and ANDing with 1
-  let carry_shifted : Signal dom (BitVec 33) := sum_ext >>> 32#33
-  let carry_masked : Signal dom (BitVec 33) := carry_shifted &&& 1#33
-  
-  -- Check if carry_masked is non-zero
-  let carry_bool : Signal dom Bool := carry_masked === 1#33
-  let carry : Signal dom (BitVec 1) := Signal.mux carry_bool 1#1 0#1
+  -- Extract 32-bit sum and 1-bit carry
+  let sum := Signal.map (fun x => x.extractLsb 31 0) sum_extended
+  let carry := Signal.map (fun x => x.extractLsb 32 32) sum_extended
   
   bundle2 sum carry
 

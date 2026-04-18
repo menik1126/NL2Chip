@@ -4,23 +4,18 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- Sequential circuit with majority-function flip-flop and XOR output.
-    state (c) <= a&b | a&c | b&c (majority of a, b, c)
-    q = a ^ b ^ state -/
+/-- Sequential circuit with majority function feedback and XOR output -/
 def prob147_circuit10 {dom : DomainConfig}
     (a b : Signal dom (BitVec 1))
     : Signal dom (BitVec 1 × BitVec 1) :=
-  -- Use Signal.loop for feedback on state c
-  let state : Signal dom (BitVec 1) :=
-    Signal.loop fun (c : Signal dom (BitVec 1)) =>
-      -- next c = a&b | a&c | b&c (majority function)
-      let ab := a &&& b
-      let ac := a &&& c
-      let bc := b &&& c
-      let nextC := ab ||| ac ||| bc
-      Signal.register 0#1 nextC
-  -- q = a ^ b ^ state
-  let q := a ^^^ b ^^^ state
-  bundle2 q state
+  let c := Signal.loop fun state =>
+    -- Majority function: a&b | a&state | b&state
+    let next_c := (a &&& b) ||| (a &&& state) ||| (b &&& state)
+    -- Register with initial value 0
+    Signal.register 0#1 next_c
+  -- Output q = a XOR b XOR c
+  let q := a ^^^ b ^^^ c
+  -- Bundle outputs: (q, state)
+  bundle2 q c
 
 #synthesizeVerilog prob147_circuit10

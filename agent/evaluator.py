@@ -32,7 +32,17 @@ PNR_TIMEOUT = 900
 DRC_TIMEOUT = 300
 LVS_TIMEOUT = 300
 STA_TIMEOUT = 120
+GLS_TIMEOUT = 120
 MIN_DIE_SIDE_UM = 50  # minimum die side for sky130hd PDN straps
+
+# ── sky130 cell simulation models (via volare PDK manager) ──────────
+SKY130_VOLARE_VERSION = "c6d73a35f524070e85faff4a6a9eef49553ebc2b"
+SKY130_VOLARE_VERILOG_DIR = (
+    Path.home() / ".volare" / "volare" / "sky130" / "versions"
+    / SKY130_VOLARE_VERSION / "sky130A" / "libs.ref" / "sky130_fd_sc_hd" / "verilog"
+)
+SKY130_PRIMITIVES_NAME = "primitives.v"
+SKY130_CELLS_NAME = "sky130_fd_sc_hd.v"
 
 # ── PVT Corner definitions (sky130hd) ──────────────────────────────
 
@@ -317,13 +327,14 @@ def generate_top_wrapper(
 class Evaluator:
     """Evaluate a Sparkle-generated .lean file: compile → extract SV → lint → sim → (synth+PPA) → (P&R+DRC+LVS)."""
 
-    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False, lean_repl=None, dataset: str = "verilogeval", dataset_obj=None):
+    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False, enable_gls: bool = False, lean_repl=None, dataset: str = "verilogeval", dataset_obj=None):
         self.project_root = project_root.resolve()
         self.dataset_name = dataset.lower()
         self.dataset_obj = dataset_obj  # Optional Dataset instance from dataset.py
         self.dataset_dir = self.project_root / "verilog-eval" / "dataset_spec-to-rtl"
         self.enable_pnr = enable_pnr or enable_drc or enable_lvs  # drc/lvs imply pnr
         self.enable_synth = enable_synth or self.enable_pnr  # pnr implies synth
+        self.enable_gls = enable_gls and self.enable_synth  # gls requires synth
         self.enable_drc = enable_drc
         self.enable_lvs = enable_lvs
         self.enable_corners = enable_corners and self.enable_pnr  # corners require pnr
@@ -363,6 +374,10 @@ class Evaluator:
             "drc_violations": None,
             "lvs_pass": None,        # None = not run, True/False = result
             "lvs_error": None,
+            "gls_synth_status": "not_run",   # post-synth gate-level sim
+            "gls_synth_mismatches": -1,
+            "gls_pnr_status": "not_run",     # post-PnR gate-level sim
+            "gls_pnr_mismatches": -1,
             "has_sorry": True,       # True = unverified (default), False = formally verified
             "detail": "",
         }
@@ -444,12 +459,30 @@ class Evaluator:
             )
             result.update(synth_result)
 
+            # 5b. Post-synthesis gate-level simulation
+            if self.enable_gls and result["synth_pass"]:
+                synth_dir = run_dir / "synth" / prob_id
+                gls_result = self._run_gls(
+                    prob_id, sv_code, sparkle_mod_name, sparkle_ports,
+                    run_dir, synth_dir, "post_synth",
+                )
+                result.update(gls_result)
+
             # 6. Full P&R + DRC + LVS (optional)
             if self.enable_pnr and result["synth_pass"]:
                 pnr_result = self._run_pnr(
                     prob_id, sv_code, sparkle_mod_name or prob_id.lower(), run_dir
                 )
                 result.update(pnr_result)
+
+                # 6b. Post-PnR gate-level simulation
+                if self.enable_gls and result["pnr_pass"]:
+                    synth_dir = run_dir / "synth" / prob_id
+                    gls_result = self._run_gls(
+                        prob_id, sv_code, sparkle_mod_name, sparkle_ports,
+                        run_dir, synth_dir, "post_pnr",
+                    )
+                    result.update(gls_result)
 
         return result
 
@@ -639,11 +672,20 @@ class Evaluator:
         except FileNotFoundError:
             return "sim_error", -1, "iverilog not found"
 
-        # Run simulation
+        # Copy data files needed by $readmemh in testbenches (e.g. wfull.txt)
+        tb_dir = tb_path.parent
+        for data_file in tb_dir.iterdir():
+            if data_file.is_file() and data_file.suffix in (".txt", ".dat", ".hex", ".mem"):
+                dest = sim_dir / data_file.name
+                if not dest.exists():
+                    shutil.copy2(data_file, dest)
+
+        # Run simulation (cwd=sim_dir so $readmemh finds copied data files)
         try:
             sim = subprocess.run(
                 ["vvp", str(sim_dir / "sim.vvp")],
                 capture_output=True, text=True, timeout=SIM_TIMEOUT,
+                cwd=str(sim_dir),
             )
             sim_output = sim.stdout + sim.stderr
             (sim_dir / "sim_output.txt").write_text(sim_output)
@@ -664,6 +706,250 @@ class Evaluator:
             return "sim_error", -1, "Simulation hit internal timeout"
 
         return "sim_fail", -1, f"Design did not pass:\n{sim_output[:300]}"
+
+    # ── Gate-Level Simulation (GLS) ──────────────────────────────────
+
+    @staticmethod
+    def _ensure_sky130_cache() -> Path:
+        """Ensure sky130 cell simulation models are available via volare.
+
+        Returns the directory containing primitives.v and sky130_fd_sc_hd.v.
+        """
+        verilog_dir = SKY130_VOLARE_VERILOG_DIR
+        prim = verilog_dir / SKY130_PRIMITIVES_NAME
+        cells = verilog_dir / SKY130_CELLS_NAME
+        if prim.exists() and cells.exists():
+            return verilog_dir
+        # Try to fetch via volare
+        try:
+            subprocess.run(
+                ["volare", "fetch", "--pdk", "sky130", SKY130_VOLARE_VERSION],
+                capture_output=True, text=True, timeout=300,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        if not prim.exists() or not cells.exists():
+            raise RuntimeError(
+                f"sky130 cell models not found at {verilog_dir}. "
+                f"Install with: pip install volare && volare fetch --pdk sky130 {SKY130_VOLARE_VERSION}"
+            )
+        return verilog_dir
+
+    def _run_gls(
+        self, prob_id: str, sv_code: str,
+        sparkle_mod_name: str, sparkle_ports: list[tuple[str, str, str]],
+        run_dir: Path, synth_dir: Path, stage: str,
+    ) -> dict:
+        """Run gate-level simulation after synthesis or P&R.
+
+        Args:
+            stage: "post_synth" or "post_pnr"
+        Returns dict with gls_{stage}_status and gls_{stage}_mismatches.
+        """
+        # Locate netlist on local filesystem
+        # ORFS naming: post-synth = 1_*_yosys.v, post-PnR = 6_1_merged.v or 6_final.v
+        if stage == "post_synth":
+            netlist_glob = "1_*_yosys.v"
+        else:
+            netlist_glob = "6_1_merged.v"
+        netlists = list((synth_dir / "orfs_results").rglob(netlist_glob))
+        if not netlists and stage == "post_pnr":
+            # Fallback: try 6_final.v
+            netlists = list((synth_dir / "orfs_results").rglob("6_final.v"))
+        if not netlists:
+            key = "synth" if stage == "post_synth" else "pnr"
+            return {
+                f"gls_{key}_status": "sim_error",
+                f"gls_{key}_mismatches": -1,
+            }
+        netlist_path = netlists[0]
+
+        if self.dataset_name == "rtllm":
+            status, mismatches, detail = self._run_gls_rtllm(
+                prob_id, sv_code, sparkle_mod_name, sparkle_ports,
+                run_dir, synth_dir, netlist_path, stage,
+            )
+        else:
+            status, mismatches, detail = self._run_gls_verilogeval(
+                prob_id, sv_code, sparkle_mod_name, sparkle_ports,
+                run_dir, synth_dir, netlist_path, stage,
+            )
+
+        key = "synth" if stage == "post_synth" else "pnr"
+        return {
+            f"gls_{key}_status": status,
+            f"gls_{key}_mismatches": mismatches,
+        }
+
+    def _run_gls_verilogeval(
+        self, prob_id: str, sv_code: str,
+        sparkle_mod_name: str, sparkle_ports: list[tuple[str, str, str]],
+        run_dir: Path, synth_dir: Path,
+        netlist_path: Path, stage: str,
+    ) -> tuple[str, int, str]:
+        """Run gate-level simulation for VerilogEval using local iverilog."""
+        sky130_dir = self._ensure_sky130_cache()
+
+        ref_sv_path = self.dataset_dir / f"{prob_id}_ref.sv"
+        test_sv_path = self.dataset_dir / f"{prob_id}_test.sv"
+        if not ref_sv_path.exists() or not test_sv_path.exists():
+            return "sim_error", -1, f"Missing ref or test SV for {prob_id}"
+
+        # Regenerate wrapper (same as RTL sim)
+        ref_sv = ref_sv_path.read_text()
+        ref_ports = parse_ref_ports(ref_sv)
+        if not sparkle_mod_name:
+            return "sim_error", -1, "Could not parse Sparkle module name"
+        wrapper = generate_top_wrapper(sparkle_mod_name, sparkle_ports, ref_ports, sv_code)
+        if not wrapper:
+            return "sim_error", -1, "Could not generate TopModule wrapper"
+
+        # Stage files
+        gls_dir = synth_dir / f"gls_{stage}"
+        gls_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ref_sv_path, gls_dir / "ref.sv")
+        shutil.copy2(test_sv_path, gls_dir / "test.sv")
+        (gls_dir / "wrapper.sv").write_text(wrapper)
+
+        # Compile with local iverilog
+        vvp_file = gls_dir / "gls.vvp"
+        compile_cmd = [
+            "iverilog", "-g2012", "-DFUNCTIONAL", "-DUNIT_DELAY=#0",
+            "-o", str(vvp_file),
+            str(sky130_dir / SKY130_PRIMITIVES_NAME),
+            str(sky130_dir / SKY130_CELLS_NAME),
+            str(netlist_path),
+            str(gls_dir / "ref.sv"),
+            str(gls_dir / "wrapper.sv"),
+            str(gls_dir / "test.sv"),
+        ]
+
+        try:
+            comp = subprocess.run(
+                compile_cmd, capture_output=True, text=True, timeout=GLS_TIMEOUT,
+            )
+            if comp.returncode != 0:
+                (gls_dir / "gls_compile_error.txt").write_text(comp.stderr)
+                return "sim_error", -1, f"GLS compile failed:\n{comp.stderr[:500]}"
+
+            sim = subprocess.run(
+                ["vvp", str(vvp_file)],
+                capture_output=True, text=True, timeout=GLS_TIMEOUT,
+                cwd=str(gls_dir),
+            )
+        except subprocess.TimeoutExpired:
+            return "sim_error", -1, f"GLS {stage}: simulation timeout"
+        except Exception as e:
+            return "sim_error", -1, f"GLS error: {e}"
+
+        sim_output = sim.stdout + sim.stderr
+        (gls_dir / "gls_output.txt").write_text(sim_output)
+
+        # Parse VerilogEval output
+        m = re.search(r"Mismatches:\s*(\d+)\s+in\s+(\d+)\s+samples", sim_output)
+        if m:
+            mismatches = int(m.group(1))
+            total = int(m.group(2))
+            if mismatches == 0:
+                return "sim_pass", 0, f"GLS {stage}: 0 mismatches in {total} samples"
+            return "sim_fail", mismatches, f"GLS {stage}: {mismatches} mismatches in {total} samples"
+
+        if "TIMEOUT" in sim_output:
+            return "sim_error", -1, f"GLS {stage}: simulation timeout"
+
+        return "sim_error", -1, f"GLS {stage}: could not parse output:\n{sim_output[:300]}"
+
+    def _run_gls_rtllm(
+        self, prob_id: str, sv_code: str,
+        sparkle_mod_name: str, sparkle_ports: list[tuple[str, str, str]],
+        run_dir: Path, synth_dir: Path,
+        netlist_path: Path, stage: str,
+    ) -> tuple[str, int, str]:
+        """Run gate-level simulation for RTLLM using local iverilog."""
+        sky130_dir = self._ensure_sky130_cache()
+
+        if self.dataset_obj is None:
+            return "sim_error", -1, "RTLLM dataset object not set on evaluator"
+
+        info = self.dataset_obj.load_problem(prob_id)
+        tb_path = info.testbench_path
+        design_name = info.design_name
+
+        if not tb_path.exists():
+            return "sim_error", -1, f"Testbench not found: {tb_path}"
+
+        # Stage files
+        gls_dir = synth_dir / f"gls_{stage}"
+        gls_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(tb_path, gls_dir / "testbench.v")
+
+        # Copy data files for $readmemh
+        tb_dir = tb_path.parent
+        for data_file in tb_dir.iterdir():
+            if data_file.is_file() and data_file.suffix in (".txt", ".dat", ".hex", ".mem"):
+                dest = gls_dir / data_file.name
+                if not dest.exists():
+                    shutil.copy2(data_file, dest)
+
+        # Build compile file list
+        compile_files = [str(netlist_path)]
+
+        if sparkle_mod_name != design_name:
+            tb_code = tb_path.read_text()
+            wrapper = self._generate_rtllm_wrapper(
+                design_name, sparkle_mod_name, sparkle_ports,
+                tb_code, sv_code, info.ref_code,
+            )
+            if not wrapper:
+                return "sim_error", -1, "Could not generate RTLLM GLS wrapper"
+            (gls_dir / "wrapper.sv").write_text(wrapper)
+            compile_files.append(str(gls_dir / "wrapper.sv"))
+
+        compile_files.append(str(gls_dir / "testbench.v"))
+
+        # Compile with local iverilog
+        vvp_file = gls_dir / "gls.vvp"
+        compile_cmd = [
+            "iverilog", "-g2012", "-DFUNCTIONAL", "-DUNIT_DELAY=#0",
+            "-o", str(vvp_file),
+            str(sky130_dir / SKY130_PRIMITIVES_NAME),
+            str(sky130_dir / SKY130_CELLS_NAME),
+        ] + compile_files
+
+        try:
+            comp = subprocess.run(
+                compile_cmd, capture_output=True, text=True, timeout=GLS_TIMEOUT,
+            )
+            if comp.returncode != 0:
+                (gls_dir / "gls_compile_error.txt").write_text(comp.stderr)
+                return "sim_error", -1, f"GLS compile failed:\n{comp.stderr[:500]}"
+
+            sim = subprocess.run(
+                ["vvp", str(vvp_file)],
+                capture_output=True, text=True, timeout=GLS_TIMEOUT,
+                cwd=str(gls_dir),
+            )
+        except subprocess.TimeoutExpired:
+            return "sim_error", -1, f"GLS {stage}: simulation timeout"
+        except Exception as e:
+            return "sim_error", -1, f"GLS error: {e}"
+
+        sim_output = sim.stdout + sim.stderr
+        (gls_dir / "gls_output.txt").write_text(sim_output)
+
+        # Parse RTLLM output
+        if RTLLM_PASS_PATTERN.search(sim_output):
+            return "sim_pass", 0, f"GLS {stage}: Your Design Passed"
+
+        fail_m = re.search(r"(\d+)\s*/\s*\d+\s*failures", sim_output)
+        if fail_m:
+            failures = int(fail_m.group(1))
+            return "sim_fail", failures, f"GLS {stage}: {failures} failures"
+
+        if "TIMEOUT" in sim_output:
+            return "sim_error", -1, f"GLS {stage}: simulation timeout"
+
+        return "sim_fail", -1, f"GLS {stage}: Design did not pass:\n{sim_output[:300]}"
 
     @staticmethod
     def _generate_rtllm_wrapper(

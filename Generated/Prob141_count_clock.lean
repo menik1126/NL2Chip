@@ -4,96 +4,108 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- 12-hour clock counter with BCD seconds (00-59), minutes (00-59), hours (01-12),
-    and am/pm indicator. Synchronous reset to 12:00:00 AM. Enable controls counting. -/
+/-- 12-hour clock with BCD outputs for hours (01-12), minutes (00-59), seconds (00-59), and AM/PM indicator -/
 def prob141_count_clock {dom : DomainConfig}
+    (ena : Signal dom Bool)
     (reset : Signal dom Bool)
-    (ena   : Signal dom Bool)
-    : Signal dom (Bool × BitVec 8 × BitVec 8 × BitVec 8) :=
-  -- State: 25 bits = {pm(1), hh(8), mm(8), ss(8)}
-  -- Reset value: pm=0, hh=0x12, mm=0x00, ss=0x00
-  -- 0x120000 = 0*2^24 + 0x12*2^16 + 0*2^8 + 0 = 18*65536 = 1179648
-  let stateReg : Signal dom (BitVec 25) :=
+    : Signal dom (BitVec 1 × BitVec 8 × BitVec 8 × BitVec 8) :=
+  -- State: [pm:1][hh:8][mm:8][ss:8] = 25 bits
+  -- Initial: pm=0, hh=0x12, mm=0x00, ss=0x00
+  let state : Signal dom (BitVec 25) :=
     Signal.loop fun (state : Signal dom (BitVec 25)) =>
-      -- Extract 4-bit BCD nibbles using shift + mask
-      let ss_ones : Signal dom (BitVec 25) := state &&& 15#25
-      let ss_tens : Signal dom (BitVec 25) := (state >>> 4#25) &&& 15#25
-      let mm_ones : Signal dom (BitVec 25) := (state >>> 8#25) &&& 15#25
-      let mm_tens : Signal dom (BitVec 25) := (state >>> 12#25) &&& 15#25
-      let hh_ones : Signal dom (BitVec 25) := (state >>> 16#25) &&& 15#25
-      let hh_tens : Signal dom (BitVec 25) := (state >>> 20#25) &&& 15#25
-      let pm_bit  : Signal dom (BitVec 25) := (state >>> 24#25) &&& 1#25
-
-      -- Enable carry conditions (Bool signals)
-      let en1 : Signal dom Bool := ss_ones === (9#25 : BitVec 25)
-      let en2 : Signal dom Bool := en1 &&& (ss_tens === (5#25 : BitVec 25))
-      let en3 : Signal dom Bool := en2 &&& (mm_ones === (9#25 : BitVec 25))
-      let en4 : Signal dom Bool := en3 &&& (mm_tens === (5#25 : BitVec 25))
-      let en5 : Signal dom Bool := en4 &&& (hh_ones === (9#25 : BitVec 25))
-      let en6 : Signal dom Bool := en4 &&& (hh_tens === (1#25 : BitVec 25)) &&& (hh_ones === (1#25 : BitVec 25))
-
-      -- Next ss_ones: 0→1→...→9→0
-      let nso : Signal dom (BitVec 25) :=
-        Signal.mux en1 (Signal.pure 0#25) (ss_ones + 1#25)
-      -- Next ss_tens: 0→1→...→5→0 (when en1)
-      let nst : Signal dom (BitVec 25) :=
-        Signal.mux en2 (Signal.pure 0#25)
-          (Signal.mux en1 (ss_tens + 1#25) ss_tens)
-      -- Next mm_ones: 0→1→...→9→0 (when en2)
-      let nmo : Signal dom (BitVec 25) :=
-        Signal.mux en3 (Signal.pure 0#25)
-          (Signal.mux en2 (mm_ones + 1#25) mm_ones)
-      -- Next mm_tens: 0→1→...→5→0 (when en3)
-      let nmt : Signal dom (BitVec 25) :=
-        Signal.mux en4 (Signal.pure 0#25)
-          (Signal.mux en3 (mm_tens + 1#25) mm_tens)
-      -- Next hh: 01→02→...→12→01 (when en4)
-      let hh_is_12 : Signal dom Bool :=
-        (hh_tens === (1#25 : BitVec 25)) &&& (hh_ones === (2#25 : BitVec 25))
-      let nho : Signal dom (BitVec 25) :=
-        Signal.mux en4
-          (Signal.mux hh_is_12 (Signal.pure 1#25)
-            (Signal.mux en5 (Signal.pure 0#25) (hh_ones + 1#25)))
-          hh_ones
-      let nht : Signal dom (BitVec 25) :=
-        Signal.mux en4
-          (Signal.mux hh_is_12 (Signal.pure 0#25)
-            (Signal.mux en5 (hh_tens + 1#25) hh_tens))
-          hh_tens
-      -- Next pm: toggle at 11:59:59 (when en6)
-      let npm : Signal dom (BitVec 25) :=
-        Signal.mux en6
-          (Signal.mux (pm_bit === (0#25 : BitVec 25)) (Signal.pure 1#25) (Signal.pure 0#25))
-          pm_bit
-
-      -- Pack next state: {pm[0], hh[7:0], mm[7:0], ss[7:0]}
-      let nextState : Signal dom (BitVec 25) :=
-        (npm <<< 24#25) |||
-        (nht <<< 20#25) |||
-        (nho <<< 16#25) |||
-        (nmt <<< 12#25) |||
-        (nmo <<< 8#25)  |||
-        (nst <<< 4#25)  |||
-        nso
-
-      -- Apply enable (hold state when not enabled) and synchronous reset
-      let nextWithEna : Signal dom (BitVec 25) :=
-        Signal.mux ena nextState state
-      let nextWithReset : Signal dom (BitVec 25) :=
-        Signal.mux reset (Signal.pure 1179648#25) nextWithEna
-
-      Signal.register 1179648#25 nextWithReset
-
-  -- Extract output fields
-  let ss_out : Signal dom (BitVec 8) :=
-    Signal.map (fun s => BitVec.extractLsb' 0 8 s) stateReg
-  let mm_out : Signal dom (BitVec 8) :=
-    Signal.map (fun s => BitVec.extractLsb' 8 8 s) stateReg
-  let hh_out : Signal dom (BitVec 8) :=
-    Signal.map (fun s => BitVec.extractLsb' 16 8 s) stateReg
-  let pm_out : Signal dom Bool :=
-    (Signal.map (fun s => BitVec.extractLsb' 24 1 s) stateReg) === (1#1 : BitVec 1)
-
-  bundle2 pm_out (bundle2 hh_out (bundle2 mm_out ss_out))
+      -- Extract current values
+      let pm := Signal.map (fun s => s.extractLsb 24 24) state
+      let hh := Signal.map (fun s => s.extractLsb 23 16) state
+      let mm := Signal.map (fun s => s.extractLsb 15 8) state
+      let ss := Signal.map (fun s => s.extractLsb 7 0) state
+      
+      -- Extract BCD digits
+      let ss_ones := Signal.map (fun s => s.extractLsb 3 0) ss
+      let ss_tens := Signal.map (fun s => s.extractLsb 7 4) ss
+      let mm_ones := Signal.map (fun s => s.extractLsb 3 0) mm
+      let mm_tens := Signal.map (fun s => s.extractLsb 7 4) mm
+      let hh_ones := Signal.map (fun s => s.extractLsb 3 0) hh
+      let hh_tens := Signal.map (fun s => s.extractLsb 7 4) hh
+      
+      -- Enable conditions (cascade)
+      let en0 := ena
+      let en1 := ena &&& (ss_ones === 9#4)
+      let en2 := en1 &&& (ss_tens === 5#4)
+      let en3 := en2 &&& (mm_ones === 9#4)
+      let en4 := en3 &&& (mm_tens === 5#4)
+      let en5 := en4 &&& (hh_ones === 9#4)
+      let en6 := en4 &&& (hh === 0x12#8)
+      
+      -- Update seconds ones digit
+      let ss_ones_next := Signal.mux (en0 &&& (ss_ones === 9#4))
+        (Signal.pure 0#4)
+        (Signal.mux en0 (ss_ones + 1#4) ss_ones)
+      
+      -- Update seconds tens digit
+      let ss_tens_next := Signal.mux (en1 &&& (ss_tens === 5#4))
+        (Signal.pure 0#4)
+        (Signal.mux en1 (ss_tens + 1#4) ss_tens)
+      
+      -- Update minutes ones digit
+      let mm_ones_next := Signal.mux (en2 &&& (mm_ones === 9#4))
+        (Signal.pure 0#4)
+        (Signal.mux en2 (mm_ones + 1#4) mm_ones)
+      
+      -- Update minutes tens digit
+      let mm_tens_next := Signal.mux (en3 &&& (mm_tens === 5#4))
+        (Signal.pure 0#4)
+        (Signal.mux en3 (mm_tens + 1#4) mm_tens)
+      
+      -- Update hours ones digit
+      let hh_ones_next := Signal.mux (en4 &&& (hh_ones === 9#4))
+        (Signal.pure 0#4)
+        (Signal.mux en4 (hh_ones + 1#4) hh_ones)
+      
+      -- Update hours tens digit and handle 12->01 rollover
+      let hh_tens_next := Signal.mux en5 (hh_tens + 1#4) hh_tens
+      
+      -- Combine hour digits
+      let hh_next_temp := Signal.map (fun t => t.1 ++ t.2) (bundle2 hh_tens_next hh_ones_next)
+      
+      -- Handle 12->01 rollover
+      let hh_next := Signal.mux (en4 &&& (hh === 0x12#8))
+        (Signal.pure 0x01#8)
+        hh_next_temp
+      
+      -- Update PM flag (toggle when going from 11:59:59 to 12:00:00)
+      let pm_next := Signal.mux en6 (~~~pm) pm
+      
+      -- Combine digits back into bytes
+      let ss_next := Signal.map (fun t => t.1 ++ t.2) (bundle2 ss_tens_next ss_ones_next)
+      let mm_next := Signal.map (fun t => t.1 ++ t.2) (bundle2 mm_tens_next mm_ones_next)
+      
+      -- Pack next state: use bit concatenation
+      let pm_ext := Signal.map (fun p => p.zeroExtend 25) pm_next
+      let hh_ext := Signal.map (fun h => h.zeroExtend 25) hh_next
+      let mm_ext := Signal.map (fun m => m.zeroExtend 25) mm_next
+      let ss_ext := Signal.map (fun s => s.zeroExtend 25) ss_next
+      
+      let pm_shifted := pm_ext <<< 24#25
+      let hh_shifted := hh_ext <<< 16#25
+      let mm_shifted := mm_ext <<< 8#25
+      
+      let next_packed := pm_shifted ||| hh_shifted ||| mm_shifted ||| ss_ext
+      
+      -- Apply reset
+      let reset_packed := Signal.pure 0x0120000#25  -- pm=0, hh=0x12, mm=0x00, ss=0x00
+      let final_next := Signal.mux reset reset_packed next_packed
+      
+      Signal.register 0x0120000#25 final_next
+  
+  -- Extract outputs from state
+  let pm_out := Signal.map (fun s => s.extractLsb 24 24) state
+  let hh_out := Signal.map (fun s => s.extractLsb 23 16) state
+  let mm_out := Signal.map (fun s => s.extractLsb 15 8) state
+  let ss_out := Signal.map (fun s => s.extractLsb 7 0) state
+  
+  -- Bundle outputs: (pm, (hh, (mm, ss)))
+  let mm_ss := bundle2 mm_out ss_out
+  let hh_mm_ss := bundle2 hh_out mm_ss
+  bundle2 pm_out hh_mm_ss
 
 #synthesizeVerilog prob141_count_clock

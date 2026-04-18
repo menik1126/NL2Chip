@@ -4,53 +4,52 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
--- State encoding: 3-bit states
-private abbrev stS    : BitVec 3 := 0#3  -- initial state
-private abbrev stS1   : BitVec 3 := 1#3  -- seen "1"
-private abbrev stS11  : BitVec 3 := 2#3  -- seen "11"
-private abbrev stS110 : BitVec 3 := 3#3  -- seen "110"
-private abbrev stDone : BitVec 3 := 4#3  -- seen "1101", start_shifting forever
+-- State encoding (need 3 bits for 5 states)
+private abbrev stS    : BitVec 3 := 0#3  -- Initial state
+private abbrev stS1   : BitVec 3 := 1#3  -- Saw 1
+private abbrev stS11  : BitVec 3 := 2#3  -- Saw 11
+private abbrev stS110 : BitVec 3 := 3#3  -- Saw 110
+private abbrev stDone : BitVec 3 := 4#3  -- Saw 1101 (final)
 
-/-- FSM that detects sequence 1101 in a bit stream.
-    When the sequence is found, start_shifting is set to 1 forever (until reset).
-    Reset is active high synchronous. -/
+/-- FSM that searches for sequence 1101 in input bit stream.
+    When found, sets start_shifting to 1 forever until reset. -/
 def prob096_review2015_fsmseq {dom : DomainConfig}
     (reset : Signal dom Bool)
-    (data  : Signal dom Bool)
+    (data : Signal dom Bool)
     : Signal dom (BitVec 1) :=
-  -- Use Signal.loop to get the registered state, then derive output
-  let state : Signal dom (BitVec 3) :=
-    Signal.loop fun (state : Signal dom (BitVec 3)) =>
-      -- Compute next state based on current state and data
-      let isS    := state === (Signal.pure stS)
-      let isS1   := state === (Signal.pure stS1)
-      let isS11  := state === (Signal.pure stS11)
-      let isS110 := state === (Signal.pure stS110)
-      let isDone := state === (Signal.pure stDone)
-      -- S:    data=1 → S1,   data=0 → S
-      let nextFromS    := Signal.mux data (Signal.pure stS1) (Signal.pure stS)
-      -- S1:   data=1 → S11,  data=0 → S
-      let nextFromS1   := Signal.mux data (Signal.pure stS11) (Signal.pure stS)
-      -- S11:  data=1 → S11,  data=0 → S110
-      let nextFromS11  := Signal.mux data (Signal.pure stS11) (Signal.pure stS110)
-      -- S110: data=1 → Done, data=0 → S
-      let nextFromS110 := Signal.mux data (Signal.pure stDone) (Signal.pure stS)
-      -- Done: stay Done
-      let nextFromDone := Signal.pure stDone
-      -- Priority mux to select next state
-      let nextState :=
-        hw_cond (Signal.pure stS)
-        | isS    => nextFromS
-        | isS1   => nextFromS1
-        | isS11  => nextFromS11
-        | isS110 => nextFromS110
-        | isDone => nextFromDone
-      -- Apply synchronous reset
-      let nextWithReset := Signal.mux reset (Signal.pure stS) nextState
-      -- Register the state
-      Signal.register stS nextWithReset
-  -- Output: start_shifting = (state == Done)
-  let isDone := state === (Signal.pure stDone)
-  Signal.mux isDone (Signal.pure 1#1) (Signal.pure 0#1)
+  let state := Signal.loop fun (state : Signal dom (BitVec 3)) =>
+    -- Next state logic based on current state and data input
+    let isS    := state === Signal.pure stS
+    let isS1   := state === Signal.pure stS1
+    let isS11  := state === Signal.pure stS11
+    let isS110 := state === Signal.pure stS110
+    
+    -- State transitions:
+    -- S:    data=1 → S1,   data=0 → S
+    -- S1:   data=1 → S11,  data=0 → S
+    -- S11:  data=1 → S11,  data=0 → S110
+    -- S110: data=1 → Done, data=0 → S
+    -- Done: stay in Done
+    
+    let nextFromS    := Signal.mux data (Signal.pure stS1) (Signal.pure stS)
+    let nextFromS1   := Signal.mux data (Signal.pure stS11) (Signal.pure stS)
+    let nextFromS11  := Signal.mux data (Signal.pure stS11) (Signal.pure stS110)
+    let nextFromS110 := Signal.mux data (Signal.pure stDone) (Signal.pure stS)
+    let nextFromDone := Signal.pure stDone
+    
+    -- Priority mux to select next state
+    let next1 := Signal.mux isS nextFromS nextFromDone
+    let next2 := Signal.mux isS1 nextFromS1 next1
+    let next3 := Signal.mux isS11 nextFromS11 next2
+    let next4 := Signal.mux isS110 nextFromS110 next3
+    
+    -- Apply reset (synchronous, active high)
+    let nextWithReset := Signal.mux reset (Signal.pure stS) next4
+    
+    -- Register the state
+    Signal.register stS nextWithReset
+  
+  -- Output: start_shifting = 1 when state == Done
+  Signal.mux (state === Signal.pure stDone) (Signal.pure 1#1) (Signal.pure 0#1)
 
 #synthesizeVerilog prob096_review2015_fsmseq

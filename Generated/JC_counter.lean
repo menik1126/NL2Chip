@@ -14,12 +14,10 @@ def JC_counter {dom : DomainConfig}
     let isZero := lsb === 0#64
     -- Shift right by 1
     let shifted := q >>> 1#64
-    -- Create MSB bit: 1 at position 63, or 0
-    let msbOne := Signal.pure (9223372036854775808#64 : BitVec 64)  -- 2^63
-    let msbZero := Signal.pure (0#64 : BitVec 64)
-    let msbBit := Signal.mux isZero msbOne msbZero
-    -- Combine shifted value with MSB
-    let nextVal := shifted ||| msbBit
+    -- Prepend 1 or 0 at MSB (bit 63)
+    let withOne := shifted ||| (1#64 <<< 63#64)
+    let withZero := shifted
+    let nextVal := Signal.mux isZero withOne withZero
     -- Active-low reset: when rst_n is low (false), reset to 0
     let nextWithReset := Signal.mux rst_n nextVal (Signal.pure 0#64)
     Signal.register 0#64 nextWithReset

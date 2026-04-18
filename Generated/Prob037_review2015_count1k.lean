@@ -4,7 +4,7 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- Counter that counts from 0 to 999 (1000 cycles period) with synchronous active-high reset. -/
+/-- Counter that counts from 0 to 999 with synchronous reset. -/
 def prob037_review2015_count1k {dom : DomainConfig}
     (reset : Signal dom Bool) : Signal dom (BitVec 10) :=
   Signal.loop fun (q : Signal dom (BitVec 10)) =>

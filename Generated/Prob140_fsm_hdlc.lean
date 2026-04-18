@@ -4,72 +4,77 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
--- State encoding (4-bit):
--- S0=0: initial / saw 0
--- S1=1: saw 1 consecutive 1
--- S2=2: saw 2 consecutive 1s
--- S3=3: saw 3 consecutive 1s
--- S4=4: saw 4 consecutive 1s
--- S5=5: saw 5 consecutive 1s
--- S6=6: saw 6 consecutive 1s
--- SERR=7: error (7+ consecutive 1s)
--- SDISC=8: discard state (after 5 ones and a zero)
--- SFLAG=9: flag state (after 6 ones and a zero)
-private abbrev stS0    : BitVec 4 := 0#4
-private abbrev stS1    : BitVec 4 := 1#4
-private abbrev stS2    : BitVec 4 := 2#4
-private abbrev stS3    : BitVec 4 := 3#4
-private abbrev stS4    : BitVec 4 := 4#4
-private abbrev stS5    : BitVec 4 := 5#4
-private abbrev stS6    : BitVec 4 := 6#4
-private abbrev stSERR  : BitVec 4 := 7#4
-private abbrev stSDISC : BitVec 4 := 8#4
-private abbrev stSFLAG : BitVec 4 := 9#4
+-- State encoding (4 bits to match reference)
+private abbrev S0    : BitVec 4 := 0#4
+private abbrev S1    : BitVec 4 := 1#4
+private abbrev S2    : BitVec 4 := 2#4
+private abbrev S3    : BitVec 4 := 3#4
+private abbrev S4    : BitVec 4 := 4#4
+private abbrev S5    : BitVec 4 := 5#4
+private abbrev S6    : BitVec 4 := 6#4
+private abbrev SERR  : BitVec 4 := 7#4
+private abbrev SDISC : BitVec 4 := 8#4
+private abbrev SFLAG : BitVec 4 := 9#4
 
-/-- HDLC framing FSM: detects disc (5 ones then zero), flag (6 ones then zero),
-    and err (7+ consecutive ones). Moore-type with synchronous reset.
-    Returns bundled (disc, flag, err) as 1-bit signals. -/
+/-- HDLC framing FSM: detects flag (01111110), discard (0111110), and error (7+ ones) -/
 def prob140_fsm_hdlc {dom : DomainConfig}
     (reset : Signal dom Bool)
     (inp : Signal dom Bool)
     : Signal dom (BitVec 1 × BitVec 1 × BitVec 1) :=
-  -- State register via Signal.loop (loop body must return Signal dom (BitVec 4))
-  let state : Signal dom (BitVec 4) :=
-    Signal.loop fun (state : Signal dom (BitVec 4)) =>
-      -- Per-state next-state computations
-      let fromS0    := Signal.mux inp (Signal.pure stS1)    (Signal.pure stS0)
-      let fromS1    := Signal.mux inp (Signal.pure stS2)    (Signal.pure stS0)
-      let fromS2    := Signal.mux inp (Signal.pure stS3)    (Signal.pure stS0)
-      let fromS3    := Signal.mux inp (Signal.pure stS4)    (Signal.pure stS0)
-      let fromS4    := Signal.mux inp (Signal.pure stS5)    (Signal.pure stS0)
-      let fromS5    := Signal.mux inp (Signal.pure stS6)    (Signal.pure stSDISC)
-      let fromS6    := Signal.mux inp (Signal.pure stSERR)  (Signal.pure stSFLAG)
-      let fromSERR  := Signal.mux inp (Signal.pure stSERR)  (Signal.pure stS0)
-      let fromSFLAG := Signal.mux inp (Signal.pure stS1)    (Signal.pure stS0)
-      let fromSDISC := Signal.mux inp (Signal.pure stS1)    (Signal.pure stS0)
-      -- Select next state based on current state
-      let nextState : Signal dom (BitVec 4) :=
-        hw_cond fromS0
-          | (state === Signal.pure stS1)    => fromS1
-          | (state === Signal.pure stS2)    => fromS2
-          | (state === Signal.pure stS3)    => fromS3
-          | (state === Signal.pure stS4)    => fromS4
-          | (state === Signal.pure stS5)    => fromS5
-          | (state === Signal.pure stS6)    => fromS6
-          | (state === Signal.pure stSERR)  => fromSERR
-          | (state === Signal.pure stSFLAG) => fromSFLAG
-          | (state === Signal.pure stSDISC) => fromSDISC
-      -- Apply synchronous reset
-      let nextWithReset := Signal.mux reset (Signal.pure stS0) nextState
-      -- Register the state
-      Signal.register stS0 nextWithReset
-  -- Compute Moore outputs from state
-  let disc : Signal dom (BitVec 1) :=
-    Signal.mux (state === Signal.pure stSDISC) (Signal.pure 1#1) (Signal.pure 0#1)
-  let flag : Signal dom (BitVec 1) :=
-    Signal.mux (state === Signal.pure stSFLAG) (Signal.pure 1#1) (Signal.pure 0#1)
-  let err : Signal dom (BitVec 1) :=
-    Signal.mux (state === Signal.pure stSERR) (Signal.pure 1#1) (Signal.pure 0#1)
-  bundle2 disc (bundle2 flag err)
+  let state := Signal.loop fun (state : Signal dom (BitVec 4)) =>
+    -- Check current state
+    let isS0 := state === Signal.pure S0
+    let isS1 := state === Signal.pure S1
+    let isS2 := state === Signal.pure S2
+    let isS3 := state === Signal.pure S3
+    let isS4 := state === Signal.pure S4
+    let isS5 := state === Signal.pure S5
+    let isS6 := state === Signal.pure S6
+    let isSERR := state === Signal.pure SERR
+    let isSFLAG := state === Signal.pure SFLAG
+    let isSDisc := state === Signal.pure SDISC
+    
+    -- Compute next state for each current state
+    let nextFromS0 := Signal.mux inp (Signal.pure S1) (Signal.pure S0)
+    let nextFromS1 := Signal.mux inp (Signal.pure S2) (Signal.pure S0)
+    let nextFromS2 := Signal.mux inp (Signal.pure S3) (Signal.pure S0)
+    let nextFromS3 := Signal.mux inp (Signal.pure S4) (Signal.pure S0)
+    let nextFromS4 := Signal.mux inp (Signal.pure S5) (Signal.pure S0)
+    let nextFromS5 := Signal.mux inp (Signal.pure S6) (Signal.pure SDISC)
+    let nextFromS6 := Signal.mux inp (Signal.pure SERR) (Signal.pure SFLAG)
+    let nextFromSERR := Signal.mux inp (Signal.pure SERR) (Signal.pure S0)
+    let nextFromSFLAG := Signal.mux inp (Signal.pure S1) (Signal.pure S0)
+    let nextFromSDisc := Signal.mux inp (Signal.pure S1) (Signal.pure S0)
+    
+    -- Select next state based on current state (priority mux)
+    let nextState := 
+      Signal.mux isS0 nextFromS0
+        (Signal.mux isS1 nextFromS1
+          (Signal.mux isS2 nextFromS2
+            (Signal.mux isS3 nextFromS3
+              (Signal.mux isS4 nextFromS4
+                (Signal.mux isS5 nextFromS5
+                  (Signal.mux isS6 nextFromS6
+                    (Signal.mux isSERR nextFromSERR
+                      (Signal.mux isSFLAG nextFromSFLAG
+                        (Signal.mux isSDisc nextFromSDisc (Signal.pure S0))))))))))
+    
+    -- Apply reset
+    let nextWithReset := Signal.mux reset (Signal.pure S0) nextState
+    
+    -- Register state
+    Signal.register S0 nextWithReset
+  
+  -- Moore outputs based on current state
+  let disc := state === Signal.pure SDISC
+  let flag := state === Signal.pure SFLAG
+  let err := state === Signal.pure SERR
+  
+  -- Convert Bool to BitVec 1 for outputs
+  let discOut := Signal.mux disc (Signal.pure 1#1) (Signal.pure 0#1)
+  let flagOut := Signal.mux flag (Signal.pure 1#1) (Signal.pure 0#1)
+  let errOut := Signal.mux err (Signal.pure 1#1) (Signal.pure 0#1)
+  
+  bundle2 discOut (bundle2 flagOut errOut)
 
 #synthesizeVerilog prob140_fsm_hdlc

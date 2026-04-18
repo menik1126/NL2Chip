@@ -6,12 +6,10 @@ open Sparkle.Core.Signal
 
 /-- Test -/
 def test2 {dom : DomainConfig}
-    (a : Signal dom Bool) (b : Signal dom Bool) (c : Signal dom Bool)
+    (a b : Signal dom (BitVec 1))
     : Signal dom (BitVec 1 × BitVec 1) :=
-  let x := a &&& b &&& c
-  let y := a ||| b
-  let out1 := Signal.mux x (Signal.pure 1#1) (Signal.pure 0#1)
-  let out2 := Signal.mux y (Signal.pure 1#1) (Signal.pure 0#1)
-  bundle2 out1 out2
+  let Y0 : Signal dom (BitVec 1) := Signal.pure 0#1
+  let z : Signal dom (BitVec 1) := Signal.pure 1#1
+  bundle2 Y0 z
 
 #synthesizeVerilog test2

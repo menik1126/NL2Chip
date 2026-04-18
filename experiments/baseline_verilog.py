@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", "-t", type=float, default=0.0, help="Sampling temperature (default: 0)")
     p.add_argument("--synth", action="store_true", help="Run synthesis + PPA on passing designs (requires Docker)")
     p.add_argument("--pnr", action="store_true", help="Run full P&R after synthesis (implies --synth)")
+    p.add_argument("--gls", action="store_true", help="Run gate-level simulation after synthesis/PnR (implies --synth)")
     return p.parse_args()
 
 
@@ -411,12 +412,12 @@ def main():
     sim_rate = f"{stats['sim_pass']/attempted*100:.1f}%" if attempted else "N/A"
 
     # ── Synthesis + PPA (serial, on sim-passing designs) ──
-    if args.pnr:
+    if args.pnr or args.gls:
         args.synth = True
 
     synth_results = {}
     if args.synth:
-        from evaluator import Evaluator as _Eval
+        from evaluator import Evaluator as _Eval, parse_module_ports
 
         # Collect sim-passing problems from results.jsonl
         passing_probs = []
@@ -432,15 +433,18 @@ def main():
         if passing_probs:
             console.print(f"\n[magenta]Running synthesis on {len(passing_probs)} passing designs...[/magenta]\n")
 
-            # We reuse Evaluator's _run_synthesis and _run_pnr directly
+            # We reuse Evaluator's _run_synthesis, _run_pnr, _run_gls directly
             evaluator = _Eval(
                 project_root=PROJECT_ROOT,
                 enable_synth=True,
                 enable_pnr=args.pnr,
+                enable_gls=args.gls,
             )
 
             synth_pass = 0
             pnr_pass = 0
+            gls_synth_pass = 0
+            gls_pnr_pass = 0
             for i, prob_id in enumerate(passing_probs, 1):
                 sv_path = output_dir / f"{prob_id}.sv"
                 if not sv_path.exists():
@@ -448,6 +452,7 @@ def main():
 
                 console.print(f"  [{i}/{len(passing_probs)}] {prob_id}  ", end="")
                 sv_code = sv_path.read_text()
+                sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
 
                 sr = evaluator._run_synthesis(prob_id, sv_code, "TopModule", output_dir)
                 if sr.get("synth_pass"):
@@ -459,6 +464,21 @@ def main():
                         ppa_parts.append(f"C={sr['cell_count']}")
                     console.print(f"[green]S✓[/green] {' '.join(ppa_parts)}", end="")
 
+                    # Post-synth GLS
+                    if args.gls:
+                        synth_dir = output_dir / "synth" / prob_id
+                        gls_r = evaluator._run_gls(
+                            prob_id, sv_code,
+                            sparkle_mod_name or "TopModule", sparkle_ports or [],
+                            output_dir, synth_dir, "post_synth",
+                        )
+                        sr.update(gls_r)
+                        if gls_r.get("gls_synth_status") == "sim_pass":
+                            gls_synth_pass += 1
+                            console.print(f"  [green]GS✓[/green]", end="")
+                        elif gls_r.get("gls_synth_status") != "not_run":
+                            console.print(f"  [red]GS✗[/red]", end="")
+
                     if args.pnr:
                         pr = evaluator._run_pnr(prob_id, sv_code, "TopModule", output_dir)
                         sr.update(pr)
@@ -469,6 +489,21 @@ def main():
                             console.print(f"  [green]P✓[/green]" +
                                 (f" WNS={wns:.2f}" if wns is not None else "") +
                                 (f" Pwr={pwr:.2f}μW" if pwr is not None else ""), end="")
+
+                            # Post-PnR GLS
+                            if args.gls:
+                                synth_dir = output_dir / "synth" / prob_id
+                                gls_r = evaluator._run_gls(
+                                    prob_id, sv_code,
+                                    sparkle_mod_name or "TopModule", sparkle_ports or [],
+                                    output_dir, synth_dir, "post_pnr",
+                                )
+                                sr.update(gls_r)
+                                if gls_r.get("gls_pnr_status") == "sim_pass":
+                                    gls_pnr_pass += 1
+                                    console.print(f"  [green]GP✓[/green]", end="")
+                                elif gls_r.get("gls_pnr_status") != "not_run":
+                                    console.print(f"  [red]GP✗[/red]", end="")
                         else:
                             console.print(f"  [red]P✗[/red]", end="")
                 else:
@@ -479,6 +514,8 @@ def main():
 
             stats["synth_pass"] = synth_pass
             stats["pnr_pass"] = pnr_pass
+            stats["gls_synth_pass"] = gls_synth_pass
+            stats["gls_pnr_pass"] = gls_pnr_pass
 
             # Append synth results to results.jsonl
             for prob_id, sr in synth_results.items():
@@ -499,8 +536,11 @@ def main():
         "sim_rate": sim_rate,
         "synth_pass": stats.get("synth_pass", 0),
         "pnr_pass": stats.get("pnr_pass", 0),
+        "gls_synth_pass": stats.get("gls_synth_pass", 0),
+        "gls_pnr_pass": stats.get("gls_pnr_pass", 0),
         "synth_enabled": args.synth,
         "pnr_enabled": args.pnr,
+        "gls_enabled": args.gls,
         "tokens_in": stats["tokens_in"],
         "tokens_out": stats["tokens_out"],
         "elapsed_seconds": int(elapsed),
@@ -523,6 +563,10 @@ def main():
         console.print(f"  综合通过:   [green]{stats.get('synth_pass', 0)}[/green]")
     if args.pnr:
         console.print(f"  P&R 通过:   [green]{stats.get('pnr_pass', 0)}[/green]")
+    if args.gls:
+        console.print(f"  GLS 综合后: [green]{stats.get('gls_synth_pass', 0)}[/green]")
+        if args.pnr:
+            console.print(f"  GLS PnR后:  [green]{stats.get('gls_pnr_pass', 0)}[/green]")
     h, rem = divmod(int(elapsed), 3600)
     m, s = divmod(rem, 60)
     console.print(f"  耗时:       {h}:{m:02d}:{s:02d}")

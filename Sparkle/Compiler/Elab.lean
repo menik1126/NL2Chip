@@ -1153,6 +1153,16 @@ mutual
       CompilerM.emitAssign resWire (.slice (.ref bvWire) (start + len - 1) start)
       return some resWire
 
+    -- BitVec.getLsb: single bit extraction → slice of width 1
+    -- getLsb x i  ≡  extractLsb' i 1 x  (returns Bool, we emit a 1-bit slice)
+    if name == ``BitVec.getLsb && args.size >= 3 then
+      trace[sparkle.compiler] "→ getLsb"
+      let idx ← extractNat args[args.size - 1]!
+      let bvWire ← translateExprToWire args[args.size - 2]! "getlsb_src"
+      let resWire ← CompilerM.makeWire hint .bit (named := isNamed)
+      CompilerM.emitAssign resWire (.slice (.ref bvWire) idx idx)
+      return some resWire
+
     -- BitVec.shiftLeft / BitVec.ushiftRight / BitVec.sshiftRight
     if (name == ``BitVec.shiftLeft || name == ``BitVec.ushiftRight || name == ``BitVec.sshiftRight)
         && args.size >= 3 then

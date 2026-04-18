@@ -4,27 +4,24 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- Gate vector operations: computes out_both (AND with left neighbor),
-    out_any (OR with right neighbor), and out_different (XOR with left
-    neighbor, wrapping) for a 4-bit input vector. -/
+/-- Bit neighbor relationships: out_both, out_any, out_different -/
 def prob094_gatesv {dom : DomainConfig}
-    (in_ : Signal dom (BitVec 4))
-    : Signal dom (BitVec 4 × BitVec 4 × BitVec 4) :=
-  -- Shift right by 1: in[3:1] at bits [2:0], bit 3 = 0
-  let in_shr1 : Signal dom (BitVec 4) := Signal.map (fun (v : BitVec 4) =>
-    BitVec.ushiftRight v 1) in_
-  -- out_both[2:0] = in[2:0] & in[3:1]; out_both[3] = don't care (0)
-  let out_both : Signal dom (BitVec 4) := in_ &&& in_shr1
-  -- out_any[3:1] = in[3:1] | in[2:0]; out_any[0] = don't care (0)
-  let out_any : Signal dom (BitVec 4) := in_ ||| in_shr1
-  -- out_different = in ^ {in[0], in[3:1]}
-  -- Compute rotated version: in[0] goes to bit 3, in[3:1] goes to bits [2:0]
-  let in_rot1 : Signal dom (BitVec 4) := Signal.map (fun (v : BitVec 4) =>
-    let shr1 : BitVec 4 := BitVec.ushiftRight v 1
-    let lsb0 : BitVec 4 := (BitVec.extractLsb' 0 1 v).zeroExtend 4
-    let lsb_top : BitVec 4 := BitVec.shiftLeft lsb0 3
-    shr1 ||| lsb_top) in_
-  let out_different : Signal dom (BitVec 4) := in_ ^^^ in_rot1
-  bundle2 out_both (bundle2 out_any out_different)
+    (input : Signal dom (BitVec 4))
+    : Signal dom ((BitVec 4 × BitVec 4) × BitVec 4) :=
+  -- out_both[i] = in[i] & in[i+1] for i=0,1,2
+  let lower3 := input &&& (0b0111#4 : BitVec 4)
+  let upper3_both := (input >>> 1#4) &&& (0b0111#4 : BitVec 4)
+  let out_both := lower3 &&& upper3_both
+  
+  -- out_any[i] = in[i] | in[i-1] for i=1,2,3
+  let upper3_any := (input >>> 1#4) &&& (0b0111#4 : BitVec 4)
+  let lower3_any := input &&& (0b0111#4 : BitVec 4)
+  let out_any := (upper3_any ||| lower3_any) <<< 1#4
+  
+  -- out_different[i] = in[i] ^ in[(i+1) mod 4]
+  let rotated := ((input &&& (0b0001#4 : BitVec 4)) <<< 3#4) ||| (input >>> 1#4)
+  let out_different := input ^^^ rotated
+  
+  bundle2 (bundle2 out_both out_any) out_different
 
 #synthesizeVerilog prob094_gatesv

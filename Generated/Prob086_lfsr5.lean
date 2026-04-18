@@ -9,10 +9,11 @@ open Sparkle.Core.Signal
 def prob086_lfsr5 {dom : DomainConfig}
     (reset : Signal dom Bool) : Signal dom (BitVec 5) :=
   Signal.loop fun (q : Signal dom (BitVec 5)) =>
-    -- Galois LFSR: shift right by 1, XOR tap mask with q[0]
-    -- Taps at positions 5 and 3 (1-indexed) = bits 4 and 2 (0-indexed)
-    -- Tap mask = 0b10100 = 20 = 0x14
-    -- q_next = (q >> 1); if q[0] then q_next ^= 0x14
+    -- Galois LFSR: shift right, XOR tapped positions with q[0]
+    -- q_next[4] = q[0],  q_next[3] = q[4],  q_next[2] = q[3]^q[0],
+    -- q_next[1] = q[2],  q_next[0] = q[1]
+    -- Equivalent to: if q[0]==1 then (q>>>1) ^ 0b10100 else (q>>>1)
+    -- Tap mask 0x14 = 0b10100: bits 4 and 2 (taps at positions 5 and 3)
     let shifted := q >>> 1#5
     let lsb := q &&& (1#5 : BitVec 5)
     let fb := lsb === (1#5 : BitVec 5)

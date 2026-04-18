@@ -56,6 +56,9 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
     drc_pass = summary.get("drc_pass", sum(1 for r in results if r.get("drc_pass")))
     lvs_pass = summary.get("lvs_pass", sum(1 for r in results if r.get("lvs_pass")))
     pnr_enabled = summary.get("pnr_enabled", any(r.get("pnr_pass") for r in results))
+    gls_enabled = summary.get("gls_enabled", any(r.get("gls_synth_status") not in (None, "not_run") for r in results))
+    gls_synth_pass = summary.get("gls_synth_pass", sum(1 for r in results if r.get("gls_synth_status") == "sim_pass"))
+    gls_pnr_pass = summary.get("gls_pnr_pass", sum(1 for r in results if r.get("gls_pnr_status") == "sim_pass"))
     model = summary.get("model", "unknown")
     elapsed = summary.get("elapsed_seconds", 0)
     tokens = summary.get("agent_tokens", {})
@@ -120,11 +123,29 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
             <td><span class="badge {drc_cls}">{drc_label if p_pass else 'N/A'}</span></td>
             <td><span class="badge {lvs_cls}">{lvs_label if p_pass else 'N/A'}</span></td>"""
 
+        gls_cell = ""
+        if gls_enabled:
+            def gls_badge(status, mismatches):
+                if status == "sim_pass":
+                    return '<span class="badge ok">Pass</span>'
+                elif status == "sim_fail":
+                    return f'<span class="badge fail">Fail ({mismatches})</span>'
+                elif status == "sim_error":
+                    return '<span class="badge warn">Error</span>'
+                return '<span class="badge na">N/A</span>'
+            gs_st = r.get("gls_synth_status", "not_run")
+            gs_mm = r.get("gls_synth_mismatches", -1)
+            gp_st = r.get("gls_pnr_status", "not_run")
+            gp_mm = r.get("gls_pnr_mismatches", -1)
+            gls_cell = f"""
+            <td>{gls_badge(gs_st, gs_mm)}</td>
+            <td>{gls_badge(gp_st, gp_mm)}</td>"""
+
         rows_html.append(f"""<tr>
             <td class="pid">{escape(pid)}</td>
             <td>{badge(c_pass)}</td>
             <td>{badge(lint)}</td>
-            <td>{sim_badge}</td>{synth_cell}{pnr_cell}
+            <td>{sim_badge}</td>{synth_cell}{gls_cell}{pnr_cell}
             <td class="num">{turns}</td>
             <td class="detail" title="{detail}">{detail}</td>
         </tr>""")
@@ -138,6 +159,12 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
             <th>WNS (ns)</th>
             <th>Power (uW)</th>"""
 
+    gls_header = ""
+    if gls_enabled:
+        gls_header = """
+            <th>GLS Synth</th>
+            <th>GLS PnR</th>"""
+
     pnr_header = ""
     if pnr_enabled:
         pnr_header = """
@@ -149,6 +176,8 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
     turns_sort_col = 4
     if synth_enabled:
         turns_sort_col += 5
+    if gls_enabled:
+        turns_sort_col += 2
     if pnr_enabled:
         turns_sort_col += 3
 
@@ -180,6 +209,21 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
             <div class="card-value">{lvs_pass}<small>/{attempted}</small></div>
             <div class="card-label">LVS Pass</div>
             <div class="card-bar"><div class="bar" style="width:{lvs_pass/max(attempted,1)*100:.0f}%;background:var(--yellow)"></div></div>
+        </div>"""
+
+    # ── GLS summary cards ──
+    gls_cards = ""
+    if gls_enabled:
+        gls_cards = f"""
+        <div class="card">
+            <div class="card-value">{gls_synth_pass}<small>/{attempted}</small></div>
+            <div class="card-label">GLS Synth Pass</div>
+            <div class="card-bar"><div class="bar" style="width:{gls_synth_pass/max(attempted,1)*100:.0f}%;background:var(--blue)"></div></div>
+        </div>
+        <div class="card">
+            <div class="card-value">{gls_pnr_pass}<small>/{attempted}</small></div>
+            <div class="card-label">GLS PnR Pass</div>
+            <div class="card-bar"><div class="bar" style="width:{gls_pnr_pass/max(attempted,1)*100:.0f}%;background:var(--blue)"></div></div>
         </div>"""
 
     # ── PPA distribution (only if synth enabled) ──
@@ -453,6 +497,7 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 24px; text-align:
         <div class="card-bar"><div class="bar sim" style="width:{sim_pass/max(attempted,1)*100:.0f}%"></div></div>
     </div>
     {synth_card}
+    {gls_cards}
     {pnr_cards}
     <div class="card">
         <div class="card-value">{_fmt_tokens(in_tok + out_tok)}</div>
@@ -477,7 +522,7 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 24px; text-align:
         <th onclick="sortTable(0)">Problem</th>
         <th onclick="sortTable(1)">Compile</th>
         <th onclick="sortTable(2)">Lint</th>
-        <th onclick="sortTable(3)">Sim</th>{synth_header}{pnr_header}
+        <th onclick="sortTable(3)">Sim</th>{synth_header}{gls_header}{pnr_header}
         <th onclick="sortTable({turns_sort_col})">Turns</th>
         <th>Detail</th>
     </tr></thead>

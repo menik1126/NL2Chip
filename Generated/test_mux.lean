@@ -4,17 +4,20 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
--- Can Signal dom (BitVec 1) be used directly where Signal dom Bool is needed?
-def test_mux {dom : DomainConfig}
-    (state : Signal dom (BitVec 10))
-    : Signal dom (BitVec 1) :=
-  let b8 : Signal dom (BitVec 1) := Signal.map (fun x => x.extractLsb' 8 1) state
-  let b9 : Signal dom (BitVec 1) := Signal.map (fun x => x.extractLsb' 9 1) state
-  let cond : Signal dom (BitVec 1) := b8 ||| b9
-  -- Can I use cond (BitVec 1) as mux condition?
-  -- Need to convert to Bool somehow...
-  -- Option: compare with 1
-  let cond_bool : Signal dom Bool := cond === (1#1 : BitVec 1)
-  Signal.mux cond_bool (Signal.pure 1#1) (Signal.pure 0#1)
+def test_mux4to1 {dom : DomainConfig}
+    (inp : Signal dom (BitVec 16)) (sel : Signal dom (BitVec 2))
+    : Signal dom (BitVec 4) :=
+  let sel0 := Signal.map (fun s => s.getLsb 0) sel
+  let sel1 := Signal.map (fun s => s.getLsb 1) sel
+  
+  let slice0 := Signal.map (fun x => BitVec.extractLsb' 0 4 x) inp
+  let slice1 := Signal.map (fun x => BitVec.extractLsb' 4 4 x) inp
+  let slice2 := Signal.map (fun x => BitVec.extractLsb' 8 4 x) inp
+  let slice3 := Signal.map (fun x => BitVec.extractLsb' 12 4 x) inp
+  
+  let mux01 := Signal.mux sel0 slice1 slice0
+  let mux23 := Signal.mux sel0 slice3 slice2
+  
+  Signal.mux sel1 mux23 mux01
 
-#synthesize test_mux
+#synthesizeVerilog test_mux4to1

@@ -4,18 +4,24 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- 32-bit edge capture: captures 1→0 transitions on each bit.
-    Output bit remains 1 until synchronous reset clears it. -/
+/-- Edge capture: captures 1→0 transitions and holds them until reset. -/
 def prob066_edgecapture {dom : DomainConfig}
-    (reset : Signal dom Bool) (inp : Signal dom (BitVec 32))
-    : Signal dom (BitVec 32) :=
-  -- d_last: register storing the previous value of inp
-  let d_last := Signal.register 0#32 inp
-  -- detected: bits where inp went from 1 to 0 (d_last=1 AND inp=0)
-  let detected := (~~~inp) &&& d_last
-  -- out: accumulates captures, cleared on reset
+    (reset : Signal dom Bool)
+    (input : Signal dom (BitVec 32)) : Signal dom (BitVec 32) :=
+  -- Register the previous input value
+  let d_last := Signal.register 0#32 input
+  
+  -- Loop for the output accumulator
   Signal.loop fun out =>
-    let nextOut := Signal.mux reset (Signal.pure 0#32) (out ||| detected)
-    Signal.register 0#32 nextOut
+    -- Detect 1→0 transitions: previous=1 AND current=0
+    let falling_edges := (~~~input) &&& d_last
+    
+    -- Accumulate captures: out | falling_edges
+    let next_out := out ||| falling_edges
+    
+    -- Apply reset
+    let final_out := Signal.mux reset (Signal.pure 0#32) next_out
+    
+    Signal.register 0#32 final_out
 
 #synthesizeVerilog prob066_edgecapture

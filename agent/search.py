@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--area-budget", type=float, default=None, help="Area constraint in μm² (optional)")
     p.add_argument("--latency-budget", type=int, default=None, help="Latency constraint in cycles (optional)")
     p.add_argument("--corners", action="store_true", help="Run multi-corner PVT STA after P&R (implies --pnr --synth)")
+    p.add_argument("--gls", action="store_true", help="Run gate-level simulation after synthesis/PnR (implies --synth)")
     p.add_argument("--quiet", "-q", action="store_true", help="Minimal output (progress bar only)")
     p.add_argument("--workers", "-w", type=int, default=1, help="Concurrent workers (default: 1, recommended: 4)")
     p.add_argument("--dataset", "-d", type=str, default="verilogeval",
@@ -392,7 +393,7 @@ def build_arch_feedback(
     return "\n".join(lines)
 
 
-def print_summary_table(stats: dict, elapsed: float, synth_enabled: bool = False, pnr_enabled: bool = False, drc_enabled: bool = False, lvs_enabled: bool = False, ppa_opt_enabled: bool = False, arch_explore_enabled: bool = False) -> None:
+def print_summary_table(stats: dict, elapsed: float, synth_enabled: bool = False, pnr_enabled: bool = False, drc_enabled: bool = False, lvs_enabled: bool = False, gls_enabled: bool = False, ppa_opt_enabled: bool = False, arch_explore_enabled: bool = False) -> None:
     """Print a rich summary table."""
     attempted = stats["total"] - stats["skipped"]
     sim_rate = f"{stats['sim_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
@@ -425,6 +426,12 @@ def print_summary_table(stats: dict, elapsed: float, synth_enabled: bool = False
     if lvs_enabled:
         lvs_rate = f"{stats['lvs_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
         table.add_row("LVS pass", f"[green]{stats['lvs_pass']}[/green] ({lvs_rate})")
+    if gls_enabled:
+        gls_s_rate = f"{stats['gls_synth_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+        table.add_row("GLS synth pass", f"[green]{stats['gls_synth_pass']}[/green] ({gls_s_rate})")
+        if pnr_enabled:
+            gls_p_rate = f"{stats['gls_pnr_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+            table.add_row("GLS PnR pass", f"[green]{stats['gls_pnr_pass']}[/green] ({gls_p_rate})")
     if ppa_opt_enabled:
         table.add_row("PPA optimized", f"[yellow]{stats['ppa_optimized']}[/yellow] ({stats['ppa_iterations_total']} iters)")
     if arch_explore_enabled:
@@ -466,6 +473,7 @@ def _process_one_problem(
         enable_drc=evaluator.enable_drc,
         enable_lvs=evaluator.enable_lvs,
         enable_corners=evaluator.enable_corners,
+        enable_gls=evaluator.enable_gls,
         lean_repl=repl,
         dataset=evaluator.dataset_name,
         dataset_obj=evaluator.dataset_obj,
@@ -808,12 +816,30 @@ def _process_one_problem_inner(
             elif result.get("pnr_pass"):
                 pnr_str += "  [red]V✗[/red]"
 
+    # Build GLS suffix
+    gls_str = ""
+    if args.gls:
+        gs = result.get("gls_synth_status", "not_run")
+        if gs == "sim_pass":
+            with _stats_lock:
+                stats["gls_synth_pass"] += 1
+            gls_str += "  [green]GS✓[/green]"
+        elif gs in ("sim_fail", "sim_error"):
+            gls_str += "  [red]GS✗[/red]"
+        gp = result.get("gls_pnr_status", "not_run")
+        if gp == "sim_pass":
+            with _stats_lock:
+                stats["gls_pnr_pass"] += 1
+            gls_str += "  [green]GP✓[/green]"
+        elif gp in ("sim_fail", "sim_error"):
+            gls_str += "  [red]GP✗[/red]"
+
     current_progress.update(
         agent_task,
         description=(
             f"{status_icon} [cyan]{prob_id}[/cyan]  "
             f"{compile_str} {lint_str}  "
-            f"{result['sim_status']}  {detail_short}{synth_str}{pnr_str}"
+            f"{result['sim_status']}  {detail_short}{synth_str}{gls_str}{pnr_str}"
         ),
     )
 
@@ -867,8 +893,8 @@ def main():
     args = parse_args()
     t0 = time.monotonic()
 
-    # --ppa-opt / --arch-explore implies --synth
-    if args.ppa_opt or args.arch_explore:
+    # --ppa-opt / --arch-explore / --gls implies --synth
+    if args.ppa_opt or args.arch_explore or args.gls:
         args.synth = True
 
     # Discover problems
@@ -903,7 +929,7 @@ def main():
     skill = load_skill()
 
     # Create evaluator (REPL will be set per-worker below)
-    evaluator = Evaluator(project_root=PROJECT_ROOT, enable_synth=args.synth, enable_pnr=args.pnr, enable_drc=args.drc, enable_lvs=args.lvs, enable_corners=args.corners, dataset=args.dataset, dataset_obj=ds)
+    evaluator = Evaluator(project_root=PROJECT_ROOT, enable_synth=args.synth, enable_pnr=args.pnr, enable_drc=args.drc, enable_lvs=args.lvs, enable_corners=args.corners, enable_gls=args.gls, dataset=args.dataset, dataset_obj=ds)
 
     # Track stats
     stats = {
@@ -916,6 +942,8 @@ def main():
         "pnr_pass": 0,
         "drc_pass": 0,
         "lvs_pass": 0,
+        "gls_synth_pass": 0,
+        "gls_pnr_pass": 0,
         "ppa_optimized": 0,
         "ppa_iterations_total": 0,
         "arch_explored": 0,
@@ -1005,6 +1033,9 @@ def main():
         "pnr_pass": stats["pnr_pass"],
         "drc_pass": stats["drc_pass"],
         "lvs_pass": stats["lvs_pass"],
+        "gls_synth_pass": stats["gls_synth_pass"],
+        "gls_pnr_pass": stats["gls_pnr_pass"],
+        "gls_enabled": args.gls,
         "ppa_optimized": stats["ppa_optimized"],
         "ppa_iterations_total": stats["ppa_iterations_total"],
         "agent_tokens": stats["agent_tokens"],
@@ -1021,7 +1052,7 @@ def main():
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print_summary_table(stats, elapsed, synth_enabled=args.synth, pnr_enabled=args.pnr or args.drc or args.lvs, drc_enabled=args.drc, lvs_enabled=args.lvs, ppa_opt_enabled=args.ppa_opt, arch_explore_enabled=args.arch_explore)
+    print_summary_table(stats, elapsed, synth_enabled=args.synth, pnr_enabled=args.pnr or args.drc or args.lvs, drc_enabled=args.drc, lvs_enabled=args.lvs, gls_enabled=args.gls, ppa_opt_enabled=args.ppa_opt, arch_explore_enabled=args.arch_explore)
 
     # Auto-generate HTML report
     report_path = generate_report(run_dir)

@@ -4,7 +4,7 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- AND gate with bubble on in2: out = in1 & ~in2 -/
+/-- AND gate with inverted second input: out = in1 & ~in2 -/
 def prob019_m2014_q4f {dom : DomainConfig}
     (in1 in2 : Signal dom (BitVec 1)) : Signal dom (BitVec 1) :=
   in1 &&& (~~~in2)

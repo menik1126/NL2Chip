@@ -5,84 +5,87 @@ open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
 -- State encoding (6 states need 3 bits)
-private abbrev stWL    : BitVec 3 := 0#3  -- Walking Left
-private abbrev stWR    : BitVec 3 := 1#3  -- Walking Right
-private abbrev stFALLL : BitVec 3 := 2#3  -- Falling (was walking left)
-private abbrev stFALLR : BitVec 3 := 3#3  -- Falling (was walking right)
-private abbrev stDIGL  : BitVec 3 := 4#3  -- Digging (was walking left)
-private abbrev stDIGR  : BitVec 3 := 5#3  -- Digging (was walking right)
+private abbrev stWL : BitVec 3 := 0#3      -- Walk Left
+private abbrev stWR : BitVec 3 := 1#3      -- Walk Right
+private abbrev stFALLL : BitVec 3 := 2#3   -- Fall Left
+private abbrev stFALLR : BitVec 3 := 3#3   -- Fall Right
+private abbrev stDIGL : BitVec 3 := 4#3    -- Dig Left
+private abbrev stDIGR : BitVec 3 := 5#3    -- Dig Right
 
-/-- Lemmings FSM with falling and digging: 6 states (WL, WR, FALLL, FALLR, DIGL, DIGR).
-    Switches direction on bump while walking. Falls when ground=0 (highest priority).
-    Digs when dig=1 while walking (second priority). Bumps have lowest priority.
-    Async reset to WalkLeft.
-    Returns (walk_left, walk_right, aaah, digging) as bundled signals. -/
+/-- Lemmings FSM: models walking, falling, and digging behavior -/
 def prob152_lemmings3 {dom : DomainConfig}
     (areset : Signal dom Bool)
-    (bump_left bump_right ground dig : Signal dom Bool)
-    : Signal dom (BitVec 1 × BitVec 1 × BitVec 1 × BitVec 1) :=
-  -- State register via Signal.loop
-  let state : Signal dom (BitVec 3) :=
-    Signal.loop fun (state : Signal dom (BitVec 3)) =>
-      let isWL    := state === (Signal.pure stWL)
-      let isWR    := state === (Signal.pure stWR)
-      let isFALLL := state === (Signal.pure stFALLL)
-      let isFALLR := state === (Signal.pure stFALLR)
-      let isDIGL  := state === (Signal.pure stDIGL)
-      -- isDIGR is the default (else) case
-
-      -- Next state logic for each current state:
-      -- WL: ground=0 → FALLL (highest priority)
-      --     else dig=1 → DIGL
-      --     else bump_left=1 → WR
-      --     else → WL
-      let nextFromWL := Signal.mux ground
+    (bump_left : Signal dom Bool)
+    (bump_right : Signal dom Bool)
+    (ground : Signal dom Bool)
+    (dig : Signal dom Bool)
+    : Signal dom ((BitVec 1 × BitVec 1) × (BitVec 1 × BitVec 1)) :=
+  let stateSignal := Signal.loop fun (state : Signal dom (BitVec 3)) =>
+    -- Next state logic based on current state
+    let isWL := state === Signal.pure stWL
+    let isWR := state === Signal.pure stWR
+    let isFALLL := state === Signal.pure stFALLL
+    let isFALLR := state === Signal.pure stFALLR
+    let isDIGL := state === Signal.pure stDIGL
+    let isDIGR := state === Signal.pure stDIGR
+    
+    let notGround := ~~~ground
+    
+    -- Next state for WL: priority is !ground > dig > bump_left
+    let nextWL := 
+      Signal.mux notGround (Signal.pure stFALLL)
         (Signal.mux dig (Signal.pure stDIGL)
           (Signal.mux bump_left (Signal.pure stWR) (Signal.pure stWL)))
-        (Signal.pure stFALLL)
-
-      -- WR: ground=0 → FALLR (highest priority)
-      --     else dig=1 → DIGR
-      --     else bump_right=1 → WL
-      --     else → WR
-      let nextFromWR := Signal.mux ground
+    
+    -- Next state for WR: priority is !ground > dig > bump_right
+    let nextWR := 
+      Signal.mux notGround (Signal.pure stFALLR)
         (Signal.mux dig (Signal.pure stDIGR)
           (Signal.mux bump_right (Signal.pure stWL) (Signal.pure stWR)))
-        (Signal.pure stFALLR)
-
-      -- FALLL: ground=1 → WL, else FALLL (bumps ignored)
-      let nextFromFALLL := Signal.mux ground (Signal.pure stWL) (Signal.pure stFALLL)
-
-      -- FALLR: ground=1 → WR, else FALLR (bumps ignored)
-      let nextFromFALLR := Signal.mux ground (Signal.pure stWR) (Signal.pure stFALLR)
-
-      -- DIGL: ground=1 → DIGL (continue digging), ground=0 → FALLL
-      let nextFromDIGL := Signal.mux ground (Signal.pure stDIGL) (Signal.pure stFALLL)
-
-      -- DIGR: ground=1 → DIGR (continue digging), ground=0 → FALLR
-      let nextFromDIGR := Signal.mux ground (Signal.pure stDIGR) (Signal.pure stFALLR)
-
-      -- Select next state based on current state
-      let nextState := Signal.mux isWL nextFromWL
-        (Signal.mux isWR nextFromWR
-          (Signal.mux isFALLL nextFromFALLL
-            (Signal.mux isFALLR nextFromFALLR
-              (Signal.mux isDIGL nextFromDIGL nextFromDIGR))))
-
-      -- Apply async reset (modeled as sync): areset → WL
-      let nextWithReset := Signal.mux areset (Signal.pure stWL) nextState
-
-      -- Register with initial value WL
-      Signal.register stWL nextWithReset
-
-  -- Derive outputs from state
-  let walk_left  := Signal.mux (state === (Signal.pure stWL))    (Signal.pure 1#1) (Signal.pure 0#1)
-  let walk_right := Signal.mux (state === (Signal.pure stWR))    (Signal.pure 1#1) (Signal.pure 0#1)
-  let aaah       := Signal.mux ((state === (Signal.pure stFALLL)) ||| (state === (Signal.pure stFALLR)))
-    (Signal.pure 1#1) (Signal.pure 0#1)
-  let digging    := Signal.mux ((state === (Signal.pure stDIGL)) ||| (state === (Signal.pure stDIGR)))
-    (Signal.pure 1#1) (Signal.pure 0#1)
-
-  bundle2 walk_left (bundle2 walk_right (bundle2 aaah digging))
+    
+    -- Next state for FALLL: ground → WL, else stay FALLL
+    let nextFALLL := Signal.mux ground (Signal.pure stWL) (Signal.pure stFALLL)
+    
+    -- Next state for FALLR: ground → WR, else stay FALLR
+    let nextFALLR := Signal.mux ground (Signal.pure stWR) (Signal.pure stFALLR)
+    
+    -- Next state for DIGL: ground → stay DIGL, else FALLL
+    let nextDIGL := Signal.mux ground (Signal.pure stDIGL) (Signal.pure stFALLL)
+    
+    -- Next state for DIGR: ground → stay DIGR, else FALLR
+    let nextDIGR := Signal.mux ground (Signal.pure stDIGR) (Signal.pure stFALLR)
+    
+    -- Mux all next states based on current state
+    let nextState := 
+      Signal.mux isWL nextWL
+        (Signal.mux isWR nextWR
+          (Signal.mux isFALLL nextFALLL
+            (Signal.mux isFALLR nextFALLR
+              (Signal.mux isDIGL nextDIGL nextDIGR))))
+    
+    -- Apply async reset (modeled as sync mux)
+    let nextWithReset := Signal.mux areset (Signal.pure stWL) nextState
+    
+    -- Register with initial value WL
+    Signal.register stWL nextWithReset
+  
+  -- Moore outputs based on registered state
+  -- Convert state comparisons to BitVec outputs
+  let isWL := stateSignal === Signal.pure stWL
+  let isWR := stateSignal === Signal.pure stWR
+  let isFALLL := stateSignal === Signal.pure stFALLL
+  let isFALLR := stateSignal === Signal.pure stFALLR
+  let isDIGL := stateSignal === Signal.pure stDIGL
+  let isDIGR := stateSignal === Signal.pure stDIGR
+  
+  let walk_left := Signal.mux isWL (Signal.pure 1#1) (Signal.pure 0#1)
+  let walk_right := Signal.mux isWR (Signal.pure 1#1) (Signal.pure 0#1)
+  let aaah := Signal.mux (isFALLL ||| isFALLR) (Signal.pure 1#1) (Signal.pure 0#1)
+  let digging := Signal.mux (isDIGL ||| isDIGR) (Signal.pure 1#1) (Signal.pure 0#1)
+  
+  -- Bundle 4 outputs as nested pairs: ((walk_left, walk_right), (aaah, digging))
+  let pair1 := bundle2 walk_left walk_right
+  let pair2 := bundle2 aaah digging
+  bundle2 pair1 pair2
 
 #synthesizeVerilog prob152_lemmings3

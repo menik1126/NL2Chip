@@ -4,47 +4,41 @@ import Sparkle.Compiler.Elab
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
 
-/-- 8x1 memory implemented as shift register with random access read.
-    S shifts into Q[0] (MSB first) when enable is high.
-    ABC selects which Q bit to output on Z. -/
+/-- 8x1 memory with shift register write and random access read.
+    S shifts into Q[0] when enable is high. ABC selects which Q bit outputs to Z. -/
 def prob084_ece241_2013_q12 {dom : DomainConfig}
     (enable : Signal dom Bool)
     (S : Signal dom (BitVec 1))
-    (A : Signal dom (BitVec 1))
-    (B : Signal dom (BitVec 1))
-    (C : Signal dom (BitVec 1)) : Signal dom (BitVec 1) :=
-  -- 8-bit shift register: Q[7:0]
-  -- When enable, shift left: Q <= {Q[6:0], S}
+    (A B C : Signal dom Bool)
+    : Signal dom (BitVec 1) :=
+  -- 8-bit shift register: Q[7:0], S shifts into Q[0]
   let q := Signal.loop fun (q : Signal dom (BitVec 8)) =>
-    -- Shift left: concatenate q[6:0] with S
-    let shifted := q <<< 1#8
-    let newQ := (fun sh sv => sh ||| (sv.zeroExtend 8)) <$> shifted <*> S
-    let nextQ := Signal.mux enable newQ q
-    Signal.register 0#8 nextQ
+    let shifted := (q <<< 1#8) ||| Signal.map (fun s => s.zeroExtend 8) S
+    let q_next := Signal.mux enable shifted q
+    Signal.register 0#8 q_next
   
-  -- Extract individual bits from q
-  let q0 := Signal.map (fun qv => (qv.extractLsb' 0 1)) q
-  let q1 := Signal.map (fun qv => (qv.extractLsb' 1 1)) q
-  let q2 := Signal.map (fun qv => (qv.extractLsb' 2 1)) q
-  let q3 := Signal.map (fun qv => (qv.extractLsb' 3 1)) q
-  let q4 := Signal.map (fun qv => (qv.extractLsb' 4 1)) q
-  let q5 := Signal.map (fun qv => (qv.extractLsb' 5 1)) q
-  let q6 := Signal.map (fun qv => (qv.extractLsb' 6 1)) q
-  let q7 := Signal.map (fun qv => (qv.extractLsb' 7 1)) q
+  -- Extract bits using shifts - work with BitVec 8 throughout
+  let q0_8 := q &&& 1#8
+  let q1_8 := (q >>> 1#8) &&& 1#8
+  let q2_8 := (q >>> 2#8) &&& 1#8
+  let q3_8 := (q >>> 3#8) &&& 1#8
+  let q4_8 := (q >>> 4#8) &&& 1#8
+  let q5_8 := (q >>> 5#8) &&& 1#8
+  let q6_8 := (q >>> 6#8) &&& 1#8
+  let q7_8 := (q >>> 7#8) &&& 1#8
   
-  -- Convert A, B, C to Bool signals
-  let aBool := A === (1#1 : BitVec 1)
-  let bBool := B === (1#1 : BitVec 1)
-  let cBool := C === (1#1 : BitVec 1)
+  -- Build mux tree with BitVec 8
+  let mux01_8 := Signal.mux C q1_8 q0_8
+  let mux23_8 := Signal.mux C q3_8 q2_8
+  let mux45_8 := Signal.mux C q5_8 q4_8
+  let mux67_8 := Signal.mux C q7_8 q6_8
   
-  -- Build 8-to-1 mux tree: ABC selects from q[0..7]
-  -- When ABC=000, select q0; when ABC=001, select q1, etc.
-  let mux01 := Signal.mux cBool q1 q0
-  let mux23 := Signal.mux cBool q3 q2
-  let mux45 := Signal.mux cBool q5 q4
-  let mux67 := Signal.mux cBool q7 q6
-  let mux03 := Signal.mux bBool mux23 mux01
-  let mux47 := Signal.mux bBool mux67 mux45
-  Signal.mux aBool mux47 mux03
+  let mux03_8 := Signal.mux B mux23_8 mux01_8
+  let mux47_8 := Signal.mux B mux67_8 mux45_8
+  
+  let result_8 := Signal.mux A mux47_8 mux03_8
+  
+  -- Extract LSB as BitVec 1
+  Signal.map (fun (v : BitVec 8) => v.extractLsb 0 0) result_8
 
 #synthesizeVerilog prob084_ece241_2013_q12
