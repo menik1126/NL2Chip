@@ -592,8 +592,9 @@ mutual
                    let resWire ← CompilerM.makeWire hint (.bitVector len) (named := isNamed)
                    CompilerM.emitAssign resWire (.slice (.ref wireS) (start + len - 1) start)
                    return resWire
-               -- Unary primitives (neg, not, etc.)
+               -- Unary primitives (neg, not) — binary ops fall through to generic fallback
                if let some op := getOperator opName then
+                if op == .not || op == .neg then
                  let wireS ← translateExprToWire s "s" (isTopLevel := false)
                  let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
                  let hwType ← inferHWTypeFromSignal exprType

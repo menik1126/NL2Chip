@@ -24,6 +24,7 @@ from pathlib import Path
 
 
 DATASET_DIR = Path("verilog-eval/dataset_spec-to-rtl")
+RTLLM_PASS_PATTERN = re.compile(r"Your Design Passed")
 BASH_TIMEOUT = 120
 SIM_TIMEOUT = 30
 SYNTH_TIMEOUT = 600
@@ -95,6 +96,39 @@ def parse_ref_ports(ref_sv: str) -> list[tuple[str, str, str]]:
         typ = f"logic {width}".strip() if width else "logic"
         ports.append((direction, typ, name))
     return ports
+
+
+def _parse_ref_module_ports(ref_code: str) -> list[tuple[str, str, str]] | None:
+    """Parse reference Verilog module to get ports in declaration order.
+
+    Handles both ANSI and non-ANSI port styles, including comma-separated names.
+    Returns [(direction, width_str, name), ...] in module declaration order, or None.
+    """
+    mod_match = re.search(r"module\s+\w+\s*\(([^)]+)\)", ref_code)
+    if not mod_match:
+        return None
+    # Extract port names from module header (last token per comma-separated entry)
+    raw_names = [p.strip().split()[-1] for p in mod_match.group(1).split(",")]
+    clean_names = [n for n in raw_names if re.match(r"\w+$", n)]
+    if not clean_names:
+        return None
+
+    # Parse port declarations: input/output [reg|wire|logic] [width] name1 [, name2, ...]
+    port_info: dict[str, tuple[str, str]] = {}
+    for m in re.finditer(
+        r"(input|output)\s+(?:reg\s+|wire\s+|logic\s+)?(\[\d+:\d+\])?\s*([^;]+)",
+        ref_code,
+    ):
+        direction = m.group(1)
+        width = f" {m.group(2)}" if m.group(2) else ""
+        for name in m.group(3).split(","):
+            name = name.strip()
+            if name and re.match(r"\w+$", name):
+                port_info[name] = (direction, width)
+
+    return [(port_info.get(n, ("input", ""))[0],
+             port_info.get(n, ("input", ""))[1],
+             n) for n in clean_names]
 
 
 def generate_top_wrapper(
@@ -283,8 +317,10 @@ def generate_top_wrapper(
 class Evaluator:
     """Evaluate a Sparkle-generated .lean file: compile → extract SV → lint → sim → (synth+PPA) → (P&R+DRC+LVS)."""
 
-    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False, lean_repl=None):
+    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False, lean_repl=None, dataset: str = "verilogeval", dataset_obj=None):
         self.project_root = project_root.resolve()
+        self.dataset_name = dataset.lower()
+        self.dataset_obj = dataset_obj  # Optional Dataset instance from dataset.py
         self.dataset_dir = self.project_root / "verilog-eval" / "dataset_spec-to-rtl"
         self.enable_pnr = enable_pnr or enable_drc or enable_lvs  # drc/lvs imply pnr
         self.enable_synth = enable_synth or self.enable_pnr  # pnr implies synth
@@ -348,6 +384,11 @@ class Evaluator:
             result["compile_pass"] = True
             result["has_sorry"] = not repl_result.complete
             sv_code = repl_result.verilog
+            # Strip trailing non-Verilog content (e.g., Lean comments after endmodule)
+            if sv_code:
+                last_end = sv_code.rfind('endmodule')
+                if last_end >= 0:
+                    sv_code = sv_code[:last_end + len('endmodule')]
         else:
             # ── Fallback: lake build (~10s) ──
             try:
@@ -446,6 +487,16 @@ class Evaluator:
         sparkle_mod_name: str, sparkle_ports: list[tuple[str, str, str]],
         run_dir: Path,
     ) -> tuple[str, int, str]:
+        """Run simulation — dispatches to VerilogEval or RTLLM mode."""
+        if self.dataset_name == "rtllm":
+            return self._run_sim_rtllm(prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir)
+        return self._run_sim_verilogeval(prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir)
+
+    def _run_sim_verilogeval(
+        self, prob_id: str, sv_code: str,
+        sparkle_mod_name: str, sparkle_ports: list[tuple[str, str, str]],
+        run_dir: Path,
+    ) -> tuple[str, int, str]:
         """Run iverilog simulation against VerilogEval testbench."""
         ref_sv_path = self.dataset_dir / f"{prob_id}_ref.sv"
         test_sv_path = self.dataset_dir / f"{prob_id}_test.sv"
@@ -516,6 +567,304 @@ class Evaluator:
             return "sim_error", -1, "Simulation hit internal timeout"
 
         return "sim_error", -1, f"Could not parse sim output:\n{sim_output[:300]}"
+
+    def _run_sim_rtllm(
+        self, prob_id: str, sv_code: str,
+        sparkle_mod_name: str, sparkle_ports: list[tuple[str, str, str]],
+        run_dir: Path,
+    ) -> tuple[str, int, str]:
+        """Run iverilog simulation against RTLLM testbench.
+
+        RTLLM testbenches instantiate the design by its name (e.g. adder_8bit uut(...)).
+        We generate a wrapper module with the design name that instantiates the Sparkle module.
+        Pass is detected by 'Your Design Passed' in output.
+        """
+        if self.dataset_obj is None:
+            return "sim_error", -1, "RTLLM dataset object not set on evaluator"
+
+        info = self.dataset_obj.load_problem(prob_id)
+        tb_path = info.testbench_path
+        design_name = info.design_name
+
+        if not tb_path.exists():
+            return "sim_error", -1, f"Testbench not found: {tb_path}"
+
+        if not sparkle_mod_name:
+            return "sim_error", -1, "Could not parse Sparkle module name"
+
+        sim_dir = run_dir / "sim" / prob_id
+        sim_dir.mkdir(parents=True, exist_ok=True)
+
+        # Rename Sparkle module if it collides with design_name
+        # (wrapper must use design_name, so the inner module needs a distinct name)
+        if sparkle_mod_name == design_name:
+            renamed = f"{sparkle_mod_name}_sparkle"
+            sv_code = re.sub(
+                rf'\bmodule\s+{re.escape(sparkle_mod_name)}\b',
+                f'module {renamed}',
+                sv_code,
+                count=1,
+            )
+            sparkle_mod_name = renamed
+
+        (sim_dir / "sparkle_dut.sv").write_text(sv_code)
+
+        # Generate wrapper: module <design_name>(...); sparkle_mod dut(...); endmodule
+        # Parse testbench to extract expected ports from the DUT instantiation
+        tb_code = tb_path.read_text()
+        wrapper = self._generate_rtllm_wrapper(
+            design_name, sparkle_mod_name, sparkle_ports, tb_code, sv_code,
+            info.ref_code,
+        )
+        if not wrapper:
+            return "sim_error", -1, "Could not generate RTLLM wrapper"
+
+        compile_files = [str(sim_dir / "sparkle_dut.sv")]
+        if wrapper:
+            (sim_dir / "wrapper.sv").write_text(wrapper)
+            compile_files.append(str(sim_dir / "wrapper.sv"))
+        compile_files.append(str(tb_path))
+
+        # Compile
+        try:
+            comp = subprocess.run(
+                ["iverilog", "-g2012", "-o", str(sim_dir / "sim.vvp")] + compile_files,
+                capture_output=True, text=True, timeout=30,
+            )
+            if comp.returncode != 0:
+                (sim_dir / "compile_error.txt").write_text(comp.stderr)
+                return "sim_error", -1, f"iverilog compile failed:\n{comp.stderr[:500]}"
+        except subprocess.TimeoutExpired:
+            return "sim_error", -1, "iverilog compile timeout"
+        except FileNotFoundError:
+            return "sim_error", -1, "iverilog not found"
+
+        # Run simulation
+        try:
+            sim = subprocess.run(
+                ["vvp", str(sim_dir / "sim.vvp")],
+                capture_output=True, text=True, timeout=SIM_TIMEOUT,
+            )
+            sim_output = sim.stdout + sim.stderr
+            (sim_dir / "sim_output.txt").write_text(sim_output)
+        except subprocess.TimeoutExpired:
+            return "sim_error", -1, "Simulation timeout"
+
+        # Parse results — RTLLM uses "Your Design Passed"
+        if RTLLM_PASS_PATTERN.search(sim_output):
+            return "sim_pass", 0, "Your Design Passed"
+
+        # Check for failure pattern
+        fail_m = re.search(r"(\d+)\s*/\s*\d+\s*failures", sim_output)
+        if fail_m:
+            failures = int(fail_m.group(1))
+            return "sim_fail", failures, f"{failures} failures"
+
+        if "TIMEOUT" in sim_output:
+            return "sim_error", -1, "Simulation hit internal timeout"
+
+        return "sim_fail", -1, f"Design did not pass:\n{sim_output[:300]}"
+
+    @staticmethod
+    def _generate_rtllm_wrapper(
+        design_name: str,
+        sparkle_mod_name: str,
+        sparkle_ports: list[tuple[str, str, str]],
+        tb_code: str,
+        sv_code: str = "",
+        ref_code: str = "",
+    ) -> str | None:
+        """Generate a wrapper module named <design_name> that instantiates the Sparkle module.
+
+        Parses the testbench to find the DUT instantiation and extract expected ports.
+        Handles bundled outputs (Sparkle packs multiple outputs into one port).
+        """
+        # Parse testbench DUT instantiation to get expected port connections
+        # Handles optional #(params) with one level of nested parens
+        inst_pattern = re.compile(
+            rf"{re.escape(design_name)}\s+(?:#\s*\((?:[^()]*|\([^()]*\))*\)\s*)?\w+\s*\(([^;]+)\)\s*;",
+            re.DOTALL,
+        )
+        inst_match = inst_pattern.search(tb_code)
+        if not inst_match:
+            return None
+
+        inst_body = inst_match.group(1)
+        tb_ports = re.findall(r"\.(\w+)\s*\(", inst_body)
+
+        # Fallback for positional connections: use reference design port names
+        ref_port_lookup: dict[str, tuple[str, str]] = {}
+        if not tb_ports and ref_code:
+            ref_ordered = _parse_ref_module_ports(ref_code)
+            if ref_ordered:
+                tb_ports = [name for _, _, name in ref_ordered]
+                ref_port_lookup = {name: (d, w) for d, w, name in ref_ordered}
+
+        if not tb_ports:
+            return None
+
+        sp_port_map = {n: (d, t) for d, t, n in sparkle_ports}
+        sp_port_map_lower = {n.lower(): n for n in sp_port_map}  # for case-insensitive fallback
+        sp_outputs = [(d, t, n) for d, t, n in sparkle_ports if d == "output"]
+
+        # Classify each testbench port: match to Sparkle port or infer from TB
+        tb_classified = []  # (pname, direction, width_str, sparkle_name_or_None)
+        for pname in tb_ports:
+            sp_match = None
+            if pname in sp_port_map:
+                sp_match = pname
+            else:
+                gen_name = f"_gen_{pname}"
+                if gen_name in sp_port_map:
+                    sp_match = gen_name
+                else:
+                    # Case-insensitive fallback
+                    pl = pname.lower()
+                    gen_lower = f"_gen_{pl}"
+                    if pl in sp_port_map_lower:
+                        sp_match = sp_port_map_lower[pl]
+                    elif gen_lower in sp_port_map_lower:
+                        sp_match = sp_port_map_lower[gen_lower]
+
+            if sp_match:
+                d, t = sp_port_map[sp_match]
+                wm = re.search(r"\[(\d+):(\d+)\]", t)
+                width = f" [{wm.group(1)}:{wm.group(2)}]" if wm else ""
+                tb_classified.append((pname, d, width, sp_match))
+            else:
+                if ref_port_lookup and pname in ref_port_lookup:
+                    direction, width = ref_port_lookup[pname]
+                else:
+                    tb_decl = re.search(
+                        rf"(reg|wire)\s*(\[\d+:\d+\])?\s*{re.escape(pname)}\s*;",
+                        tb_code,
+                    )
+                    if tb_decl:
+                        kind = tb_decl.group(1)
+                        width = f" {tb_decl.group(2)}" if tb_decl.group(2) else ""
+                        direction = "input" if kind == "reg" else "output"
+                    else:
+                        direction, width = "input", ""
+                tb_classified.append((pname, direction, width, None))
+
+        # Detect bundled output: unmatched TB outputs whose total width == single Sparkle output
+        unmatched_outs = [(p, w) for p, d, w, m in tb_classified if d == "output" and m is None]
+        bundled_sp = None
+        if unmatched_outs and len(sp_outputs) == 1:
+            sp_out_d, sp_out_t, sp_out_n = sp_outputs[0]
+            sp_w = _port_width(sp_out_t)
+            tb_total = 0
+            for _, w in unmatched_outs:
+                wm = re.search(r"\[(\d+):(\d+)\]", w)
+                tb_total += (abs(int(wm.group(1)) - int(wm.group(2))) + 1) if wm else 1
+            if sp_w == tb_total:
+                bundled_sp = (sp_out_n, sp_out_t)
+
+        # ── Build wrapper ──
+        lines = [f"module {design_name} ("]
+        port_decls = [f"    {d}{w} {p}" for p, d, w, _ in tb_classified]
+        lines.append(",\n".join(port_decls))
+        lines.append(");")
+        lines.append("")
+
+        # Wire for bundled output
+        if bundled_sp:
+            sp_out_n, sp_out_t = bundled_sp
+            wm = re.search(r"\[(\d+):(\d+)\]", sp_out_t)
+            wdecl = f" [{wm.group(1)}:{wm.group(2)}]" if wm else ""
+            lines.append(f"    wire{wdecl} {sp_out_n}_wire;")
+
+        # Wires for directly-matched outputs
+        for p, d, w, m in tb_classified:
+            if d == "output" and m is not None:
+                lines.append(f"    wire{w} {m}_wire;")
+
+        lines.append("")
+
+        # Instantiate Sparkle module
+        lines.append(f"    {sparkle_mod_name} sparkle_dut (")
+        inst_conns = []
+        for _, _, sn in sparkle_ports:
+            # Check if this is a matched input
+            matched_input = next(
+                (p for p, d, _, m in tb_classified if d == "input" and m == sn), None
+            )
+            if matched_input:
+                inst_conns.append(f"        .{sn}({matched_input})")
+                continue
+            # Check if this is a matched output
+            matched_output = next(
+                (p for p, d, _, m in tb_classified if d == "output" and m == sn), None
+            )
+            if matched_output:
+                inst_conns.append(f"        .{sn}({sn}_wire)")
+                continue
+            # Check if this is the bundled output
+            if bundled_sp and sn == bundled_sp[0]:
+                inst_conns.append(f"        .{sn}({sn}_wire)")
+                continue
+            # Unmatched: handle clk/rst, _gen_ prefix, or tie off
+            if sn == "clk":
+                clk_sig = "clk" if "clk" in tb_ports else "1'b0"
+                inst_conns.append(f"        .clk({clk_sig})")
+            elif sn == "rst":
+                rst_sig = "rst" if "rst" in tb_ports else ("reset" if "reset" in tb_ports else "1'b0")
+                inst_conns.append(f"        .rst({rst_sig})")
+            elif sn.startswith("_gen_"):
+                base = sn[5:]
+                matched_tb = next((tp for tp in tb_ports if tp.lower() == base.lower()), None)
+                inst_conns.append(f"        .{sn}({matched_tb if matched_tb else sn})")
+            else:
+                inst_conns.append(f"        .{sn}({sn})")
+        lines.append(",\n".join(inst_conns))
+        lines.append("    );")
+
+        # ── Output assignments ──
+        if bundled_sp:
+            sp_out_n, sp_out_t = bundled_sp
+            sp_w = _port_width(sp_out_t)
+
+            # Try to determine concat field order from SV code
+            concat_order = None
+            concat_pat = re.search(
+                rf"assign\s+{re.escape(sp_out_n)}\s*=\s*\{{([^}}]+)\}}", sv_code
+            )
+            if not concat_pat:
+                indirect = re.search(
+                    rf"assign\s+{re.escape(sp_out_n)}\s*=\s*(\w+)\s*;", sv_code
+                )
+                if indirect:
+                    concat_pat = re.search(
+                        rf"assign\s+{re.escape(indirect.group(1))}\s*=\s*\{{([^}}]+)\}}", sv_code
+                    )
+            if concat_pat:
+                fields = [f.strip().replace("_gen_", "") for f in concat_pat.group(1).split(",")]
+                tb_out_names = {n for n, _ in unmatched_outs}
+                if len(fields) == len(unmatched_outs) and all(f in tb_out_names for f in fields):
+                    concat_order = fields
+
+            ordered = concat_order or [n for n, _ in unmatched_outs]
+            offset = sp_w
+            for field_name in ordered:
+                for n, w in unmatched_outs:
+                    if n == field_name:
+                        wm = re.search(r"\[(\d+):(\d+)\]", w)
+                        fw = (abs(int(wm.group(1)) - int(wm.group(2))) + 1) if wm else 1
+                        high, low = offset - 1, offset - fw
+                        if fw == 1:
+                            lines.append(f"    assign {n} = {sp_out_n}_wire[{low}];")
+                        else:
+                            lines.append(f"    assign {n} = {sp_out_n}_wire[{high}:{low}];")
+                        offset -= fw
+                        break
+
+        # Direct-mapped outputs
+        for p, d, _, m in tb_classified:
+            if d == "output" and m is not None:
+                lines.append(f"    assign {p} = {m}_wire;")
+
+        lines.append("endmodule")
+        return "\n".join(lines)
 
     def _run_synthesis(
         self, prob_id: str, sv_code: str, top_module: str, run_dir: Path

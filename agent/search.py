@@ -32,6 +32,7 @@ _log_lock = threading.Lock()
 sys.path.insert(0, str(Path(__file__).parent))
 
 from coding_agent import CodingAgent
+from dataset import Dataset, ProblemInfo
 from evaluator import Evaluator
 from lean_repl import LeanREPLPool
 from report import generate_report
@@ -80,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--corners", action="store_true", help="Run multi-corner PVT STA after P&R (implies --pnr --synth)")
     p.add_argument("--quiet", "-q", action="store_true", help="Minimal output (progress bar only)")
     p.add_argument("--workers", "-w", type=int, default=1, help="Concurrent workers (default: 1, recommended: 4)")
+    p.add_argument("--dataset", "-d", type=str, default="verilogeval",
+                    choices=["verilogeval", "rtllm"],
+                    help="Dataset to evaluate (default: verilogeval)")
     p.add_argument("--no-repl", action="store_true", help="Disable Lean REPL (use lake build instead)")
     return p.parse_args()
 
@@ -111,13 +115,22 @@ def load_skill() -> str:
     return skill_path.read_text()
 
 
-def build_user_message(prob_id: str, has_repl: bool = False) -> str:
+def build_user_message(prob_id: str, has_repl: bool = False, info: ProblemInfo | None = None, dataset_name: str = "verilogeval") -> str:
     """Build the user message for the agent, including NL description and reference Verilog."""
-    prompt_file = DATASET_DIR / f"{prob_id}_prompt.txt"
-    ref_file = DATASET_DIR / f"{prob_id}_ref.sv"
+    if info is not None:
+        nl_desc = info.prompt_text
+        ref_sv = info.ref_code
+    else:
+        prompt_file = DATASET_DIR / f"{prob_id}_prompt.txt"
+        ref_file = DATASET_DIR / f"{prob_id}_ref.sv"
+        nl_desc = prompt_file.read_text() if prompt_file.exists() else "(no description available)"
+        ref_sv = ref_file.read_text() if ref_file.exists() else "(no reference Verilog available)"
 
-    nl_desc = prompt_file.read_text() if prompt_file.exists() else "(no description available)"
-    ref_sv = ref_file.read_text() if ref_file.exists() else "(no reference Verilog available)"
+    # RTLLM uses design_name as function name; VerilogEval uses prob_id.lower()
+    if dataset_name == "rtllm":
+        func_name = prob_id  # e.g. "adder_8bit"
+    else:
+        func_name = prob_id.lower()
 
     if has_repl:
         compile_instructions = (
@@ -152,10 +165,10 @@ def build_user_message(prob_id: str, has_repl: bool = False) -> str:
         f"open Sparkle.Core.Domain\n"
         f"open Sparkle.Core.Signal\n\n"
         f"/-- <description> -/\n"
-        f"def {prob_id.lower()} {{dom : DomainConfig}}\n"
+        f"def {func_name} {{dom : DomainConfig}}\n"
         f"    (<inputs>) : <output_type> :=\n"
         f"  <implementation>\n\n"
-        f"#synthesizeVerilog {prob_id.lower()}\n"
+        f"#synthesizeVerilog {func_name}\n"
         f"```\n"
     )
 
@@ -454,6 +467,8 @@ def _process_one_problem(
         enable_lvs=evaluator.enable_lvs,
         enable_corners=evaluator.enable_corners,
         lean_repl=repl,
+        dataset=evaluator.dataset_name,
+        dataset_obj=evaluator.dataset_obj,
     )
 
     try:
@@ -518,7 +533,9 @@ def _process_one_problem_inner(
         lean_repl=repl,
     )
 
-    user_msg = build_user_message(prob_id, has_repl=has_repl)
+    # Load problem info from dataset
+    info = evaluator.dataset_obj.load_problem(prob_id) if evaluator.dataset_obj else None
+    user_msg = build_user_message(prob_id, has_repl=has_repl, info=info, dataset_name=evaluator.dataset_name)
     agent_stats = None
     try:
         agent_stats = agent.run(
@@ -855,7 +872,8 @@ def main():
         args.synth = True
 
     # Discover problems
-    problems = discover_problems(limit=args.limit, filter_re=args.filter)
+    ds = Dataset(args.dataset, project_root=PROJECT_ROOT)
+    problems = ds.discover_problems(limit=args.limit, filter_re=args.filter)
     if not problems:
         console.print("[red]No problems found matching criteria.[/red]")
         sys.exit(1)
@@ -885,7 +903,7 @@ def main():
     skill = load_skill()
 
     # Create evaluator (REPL will be set per-worker below)
-    evaluator = Evaluator(project_root=PROJECT_ROOT, enable_synth=args.synth, enable_pnr=args.pnr, enable_drc=args.drc, enable_lvs=args.lvs, enable_corners=args.corners)
+    evaluator = Evaluator(project_root=PROJECT_ROOT, enable_synth=args.synth, enable_pnr=args.pnr, enable_drc=args.drc, enable_lvs=args.lvs, enable_corners=args.corners, dataset=args.dataset, dataset_obj=ds)
 
     # Track stats
     stats = {
