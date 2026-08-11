@@ -16,7 +16,9 @@ Returns a score dict for each problem.
 from __future__ import annotations
 
 import math
+import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -24,7 +26,8 @@ from pathlib import Path
 
 
 DATASET_DIR = Path("verilog-eval/dataset_spec-to-rtl")
-RTLLM_PASS_PATTERN = re.compile(r"Your Design Passed")
+RTLLM_PASS_PATTERN = re.compile(r"Your Design Passed", re.IGNORECASE)
+RESBENCH_PASS_PATTERN = re.compile(r"All tests passed|Test PASSED", re.IGNORECASE)
 BASH_TIMEOUT = 120
 SIM_TIMEOUT = 30
 SYNTH_TIMEOUT = 600
@@ -68,19 +71,164 @@ PVT_CORNERS = [
 # ── Port parsing (from autoformalize.py) ─────────────────────────
 
 
-def parse_module_ports(sv_code: str) -> tuple[str, list[tuple[str, str, str]]]:
-    """Parse a SystemVerilog module to get name and ports.
-    Returns (module_name, [(direction, type, name), ...])
-    """
-    m = re.search(r"module\s+(\w+)\s*\(", sv_code)
-    if not m:
+def _matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _split_sv_commas(text: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    paren = bracket = brace = 0
+    for idx, ch in enumerate(text):
+        if ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren = max(0, paren - 1)
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]":
+            bracket = max(0, bracket - 1)
+        elif ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace = max(0, brace - 1)
+        elif ch == "," and paren == 0 and bracket == 0 and brace == 0:
+            parts.append(text[start:idx].strip())
+            start = idx + 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _module_records(sv_code: str) -> list[tuple[str, str, str]]:
+    """Return module name, ANSI port text, and body text without regex backtracking."""
+    sv_code = re.sub(r"//.*", "", sv_code)
+    sv_code = re.sub(r"/\*.*?\*/", "", sv_code, flags=re.DOTALL)
+    records: list[tuple[str, str, str]] = []
+    search_from = 0
+    while True:
+        m = re.search(r"\bmodule\s+([A-Za-z_]\w*)\b", sv_code[search_from:])
+        if not m:
+            break
+        module_start = search_from + m.start()
+        mod_name = m.group(1)
+        idx = search_from + m.end()
+        while idx < len(sv_code) and sv_code[idx].isspace():
+            idx += 1
+        if idx < len(sv_code) and sv_code[idx] == "#":
+            idx += 1
+            while idx < len(sv_code) and sv_code[idx].isspace():
+                idx += 1
+            if idx < len(sv_code) and sv_code[idx] == "(":
+                end = _matching_paren(sv_code, idx)
+                if end == -1:
+                    search_from = idx + 1
+                    continue
+                idx = end + 1
+        while idx < len(sv_code) and sv_code[idx].isspace():
+            idx += 1
+
+        header_text = ""
+        header_end = idx
+        if idx < len(sv_code) and sv_code[idx] == "(":
+            end = _matching_paren(sv_code, idx)
+            if end == -1:
+                search_from = idx + 1
+                continue
+            header_text = sv_code[idx + 1:end]
+            header_end = end + 1
+
+        end_match = re.search(r"\bendmodule\b", sv_code[header_end:])
+        if end_match:
+            module_end = header_end + end_match.start()
+            search_from = header_end + end_match.end()
+        else:
+            module_end = len(sv_code)
+            search_from = len(sv_code)
+        records.append((mod_name, header_text, sv_code[header_end:module_end]))
+
+        if search_from <= module_start:
+            search_from = module_start + len("module")
+    return records
+
+
+def _first_module_record(
+    sv_code: str,
+    module_name: str | None = None,
+) -> tuple[str, str, str]:
+    records = _module_records(sv_code)
+    if module_name:
+        for record in records:
+            if record[0] == module_name:
+                return record
+    if records:
+        return records[0]
+    return "", "", ""
+
+
+def _first_module_header(
+    sv_code: str,
+    module_name: str | None = None,
+) -> tuple[str, str]:
+    """Return a module name and ANSI port text without regex backtracking."""
+    mod_name, header_text, _ = _first_module_record(sv_code, module_name)
+    return mod_name, header_text
+
+
+def parse_module_name(sv_code: str, module_name: str | None = None) -> str:
+    """Parse a module name, allowing an optional parameter list."""
+    mod_name, _ = _first_module_header(sv_code, module_name)
+    return mod_name
+
+
+def parse_module_ports(
+    sv_code: str,
+    module_name: str | None = None,
+) -> tuple[str, list[tuple[str, str, str]]]:
+    """Parse a SystemVerilog module to get name and ports."""
+    mod_name, header_text, body_text = _first_module_record(sv_code, module_name)
+    if not mod_name:
         return "", []
-    mod_name = m.group(1)
+
     ports = []
+    if header_text and re.search(r"\b(?:input|output)\b", header_text):
+        current_direction = None
+        current_width = ""
+        for entry in _split_sv_commas(header_text):
+            m = re.match(
+                r"^(?:(input|output)\s+)?(?:(?:reg|logic|wire)\s*)?(?:signed\s*)?(\[[^\]]+\])?\s*([A-Za-z_]\w*)$",
+                entry,
+            )
+            if not m:
+                continue
+            if m.group(1):
+                current_direction = m.group(1)
+                current_width = ""
+            if m.group(2) is not None:
+                current_width = m.group(2)
+            if current_direction is None:
+                continue
+            typ = f"logic {current_width}".strip() if current_width else "logic"
+            ports.append((current_direction, typ, m.group(3)))
+        if ports:
+            return mod_name, ports
+
     for pm in re.finditer(
-        r"(input|output)\s+(logic(?:\s*\[\d+:\d+\])?)\s+(\w+)", sv_code
+        r"(input|output)\s+(?:(?:reg|logic|wire)\s*)?(?:signed\s*)?(\[[^\]]+\])?\s*([A-Za-z_]\w*)",
+        body_text,
     ):
-        direction, typ, name = pm.group(1), pm.group(2), pm.group(3)
+        direction, width, name = pm.group(1), pm.group(2), pm.group(3)
+        typ = f"logic {width}".strip() if width else "logic"
         ports.append((direction, typ, name))
     return mod_name, ports
 
@@ -93,11 +241,110 @@ def _port_width(typ: str) -> int:
     return 1
 
 
+def _strip_sv_comments(code: str) -> str:
+    code = re.sub(r"//.*", "", code)
+    return re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
+
+
+def _base_port_name(name: str) -> str:
+    name = name.lower()
+    return name[5:] if name.startswith("_gen_") else name
+
+
+def _port_alias_key(name: str) -> str:
+    base = _base_port_name(name)
+    compact = re.sub(r"[^a-z0-9]", "", base)
+    if compact == "input":
+        return "in"
+    if compact == "output":
+        return "out"
+    if compact == "clock":
+        return "clk"
+    if compact in {"reset", "rst", "areset", "arst"}:
+        return "rst"
+    if compact in {"resetn", "rstn", "aresetn", "arstn"}:
+        return "rstn"
+    compact = compact.replace("areset", "rst")
+    compact = compact.replace("reset", "rst")
+    compact = compact.replace("arst", "rst")
+    return compact
+
+
+def _ports_equivalent(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if _base_port_name(left) == _base_port_name(right):
+        return True
+    return _port_alias_key(left) == _port_alias_key(right)
+
+
+def _is_reset_like(name: str) -> bool:
+    base = _base_port_name(name)
+    compact = re.sub(r"[^a-z0-9]", "", base)
+    tokens = [t for t in re.split(r"[^a-z0-9]+", base) if t]
+    reset_tokens = {
+        "reset", "rst", "areset", "arst",
+        "resetn", "rstn", "aresetn", "arstn",
+        "resetni", "rstni", "aresetni", "arstni",
+        "resetb", "rstb",
+    }
+    reset_suffixes = tuple(reset_tokens - {"reset", "rst", "areset", "arst"})
+    return (
+        compact in reset_tokens
+        or compact.endswith(reset_suffixes)
+        or any(t in reset_tokens for t in tokens)
+    )
+
+
+def _is_active_low_reset(name: str) -> bool:
+    base = _base_port_name(name)
+    compact = re.sub(r"[^a-z0-9]", "", base)
+    return (
+        base.endswith(("_n", "_ni", "_b"))
+        or compact in {"resetn", "rstn", "aresetn", "arstn", "resetni", "rstni", "aresetni", "arstni", "resetb", "rstb"}
+        or compact.endswith(("resetn", "rstn", "aresetn", "arstn", "resetni", "rstni", "aresetni", "arstni", "resetb", "rstb"))
+    )
+
+
+def _reset_expr(name: str) -> str:
+    return f"~{name}" if _is_active_low_reset(name) else name
+
+
+def _has_async_reset_sensitivity(reset_name: str, sv_code: str) -> bool:
+    clean = _strip_sv_comments(sv_code).lower()
+    reset = re.escape(reset_name.lower())
+    for sens in re.findall(r"\balways(?:_ff)?\s*@\s*\(([^)]*)\)", clean, re.DOTALL):
+        if re.search(rf"\b(?:posedge|negedge)\s+{reset}\b", sens):
+            return True
+    return False
+
+
+def _async_reset_expr(
+    ref_inputs: list[tuple[str, str, str]],
+    ref_code: str = "",
+    prompt_text: str = "",
+) -> str | None:
+    reset_ports = [n for _, _, n in ref_inputs if _is_reset_like(n)]
+    if not reset_ports:
+        return None
+
+    prompt = prompt_text.lower()
+    for name in reset_ports:
+        base = _base_port_name(name)
+        if base.startswith(("areset", "arst")):
+            return _reset_expr(name)
+        if _has_async_reset_sensitivity(name, ref_code):
+            return _reset_expr(name)
+        if re.search(r"\b(?:async|asynchronous)\b", prompt) and base in prompt:
+            return _reset_expr(name)
+    return None
+
+
 def parse_ref_ports(ref_sv: str) -> list[tuple[str, str, str]]:
     """Parse RefModule ports from reference Verilog."""
     ports = []
     for m in re.finditer(
-        r"(input|output)\s+(?:reg\s+|logic\s+|wire\s+)?(\[[\d:]+\])?\s*(\w+)",
+        r"(input|output)\s+(?:reg\s*|logic\s*|wire\s*)?(?:signed\s*)?(\[[\d:]+\])?\s*([A-Za-z_]\w*)",
         ref_sv,
     ):
         direction = m.group(1)
@@ -108,37 +355,95 @@ def parse_ref_ports(ref_sv: str) -> list[tuple[str, str, str]]:
     return ports
 
 
-def _parse_ref_module_ports(ref_code: str) -> list[tuple[str, str, str]] | None:
+def _parse_ref_module_ports(
+    ref_code: str,
+    preferred_port_names: list[str] | None = None,
+) -> list[tuple[str, str, str]] | None:
     """Parse reference Verilog module to get ports in declaration order.
 
     Handles both ANSI and non-ANSI port styles, including comma-separated names.
-    Returns [(direction, width_str, name), ...] in module declaration order, or None.
+    If multiple modules exist, prefer the one whose ports overlap most with
+    preferred_port_names. Returns [(direction, width_str, name), ...] in module
+    declaration order, or None.
     """
-    mod_match = re.search(r"module\s+\w+\s*\(([^)]+)\)", ref_code)
-    if not mod_match:
-        return None
-    # Extract port names from module header (last token per comma-separated entry)
-    raw_names = [p.strip().split()[-1] for p in mod_match.group(1).split(",")]
-    clean_names = [n for n in raw_names if re.match(r"\w+$", n)]
-    if not clean_names:
-        return None
-
-    # Parse port declarations: input/output [reg|wire|logic] [width] name1 [, name2, ...]
-    port_info: dict[str, tuple[str, str]] = {}
-    for m in re.finditer(
-        r"(input|output)\s+(?:reg\s+|wire\s+|logic\s+)?(\[\d+:\d+\])?\s*([^;]+)",
+    module_matches = list(re.finditer(
+        r"module\s+(\w+)\s*(?:#\s*\((?:[^)(]+|\([^)(]*\))*\)\s*)?\((.*?)\)\s*;(.*?)endmodule",
         ref_code,
-    ):
-        direction = m.group(1)
-        width = f" {m.group(2)}" if m.group(2) else ""
-        for name in m.group(3).split(","):
-            name = name.strip()
-            if name and re.match(r"\w+$", name):
-                port_info[name] = (direction, width)
+        re.DOTALL,
+    ))
+    if not module_matches:
+        return None
 
-    return [(port_info.get(n, ("input", ""))[0],
-             port_info.get(n, ("input", ""))[1],
-             n) for n in clean_names]
+    preferred = set(preferred_port_names or [])
+    candidates: list[tuple[int, int, list[tuple[str, str, str]]]] = []
+
+    for mod_match in module_matches:
+        header = re.sub(r"//.*", "", mod_match.group(2))
+        header = re.sub(r"/\*.*?\*/", "", header, flags=re.DOTALL)
+        body = re.sub(r"//.*", "", mod_match.group(3))
+        body = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
+
+        ports = []
+        if re.search(r"\b(?:input|output)\b", header):
+            current_direction = None
+            current_width = ""
+            for entry in [p.strip() for p in header.split(",") if p.strip()]:
+                m = re.match(
+                    r"^(?:(input|output)\s+)?(?:(?:reg|logic|wire)\s*)?(?:signed\s*)?(\[[^\]]+\])?\s*([A-Za-z_]\w*)$",
+                    entry,
+                )
+                if not m:
+                    continue
+                if m.group(1):
+                    current_direction = m.group(1)
+                    current_width = ""
+                if m.group(2) is not None:
+                    current_width = f" {m.group(2)}"
+                if current_direction is None:
+                    continue
+                ports.append((current_direction, current_width, m.group(3)))
+        else:
+            raw_names = [p.strip().split()[-1] for p in header.split(",")]
+            clean_names = [n for n in raw_names if re.match(r"\w+$", n)]
+            if not clean_names:
+                continue
+
+            port_info: dict[str, tuple[str, str]] = {}
+            for m in re.finditer(
+                r"(input|output)\s+(?:reg\s*|wire\s*|logic\s*)?(?:signed\s*)?(\[[^\]]+\])?\s*([^;]+)",
+                body,
+            ):
+                direction = m.group(1)
+                width = f" {m.group(2)}" if m.group(2) else ""
+                for name in m.group(3).split(","):
+                    name = name.strip()
+                    if name and re.match(r"\w+$", name):
+                        port_info[name] = (direction, width)
+
+            ports = [
+                (port_info.get(n, ("input", ""))[0], port_info.get(n, ("input", ""))[1], n)
+                for n in clean_names
+            ]
+
+        if ports:
+            overlap = sum(1 for _, _, name in ports if name in preferred)
+            candidates.append((overlap, len(ports), ports))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def _rename_module_declaration(sv_code: str, old_name: str, new_name: str) -> str:
+    """Rename only the first module declaration."""
+    return re.sub(
+        rf"(\bmodule\s+){re.escape(old_name)}(\b)",
+        rf"\1{new_name}\2",
+        sv_code,
+        count=1,
+    )
 
 
 def generate_top_wrapper(
@@ -146,6 +451,8 @@ def generate_top_wrapper(
     sparkle_ports: list[tuple[str, str, str]],
     ref_ports: list[tuple[str, str, str]],
     sv_code: str = "",
+    ref_code: str = "",
+    prompt_text: str = "",
 ) -> str | None:
     """Generate a TopModule wrapper mapping ref ports to sparkle ports."""
     ref_inputs = [(d, t, n) for d, t, n in ref_ports if d == "input"]
@@ -161,7 +468,7 @@ def generate_top_wrapper(
     matched_sp = set()
     for _, _, rn in ref_user_inputs:
         for _, _, sn in sp_user_inputs:
-            if sn not in matched_sp and (sn == rn or sn == f"_gen_{rn}"):
+            if sn not in matched_sp and _ports_equivalent(sn, rn):
                 input_map[rn] = sn
                 matched_sp.add(sn)
                 break
@@ -184,7 +491,7 @@ def generate_top_wrapper(
         matched_sp_out = set()
         for _, _, rn in ref_outputs:
             for _, _, sn in sp_outputs:
-                if sn not in matched_sp_out and (sn == rn or sn == f"_gen_{rn}"):
+                if sn not in matched_sp_out and _ports_equivalent(sn, rn):
                     output_map[rn] = sn
                     matched_sp_out.add(sn)
                     break
@@ -212,15 +519,14 @@ def generate_top_wrapper(
 
     lines.append(f"    {sparkle_mod_name} dut (")
     inst_conns = []
+    async_reset = _async_reset_expr(ref_inputs, ref_code=ref_code, prompt_text=prompt_text)
 
     for _, _, sn in sp_inputs:
         if sn == "clk":
             inst_conns.append(f"        .clk(clk)")
         elif sn == "rst":
-            if "areset" in input_map:
-                inst_conns.append(f"        .rst(areset)")
-            elif "reset" in input_map:
-                inst_conns.append(f"        .rst(reset)")
+            if async_reset:
+                inst_conns.append(f"        .rst({async_reset})")
             else:
                 inst_conns.append(f"        .rst(1'b0)")
         else:
@@ -316,6 +622,647 @@ def generate_top_wrapper(
     else:
         for rn, sn in output_map.items():
             lines.append(f"    assign {rn} = {sn}_wire;")
+
+    lines.append("endmodule")
+    return "\n".join(lines)
+
+
+def _cvdp_split_commas(text: str) -> list[str]:
+    """Split a SystemVerilog comma list without splitting nested expressions."""
+    parts = []
+    start = 0
+    depth = 0
+    for idx, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}" and depth > 0:
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:idx].strip())
+            start = idx + 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _cvdp_normalize_type(width_or_type: str) -> str:
+    """Convert a parsed width/type fragment into a legal SV logic type."""
+    text = (width_or_type or "").strip()
+    if not text:
+        return "logic"
+    if re.match(r"^(?:logic|wire|reg)\b", text):
+        return text
+    return f"logic {text}"
+
+
+def _cvdp_numeric_width(typ: str) -> int | None:
+    """Return a concrete bit width when the declaration uses numeric bounds."""
+    m = re.search(r"\[\s*(\d+)\s*:\s*(\d+)\s*\]", typ)
+    if not m:
+        if "[" in (typ or "") and "]" in (typ or ""):
+            return None
+        return 1
+    return abs(int(m.group(1)) - int(m.group(2))) + 1
+
+
+def _cvdp_expr_numeric_width(expr: str, type_lookup: dict[str, str]) -> int | None:
+    """Return a concrete width for a simple field expression, honoring slices."""
+    text = expr.strip()
+    m = re.search(r"\[\s*(\d+)\s*:\s*(\d+)\s*\]\s*$", text)
+    if m:
+        return abs(int(m.group(1)) - int(m.group(2))) + 1
+    m = re.search(r"\[\s*(\d+)\s*\]\s*$", text)
+    if m:
+        return 1
+    name = _cvdp_expr_signal_name(text)
+    if not name:
+        return None
+    typ = type_lookup.get(name)
+    if name.startswith("_gen_"):
+        typ = typ or type_lookup.get(name[5:])
+    return _cvdp_numeric_width(typ or "")
+
+
+def _cvdp_port_width_decl(typ: str) -> str:
+    m = re.search(r"(\[[^\]]+\])", typ)
+    return f" {m.group(1)}" if m else ""
+
+
+def _cvdp_type_mentions_parameter(typ: str, params: set[str]) -> bool:
+    return any(re.search(rf"\b{re.escape(param)}\b", typ or "") for param in params)
+
+
+def _cvdp_expr_signal_name(expr: str) -> str | None:
+    """Return the signal identifier at the root of a simple SV expression."""
+    text = expr.strip()
+    text = re.sub(r"\[[^\]]+\]\s*$", "", text)
+    m = re.match(r"([A-Za-z_]\w*)$", text)
+    if m:
+        return m.group(1)
+    m = re.match(r"([A-Za-z_]\w*)", text)
+    return m.group(1) if m else None
+
+
+def _cvdp_signal_type_lookup(
+    sv_code: str,
+    sparkle_ports: list[tuple[str, str, str]],
+) -> dict[str, str]:
+    """Collect concrete widths for generated ports and internal SV signals."""
+    lookup: dict[str, str] = {}
+
+    def remember(name: str, typ: str) -> None:
+        norm = _cvdp_normalize_type(typ)
+        lookup.setdefault(name, norm)
+        if name.startswith("_gen_"):
+            lookup.setdefault(name[5:], norm)
+
+    for _, typ, name in sparkle_ports:
+        remember(name, typ)
+
+    clean = _strip_sv_comments(sv_code)
+    for m in re.finditer(
+        r"\b(?:logic|wire|reg)\s*(?:signed\s*)?(\[[^\]]+\])?\s*([^;]+);",
+        clean,
+        re.DOTALL,
+    ):
+        typ = _cvdp_normalize_type(m.group(1) or "")
+        for decl in _cvdp_split_commas(m.group(2)):
+            name_match = re.match(r"\s*([A-Za-z_]\w*)", decl.split("=", 1)[0].strip())
+            if name_match:
+                remember(name_match.group(1), typ)
+    return lookup
+
+
+def _cvdp_name_forms(name: str) -> set[str]:
+    base = _base_port_name(name)
+    forms = {base, re.sub(r"[^a-z0-9]", "", base)}
+    variants = {base}
+    for prefix in ("o_", "out_", "output_", "predict_branch_", "predict_"):
+        if base.startswith(prefix):
+            variants.add(base[len(prefix):])
+    for suffix in ("_bit", "_flag", "_val", "_value", "_out", "_output", "_bv", "_signal", "_reg", "_r", "_o"):
+        for item in list(variants):
+            if item.endswith(suffix):
+                variants.add(item[: -len(suffix)])
+    for item in variants:
+        if item:
+            forms.add(item)
+            forms.add(re.sub(r"[^a-z0-9]", "", item))
+    return {f for f in forms if f}
+
+
+def _cvdp_match_output_for_field(
+    field_expr: str,
+    expected_outputs: list[tuple[str, str, str]],
+    used_outputs: set[str],
+) -> tuple[str, str, str] | None:
+    """Map a packed concat field back to the benchmark output it represents."""
+    field_name = _cvdp_expr_signal_name(field_expr)
+    if not field_name:
+        return None
+    candidates = [p for p in expected_outputs if p[2] not in used_outputs]
+
+    match = _cvdp_match_port(field_name, candidates, direction="output")
+    if match:
+        return match
+
+    field_forms = _cvdp_name_forms(field_name)
+    scored: list[tuple[int, tuple[str, str, str]]] = []
+    for cand in candidates:
+        out_forms = _cvdp_name_forms(cand[2])
+        field_compact = re.sub(r"[^a-z0-9]", "", _base_port_name(field_name))
+        out_compact = re.sub(r"[^a-z0-9]", "", _base_port_name(cand[2]))
+        score = 0
+        if field_forms & out_forms:
+            score = 90
+        elif re.sub(r"[^a-z0-9]", "", _base_port_name(cand[2])) in field_forms:
+            score = 80
+        elif any(len(form) >= 4 and form in field_compact for form in out_forms):
+            score = 70
+        elif any(len(form) >= 4 and form in out_compact for form in field_forms):
+            score = 65
+        elif "pc" in out_forms and any(form.endswith("pc") for form in field_forms):
+            score = 60
+        if score:
+            scored.append((score, cand))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def _cvdp_concat_assignments(sv_code: str) -> dict[str, list[str]]:
+    clean = _strip_sv_comments(sv_code)
+    assigns: dict[str, list[str]] = {}
+    for m in re.finditer(
+        r"\bassign\s+([A-Za-z_]\w*)\s*=\s*\{([^;]+)\}\s*;",
+        clean,
+        re.DOTALL,
+    ):
+        assigns[m.group(1)] = _cvdp_split_commas(m.group(2))
+    return assigns
+
+
+def _cvdp_infer_concat_fields(sv_code: str, sp_out_name: str) -> list[str] | None:
+    """Infer raw SV fields packed into a Sparkle bundled output."""
+    clean = _strip_sv_comments(sv_code)
+    assigns = _cvdp_concat_assignments(clean)
+    direct = assigns.get(sp_out_name)
+    if direct is None:
+        indirect = re.search(
+            rf"\bassign\s+{re.escape(sp_out_name)}\s*=\s*([A-Za-z_]\w*)\s*;",
+            clean,
+        )
+        if indirect:
+            direct = assigns.get(indirect.group(1))
+    if direct is None:
+        return None
+
+    def expand(expr: str, seen: set[str]) -> list[str]:
+        name = _cvdp_expr_signal_name(expr)
+        if name and name.startswith("_tmp") and name in assigns and name not in seen:
+            out: list[str] = []
+            for child in assigns[name]:
+                out.extend(expand(child, seen | {name}))
+            return out
+        return [expr.strip()]
+
+    fields: list[str] = []
+    for item in direct:
+        fields.extend(expand(item, {sp_out_name}))
+    return fields
+
+
+def _cvdp_infer_bundled_output_mapping(
+    sv_code: str,
+    sp_out_name: str,
+    expected_outputs: list[tuple[str, str, str]],
+    sparkle_ports: list[tuple[str, str, str]],
+) -> list[tuple[tuple[str, str, str], str, str | None]]:
+    """Return MSB-first mapping from expected output ports to packed fields."""
+    fields = _cvdp_infer_concat_fields(sv_code, sp_out_name) or []
+    if not fields:
+        return []
+    type_lookup = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
+    used: set[str] = set()
+    mapping: list[tuple[tuple[str, str, str], str, str | None]] = []
+    for field in fields:
+        matched = _cvdp_match_output_for_field(field, expected_outputs, used)
+        if not matched:
+            continue
+        field_name = _cvdp_expr_signal_name(field) or ""
+        field_type = type_lookup.get(field_name)
+        if field_name.startswith("_gen_"):
+            field_type = field_type or type_lookup.get(field_name[5:])
+        mapping.append((matched, field, field_type))
+        used.add(matched[2])
+    return mapping
+
+
+def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
+    """Infer CVDP top-level ports/parameters touched by cocotb harnesses."""
+    py_files = {
+        str(path): str(content)
+        for path, content in harness_files.items()
+        if str(path).endswith(".py")
+    }
+    port_py_text = "\n\n".join(
+        content
+        for path, content in py_files.items()
+        if Path(path).name != "harness_library.py"
+    )
+    param_py_text = "\n\n".join(py_files.values())
+    id_names = set(re.findall(r"\bdut\._id\s*\(\s*[\"']([A-Za-z_]\w*)[\"']", port_py_text))
+    indexed_names = set(re.findall(r"\bdut\s*\[\s*[\"']([A-Za-z_]\w*)[\"']\s*\]", port_py_text))
+    all_names = (
+        set(re.findall(r"\bdut\.([A-Za-z_]\w*)\b", port_py_text))
+        | id_names
+        | indexed_names
+    ) - {"_log", "_id"}
+    assigned = set(
+        re.findall(r"\bdut\.([A-Za-z_]\w*)\.value\s*=(?!=)", port_py_text)
+    )
+    assigned.update(
+        re.findall(r"\bdut\._id\s*\(\s*[\"']([A-Za-z_]\w*)[\"'][^)]*\)\.value\s*=(?!=)", port_py_text)
+    )
+    assigned.update(
+        re.findall(r"\bdut\s*\[\s*[\"']([A-Za-z_]\w*)[\"']\s*\]\.value\s*=(?!=)", port_py_text)
+    )
+    assigned.update(re.findall(r"\bdut\.([A-Za-z_]\w*)\s*<=", port_py_text))
+    assigned.update(
+        re.findall(r"\bdut\s*\[\s*[\"']([A-Za-z_]\w*)[\"']\s*\]\s*<=", port_py_text)
+    )
+    clocked = set(re.findall(r"\bClock\s*\(\s*dut\.([A-Za-z_]\w*)\b", port_py_text))
+
+    params: set[str] = set()
+    for body in re.findall(r"\b(?:parameter|parameters)\s*=\s*\{([^}]+)\}", param_py_text):
+        params.update(re.findall(r"[\"']([A-Za-z_]\w*)[\"']\s*:", body))
+    params.update(
+        name for name in all_names
+        if name not in assigned
+        and name == name.upper()
+        and re.search(r"(?:^|_)(?:WIDTH|DEPTH|SIZE|THRESHOLD|PARAM|COUNT|NUM|NS|N)(?:_|$)", name)
+    )
+
+    clock_or_reset = {
+        n for n in all_names
+        if _is_reset_like(n) or "clk" in n.lower() or "clock" in n.lower()
+    }
+    inputs = set(assigned) | set(clocked) | clock_or_reset
+    ports = all_names - params
+    outputs = ports - inputs
+    return {
+        "ports": ports,
+        "inputs": inputs & ports,
+        "outputs": outputs,
+        "params": params,
+    }
+
+
+def _cvdp_parse_module_parameters(ref_code: str, usage_params: set[str]) -> list[str]:
+    """Parse parameter declarations from the reference/context module header."""
+    text = re.sub(r"//.*", "", ref_code)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    params: dict[str, str] = {}
+    module_re = re.compile(
+        r"module\s+\w+\s*#\s*\((?P<params>(?:[^)(]+|\([^)(]*\))*)\)\s*\(",
+        re.DOTALL,
+    )
+    for match in module_re.finditer(text):
+        for entry in _cvdp_split_commas(match.group("params")):
+            m = re.search(
+                r"\bparameter\b\s+(?:(?:integer|int|logic|bit)\s+)?"
+                r"(?:\[[^\]]+\]\s*)?(?P<name>[A-Za-z_]\w*)"
+                r"(?:\s*=\s*(?P<expr>.+))?$",
+                entry,
+                re.DOTALL,
+            )
+            if not m:
+                continue
+            name = m.group("name")
+            expr = (m.group("expr") or "1").strip()
+            params.setdefault(name, f"parameter {name} = {expr}")
+
+    for name in sorted(usage_params):
+        params.setdefault(name, f"parameter {name} = 1")
+    return list(params.values())
+
+
+def _cvdp_match_port(
+    name: str,
+    candidates: list[tuple[str, str, str]],
+    *,
+    direction: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Find a candidate port by exact, _gen_-stripped, or case-insensitive name."""
+    filtered = [p for p in candidates if direction is None or p[0] == direction]
+    wanted = [name, f"_gen_{name}"]
+    lowered = {n.lower() for n in wanted}
+    for port in filtered:
+        if port[2] in wanted:
+            return port
+    for port in filtered:
+        if port[2].lower() in lowered:
+            return port
+    for port in filtered:
+        if _ports_equivalent(port[2], name):
+            return port
+    return None
+
+
+def _cvdp_clock_or_reset_match(
+    sp_name: str,
+    expected_inputs: list[tuple[str, str, str]],
+) -> str | None:
+    names = [n for _, _, n in expected_inputs]
+    lower = {n.lower(): n for n in names}
+    if sp_name == "clk":
+        for cand in ("clk", "clock", "clk_i", "clk_in", "i_clk", "aclk", "ATTN_CLK"):
+            if cand.lower() in lower:
+                return lower[cand.lower()]
+        for n in names:
+            if "clk" in n.lower() or "clock" in n.lower():
+                return n
+    if sp_name == "rst":
+        for cand in ("rst", "reset", "srst", "rst_i", "rst_in", "reset_i", "reset_in", "reset_n", "rst_ni"):
+            if cand.lower() in lower:
+                return lower[cand.lower()]
+        for n in names:
+            nl = n.lower()
+            if "rst" in nl or "reset" in nl:
+                return n
+    return None
+
+
+def _cvdp_bridge_reset_expr(sp_name: str, matched_name: str) -> str:
+    if (
+        _is_reset_like(sp_name)
+        and _is_reset_like(matched_name)
+        and _is_active_low_reset(sp_name) != _is_active_low_reset(matched_name)
+    ):
+        return f"~{matched_name}"
+    return matched_name
+
+
+def _cvdp_infer_concat_order(sv_code: str, sp_out_name: str) -> list[str] | None:
+    """Infer names packed into a Sparkle bundled output, if visible."""
+    fields = _cvdp_infer_concat_fields(sv_code, sp_out_name)
+    if not fields:
+        return None
+    names = []
+    for field in fields:
+        name = _cvdp_expr_signal_name(field)
+        if name:
+            names.append(name[5:] if name.startswith("_gen_") else name)
+    return names or None
+
+
+def generate_cvdp_wrapper(
+    design_name: str,
+    sparkle_mod_name: str,
+    sparkle_ports: list[tuple[str, str, str]],
+    ref_code: str,
+    harness_files: dict,
+    sv_code: str = "",
+) -> str | None:
+    """Generate a CVDP top wrapper matching cocotb's expected DUT interface."""
+    usage = _cvdp_parse_harness_usage(harness_files)
+    preferred_names = sorted(usage["ports"] | usage["params"])
+    raw_ref_ports = _parse_ref_module_ports(ref_code, preferred_names) or []
+    ref_ports = [(d, _cvdp_normalize_type(t), n) for d, t, n in raw_ref_ports]
+
+    by_name = {n: (d, t, n) for d, t, n in ref_ports}
+    expected_ports = list(ref_ports)
+    sp_inputs = [(d, t, n) for d, t, n in sparkle_ports if d == "input"]
+    sp_outputs = [(d, t, n) for d, t, n in sparkle_ports if d == "output"]
+    bundled_type_by_output: dict[str, str] = {}
+    if len(sp_outputs) == 1:
+        candidate_output_names = sorted(
+            set(usage["outputs"]) | {n for d, _, n in ref_ports if d == "output"}
+        )
+        pseudo_outputs = [("output", "logic", n) for n in candidate_output_names]
+        for out_port, _, field_type in _cvdp_infer_bundled_output_mapping(
+            sv_code,
+            sp_outputs[0][2],
+            pseudo_outputs,
+            sparkle_ports,
+        ):
+            if field_type:
+                bundled_type_by_output[out_port[2]] = field_type
+
+    for name in sorted(usage["ports"]):
+        if name in by_name:
+            continue
+        sp_match = _cvdp_match_port(name, sparkle_ports)
+        if sp_match:
+            typ = sp_match[1]
+        elif name in usage["outputs"] and name in bundled_type_by_output:
+            typ = bundled_type_by_output[name]
+        elif name in usage["outputs"] and len(sp_outputs) == 1:
+            typ = sp_outputs[0][1]
+        else:
+            typ = "logic"
+        direction = "input" if name in usage["inputs"] else "output"
+        port = (direction, _cvdp_normalize_type(typ), name)
+        by_name[name] = port
+        expected_ports.append(port)
+
+    if bundled_type_by_output:
+        expected_ports = [
+            (d, bundled_type_by_output.get(n, t) if d == "output" else t, n)
+            for d, t, n in expected_ports
+        ]
+
+    if not expected_ports or not sparkle_mod_name:
+        return None
+
+    expected_inputs = [(d, t, n) for d, t, n in expected_ports if d == "input"]
+    expected_outputs = [(d, t, n) for d, t, n in expected_ports if d == "output"]
+    param_decls = _cvdp_parse_module_parameters(ref_code, usage["params"])
+    param_names = set(usage["params"])
+    for decl in param_decls:
+        m = re.search(r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)", decl)
+        if m:
+            param_names.add(m.group(1))
+
+    wrapper_notes: list[str] = []
+    if param_names:
+        wrapper_notes.append(
+            "benchmark parameters exposed by wrapper: "
+            + ", ".join(sorted(param_names))
+        )
+
+    def note_fixed_width_core_port(
+        sp_port: tuple[str, str, str],
+        expected: tuple[str, str, str] | None,
+    ) -> None:
+        if expected is None or not param_names:
+            return
+        _, sp_t, sp_n = sp_port
+        _, exp_t, exp_n = expected
+        if (
+            _cvdp_type_mentions_parameter(exp_t, param_names)
+            and _cvdp_numeric_width(sp_t) is not None
+            and not _cvdp_type_mentions_parameter(sp_t, param_names)
+        ):
+            wrapper_notes.append(
+                f"Sparkle core port {sp_n} has fixed type {sp_t} while "
+                f"benchmark port {exp_n} is parameterized as {exp_t}"
+            )
+
+    for sp_port in sp_inputs:
+        _, _, sn = sp_port
+        matched_name = _cvdp_clock_or_reset_match(sn, expected_inputs)
+        matched_port = None
+        if matched_name is not None:
+            matched_port = next((p for p in expected_inputs if p[2] == matched_name), None)
+        if matched_port is None:
+            base = sn[5:] if sn.startswith("_gen_") else sn
+            matched_port = _cvdp_match_port(base, expected_inputs, direction="input")
+        note_fixed_width_core_port(sp_port, matched_port)
+
+    for sp_port in sp_outputs:
+        _, _, sn = sp_port
+        base = sn[5:] if sn.startswith("_gen_") else sn
+        note_fixed_width_core_port(sp_port, _cvdp_match_port(base, expected_outputs, direction="output"))
+
+    lines = [f"module {design_name}"]
+    if param_decls:
+        lines.append(" #(")
+        lines.append(",\n".join(f"    {decl}" for decl in param_decls))
+        lines.append(")")
+    lines.append(" (")
+    lines.append(",\n".join(f"    {d} {t} {n}" for d, t, n in expected_ports))
+    lines.append(");")
+    lines.append("")
+    for note in wrapper_notes:
+        lines.append(f"    // CVDP adapter diagnostic: {note}")
+    if wrapper_notes:
+        lines.append("")
+
+    for _, t, n in sp_outputs:
+        lines.append(f"    {t} {n}_wire;")
+    if sp_outputs:
+        lines.append("")
+
+    lines.append(f"    {sparkle_mod_name} sparkle_dut (")
+    inst_conns = []
+    for d, _, sn in sparkle_ports:
+        if d == "output":
+            inst_conns.append(f"        .{sn}({sn}_wire)")
+            continue
+
+        matched = _cvdp_clock_or_reset_match(sn, expected_inputs)
+        if matched is None:
+            base = sn[5:] if sn.startswith("_gen_") else sn
+            match = _cvdp_match_port(base, expected_inputs, direction="input")
+            matched = match[2] if match else None
+        conn = _cvdp_bridge_reset_expr(sn, matched) if matched else "'0"
+        inst_conns.append(f"        .{sn}({conn})")
+
+    lines.append(",\n".join(inst_conns))
+    lines.append("    );")
+    lines.append("")
+
+    assigned_outputs: set[str] = set()
+    for _, _, rn in expected_outputs:
+        sp_match = _cvdp_match_port(rn, sp_outputs, direction="output")
+        if sp_match:
+            lines.append(f"    assign {rn} = {sp_match[2]}_wire;")
+            assigned_outputs.add(rn)
+
+    if len(sp_outputs) == 1:
+        sp_out_d, sp_out_t, sp_out_n = sp_outputs[0]
+        remaining = [(d, t, n) for d, t, n in expected_outputs if n not in assigned_outputs]
+        if len(remaining) == 1:
+            lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
+            assigned_outputs.add(remaining[0][2])
+        elif remaining:
+            sp_w = _cvdp_numeric_width(sp_out_t)
+            ref_widths = [(_cvdp_numeric_width(t), n) for _, t, n in remaining]
+            fields = _cvdp_infer_concat_fields(sv_code, sp_out_n) or []
+            type_lookup = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
+            field_assigned = False
+            if sp_w is not None and fields:
+                offset = sp_w
+                used_for_fields: set[str] = set()
+                field_assigns: list[tuple[str, int, int]] = []
+                unmatched_field_slices: list[tuple[str, int, int, int]] = []
+                all_widths_known = True
+                for field in fields:
+                    field_width = _cvdp_expr_numeric_width(field, type_lookup)
+                    if field_width is None:
+                        all_widths_known = False
+                        break
+                    high = offset - 1
+                    low = offset - field_width
+                    matched_out = _cvdp_match_output_for_field(
+                        field,
+                        remaining,
+                        used_for_fields,
+                    )
+                    matched_width = _cvdp_numeric_width(matched_out[1]) if matched_out else None
+                    if matched_out and (matched_width is None or matched_width == field_width):
+                        field_assigns.append((matched_out[2], high, low))
+                        used_for_fields.add(matched_out[2])
+                    else:
+                        unmatched_field_slices.append((field, high, low, field_width))
+                    offset -= field_width
+                if all_widths_known and offset == 0:
+                    for _, high, low, field_width in unmatched_field_slices:
+                        width_matches = [
+                            p for p in remaining
+                            if p[2] not in used_for_fields
+                            and _cvdp_numeric_width(p[1]) == field_width
+                        ]
+                        if len(width_matches) == 1:
+                            out_port = width_matches[0]
+                            field_assigns.append((out_port[2], high, low))
+                            used_for_fields.add(out_port[2])
+                    for n, high, low in field_assigns:
+                        if high == low:
+                            lines.append(f"    assign {n} = {sp_out_n}_wire[{low}];")
+                        else:
+                            lines.append(f"    assign {n} = {sp_out_n}_wire[{high}:{low}];")
+                        assigned_outputs.add(n)
+                    field_assigned = bool(field_assigns)
+
+            if (
+                not field_assigned
+                and sp_w is not None
+                and all(w is not None for w, _ in ref_widths)
+            ):
+                total = sum(w for w, _ in ref_widths if w is not None)
+                if total == sp_w:
+                    concat_order = _cvdp_infer_concat_order(sv_code, sp_out_n)
+                    remaining_names = {n for _, _, n in remaining}
+                    if (
+                        concat_order
+                        and len(concat_order) == len(remaining)
+                        and set(concat_order) == remaining_names
+                    ):
+                        ordered = [next(p for p in remaining if p[2] == name) for name in concat_order]
+                        offset = sp_w
+                        for _, t, n in ordered:
+                            width = _cvdp_numeric_width(t) or 1
+                            high = offset - 1
+                            low = offset - width
+                            if width == 1:
+                                lines.append(f"    assign {n} = {sp_out_n}_wire[{low}];")
+                            else:
+                                lines.append(f"    assign {n} = {sp_out_n}_wire[{high}:{low}];")
+                            assigned_outputs.add(n)
+                            offset -= width
+
+    for _, _, rn in expected_outputs:
+        if rn not in assigned_outputs:
+            lines.append(
+                f"    // CVDP adapter fallback: output {rn} was not mapped from Sparkle output; "
+                "drive zero so simulation reports a functional mismatch."
+            )
+            lines.append(f"    assign {rn} = '0;")
 
     lines.append("endmodule")
     return "\n".join(lines)
@@ -520,9 +1467,15 @@ class Evaluator:
         sparkle_mod_name: str, sparkle_ports: list[tuple[str, str, str]],
         run_dir: Path,
     ) -> tuple[str, int, str]:
-        """Run simulation — dispatches to VerilogEval or RTLLM mode."""
+        """Run simulation — dispatches to dataset-specific mode."""
         if self.dataset_name == "rtllm":
             return self._run_sim_rtllm(prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir)
+        if self.dataset_name == "cvdp":
+            return self._run_sim_cvdp(prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir)
+        if self.dataset_name == "resbench":
+            return self._run_sim_resbench(prob_id, sv_code, sparkle_mod_name, run_dir)
+        if self.dataset_name == "realbench":
+            return "not_run", -1, "RealBench functional evaluation is handled by the RealBench verifier"
         return self._run_sim_verilogeval(prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir)
 
     def _run_sim_verilogeval(
@@ -538,14 +1491,23 @@ class Evaluator:
             return "sim_error", -1, f"Missing ref or test SV for {prob_id}"
 
         ref_sv = ref_sv_path.read_text()
+        prompt_path = self.dataset_dir / f"{prob_id}_prompt.txt"
+        prompt_text = prompt_path.read_text(errors="replace") if prompt_path.exists() else ""
 
         # Generate wrapper
-        ref_ports = parse_ref_ports(ref_sv)
+        ref_ports = _parse_ref_module_ports(ref_sv) or parse_ref_ports(ref_sv)
 
         if not sparkle_mod_name:
             return "sim_error", -1, "Could not parse Sparkle module name"
 
-        wrapper = generate_top_wrapper(sparkle_mod_name, sparkle_ports, ref_ports, sv_code)
+        wrapper = generate_top_wrapper(
+            sparkle_mod_name,
+            sparkle_ports,
+            ref_ports,
+            sv_code,
+            ref_code=ref_sv,
+            prompt_text=prompt_text,
+        )
         if not wrapper:
             return "sim_error", -1, "Could not generate TopModule wrapper"
 
@@ -554,6 +1516,12 @@ class Evaluator:
         sim_dir.mkdir(parents=True, exist_ok=True)
         (sim_dir / "sparkle_dut.sv").write_text(sv_code)
         (sim_dir / "wrapper.sv").write_text(wrapper)
+        tb_copy = sim_dir / "testbench.sv"
+        tb_text = test_sv_path.read_text(errors="replace")
+        # Some VerilogEval testbenches dump tb_mismatch before its declaration.
+        # The signal is only for waveforms, and Icarus 13 rejects the forward reference.
+        tb_text = re.sub(r"\btb_mismatch\s*,\s*", "", tb_text)
+        tb_copy.write_text(tb_text)
 
         # Compile
         try:
@@ -563,7 +1531,7 @@ class Evaluator:
                     str(ref_sv_path),
                     str(sim_dir / "sparkle_dut.sv"),
                     str(sim_dir / "wrapper.sv"),
-                    str(test_sv_path),
+                    str(tb_copy),
                 ],
                 capture_output=True, text=True, timeout=30,
             )
@@ -707,6 +1675,245 @@ class Evaluator:
 
         return "sim_fail", -1, f"Design did not pass:\n{sim_output[:300]}"
 
+    def _run_sim_cvdp(
+        self, prob_id: str, sv_code: str,
+        sparkle_mod_name: str,
+        sparkle_ports: list[tuple[str, str, str]],
+        run_dir: Path,
+    ) -> tuple[str, int, str]:
+        """Run a CVDP cocotb harness in its Docker simulation image."""
+        if self.dataset_obj is None:
+            return "sim_error", -1, "CVDP dataset object not set on evaluator"
+
+        info = self.dataset_obj.load_problem(prob_id)
+        harness_files = info.metadata.get("harness_files", {})
+        verilog_sources = info.metadata.get("verilog_sources", [])
+        design_name = info.design_name
+        if not harness_files:
+            return "sim_error", -1, "CVDP harness files missing"
+        if not verilog_sources:
+            return "sim_error", -1, "CVDP VERILOG_SOURCES missing"
+
+        sim_dir = run_dir / "cvdp_sim" / prob_id
+        if sim_dir.exists():
+            shutil.rmtree(sim_dir)
+        sim_dir.mkdir(parents=True, exist_ok=True)
+
+        image_name = os.environ.get("OSS_SIM_IMAGE", "nvidia/cvdp-sim:v1.0.0")
+        for rel_path, content in harness_files.items():
+            out_path = sim_dir / rel_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if rel_path == "docker-compose.yml":
+                content = str(content).replace("__OSS_SIM_IMAGE__", image_name)
+            out_path.write_text(str(content))
+
+        target_mod_name, target_ports = parse_module_ports(sv_code, module_name=design_name)
+        if target_mod_name == design_name:
+            sparkle_mod_name, sparkle_ports = target_mod_name, target_ports
+        elif not sparkle_mod_name:
+            sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
+
+        if sparkle_mod_name:
+            inner_name = sparkle_mod_name
+            if sparkle_mod_name == design_name:
+                inner_name = f"{design_name}_sparkle_inner"
+                sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, inner_name)
+
+            wrapper = generate_cvdp_wrapper(
+                design_name=design_name,
+                sparkle_mod_name=inner_name,
+                sparkle_ports=sparkle_ports,
+                ref_code=info.ref_code,
+                harness_files=harness_files,
+                sv_code=sv_code,
+            )
+            if wrapper:
+                sv_code = f"{sv_code.rstrip()}\n\n{wrapper}\n"
+            elif sparkle_mod_name != design_name:
+                sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, design_name)
+
+        def local_source_path(source: str) -> Path:
+            if source.startswith("/code/"):
+                return sim_dir / source[len("/code/"):]
+            return sim_dir / source.lstrip("/")
+
+        primary = next(
+            (s for s in verilog_sources if design_name in Path(s).stem),
+            verilog_sources[0],
+        )
+        context_files = info.metadata.get("input_context_files", {})
+        for source in verilog_sources:
+            out_path = local_source_path(source)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            rel_source = str(out_path.relative_to(sim_dir))
+            context_code = str(context_files.get(rel_source, ""))
+            out_path.write_text(sv_code if source == primary else context_code)
+
+        sim_mode = os.environ.get("CVDP_SIM_MODE", "local").lower()
+        if sim_mode != "docker":
+            return self._run_sim_cvdp_local(sim_dir)
+
+        compose = ["docker", "compose"]
+        try:
+            check = subprocess.run(
+                compose + ["version"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if check.returncode != 0:
+                compose = ["docker-compose"]
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            compose = ["docker-compose"]
+
+        service = "direct"
+        compose_text = (sim_dir / "docker-compose.yml").read_text(errors="replace")
+        service_match = re.search(r"^\s{2}([A-Za-z0-9_-]+):\s*$", compose_text, re.MULTILINE)
+        if service_match:
+            service = service_match.group(1)
+
+        try:
+            proc = subprocess.run(
+                compose + [
+                    "-f", "docker-compose.yml",
+                    "up", "--abort-on-container-exit",
+                    "--exit-code-from", service,
+                ],
+                cwd=str(sim_dir),
+                capture_output=True, text=True, timeout=180,
+            )
+            cleanup = subprocess.run(
+                compose + ["-f", "docker-compose.yml", "down", "-v"],
+                cwd=str(sim_dir),
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return "sim_error", -1, "CVDP docker simulation timeout"
+        except FileNotFoundError as e:
+            return "sim_error", -1, f"Docker compose not found: {e}"
+
+        output = proc.stdout + proc.stderr
+        if "cleanup" in locals() and cleanup.stdout:
+            output += "\n[CLEANUP]\n" + cleanup.stdout
+        (sim_dir / "cvdp_output.txt").write_text(output)
+        tail = "\n".join(output.splitlines()[-40:])
+        if proc.returncode == 0:
+            return "sim_pass", 0, "CVDP harness passed"
+        if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
+            return "sim_fail", -1, f"CVDP harness failed:\n{tail[:1200]}"
+        return "sim_error", -1, f"CVDP harness error:\n{tail[:1200]}"
+
+    def _run_sim_cvdp_local(self, sim_dir: Path) -> tuple[str, int, str]:
+        """Run a CVDP harness directly with local pytest/cocotb and Icarus."""
+        env_file = sim_dir / "src" / ".env"
+        test_runner = sim_dir / "src" / "test_runner.py"
+        if not env_file.exists() or not test_runner.exists():
+            return "sim_error", -1, "CVDP local harness missing src/.env or src/test_runner.py"
+
+        env = os.environ.copy()
+        for raw_line in env_file.read_text(errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().replace("/code/", f"{sim_dir}/")
+            env[key] = value
+        env["PYTHONPATH"] = str(sim_dir / "src") + os.pathsep + env.get("PYTHONPATH", "")
+
+        rundir = sim_dir / "rundir"
+        rundir.mkdir(parents=True, exist_ok=True)
+        cache_dir = sim_dir / "harness" / ".cache"
+        timeout_s = int(os.environ.get("CVDP_LOCAL_TIMEOUT", "180"))
+        cmd = [
+            sys.executable, "-m", "pytest", "-s",
+            "-o", f"cache_dir={cache_dir}",
+            str(test_runner),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(rundir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+            output = stdout + stderr
+            (sim_dir / "cvdp_local_output.txt").write_text(output)
+            return "sim_error", -1, f"CVDP local simulation timeout after {timeout_s}s"
+
+        output = stdout + stderr
+        (sim_dir / "cvdp_local_output.txt").write_text(output)
+        tail = "\n".join(output.splitlines()[-40:])
+        if proc.returncode == 0:
+            return "sim_pass", 0, "CVDP local harness passed"
+        if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
+            return "sim_fail", -1, f"CVDP local harness failed:\n{tail[:1200]}"
+        return "sim_error", -1, f"CVDP local harness error:\n{tail[:1200]}"
+
+    def _run_sim_resbench(
+        self, prob_id: str, sv_code: str,
+        sparkle_mod_name: str, run_dir: Path,
+    ) -> tuple[str, int, str]:
+        """Run ResBench's embedded Icarus testbench."""
+        if self.dataset_obj is None:
+            return "sim_error", -1, "ResBench dataset object not set on evaluator"
+        info = self.dataset_obj.load_problem(prob_id)
+        testbench = info.metadata.get("testbench", "")
+        if not testbench:
+            return "sim_error", -1, "ResBench testbench missing"
+        if sparkle_mod_name and sparkle_mod_name != info.design_name:
+            sv_code = re.sub(
+                rf"\bmodule\s+{re.escape(sparkle_mod_name)}\b",
+                f"module {info.design_name}",
+                sv_code,
+                count=1,
+            )
+
+        sim_dir = run_dir / "sim" / prob_id
+        sim_dir.mkdir(parents=True, exist_ok=True)
+        dut_path = sim_dir / "dut.sv"
+        tb_path = sim_dir / "testbench.sv"
+        vvp_path = sim_dir / "sim.vvp"
+        dut_path.write_text(sv_code)
+        tb_path.write_text(testbench)
+
+        try:
+            comp = subprocess.run(
+                ["iverilog", "-g2012", "-o", str(vvp_path), str(dut_path), str(tb_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return "sim_error", -1, "ResBench iverilog timeout"
+        except FileNotFoundError:
+            return "sim_error", -1, "iverilog not found"
+        if comp.returncode != 0:
+            (sim_dir / "compile_error.txt").write_text(comp.stderr)
+            return "sim_error", -1, f"iverilog compile failed:\n{comp.stderr[:800]}"
+
+        try:
+            sim = subprocess.run(
+                ["vvp", str(vvp_path)],
+                capture_output=True, text=True, timeout=SIM_TIMEOUT,
+                cwd=str(sim_dir),
+            )
+        except subprocess.TimeoutExpired:
+            return "sim_error", -1, "ResBench simulation timeout"
+        output = sim.stdout + sim.stderr
+        (sim_dir / "sim_output.txt").write_text(output)
+        if RESBENCH_PASS_PATTERN.search(output):
+            return "sim_pass", 0, "All tests passed"
+        if "Some tests failed" in output or "FAIL" in output:
+            return "sim_fail", -1, output[-800:]
+        return "sim_error", -1, f"Could not parse ResBench output:\n{output[-800:]}"
+
     # ── Gate-Level Simulation (GLS) ──────────────────────────────────
 
     @staticmethod
@@ -746,6 +1953,13 @@ class Evaluator:
             stage: "post_synth" or "post_pnr"
         Returns dict with gls_{stage}_status and gls_{stage}_mismatches.
         """
+        if self.dataset_name in {"cvdp", "realbench"}:
+            key = "synth" if stage == "post_synth" else "pnr"
+            return {
+                f"gls_{key}_status": "not_run",
+                f"gls_{key}_mismatches": -1,
+            }
+
         # Locate netlist on local filesystem
         # ORFS naming: post-synth = 1_*_yosys.v, post-PnR = 6_1_merged.v or 6_final.v
         if stage == "post_synth":
@@ -764,7 +1978,7 @@ class Evaluator:
             }
         netlist_path = netlists[0]
 
-        if self.dataset_name == "rtllm":
+        if self.dataset_name in {"rtllm", "resbench"}:
             status, mismatches, detail = self._run_gls_rtllm(
                 prob_id, sv_code, sparkle_mod_name, sparkle_ports,
                 run_dir, synth_dir, netlist_path, stage,
@@ -797,10 +2011,19 @@ class Evaluator:
 
         # Regenerate wrapper (same as RTL sim)
         ref_sv = ref_sv_path.read_text()
-        ref_ports = parse_ref_ports(ref_sv)
+        prompt_path = self.dataset_dir / f"{prob_id}_prompt.txt"
+        prompt_text = prompt_path.read_text(errors="replace") if prompt_path.exists() else ""
+        ref_ports = _parse_ref_module_ports(ref_sv) or parse_ref_ports(ref_sv)
         if not sparkle_mod_name:
             return "sim_error", -1, "Could not parse Sparkle module name"
-        wrapper = generate_top_wrapper(sparkle_mod_name, sparkle_ports, ref_ports, sv_code)
+        wrapper = generate_top_wrapper(
+            sparkle_mod_name,
+            sparkle_ports,
+            ref_ports,
+            sv_code,
+            ref_code=ref_sv,
+            prompt_text=prompt_text,
+        )
         if not wrapper:
             return "sim_error", -1, "Could not generate TopModule wrapper"
 
@@ -937,9 +2160,11 @@ class Evaluator:
         sim_output = sim.stdout + sim.stderr
         (gls_dir / "gls_output.txt").write_text(sim_output)
 
-        # Parse RTLLM output
-        if RTLLM_PASS_PATTERN.search(sim_output):
-            return "sim_pass", 0, f"GLS {stage}: Your Design Passed"
+        # Parse RTLLM/ResBench output
+        if RTLLM_PASS_PATTERN.search(sim_output) or (
+            self.dataset_name == "resbench" and RESBENCH_PASS_PATTERN.search(sim_output)
+        ):
+            return "sim_pass", 0, f"GLS {stage}: Design passed"
 
         fail_m = re.search(r"(\d+)\s*/\s*\d+\s*failures", sim_output)
         if fail_m:
@@ -980,8 +2205,9 @@ class Evaluator:
 
         # Fallback for positional connections: use reference design port names
         ref_port_lookup: dict[str, tuple[str, str]] = {}
+        ref_ordered_for_reset = _parse_ref_module_ports(ref_code) if ref_code else None
         if not tb_ports and ref_code:
-            ref_ordered = _parse_ref_module_ports(ref_code)
+            ref_ordered = ref_ordered_for_reset
             if ref_ordered:
                 tb_ports = [name for _, _, name in ref_ordered]
                 ref_port_lookup = {name: (d, w) for d, w, name in ref_ordered}
@@ -1004,6 +2230,10 @@ class Evaluator:
                 if gen_name in sp_port_map:
                     sp_match = gen_name
                 else:
+                    alias_match = next((sn for sn in sp_port_map if _ports_equivalent(sn, pname)), None)
+                    if alias_match:
+                        sp_match = alias_match
+                if sp_match is None:
                     # Case-insensitive fallback
                     pl = pname.lower()
                     gen_lower = f"_gen_{pl}"
@@ -1070,6 +2300,8 @@ class Evaluator:
         # Instantiate Sparkle module
         lines.append(f"    {sparkle_mod_name} sparkle_dut (")
         inst_conns = []
+        ref_inputs = [(d, w, n) for d, w, n in (ref_ordered_for_reset or []) if d == "input"]
+        async_reset = _async_reset_expr(ref_inputs, ref_code=ref_code)
         for _, _, sn in sparkle_ports:
             # Check if this is a matched input
             matched_input = next(
@@ -1094,11 +2326,11 @@ class Evaluator:
                 clk_sig = "clk" if "clk" in tb_ports else "1'b0"
                 inst_conns.append(f"        .clk({clk_sig})")
             elif sn == "rst":
-                rst_sig = "rst" if "rst" in tb_ports else ("reset" if "reset" in tb_ports else "1'b0")
+                rst_sig = async_reset if async_reset else "1'b0"
                 inst_conns.append(f"        .rst({rst_sig})")
             elif sn.startswith("_gen_"):
                 base = sn[5:]
-                matched_tb = next((tp for tp in tb_ports if tp.lower() == base.lower()), None)
+                matched_tb = next((tp for tp in tb_ports if _ports_equivalent(tp, base)), None)
                 inst_conns.append(f"        .{sn}({matched_tb if matched_tb else sn})")
             else:
                 inst_conns.append(f"        .{sn}({sn})")

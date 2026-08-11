@@ -25,6 +25,7 @@ import Sparkle.Compiler.Elab
 
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
+open Sparkle.Library.RTL
 
 /-- <one-line docstring> -/
 def <func_name> {dom : DomainConfig}
@@ -66,6 +67,30 @@ def <func_name> {dom : DomainConfig}
 | `bundle2 a b` | Bundle two signals into a pair |
 | `Signal.map (f : α → β) (s : Signal dom α)` | Apply pure function (e.g., bit extract) |
 | `hw_cond default \| cond1 => val1 \| cond2 => val2` | Priority mux chain |
+
+## RTL Helper Library
+
+`import Sparkle` exposes `Sparkle.Library.RTL`. Prefer these helpers for common
+real-world RTL idioms instead of inventing ad-hoc code each time:
+
+| Helper | Purpose |
+|--------|---------|
+| `boolToBV1 b` / `bv1ToBool x` | Convert between `Signal dom Bool` and 1-bit BitVec |
+| `bit x i` / `bitBool x i` | Extract bit `i` (`i = 0` is LSB) |
+| `slice x lo` | Extract a fixed-width slice; add a type annotation for the result width |
+| `trunc x` / `zext x` | Truncate or zero-extend with result width inferred from type |
+| `isZero x` / `nonZero x` / `allOnes x` | Reduction-style comparisons |
+| `dff init d` / `dffe init en d` | Register aliases, with or without enable |
+| `resetHigh init rst next` / `resetLow init rstN next` | Reset mux before a register |
+| `syncRam1R1W` | Synchronous 1R1W RAM, 1-cycle read latency |
+| `regFile1R1W` | Register-file style 1R1W storage with combinational read |
+| `reverseBits8/16/32 x` | Fixed-width bit reversal helpers |
+| `popCount8/16/32 x` | Fixed-width popcount helpers |
+| `priorityEncodeLsb8/16/32 x` | Fixed-width LSB-priority encoder helpers |
+
+For CVDP/real-world-IP style tasks, read `Benchmark/RTLIdioms.lean` first. It shows
+synthesizable patterns for slicing, multi-output packing, reset/enable registers, and
+small register-file memories.
 
 ## Constants
 - BitVec literal: `N#W` where N is the value and W is the bit width
@@ -131,6 +156,12 @@ def myFSM {dom : DomainConfig}
 7. Use `Signal.map` for bit extraction/manipulation from pure functions
 8. Bit widths must match exactly — no implicit truncation
 9. Use `Signal.circuit` with `<~` for imperative-style register assignment
+10. For parameterized/generate-like logic, prefer fixed-width helpers (`slice`, `bit`,
+    `reverseBits8/16/32`, `popCount8/16/32`) or explicit bit-slice chains. Avoid generic
+    higher-order folds in synthesized code unless you have verified they lower to Verilog.
+11. For memory/register-file tasks, prefer `syncRam1R1W` or `regFile1R1W`; preserve the
+    required read latency from the Verilog/testbench.
+12. For protocols/FSMs, explicitly model valid/ready, reset polarity, and output latency.
 
 ## Your Workflow
 

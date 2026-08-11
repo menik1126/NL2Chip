@@ -133,6 +133,12 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
       s!"{indent}always_ff @(negedge {sanitizeName baseClock}) begin\n" ++
       s!"{indent}    {sanitizeName output} <= {emitExpr input};\n" ++
       s!"{indent}end"
+    -- If clock name ends with "__norst", emit posedge trigger without reset
+    else if clock.endsWith "__norst" then
+      let baseClock := clock.dropRight 7
+      s!"{indent}always_ff @(posedge {sanitizeName baseClock}) begin\n" ++
+      s!"{indent}    {sanitizeName output} <= {emitExpr input};\n" ++
+      s!"{indent}end"
     else
       s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge {sanitizeName reset}) begin\n" ++
       s!"{indent}    if ({sanitizeName reset})\n" ++

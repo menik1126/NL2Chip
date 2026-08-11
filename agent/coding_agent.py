@@ -7,6 +7,7 @@ Uses the Anthropic API with tool_use to give the agent real coding capabilities.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -179,8 +180,17 @@ MAX_GREP_RESULTS = 200
 MAX_GLOB_RESULTS = 500
 BASH_TIMEOUT = 120
 MAX_TURNS = 80
-API_MAX_RETRIES = 10
-API_BASE_DELAY = 30
+DEFAULT_HISTORY_WINDOW = 10
+API_MAX_RETRIES = int(os.environ.get("SPARKLE_API_MAX_RETRIES", "20"))
+API_BASE_DELAY = int(os.environ.get("SPARKLE_API_BASE_DELAY", "30"))
+API_MAX_DELAY = int(os.environ.get("SPARKLE_API_MAX_DELAY", "300"))
+RETRIABLE_PROVIDER_ERROR_PATTERNS = (
+    "价格尚未由管理员配置",
+    "has not been priced by administrator",
+    "has not been priced by the administrator",
+    "upstream request failed",
+    "provider error",
+)
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -197,6 +207,57 @@ def load_env(path: Path) -> dict[str, str]:
             v = v.strip().strip("'\"")
             env[k.strip()] = v
     return env
+
+
+def _error_text(exc: Exception) -> str:
+    """Best-effort extraction of provider error text."""
+    pieces = [str(exc)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            pieces.extend(str(v) for v in err.values() if v)
+        elif err:
+            pieces.append(str(err))
+    return " ".join(p for p in pieces if p).lower()
+
+
+def is_retriable_api_error(exc: Exception) -> bool:
+    """Return True for transient Anthropic/provider failures worth retrying."""
+    if isinstance(exc, (anthropic.RateLimitError, anthropic.APIConnectionError)):
+        return True
+    if not isinstance(exc, anthropic.APIStatusError):
+        return False
+    if exc.status_code >= 500 or exc.status_code == 429:
+        return True
+    if exc.status_code == 400:
+        text = _error_text(exc)
+        return any(pattern in text for pattern in RETRIABLE_PROVIDER_ERROR_PATTERNS)
+    return False
+
+
+def retry_delay_seconds(attempt: int) -> int:
+    """Exponential backoff with a hard cap."""
+    return min(API_BASE_DELAY * (2 ** attempt), API_MAX_DELAY)
+
+
+def create_message_with_retries(client: anthropic.Anthropic, **kwargs):
+    """Call client.messages.create with retry handling for transient provider errors."""
+    last_exc = None
+    for attempt in range(API_MAX_RETRIES):
+        try:
+            return client.messages.create(**kwargs)
+        except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
+            last_exc = exc
+            if not is_retriable_api_error(exc) or attempt == API_MAX_RETRIES - 1:
+                raise
+            delay = retry_delay_seconds(attempt)
+            print(f"  [Agent] {getattr(exc, 'status_code', '?')} error, retrying in {delay}s...")
+            time.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("client.messages.create failed without raising an exception")
 
 
 class CodingAgent:
@@ -232,6 +293,8 @@ class CodingAgent:
         user_message: str,
         *,
         max_turns: int = MAX_TURNS,
+        compact_history: bool = False,
+        history_window: int = DEFAULT_HISTORY_WINDOW,
     ) -> dict:
         """Run the coding agent with a system prompt and user message.
 
@@ -240,6 +303,8 @@ class CodingAgent:
         messages = [{"role": "user", "content": user_message}]
         total_input = 0
         total_output = 0
+        tool_counts: dict[str, int] = {}
+        compile_checks = 0
 
         # Select tools: include lean_check only if REPL is available
         tools = self._get_tools()
@@ -256,24 +321,27 @@ class CodingAgent:
             })
 
         for turn in range(max_turns):
-            for attempt in range(API_MAX_RETRIES):
-                try:
-                    response = self.client.messages.create(
-                        model=self.model,
-                        max_tokens=self.max_tokens,
-                        system=system_prompt,
-                        tools=tools,
-                        messages=messages,
-                    )
-                    break
-                except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError) as e:
-                    if isinstance(e, anthropic.APIStatusError) and e.status_code < 500 and e.status_code != 429:
-                        raise
-                    if attempt == API_MAX_RETRIES - 1:
-                        raise
-                    delay = min(API_BASE_DELAY * (2 ** attempt), 300)
-                    print(f"  [Agent] {getattr(e, 'status_code', '?')} error, retrying in {delay}s...")
-                    time.sleep(delay)
+            request_messages, compacted = self._messages_for_request(
+                messages,
+                compact_history=compact_history,
+                history_window=history_window,
+            )
+            if compacted and log_file:
+                self._log_event(log_file, {
+                    "type": "context_compacted",
+                    "turn": turn,
+                    "full_messages": len(messages),
+                    "request_messages": len(request_messages),
+                    "history_window": history_window,
+                })
+            response = create_message_with_retries(
+                self.client,
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system_prompt,
+                tools=tools,
+                messages=request_messages,
+            )
 
             total_input += response.usage.input_tokens
             total_output += response.usage.output_tokens
@@ -290,6 +358,13 @@ class CodingAgent:
             for block in response.content:
                 if block.type != "tool_use":
                     continue
+                tool_counts[block.name] = tool_counts.get(block.name, 0) + 1
+                if block.name in ("lean_check", "lean_proof_step"):
+                    compile_checks += 1
+                elif block.name == "bash":
+                    command = str(block.input.get("command", ""))
+                    if re.search(r"\b(lake\s+build|lake\s+env\s+lean|lean\s+)", command):
+                        compile_checks += 1
                 result = self._execute_tool(block.name, block.input)
                 tool_results.append({
                     "type": "tool_result",
@@ -297,13 +372,9 @@ class CodingAgent:
                     "content": result,
                 })
                 if log_file:
-                    self._log_event(log_file, {
-                        "type": "tool_execution",
-                        "turn": turn,
-                        "tool_name": block.name,
-                        "tool_input": block.input,
-                        "tool_result_preview": result[:2000],
-                    })
+                    self._log_tool_execution(
+                        log_file, turn, block.id, block.name, block.input, result
+                    )
 
             if not tool_results:
                 break
@@ -313,13 +384,17 @@ class CodingAgent:
             "input_tokens": total_input,
             "output_tokens": total_output,
             "turns": turn + 1,
+            "tool_counts": tool_counts,
+            "compile_checks": compile_checks,
             "messages": messages,
         }
         if log_file:
             self._log_event(log_file, {"type": "session_end",
                                        "input_tokens": total_input,
                                        "output_tokens": total_output,
-                                       "turns": turn + 1})
+                                       "turns": turn + 1,
+                                       "tool_counts": tool_counts,
+                                       "compile_checks": compile_checks})
         return stats
 
     def resume(
@@ -329,6 +404,8 @@ class CodingAgent:
         feedback_message: str,
         *,
         max_turns: int = MAX_TURNS,
+        compact_history: bool = False,
+        history_window: int = DEFAULT_HISTORY_WINDOW,
     ) -> dict:
         """Resume an existing agent conversation with a new feedback message.
 
@@ -346,6 +423,8 @@ class CodingAgent:
 
         total_input = 0
         total_output = 0
+        tool_counts: dict[str, int] = {}
+        compile_checks = 0
 
         # Select tools: include lean_check only if REPL is available
         tools = self._get_tools()
@@ -361,24 +440,27 @@ class CodingAgent:
             })
 
         for turn in range(max_turns):
-            for attempt in range(API_MAX_RETRIES):
-                try:
-                    response = self.client.messages.create(
-                        model=self.model,
-                        max_tokens=self.max_tokens,
-                        system=system_prompt,
-                        tools=tools,
-                        messages=messages,
-                    )
-                    break
-                except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError) as e:
-                    if isinstance(e, anthropic.APIStatusError) and e.status_code < 500 and e.status_code != 429:
-                        raise
-                    if attempt == API_MAX_RETRIES - 1:
-                        raise
-                    delay = min(API_BASE_DELAY * (2 ** attempt), 300)
-                    print(f"  [Agent] {getattr(e, 'status_code', '?')} error, retrying in {delay}s...")
-                    time.sleep(delay)
+            request_messages, compacted = self._messages_for_request(
+                messages,
+                compact_history=compact_history,
+                history_window=history_window,
+            )
+            if compacted and log_file:
+                self._log_event(log_file, {
+                    "type": "context_compacted",
+                    "turn": turn,
+                    "full_messages": len(messages),
+                    "request_messages": len(request_messages),
+                    "history_window": history_window,
+                })
+            response = create_message_with_retries(
+                self.client,
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system_prompt,
+                tools=tools,
+                messages=request_messages,
+            )
 
             total_input += response.usage.input_tokens
             total_output += response.usage.output_tokens
@@ -395,6 +477,13 @@ class CodingAgent:
             for block in response.content:
                 if block.type != "tool_use":
                     continue
+                tool_counts[block.name] = tool_counts.get(block.name, 0) + 1
+                if block.name in ("lean_check", "lean_proof_step"):
+                    compile_checks += 1
+                elif block.name == "bash":
+                    command = str(block.input.get("command", ""))
+                    if re.search(r"\b(lake\s+build|lake\s+env\s+lean|lean\s+)", command):
+                        compile_checks += 1
                 result = self._execute_tool(block.name, block.input)
                 tool_results.append({
                     "type": "tool_result",
@@ -402,13 +491,9 @@ class CodingAgent:
                     "content": result,
                 })
                 if log_file:
-                    self._log_event(log_file, {
-                        "type": "tool_execution",
-                        "turn": turn,
-                        "tool_name": block.name,
-                        "tool_input": block.input,
-                        "tool_result_preview": result[:2000],
-                    })
+                    self._log_tool_execution(
+                        log_file, turn, block.id, block.name, block.input, result
+                    )
 
             if not tool_results:
                 break
@@ -418,14 +503,91 @@ class CodingAgent:
             "input_tokens": total_input,
             "output_tokens": total_output,
             "turns": turn + 1,
+            "tool_counts": tool_counts,
+            "compile_checks": compile_checks,
             "messages": messages,
         }
         if log_file:
             self._log_event(log_file, {"type": "resume_end",
                                        "input_tokens": total_input,
                                        "output_tokens": total_output,
-                                       "turns": turn + 1})
+                                       "turns": turn + 1,
+                                       "tool_counts": tool_counts,
+                                       "compile_checks": compile_checks})
         return stats
+
+    def resume_compact(
+        self,
+        system_prompt: str,
+        compact_message: str,
+        *,
+        max_turns: int = MAX_TURNS,
+        label: str = "compact_repair",
+        compact_history: bool = True,
+        history_window: int = DEFAULT_HISTORY_WINDOW,
+    ) -> dict:
+        """Resume with a compact, fresh prompt instead of the full prior history."""
+        if self.log_dir:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = self.log_dir / "agent_session.jsonl"
+            self._log_event(log_file, {
+                "type": "compact_resume_start",
+                "label": label,
+                "model": self.model,
+                "prompt_chars": len(compact_message),
+                "prompt_preview": compact_message[:500],
+            })
+
+        stats = self.run(
+            system_prompt=system_prompt,
+            user_message=compact_message,
+            max_turns=max_turns,
+            compact_history=compact_history,
+            history_window=history_window,
+        )
+        stats["compact_context"] = True
+        stats["compact_label"] = label
+        return stats
+
+    # ── Context compaction helpers ───────────────────────────────
+
+    @staticmethod
+    def _is_tool_result_message(message: dict) -> bool:
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, list):
+            return False
+        return any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+
+    @classmethod
+    def _messages_for_request(
+        cls,
+        messages: list[dict],
+        *,
+        compact_history: bool,
+        history_window: int,
+    ) -> tuple[list[dict], bool]:
+        """Return a compact request view while keeping the caller's full history intact."""
+        history_window = max(2, history_window)
+        if not compact_history or len(messages) <= history_window + 2:
+            return messages, False
+
+        tail = list(messages[-history_window:])
+        while tail and cls._is_tool_result_message(tail[0]):
+            tail = tail[1:]
+        if not tail:
+            tail = []
+
+        omitted = max(0, len(messages) - len(tail) - 1)
+        note = {
+            "role": "user",
+            "content": (
+                "Context compaction notice: older assistant/tool turns are omitted from this API request "
+                f"({omitted} messages omitted). The files on disk are the source of truth. "
+                "If you need prior code or context, use read_file/grep/list_directory. "
+                "Focus on the current file state and the most recent tool feedback."
+            ),
+        }
+        return [messages[0], note, *tail], True
 
     # ── Logging helpers ──────────────────────────────────────────
 
@@ -435,6 +597,37 @@ class CodingAgent:
         event["timestamp"] = datetime.now(timezone.utc).isoformat()
         with open(log_file, "a") as f:
             f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+    @staticmethod
+    def _log_tool_execution(
+        log_file: Path,
+        turn: int,
+        tool_use_id: str,
+        tool_name: str,
+        tool_input: dict,
+        result: str,
+    ) -> None:
+        encoded = result.encode("utf-8", errors="replace")
+        digest = hashlib.sha256(encoded).hexdigest()
+        safe_tool = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_name)[:64]
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_use_id)[:64]
+
+        result_dir = log_file.parent / "tool_results"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        result_path = result_dir / f"turn_{turn:03d}_{safe_tool}_{safe_id}.txt"
+        result_path.write_text(result, encoding="utf-8")
+
+        CodingAgent._log_event(log_file, {
+            "type": "tool_execution",
+            "turn": turn,
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "tool_result_preview": result[:2000],
+            "tool_result_path": str(result_path.relative_to(log_file.parent)),
+            "tool_result_bytes": len(encoded),
+            "tool_result_sha256": digest,
+        })
 
     @staticmethod
     def _log_assistant_turn(log_file: Path, turn: int, response) -> None:

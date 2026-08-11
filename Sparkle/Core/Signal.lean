@@ -164,6 +164,20 @@ def registerNeg (init : α) (input : Signal dom α) : Signal dom α :=
     | n + 1 => input.val n⟩
 
 /--
+  Positive-edge-triggered D flip-flop without a reset port.
+
+  Semantically identical to `register` (same single-cycle delay model),
+  but the compiler emits `always_ff @(posedge clk)` with NO reset port
+  in the generated SystemVerilog.
+
+  Use this when the target module interface has no reset signal.
+-/
+def registerNoReset (init : α) (input : Signal dom α) : Signal dom α :=
+  ⟨fun t => match t with
+    | 0 => init
+    | n + 1 => input.val n⟩
+
+/--
   Register with enable signal.
 
   When enable is true: register updates normally

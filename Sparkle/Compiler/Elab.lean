@@ -1262,6 +1262,19 @@ mutual
       let w ← CompilerM.emitRegister hint "clk__neg" "rst" (.ref inputWire) initVal hwType (named := isNamed)
       return some w
 
+    -- Signal.registerNoReset: posedge-triggered register without reset port
+    if name.toString.endsWith ".registerNoReset" && args.size >= 2 then
+      trace[sparkle.compiler] "→ registerNoReset"
+      let init := args[args.size-2]!
+      let input := args[args.size-1]!
+      let (initVal, _) ← extractBitVecLiteral init
+      let inputWire ← translateExprToWire input "reg_input"
+      let exprType ← CompilerM.liftMetaM (inferType e)
+      let hwType ← inferHWTypeFromSignal exprType
+      -- Use "clk__norst" as clock name; backend detects suffix and emits @(posedge clk) without reset
+      let w ← CompilerM.emitRegister hint "clk__norst" "rst" (.ref inputWire) initVal hwType (named := isNamed)
+      return some w
+
     -- Signal.registerWithEnable: register with conditional update
     if name.toString.endsWith ".registerWithEnable" && args.size >= 3 then
       trace[sparkle.compiler] "→ registerWithEnable"
@@ -1574,9 +1587,17 @@ mutual
         | .memory .. => true
         | _ => false
       )
+      -- Check if any register uses reset (clock name doesn't end with __neg or __norst)
+      let hasResetRegisters := module.body.any (fun stmt =>
+        match stmt with
+        | .register _ clock _ _ _ => !(clock.endsWith "__neg" || clock.endsWith "__norst")
+        | .memory .. => true
+        | _ => false
+      )
       if hasRegisters then
         module := module.addInput { name := "clk", ty := .bit }
-        module := module.addInput { name := "rst", ty := .bit }
+        if hasResetRegisters then
+          module := module.addInput { name := "rst", ty := .bit }
       return (module, finalCircuitState.design)
     | _ =>
       throwError s!"Cannot synthesize {declName}: not a definition"
