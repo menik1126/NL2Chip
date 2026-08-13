@@ -9,6 +9,10 @@
   localparam, integer, for loops, generate if/endgenerate.
 -/
 
+import Sparkle.IR.Type
+
+open Sparkle.IR.Type
+
 namespace Tools.SVParser.AST
 
 /-- Verilog numeric literal with optional width and base -/
@@ -31,7 +35,7 @@ inductive SVUnaryOp where
 /-- Binary operators -/
 inductive SVBinOp where
   -- Arithmetic
-  | add | sub | mul
+  | add | sub | mul | pow
   -- Bitwise
   | bitAnd | bitOr | bitXor
   -- Shift
@@ -50,10 +54,13 @@ inductive SVExpr where
   | binary  (op : SVBinOp) (lhs rhs : SVExpr)
   | ternary (cond then_ else_ : SVExpr)
   | index   (arr : SVExpr) (idx : SVExpr)
-  | slice   (expr : SVExpr) (hi lo : Nat)
+  /-- Constant part-select.  Bounds remain syntax expressions until lowering so
+      parameterized ranges such as `[W-1:0]` are not guessed as 32 bits. -/
+  | slice   (expr : SVExpr) (hi lo : DimExpr)
   | partSelectPlus (expr : SVExpr) (base : SVExpr) (width : SVExpr)  -- [base +: width]
   | concat  (args : List SVExpr)
   | repeat_ (count : SVExpr) (value : SVExpr)  -- {n{expr}}
+  | sizedCast (width : DimExpr) (value : SVExpr)
   deriving Repr, BEq
 
 /-- Statements (inside always blocks) -/
@@ -83,24 +90,24 @@ inductive SVPortDir where
 structure SVPort where
   dir    : SVPortDir
   isReg  : Bool := false            -- output reg
-  width  : Option (Nat × Nat)       -- [hi:lo] or none for 1-bit
+  width  : Option (DimExpr × DimExpr) -- [hi:lo] or none for 1-bit
   name   : String
   deriving Repr, BEq
 
 /-- Parameter declaration -/
 structure SVParam where
   name     : String
-  width    : Option (Nat × Nat)     -- optional [hi:lo]
+  width    : Option (DimExpr × DimExpr) -- optional [hi:lo]
   value    : SVExpr                 -- default value expression
   isLocal  : Bool := false          -- localparam vs parameter
   deriving Repr, BEq
 
 /-- Module-level items -/
 inductive SVModuleItem where
-  | wireDecl      (name : String) (width : Option (Nat × Nat))
+  | wireDecl      (name : String) (width : Option (DimExpr × DimExpr))
                   (initExpr : Option SVExpr)              -- wire [w] x = expr;
-  | regDecl       (name : String) (width : Option (Nat × Nat))
-                  (arraySize : Option Nat)                -- reg [w] x [0:N];
+  | regDecl       (name : String) (width : Option (DimExpr × DimExpr))
+                  (arraySize : Option DimExpr)            -- reg [w] x [0:N];
   | integerDecl   (name : String)                         -- integer i;
   | paramDecl     (param : SVParam)                       -- parameter/localparam
   | contAssign    (lhs rhs : SVExpr)                      -- assign lhs = rhs;
@@ -112,6 +119,10 @@ inductive SVModuleItem where
                   (paramOverrides : List (String × SVExpr) := [])
   | taskDecl      (name : String) (body : List SVStmt)    -- task ... endtask
   | readmemh      (filename : String) (memName : String)  -- $readmemh("file", mem)
+  /-- Sparkle emits elaboration-time validation guards.  They are represented
+      explicitly so lowering can discard only these canonical diagnostics
+      while continuing to reject ordinary parameter-dependent generate logic. -/
+  | validationGuard (cond : SVExpr)
   deriving Repr, BEq
 
 /-- A parsed Verilog module -/

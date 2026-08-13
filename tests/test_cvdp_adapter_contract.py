@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "agent"))
 
 from dataset import ProblemInfo  # noqa: E402
-from evaluator import Evaluator, generate_cvdp_wrapper, parse_module_ports  # noqa: E402
-from search import format_benchmark_interface_contract  # noqa: E402
+from evaluator import (  # noqa: E402
+    CVDP_PARAMETERIZATION_UNSUPPORTED,
+    CVDPAdapterContractError,
+    Evaluator,
+    _cvdp_parameter_override_analysis,
+    generate_cvdp_wrapper,
+    parse_module_ports,
+)
+from search import classify_failure_record, format_benchmark_interface_contract  # noqa: E402
 
 
 def _cvdp_info(
@@ -34,6 +44,24 @@ def _cvdp_info(
             "verilog_sources": [f"/code/rtl/{design_name}.sv"],
         },
     )
+
+
+def test_parse_module_ports_preserves_multiple_symbolic_dimensions():
+    module_name, ports = parse_module_ports(
+        """
+        module generic_vector #(parameter size = 4) (
+            input logic [7:0] [(size - 1):0] _gen_sig,
+            output logic [7:0] [(size - 1):0] out
+        );
+        endmodule
+        """
+    )
+
+    assert module_name == "generic_vector"
+    assert ports == [
+        ("input", "logic [7:0] [(size - 1):0]", "_gen_sig"),
+        ("output", "logic [7:0] [(size - 1):0]", "out"),
+    ]
 
 
 def test_cvdp_contract_lists_parameter_sweep_values():
@@ -64,10 +92,29 @@ def test_cvdp_contract_lists_parameter_sweep_values():
 
     contract = format_benchmark_interface_contract(info)
 
-    assert "Benchmark parameters referenced by harness: DATA_WIDTH, FILO_DEPTH" in contract
+    assert "Benchmark parameters required by reference/harness: DATA_WIDTH, FILO_DEPTH" in contract
     assert "DATA_WIDTH={10, 12}" in contract
     assert "FILO_DEPTH={12, 16}" in contract
-    assert "do not merely expose Verilog parameters" in contract
+    assert "fixed Sparkle core behind a parameterized wrapper is not a valid implementation" in contract
+    assert "#synthesizeVerilog <design> parameters [PARAM := <nonnegative-default>]" in contract
+    assert "native SystemVerilog module parameter" in contract
+
+
+def test_cvdp_contract_includes_reference_parameter_without_harness_override():
+    info = _cvdp_info(
+        """
+        module dut #(parameter WIDTH = 8) (
+            output logic [WIDTH-1:0] data_out
+        );
+        endmodule
+        """,
+        "runner.build()",
+    )
+
+    contract = format_benchmark_interface_contract(info)
+
+    assert "Benchmark parameters required by reference/harness: WIDTH" in contract
+    assert "parameters [PARAM := <nonnegative-default>]" in contract
 
 
 def test_cvdp_contract_recognizes_hamming_pair_helper():
@@ -128,7 +175,7 @@ def test_cvdp_contract_does_not_treat_prompt_parameters_as_output_ports():
 
     contract = format_benchmark_interface_contract(info)
 
-    assert "Benchmark parameters referenced by harness: IN_WIDTH, N, OUT_WIDTH" in contract
+    assert "Benchmark parameters required by reference/harness: IN_WIDTH, N, OUT_WIDTH" in contract
     assert "Expected inputs: input bits: logic [N*IN_WIDTH-1:0]" in contract
     assert "Expected outputs: output I:" in contract
     assert "output Q:" in contract
@@ -357,17 +404,60 @@ def test_cvdp_wrapper_does_not_blindly_slice_without_concat_fields():
     assert "assign left = '0;" in wrapper
 
 
-def test_cvdp_wrapper_notes_fixed_width_core_for_parameterized_port():
+def test_cvdp_wrapper_rejects_parameterized_adapter_around_fixed_core():
+    with pytest.raises(CVDPAdapterContractError, match=CVDP_PARAMETERIZATION_UNSUPPORTED):
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[
+                ("input", "logic [7:0]", "_gen_data_in"),
+                ("output", "logic [7:0]", "_gen_data_out"),
+            ],
+            ref_code="""
+            module dut #(
+                parameter WIDTH = 8
+            ) (
+                input logic [WIDTH-1:0] data_in,
+                output logic [WIDTH-1:0] data_out
+            );
+            endmodule
+            """,
+            harness_files={
+                "src/test.py": """
+                def test_runner(WIDTH):
+                    runner.build(parameters={"WIDTH": WIDTH})
+                dut.data_in.value = 0
+                assert int(dut.data_out.value) == 0
+                """,
+            },
+            sv_code="module sparkle_inner(input logic [7:0] _gen_data_in, output logic [7:0] _gen_data_out); endmodule",
+        )
+
+
+def test_cvdp_wrapper_forwards_native_sparkle_parameters():
+    core = """
+    module sparkle_inner #(
+        parameter int WIDTH = 8,
+        DEPTH = 4
+    ) (
+        input logic [WIDTH-1:0] _gen_data_in,
+        output logic [WIDTH-1:0] _gen_data_out
+    );
+        logic [WIDTH-1:0] storage [0:DEPTH-1];
+        assign _gen_data_out = _gen_data_in;
+    endmodule
+    """
     wrapper = generate_cvdp_wrapper(
         design_name="dut",
         sparkle_mod_name="sparkle_inner",
         sparkle_ports=[
-            ("input", "logic [7:0]", "_gen_data_in"),
-            ("output", "logic [7:0]", "_gen_data_out"),
+            ("input", "logic [WIDTH-1:0]", "_gen_data_in"),
+            ("output", "logic [WIDTH-1:0]", "_gen_data_out"),
         ],
         ref_code="""
         module dut #(
-            parameter WIDTH = 8
+            parameter int WIDTH = 8,
+            DEPTH = 4
         ) (
             input logic [WIDTH-1:0] data_in,
             output logic [WIDTH-1:0] data_out
@@ -376,18 +466,922 @@ def test_cvdp_wrapper_notes_fixed_width_core_for_parameterized_port():
         """,
         harness_files={
             "src/test.py": """
-            def test_runner(WIDTH):
-                runner.build(parameters={"WIDTH": WIDTH})
+            def test_runner(WIDTH, DEPTH):
+                runner.build(parameters={"WIDTH": WIDTH, "DEPTH": DEPTH})
             dut.data_in.value = 0
-            assert int(dut.data_out.value) == 0
+            int(dut.data_out.value)
             """,
         },
-        sv_code="module sparkle_inner(input logic [7:0] _gen_data_in, output logic [7:0] _gen_data_out); endmodule",
+        sv_code=core,
     )
 
     assert wrapper is not None
-    assert "Sparkle core port _gen_data_in has fixed type logic [7:0]" in wrapper
-    assert "benchmark port data_in is parameterized as logic [WIDTH-1:0]" in wrapper
+    assert "parameter int WIDTH = 8" in wrapper
+    assert "parameter int DEPTH = 4" in wrapper
+    assert "sparkle_inner #(\n        .WIDTH(WIDTH),\n        .DEPTH(DEPTH)\n    ) sparkle_dut (" in wrapper
+    assert "logic [WIDTH-1:0] _gen_data_out_wire;" in wrapper
+
+
+def test_cvdp_wrapper_rejects_declared_parameter_around_fixed_width_ports():
+    core = """
+    module sparkle_inner #(parameter WIDTH = 8) (
+        input logic [7:0] _gen_data_in,
+        output logic [7:0] _gen_data_out
+    );
+        // WIDTH affects real logic, so the separate mapped-port check must
+        // still reject the fixed 8-bit interface.
+        assign _gen_data_out = _gen_data_in << (WIDTH - 8);
+    endmodule
+    """
+
+    with pytest.raises(CVDPAdapterContractError, match="fixed-width datapath"):
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[
+                ("input", "logic [7:0]", "_gen_data_in"),
+                ("output", "logic [7:0]", "_gen_data_out"),
+            ],
+            ref_code="""
+            module dut #(parameter WIDTH = 8) (
+                input logic [WIDTH-1:0] data_in,
+                output logic [WIDTH-1:0] data_out
+            );
+            endmodule
+            """,
+            harness_files={
+                "src/test.py": 'runner.build(parameters={"WIDTH": WIDTH})'
+            },
+            sv_code=core,
+        )
+
+
+def test_cvdp_wrapper_rejects_declaration_only_internal_parameter():
+    with pytest.raises(CVDPAdapterContractError, match="does not use"):
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[("output", "logic", "empty")],
+            ref_code="""
+            module dut #(parameter DEPTH = 8) (output logic empty);
+            endmodule
+            """,
+            harness_files={
+                "src/test.py": 'runner.build(parameters={"DEPTH": DEPTH})'
+            },
+            sv_code="""
+            module sparkle_inner #(parameter DEPTH = 8) (output logic empty);
+                assign empty = 1'b1;
+            endmodule
+            """,
+        )
+
+
+def test_cvdp_wrapper_rejects_parameter_used_only_by_dead_localparam():
+    with pytest.raises(CVDPAdapterContractError, match="does not use"):
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[("output", "logic", "empty")],
+            ref_code="""
+            module dut #(parameter DEPTH = 8) (output logic empty);
+            endmodule
+            """,
+            harness_files={
+                "src/test.py": 'runner.build(parameters={"DEPTH": DEPTH})'
+            },
+            sv_code="""
+            module sparkle_inner #(parameter DEPTH = 8) (output logic empty);
+                localparam integer UNUSED = DEPTH;
+                assign empty = 1'b1;
+            endmodule
+            """,
+        )
+
+
+def test_cvdp_wrapper_accepts_live_localparam_parameter_dependency():
+    wrapper = generate_cvdp_wrapper(
+        design_name="dut",
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=[("output", "logic [DEPTH-1:0]", "data")],
+        ref_code="""
+        module dut #(parameter DEPTH = 8) (
+            output logic [DEPTH-1:0] data
+        ); endmodule
+        """,
+        harness_files={
+            "src/test.py": 'runner.build(parameters={"DEPTH": DEPTH})'
+        },
+        sv_code="""
+        module sparkle_inner #(parameter DEPTH = 8) (output logic [DEPTH-1:0] data);
+            localparam integer LIVE = DEPTH;
+            logic [LIVE-1:0] storage;
+            assign data = storage;
+        endmodule
+        """,
+    )
+    assert wrapper is not None
+
+
+def test_cvdp_wrapper_ignores_sparkle_parameter_contract_guards():
+    with pytest.raises(CVDPAdapterContractError, match="does not use"):
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[("output", "logic", "empty")],
+            ref_code="""
+            module dut #(parameter DEPTH = 8) (output logic empty);
+            endmodule
+            """,
+            harness_files={
+                "src/test.py": 'runner.build(parameters={"DEPTH": DEPTH})'
+            },
+            sv_code="""
+            module sparkle_inner #(parameter DEPTH = 8) (output logic empty);
+                generate if (!(DEPTH >= 0)) begin : sparkle_invalid_nat_parameter_0
+                    initial $fatal(1, "Sparkle Nat parameter DEPTH must be nonnegative");
+                end endgenerate
+                assign empty = 1'b1;
+            endmodule
+            """,
+        )
+
+
+def test_cvdp_wrapper_rejects_parameter_used_only_by_dead_default_dependency():
+    with pytest.raises(CVDPAdapterContractError, match="does not use"):
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[("output", "logic", "empty")],
+            ref_code="""
+            module dut #(parameter DEPTH = 8) (output logic empty);
+            endmodule
+            """,
+            harness_files={
+                "src/test.py": 'runner.build(parameters={"DEPTH": DEPTH})'
+            },
+            sv_code="""
+            module sparkle_inner #(
+                parameter DEPTH = 8,
+                parameter UNUSED = DEPTH
+            ) (output logic empty);
+                assign empty = 1'b1;
+            endmodule
+            """,
+        )
+
+
+def test_cvdp_wrapper_accepts_transitively_live_parameter_dependency():
+    wrapper = generate_cvdp_wrapper(
+        design_name="dut",
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=[("output", "logic [DEPTH-1:0]", "data_out")],
+        ref_code="""
+        module dut #(parameter WIDTH = 4) (output logic [(2*WIDTH)-1:0] data_out);
+        endmodule
+        """,
+        harness_files={
+            "src/test.py": 'runner.build(parameters={"WIDTH": WIDTH})'
+        },
+        sv_code="""
+        module sparkle_inner #(
+            parameter WIDTH = 4,
+            parameter DEPTH = 2 * WIDTH
+        ) (output logic [DEPTH-1:0] data_out);
+            assign data_out = '0;
+        endmodule
+        """,
+    )
+
+    assert wrapper is not None
+    assert ".WIDTH(WIDTH)" in wrapper
+
+
+def test_cvdp_wrapper_accepts_parameter_used_by_internal_memory():
+    wrapper = generate_cvdp_wrapper(
+        design_name="dut",
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=[("output", "logic", "empty")],
+        ref_code="""
+        module dut #(parameter DEPTH = 8) (output logic empty);
+        endmodule
+        """,
+        harness_files={
+            "src/test.py": 'runner.build(parameters={"DEPTH": DEPTH})'
+        },
+        sv_code="""
+        module sparkle_inner #(parameter DEPTH = 8) (output logic empty);
+            logic storage [0:DEPTH-1];
+            assign empty = storage[0];
+        endmodule
+        """,
+    )
+
+    assert wrapper is not None
+    assert ".DEPTH(DEPTH)" in wrapper
+
+
+def test_cvdp_wrapper_rejects_fixed_core_for_reference_parameter_without_override():
+    with pytest.raises(CVDPAdapterContractError, match=CVDP_PARAMETERIZATION_UNSUPPORTED) as error:
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[("output", "logic [7:0]", "data_out")],
+            ref_code="""
+            module dut #(parameter WIDTH = 8) (
+                output logic [WIDTH-1:0] data_out
+            );
+            endmodule
+            """,
+            harness_files={"src/test.py": "int(dut.data_out.value)"},
+            sv_code="module sparkle_inner(output logic [7:0] data_out); endmodule",
+        )
+
+    assert "WIDTH" in str(error.value)
+
+
+def test_cvdp_wrapper_rejects_partially_parameterized_core():
+    with pytest.raises(CVDPAdapterContractError, match=CVDP_PARAMETERIZATION_UNSUPPORTED) as error:
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[("output", "logic [WIDTH-1:0]", "data_out")],
+            ref_code="""
+            module dut #(
+                parameter WIDTH = 8,
+                parameter DEPTH = 4
+            ) (output logic [WIDTH-1:0] data_out);
+            endmodule
+            """,
+            harness_files={"src/test.py": "int(dut.data_out.value)"},
+            sv_code="""
+            module sparkle_inner #(parameter WIDTH = 8) (
+                output logic [WIDTH-1:0] data_out
+            );
+            endmodule
+            """,
+        )
+
+    assert "DEPTH" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("harness", "expected_name", "unresolved"),
+    [
+        (
+            """
+            def test_runner(W):
+                p = {}
+                p["WIDTH"] = W
+                runner.build(parameters=p)
+            """,
+            "WIDTH",
+            False,
+        ),
+        (
+            """
+            def test_runner(W):
+                p = {}
+                p.update({"WIDTH": W})
+                runner.build(parameters=p)
+            """,
+            "WIDTH",
+            False,
+        ),
+        (
+            """
+            def test_runner(W):
+                runner.build(**{"parameters": {"WIDTH": W}})
+            """,
+            "WIDTH",
+            False,
+        ),
+        (
+            """
+            def test_runner(**kwargs):
+                runner.build(**kwargs)
+            """,
+            None,
+            True,
+        ),
+        (
+            """
+            def test_runner(W):
+                p = {}
+                (p.update({"WIDTH": W}), runner.build(parameters=p))
+            """,
+            None,
+            True,
+        ),
+        (
+            """
+            def test_runner(configure):
+                p = {}
+                configure(p)
+                runner.build(parameters=p)
+            """,
+            None,
+            True,
+        ),
+        (
+            """
+            def test_runner(W):
+                kwargs = {"parameters": {}}
+                kwargs["parameters"]["WIDTH"] = W
+                runner.build(**kwargs)
+            """,
+            None,
+            True,
+        ),
+        (
+            """
+            def test_runner(W):
+                kwargs = {"parameters": {}}
+                kwargs["parameters"].update({"WIDTH": W})
+                runner.build(**kwargs)
+            """,
+            None,
+            True,
+        ),
+    ],
+)
+def test_cvdp_fixed_core_parameter_detection_is_fail_closed(
+    harness, expected_name, unresolved
+):
+    harness_files = {"src/test.py": harness}
+    analysis = _cvdp_parameter_override_analysis(harness_files)
+
+    assert analysis.may_have_overrides is True
+    assert analysis.unresolved is unresolved
+    assert analysis.build_call_count == 1
+    if expected_name is not None:
+        assert expected_name in analysis.parameter_names
+
+    with pytest.raises(CVDPAdapterContractError, match=CVDP_PARAMETERIZATION_UNSUPPORTED):
+        generate_cvdp_wrapper(
+            design_name="dut",
+            sparkle_mod_name="sparkle_inner",
+            sparkle_ports=[("output", "logic", "out")],
+            ref_code="module dut(output logic done); endmodule",
+            harness_files=harness_files,
+            sv_code="module sparkle_inner(output logic out); endmodule",
+        )
+
+
+def test_cvdp_parameter_analysis_keeps_same_named_locals_in_their_function_scope():
+    harness_files = {
+        "src/test.py": """
+        def unrelated_helper(W):
+            p = {"GHOST_WIDTH": W}
+            return p
+
+        def actual_runner():
+            p = {}
+            runner.build(parameters=p)
+        """,
+    }
+
+    analysis = _cvdp_parameter_override_analysis(harness_files)
+
+    assert analysis.may_have_overrides is False
+    assert analysis.parameter_names == frozenset()
+    wrapper = generate_cvdp_wrapper(
+        design_name="dut",
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=[("output", "logic", "out")],
+        ref_code="module dut(output logic done); endmodule",
+        harness_files=harness_files,
+        sv_code="module sparkle_inner(output logic out); endmodule",
+    )
+    assert wrapper is not None
+
+
+def test_cvdp_parameter_analysis_ignores_unrelated_build_without_parameters():
+    analysis = _cvdp_parameter_override_analysis({
+        "src/test.py": """
+        def unrelated_helper():
+            cache_builder.build(cache_key="GHOST_WIDTH")
+
+        def test_runner(params):
+            runner.build(parameters=params)
+        """,
+    })
+
+    assert analysis.may_have_overrides is True
+    assert analysis.unresolved is True
+    assert analysis.parameter_names == frozenset()
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        """
+        def test_runner(W):
+            r = get_runner(simulator="icarus")
+            r.build(parameters={"WIDTH": W})
+        """,
+        """
+        def test_runner(W):
+            get_runner(simulator="icarus").build(parameters={"WIDTH": W})
+        """,
+    ],
+)
+def test_cvdp_parameter_analysis_does_not_depend_on_runner_variable_name(harness):
+    analysis = _cvdp_parameter_override_analysis({"src/test.py": harness})
+
+    assert analysis.may_have_overrides is True
+    assert analysis.parameter_names == frozenset({"WIDTH"})
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        """
+        p = {}
+        discarded = p.update({"WIDTH": 8})
+        runner.build(parameters=p)
+        """,
+        """
+        p = {}
+        if p.update({"WIDTH": 8}):
+            pass
+        runner.build(parameters=p)
+        """,
+    ],
+)
+def test_cvdp_parameter_analysis_applies_embedded_mapping_mutations(harness):
+    analysis = _cvdp_parameter_override_analysis({"src/test.py": harness})
+
+    assert analysis.may_have_overrides is True
+    assert analysis.unresolved is False
+    assert analysis.parameter_names == frozenset({"WIDTH"})
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        """
+        compile_dut = runner.build
+        compile_dut(parameters={"WIDTH": 8})
+        """,
+        """
+        compile_dut = runner.build
+        kwargs = {"parameters": {"WIDTH": 8}}
+        compile_dut(**kwargs)
+        """,
+        """
+        from functools import partial
+        compile_dut = partial(runner.build, parameters={"WIDTH": 8})
+        compile_dut()
+        """,
+    ],
+)
+def test_cvdp_parameter_analysis_tracks_bound_build_aliases(harness):
+    analysis = _cvdp_parameter_override_analysis({"src/test.py": harness})
+
+    assert analysis.may_have_overrides is True
+    assert "WIDTH" in analysis.parameter_names
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        """
+        compile_dut = getattr(runner, "build")
+        kwargs = {"parameters": {"WIDTH": 8}}
+        compile_dut(**kwargs)
+        """,
+        """
+        holder.compile_dut = runner.build
+        kwargs = {"parameters": {"WIDTH": 8}}
+        holder.compile_dut(**kwargs)
+        """,
+        """
+        compile_dut, = (runner.build,)
+        kwargs = {"parameters": {"WIDTH": 8}}
+        compile_dut(**kwargs)
+        """,
+        """
+        def select_build():
+            return runner.build
+
+        compile_dut = select_build()
+        kwargs = {"parameters": {"WIDTH": 8}}
+        compile_dut(**kwargs)
+        """,
+    ],
+)
+def test_cvdp_parameter_analysis_tracks_indirect_build_aliases(harness):
+    analysis = _cvdp_parameter_override_analysis({"src/test.py": harness})
+
+    assert analysis.may_have_overrides is True
+    assert analysis.parameter_names == frozenset({"WIDTH"})
+
+
+def test_cvdp_parameter_analysis_ignores_unrelated_parameters_keyword():
+    analysis = _cvdp_parameter_override_analysis({
+        "src/test.py": """
+        cache.configure(parameters={"THREADS": 4})
+        runner.build()
+        """,
+    })
+
+    assert analysis.may_have_overrides is False
+    assert analysis.parameter_names == frozenset()
+
+
+def test_cvdp_parameter_analysis_fails_closed_on_called_closure_mutation():
+    analysis = _cvdp_parameter_override_analysis({
+        "src/test.py": """
+        parameters = {}
+
+        def configure():
+            parameters["WIDTH"] = 8
+
+        configure()
+        runner.build(parameters=parameters)
+        """,
+    })
+    shadowed = _cvdp_parameter_override_analysis({
+        "src/test.py": """
+        parameters = {}
+
+        def configure():
+            parameters = {"GHOST_WIDTH": 99}
+            return parameters
+
+        configure()
+        runner.build(parameters=parameters)
+        """,
+    })
+
+    assert analysis.may_have_overrides is True
+    assert analysis.unresolved is True
+    assert shadowed.may_have_overrides is False
+
+
+def test_cvdp_parameter_analysis_models_dict_copy_as_an_independent_mapping():
+    original_kept = _cvdp_parameter_override_analysis({
+        "src/test.py": """
+        def test_runner():
+            p = {"WIDTH": 8}
+            q = p.copy()
+            q.clear()
+            runner.build(parameters=p)
+        """,
+    })
+    original_empty = _cvdp_parameter_override_analysis({
+        "src/test.py": """
+        def test_runner():
+            p = {}
+            q = p.copy()
+            q.update({"WIDTH": 8})
+            runner.build(parameters=p)
+        """,
+    })
+
+    assert original_kept.may_have_overrides is True
+    assert original_kept.parameter_names == frozenset({"WIDTH"})
+    assert original_empty.may_have_overrides is False
+    assert original_empty.parameter_names == frozenset()
+
+
+def test_cvdp_sim_rejects_fixed_core_before_running_parameter_harness(tmp_path, monkeypatch):
+    info = _cvdp_info(
+        """
+        module dut #(parameter WIDTH = 8) (
+            input logic [WIDTH-1:0] data_in,
+            output logic [WIDTH-1:0] data_out
+        );
+        endmodule
+        """,
+        """
+        def test_runner(WIDTH):
+            runner.build(parameters={"WIDTH": WIDTH})
+        """,
+    )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(project_root=tmp_path, dataset="cvdp", dataset_obj=DatasetStub())
+    local_sim_called = False
+
+    def fake_local_sim(_sim_dir: Path):
+        nonlocal local_sim_called
+        local_sim_called = True
+        return "sim_pass", 0, "unexpected"
+
+    monkeypatch.setenv("CVDP_SIM_MODE", "local")
+    monkeypatch.setattr(evaluator, "_run_sim_cvdp_local", fake_local_sim)
+    code = "module sparkle_inner(input logic [7:0] _gen_data_in, output logic [7:0] out); endmodule"
+    module_name, ports = parse_module_ports(code)
+
+    status, mismatches, detail = evaluator._run_sim_cvdp(
+        "cvdp_test", code, module_name, ports, tmp_path
+    )
+
+    assert status == "sim_error"
+    assert mismatches == -1
+    assert CVDP_PARAMETERIZATION_UNSUPPORTED in detail
+    assert "WIDTH" in detail
+    assert not local_sim_called
+    assert not (tmp_path / "cvdp_sim" / "cvdp_test").exists()
+
+
+def test_cvdp_sim_allows_native_sparkle_parameter_forwarding(tmp_path, monkeypatch):
+    info = _cvdp_info(
+        """
+        module dut #(parameter WIDTH = 8) (
+            input logic [WIDTH-1:0] data_in,
+            output logic [WIDTH-1:0] data_out
+        );
+        endmodule
+        """,
+        """
+        def test_runner(WIDTH):
+            runner.build(parameters={"WIDTH": WIDTH})
+        """,
+    )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(project_root=tmp_path, dataset="cvdp", dataset_obj=DatasetStub())
+    captured = {}
+
+    def fake_local_sim(sim_dir: Path):
+        captured["source"] = (sim_dir / "rtl" / "dut.sv").read_text()
+        return "sim_pass", 0, "native parameter sweep accepted"
+
+    monkeypatch.setenv("CVDP_SIM_MODE", "local")
+    monkeypatch.setattr(evaluator, "_run_sim_cvdp_local", fake_local_sim)
+    code = """
+    module dut #(parameter WIDTH = 8) (
+        input logic [WIDTH-1:0] _gen_data_in,
+        output logic [WIDTH-1:0] _gen_data_out
+    );
+        assign _gen_data_out = _gen_data_in;
+    endmodule
+    """
+    module_name, ports = parse_module_ports(code)
+
+    status, mismatches, detail = evaluator._run_sim_cvdp(
+        "cvdp_test", code, module_name, ports, tmp_path
+    )
+
+    assert (status, mismatches, detail) == (
+        "sim_pass",
+        0,
+        "native parameter sweep accepted",
+    )
+    assert "module dut_sparkle_inner #(parameter WIDTH = 8)" in captured["source"]
+    assert "dut_sparkle_inner #(\n        .WIDTH(WIDTH)\n    ) sparkle_dut (" in captured["source"]
+
+
+def test_cvdp_sim_allows_dynamic_parameter_dict_with_reference_contract(
+    tmp_path, monkeypatch
+):
+    info = _cvdp_info(
+        "module dut #(parameter WIDTH = 8) (output logic [WIDTH-1:0] data_out); endmodule",
+        """
+        def test_runner(params):
+            runner.build(parameters=params)
+        """,
+    )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(project_root=tmp_path, dataset="cvdp", dataset_obj=DatasetStub())
+    local_sim_called = False
+
+    def fake_local_sim(_sim_dir: Path):
+        nonlocal local_sim_called
+        local_sim_called = True
+        return "sim_pass", 0, "dynamic parameter dictionary accepted"
+
+    monkeypatch.setenv("CVDP_SIM_MODE", "local")
+    monkeypatch.setattr(evaluator, "_run_sim_cvdp_local", fake_local_sim)
+    code = """
+    module sparkle_inner #(parameter WIDTH = 8) (
+        output logic [WIDTH-1:0] data_out
+    );
+        assign data_out = '0;
+    endmodule
+    """
+    module_name, ports = parse_module_ports(code)
+
+    status, mismatches, detail = evaluator._run_sim_cvdp(
+        "cvdp_test", code, module_name, ports, tmp_path
+    )
+
+    assert (status, mismatches, detail) == (
+        "sim_pass",
+        0,
+        "dynamic parameter dictionary accepted",
+    )
+    assert local_sim_called
+
+
+def test_cvdp_sim_rejects_internal_structure_parameter_even_with_fixed_ports(tmp_path):
+    info = _cvdp_info(
+        """
+        module dut #(parameter DEPTH = 8) (
+            input logic clk,
+            output logic empty
+        );
+        endmodule
+        """,
+        """
+        def test_runner(DEPTH):
+            runner.build(parameters={"DEPTH": DEPTH})
+        """,
+    )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(project_root=tmp_path, dataset="cvdp", dataset_obj=DatasetStub())
+    code = "module sparkle_inner(input logic clk, output logic out); endmodule"
+    module_name, ports = parse_module_ports(code)
+
+    status, _, detail = evaluator._run_sim_cvdp(
+        "cvdp_test", code, module_name, ports, tmp_path
+    )
+
+    assert status == "sim_error"
+    assert CVDP_PARAMETERIZATION_UNSUPPORTED in detail
+    assert "DEPTH" in detail
+
+
+def test_cvdp_sim_rejects_unresolved_dynamic_parameter_dictionary(tmp_path):
+    info = _cvdp_info(
+        "module dut #(parameter WIDTH = 8) (output logic done); endmodule",
+        """
+        def test_runner(params):
+            runner.build(parameters=params)
+        """,
+    )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(project_root=tmp_path, dataset="cvdp", dataset_obj=DatasetStub())
+    code = "module sparkle_inner(output logic out); endmodule"
+    module_name, ports = parse_module_ports(code)
+
+    status, _, detail = evaluator._run_sim_cvdp(
+        "cvdp_test", code, module_name, ports, tmp_path
+    )
+
+    assert status == "sim_error"
+    assert CVDP_PARAMETERIZATION_UNSUPPORTED in detail
+    assert "full parameter set could not be resolved" in detail
+
+
+def test_unsupported_parameterization_is_repairable_and_skips_synthesis(tmp_path, monkeypatch):
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / "cvdp_test.lean").write_text("def placeholder := 0")
+    sv_code = "module sparkle_inner(input logic [7:0] data_in, output logic [7:0] out); endmodule"
+
+    class ReplStub:
+        def check_file(self, _path: Path):
+            return SimpleNamespace(
+                passed=True,
+                complete=True,
+                verilog=sv_code,
+                error_text="",
+            )
+
+    evaluator = Evaluator(
+        project_root=tmp_path,
+        dataset="cvdp",
+        enable_synth=True,
+        lean_repl=ReplStub(),
+    )
+    synthesis_called = False
+
+    monkeypatch.setattr(evaluator, "_run_lint", lambda _path: True)
+    monkeypatch.setattr(
+        evaluator,
+        "_run_sim",
+        lambda *_args: (
+            "sim_error",
+            -1,
+            f"{CVDP_PARAMETERIZATION_UNSUPPORTED}: fixed core",
+        ),
+    )
+
+    def fake_synthesis(*_args):
+        nonlocal synthesis_called
+        synthesis_called = True
+        return {"synth_pass": True}
+
+    monkeypatch.setattr(evaluator, "_run_synthesis", fake_synthesis)
+
+    result = evaluator.evaluate("cvdp_test", tmp_path / "run")
+
+    assert result["unsupported_parameterization"] is True
+    assert result["terminal_capability_error"] is False
+    assert result["repairable_parameterization_error"] is True
+    assert result["synth_pass"] is False
+    assert result["area_um2"] is None
+    assert not synthesis_called
+    assert classify_failure_record(result) == {
+        "failure_stage": "simulation",
+        "failure_category": "parameterization_contract",
+        "failure_family": "interface",
+    }
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        'runner.build(parameters={"WIDTH": WIDTH})',
+        "runner.build()",
+    ],
+    ids=["explicit-sweep", "native-reference-parameter"],
+)
+def test_native_parameter_sweep_keeps_sim_result_but_skips_default_ppa(
+    tmp_path, monkeypatch, harness
+):
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / "cvdp_test.lean").write_text("def placeholder := 0")
+    sv_code = """
+    module sparkle_inner #(parameter WIDTH = 8) (
+        input logic [WIDTH-1:0] data_in,
+        output logic [WIDTH-1:0] data_out
+    );
+        assign data_out = data_in;
+    endmodule
+    """
+    info = _cvdp_info(
+        """
+        module dut #(parameter WIDTH = 8) (
+            input logic [WIDTH-1:0] data_in,
+            output logic [WIDTH-1:0] data_out
+        );
+        endmodule
+        """,
+        harness,
+    )
+
+    class ReplStub:
+        def check_file(self, _path: Path):
+            return SimpleNamespace(
+                passed=True,
+                complete=True,
+                verilog=sv_code,
+                error_text="",
+            )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(
+        project_root=tmp_path,
+        dataset="cvdp",
+        dataset_obj=DatasetStub(),
+        enable_synth=True,
+        lean_repl=ReplStub(),
+    )
+    synthesis_called = False
+
+    monkeypatch.setattr(evaluator, "_run_lint", lambda _path: True)
+    monkeypatch.setattr(
+        evaluator,
+        "_run_sim",
+        lambda *_args: ("sim_pass", 0, "all native parameter configurations passed"),
+    )
+
+    def fake_synthesis(*_args):
+        nonlocal synthesis_called
+        synthesis_called = True
+        return {"synth_pass": True, "area_um2": 1.0}
+
+    monkeypatch.setattr(evaluator, "_run_synthesis", fake_synthesis)
+
+    result = evaluator.evaluate("cvdp_test", tmp_path / "run")
+
+    assert result["sim_status"] == "sim_pass"
+    assert result["sim_mismatches"] == 0
+    assert result["parameterized_ppa_unsupported"] is True
+    assert result["synth_status"] == "not_run_parameterized_sweep"
+    assert result["ppa_status"] == "unsupported_parameter_sweep"
+    assert result["synth_pass"] is False
+    assert result["area_um2"] is None
+    assert result["terminal_capability_error"] is False
+    assert "module-default configuration" in result["ppa_error"]
+    assert not synthesis_called
 
 
 def test_cvdp_wrapper_bridges_observed_internal_memory_without_making_it_a_port():
@@ -395,10 +1389,10 @@ def test_cvdp_wrapper_bridges_observed_internal_memory_without_making_it_a_port(
         design_name="fifo_policy",
         sparkle_mod_name="fifo_policy_sparkle_inner",
         sparkle_ports=[
-            ("input", "logic [4:0]", "_gen_index"),
+            ("input", "logic [$clog2(NINDEXES)-1:0]", "_gen_index"),
             ("input", "logic", "clk"),
             ("input", "logic", "rst"),
-            ("output", "logic [1:0]", "out"),
+            ("output", "logic [$clog2(NWAYS)-1:0]", "out"),
         ],
         ref_code="""
         module fifo_policy #(
@@ -421,13 +1415,16 @@ def test_cvdp_wrapper_bridges_observed_internal_memory_without_making_it_a_port(
             """,
         },
         sv_code="""
-        module fifo_policy_sparkle_inner(
-            input logic [4:0] _gen_index,
+        module fifo_policy_sparkle_inner #(
+            parameter NWAYS = 4,
+            parameter NINDEXES = 32
+        ) (
+            input logic [$clog2(NINDEXES)-1:0] _gen_index,
             input logic clk,
             input logic rst,
-            output logic [1:0] out
+            output logic [$clog2(NWAYS)-1:0] out
         );
-            logic [1:0] _gen_current_way [0:31];
+            logic [$clog2(NWAYS)-1:0] _gen_current_way [0:NINDEXES-1];
             assign out = _gen_current_way[_gen_index];
         endmodule
         """,
@@ -437,6 +1434,12 @@ def test_cvdp_wrapper_bridges_observed_internal_memory_without_making_it_a_port(
     port_block = wrapper.split(");", 1)[0]
     assert "fifo_array" not in port_block
     assert "logic [$clog2(NWAYS)-1:0] fifo_array [NINDEXES-1:0];" in wrapper
+    assert (
+        "fifo_policy_sparkle_inner #(\n"
+        "        .NWAYS(NWAYS),\n"
+        "        .NINDEXES(NINDEXES)\n"
+        "    ) sparkle_dut ("
+    ) in wrapper
     assert "assign way_replace = out_wire;" in wrapper
     assert (
         "for (genvar _cvdp_bridge_fifo_array_i = 0; "
@@ -459,7 +1462,11 @@ def test_cvdp_direct_top_is_evaluated_without_sparkle_wrapper(tmp_path, monkeypa
         assign data_out = {WIDTH{clk}};
     endmodule
     """
-    info = _cvdp_info(code, "", design_name="dut")
+    info = _cvdp_info(
+        code,
+        'runner.build(parameters={"WIDTH": 4})',
+        design_name="dut",
+    )
 
     class DatasetStub:
         def load_problem(self, prob_id: str) -> ProblemInfo:
@@ -489,3 +1496,82 @@ def test_cvdp_direct_top_is_evaluated_without_sparkle_wrapper(tmp_path, monkeypa
     assert (status, mismatches, detail) == ("sim_pass", 0, "ok")
     assert captured["source"] == code
     assert "dut_sparkle_inner" not in captured["source"]
+
+
+def test_cvdp_direct_top_must_declare_harness_parameters(tmp_path):
+    code = "module dut(output logic done); assign done = 1'b1; endmodule"
+    info = _cvdp_info(
+        code,
+        'runner.build(parameters={"WIDTH": 4})',
+        design_name="dut",
+    )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(project_root=tmp_path, dataset="cvdp", dataset_obj=DatasetStub())
+    module_name, ports = parse_module_ports(code, module_name="dut")
+
+    status, _, detail = evaluator._run_sim_cvdp(
+        "cvdp_test",
+        code,
+        module_name,
+        ports,
+        tmp_path,
+        direct_top=True,
+    )
+
+    assert status == "sim_error"
+    assert CVDP_PARAMETERIZATION_UNSUPPORTED in detail
+    assert "does not declare harness parameter(s): WIDTH" in detail
+
+
+def test_cvdp_direct_top_passes_unresolved_dynamic_parameters_to_simulator(
+    tmp_path, monkeypatch
+):
+    code = """
+    module dut #(parameter WIDTH = 4) (output logic [WIDTH-1:0] done);
+        assign done = '0;
+    endmodule
+    """
+    info = _cvdp_info(
+        code,
+        """
+        def test_runner(params):
+            runner.build(parameters=params)
+        """,
+        design_name="dut",
+    )
+
+    class DatasetStub:
+        def load_problem(self, prob_id: str) -> ProblemInfo:
+            return info
+
+    evaluator = Evaluator(project_root=tmp_path, dataset="cvdp", dataset_obj=DatasetStub())
+    module_name, ports = parse_module_ports(code, module_name="dut")
+    local_sim_called = False
+
+    def fake_local_sim(_sim_dir: Path):
+        nonlocal local_sim_called
+        local_sim_called = True
+        return "sim_pass", 0, "simulator accepted dynamic parameters"
+
+    monkeypatch.setenv("CVDP_SIM_MODE", "local")
+    monkeypatch.setattr(evaluator, "_run_sim_cvdp_local", fake_local_sim)
+
+    status, mismatches, detail = evaluator._run_sim_cvdp(
+        "cvdp_test",
+        code,
+        module_name,
+        ports,
+        tmp_path,
+        direct_top=True,
+    )
+
+    assert (status, mismatches, detail) == (
+        "sim_pass",
+        0,
+        "simulator accepted dynamic parameters",
+    )
+    assert local_sim_called

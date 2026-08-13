@@ -91,6 +91,31 @@ where
 -- Expression parsing (all mutually recursive)
 -- ============================================================================
 
+/-- Translate the constant-expression subset accepted in packed ranges into
+    the native symbolic dimension language.  Rejecting unsupported syntax is
+    intentional: silently guessing a concrete width changes module semantics. -/
+partial def exprToDimExpr? : SVExpr → Option Sparkle.IR.Type.DimExpr
+  | .lit (.decimal _ value) | .lit (.hex _ value) | .lit (.binary _ value) =>
+      some (.literal value)
+  | .ident name => some (.param name)
+  -- Sparkle's backend clamps a hardware dimension before placing it in a
+  -- declaration range: `(d > 0 ? d : 1)`.  The guard emitted alongside the
+  -- declaration rejects the invalid branch, so recover the native dimension
+  -- here instead of baking the compatibility clamp into the IR.
+  | .ternary (.binary .gt condition (.lit (.decimal _ 0))) then_ (.lit (.decimal _ 1)) => do
+      if condition == then_ then exprToDimExpr? condition else none
+  | .binary .add lhs rhs => return (Sparkle.IR.Type.DimExpr.mkAdd (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
+  | .binary .sub lhs rhs => return (Sparkle.IR.Type.DimExpr.mkSub (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
+  | .binary .mul lhs rhs => return (Sparkle.IR.Type.DimExpr.mkMul (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
+  | .binary .pow lhs rhs => return (Sparkle.IR.Type.DimExpr.mkPow (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
+  -- SystemVerilog rendering of Nat subtraction: `(lhs >= rhs) ? lhs-rhs : 0`.
+  | .ternary (.binary .ge lhs rhs) (.binary .sub thenLhs thenRhs)
+      (.lit (.decimal _ 0)) => do
+      if lhs == thenLhs && rhs == thenRhs then
+        return Sparkle.IR.Type.DimExpr.mkSub (← exprToDimExpr? lhs) (← exprToDimExpr? rhs)
+      else none
+  | _ => none
+
 mutual
 
 partial def parseExpr : P SVExpr := parseTernary
@@ -217,9 +242,12 @@ partial def parseMul : P SVExpr := do
   let mut e ← parseUnary
   let mut cont := true
   while cont do
-    match ← attempt (token (matchStr "*")) with
-    | some _ => let rhs ← parseUnary; e := SVExpr.binary .mul e rhs
-    | none => cont := false
+    match ← attempt (op2 "**") with
+    | some _ => let rhs ← parseUnary; e := SVExpr.binary .pow e rhs
+    | none =>
+      match ← attempt (token (matchStr "*")) with
+      | some _ => let rhs ← parseUnary; e := SVExpr.binary .mul e rhs
+      | none => cont := false
   pure e
 
 partial def parseUnary : P SVExpr := do
@@ -275,10 +303,13 @@ partial def parsePostfix (e : SVExpr) : P SVExpr := do
     | some _ =>
       let lo ← parseExpr
       rbracket
-      match idx, lo with
-      | .lit (.decimal _ hi), .lit (.decimal _ lo') => parsePostfix (SVExpr.slice e hi lo')
-      | .lit (.hex _ hi), .lit (.decimal _ lo') => parsePostfix (SVExpr.slice e hi lo')
-      | _, _ => parsePostfix (SVExpr.slice e 0 0)
+      let hiDim ← match exprToDimExpr? idx with
+        | some dim => pure dim
+        | none => fail "unsupported symbolic high bound in part-select"
+      let loDim ← match exprToDimExpr? lo with
+        | some dim => pure dim
+        | none => fail "unsupported symbolic low bound in part-select"
+      parsePostfix (SVExpr.slice e hiDim loDim)
     | none =>
       rbracket
       parsePostfix (SVExpr.index e idx)
@@ -303,7 +334,22 @@ partial def parsePrimary : P SVExpr := do
         | some _ => let e ← parseExpr; args := args ++ [e]
         | none => cont := false
       rbrace; pure (SVExpr.concat args)
-  | some '(' => lparen; let e ← parseExpr; rparen; pure e
+  | some '(' =>
+    lparen
+    let e ← parseExpr
+    rparen
+    -- A parenthesized constant expression followed by `'(value)` is a
+    -- parameter-sized SystemVerilog cast (the form emitted by Sparkle).
+    match ← attempt (token (matchStr "'")) with
+    | some _ =>
+      lparen
+      let value ← parseExpr
+      rparen
+      let width ← match exprToDimExpr? e with
+        | some dim => pure dim
+        | none => fail "unsupported symbolic width in sized cast"
+      pure (.sizedCast width value)
+    | none => pure e
   | some '"' =>
     -- String literal: "text" → treat as constant 0 (debug strings not synthesizable)
     let _ ← nextChar  -- consume opening "
@@ -319,13 +365,11 @@ partial def parsePrimary : P SVExpr := do
     let name ← identifier
     lparen; let arg ← parseExpr; rparen
     if name == "signed" then
-      -- Apply $signed to concat and slice expressions (known sub-32-bit width)
-      -- Identity for full-width wire references (already 32-bit)
-      match arg with
-      | .concat _ => pure (SVExpr.unary .signed arg)
-      | .slice _ _ _ => pure (SVExpr.unary .signed arg)
-      | .index _ _ => pure (SVExpr.unary .signed arg)
-      | _ => pure arg
+      -- Preserve the cast in the AST even when its argument is an identifier.
+      -- Assuming every identifier is 32 bits is unsound once a declaration
+      -- width is a retained module parameter; the native lowering path can
+      -- now diagnose this unsupported case instead of losing signedness.
+      pure (SVExpr.unary .signed arg)
     else
       pure arg
   | some '\'' =>
@@ -460,9 +504,21 @@ def parsePortDir : P SVPortDir := do
     | some _ => pure .output
     | none => keyword "inout"; pure .inout
 
-def parseOptWidth : P (Option (Nat × Nat)) := do
-  match ← attempt bitRange with
-  | some r => pure (some r) | none => pure none
+def parseOptWidth : P (Option (Sparkle.IR.Type.DimExpr × Sparkle.IR.Type.DimExpr)) := do
+  match ← attempt lbracket with
+  | some _ =>
+    let hi ← parseExpr
+    colon
+    let lo ← parseExpr
+    rbracket
+    let hiDim ← match exprToDimExpr? hi with
+      | some dim => pure dim
+      | none => fail "unsupported symbolic high bound in packed range"
+    let loDim ← match exprToDimExpr? lo with
+      | some dim => pure dim
+      | none => fail "unsupported symbolic low bound in packed range"
+    pure (some (hiDim, loDim))
+  | none => pure none
 
 /-- Parse a port: direction [reg] [width] name -/
 def parsePortInList : P SVPort := do
@@ -545,10 +601,11 @@ def parseSensitivity : P SVSensitivity := do
     | none => let _ ← token (matchStr "*"); pure SVSensitivity.star
 
 partial def parseAlwaysBlock : P SVModuleItem := do
-  keyword "always"
-  let _ ← attempt (matchStr "_ff")
-  let _ ← attempt (matchStr "_comb")
-  ws
+  let flavor ← match ← attempt (keyword "always_ff") with
+    | some _ => pure "ff"
+    | none => match ← attempt (keyword "always_comb") with
+      | some _ => pure "comb"
+      | none => keyword "always"; pure "plain"
   match ← attempt at_ with
   | some _ =>
     -- Sensitivity list: @(posedge clk or negedge rst) or @*
@@ -564,7 +621,8 @@ partial def parseAlwaysBlock : P SVModuleItem := do
       let body ← parseAlwaysBody
       pure (SVModuleItem.alwaysBlock sens body)
   | none =>
-    -- always @* shorthand (without @)
+    -- always_comb has an implicit complete combinational sensitivity list.
+    if flavor == "ff" then fail "always_ff requires an explicit event control"
     let body ← parseAlwaysBody
     pure (SVModuleItem.alwaysBlock .star body)
 where
@@ -655,6 +713,34 @@ partial def parseGenerateBlock : P (List SVModuleItem) := do
   keyword "endgenerate"
   pure [SVModuleItem.generateBlock cond ifItems elseItems]
 
+/-- Parse the validation-generate shape emitted by Sparkle.  Its body contains
+    only an `initial $fatal` diagnostic and is regenerated from IR dimensions,
+    so it is safe to omit during lowering. -/
+partial def parseValidationGenerate : P (List SVModuleItem) := do
+  keyword "if"
+  lparen
+  let cond ← parseExpr
+  rparen
+  keyword "begin"
+  colon
+  let label ← identifier
+  unless label.startsWith "sparkle_invalid_nat_parameter_" ||
+      label.startsWith "sparkle_invalid_dimension_" do
+    fail "not a canonical Sparkle validation-generate label"
+  keyword "initial"
+  let _ ← token (matchStr "$fatal")
+  lparen
+  let mut depth : Nat := 1
+  while depth > 0 do
+    let ch ← nextChar
+    if ch == '(' then depth := depth + 1
+    else if ch == ')' then depth := depth - 1
+  ws
+  semi
+  keyword "end"
+  keyword "endgenerate"
+  pure [.validationGuard cond]
+
 partial def parseModuleItems : P (List SVModuleItem) := do
   match ← attempt (keyword "assign") with
   | some _ =>
@@ -676,30 +762,60 @@ partial def parseModuleItems : P (List SVModuleItem) := do
           | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.wireDecl n2 w none]
           | none => cont := false
         semi; pure items
-    | none => match ← attempt (keyword "reg") with
+    | none => match ← attempt (keyword "logic") with
+      | some _ =>
+        let _ ← attempt (keyword "signed")
+        let w ← parseOptWidth
+        let n ← identifier
+        match ← attempt lbracket with
+        | some _ =>
+          let lo ← parseExpr
+          colon
+          let hi ← parseExpr
+          rbracket
+          let loDim ← match exprToDimExpr? lo with
+            | some dim => pure dim
+            | none => fail "unsupported symbolic low bound in unpacked array range"
+          let hiDim ← match exprToDimExpr? hi with
+            | some dim => pure dim
+            | none => fail "unsupported symbolic high bound in unpacked array range"
+          let arrSize := match hiDim, loDim with
+            | .sub base (.literal 1), .literal 0 => base
+            | _, _ => Sparkle.IR.Type.DimExpr.mkAdd
+                (Sparkle.IR.Type.DimExpr.mkSub hiDim loDim) 1
+          semi
+          pure [SVModuleItem.regDecl n w (some arrSize)]
+        | none =>
+          match ← attempt eqSign with
+          | some _ => let e ← parseExpr; semi; pure [SVModuleItem.wireDecl n w (some e)]
+          | none =>
+            let mut items := [SVModuleItem.wireDecl n w none]
+            let mut cont := true
+            while cont do
+              match ← attempt comma with
+              | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.wireDecl n2 w none]
+              | none => cont := false
+            semi; pure items
+      | none => match ← attempt (keyword "reg") with
       | some _ =>
         let _ ← attempt (keyword "signed")
         let w ← parseOptWidth; let n ← identifier
         match ← attempt lbracket with
         | some _ =>
-          -- Array dimension: try [lo:hi] with numeric values
-          let arrSize ← match ← attempt (do
-            let lo ← token digits
-            colon
-            let hi ← token digits
-            rbracket
-            pure (hi.toNat! - lo.toNat! + 1)) with
-          | some size => pure size
-          | none =>
-            -- Parameterized — skip until ]
-            let mut depth : Nat := 1
-            while depth > 0 do
-              match ← attempt rbracket with
-              | some _ => depth := depth - 1
-              | none => match ← attempt lbracket with
-                | some _ => depth := depth + 1
-                | none => let _ ← nextChar; pure ()
-            pure 32  -- default
+          let lo ← parseExpr
+          colon
+          let hi ← parseExpr
+          rbracket
+          let loDim ← match exprToDimExpr? lo with
+            | some dim => pure dim
+            | none => fail "unsupported symbolic low bound in unpacked array range"
+          let hiDim ← match exprToDimExpr? hi with
+            | some dim => pure dim
+            | none => fail "unsupported symbolic high bound in unpacked array range"
+          let arrSize := match hiDim, loDim with
+            | .sub base (.literal 1), .literal 0 => base
+            | _, _ => Sparkle.IR.Type.DimExpr.mkAdd
+                (Sparkle.IR.Type.DimExpr.mkSub hiDim loDim) 1
           semi
           pure [SVModuleItem.regDecl n w (some arrSize)]
         | none =>
@@ -721,7 +837,10 @@ partial def parseModuleItems : P (List SVModuleItem) := do
             | some _ =>
               let p ← parseParamDecl false; semi; pure [SVModuleItem.paramDecl p]
             | none => match ← attempt (keyword "generate") with
-              | some _ => parseGenerateBlock
+              | some _ =>
+                match ← attempt parseValidationGenerate with
+                | some guard => pure guard
+                | none => parseGenerateBlock
               | none => match ← attempt (keyword "initial") with
                 | some _ =>
                   -- Parse initial block — extract $readmemh if present
@@ -802,10 +921,11 @@ partial def parseModuleItems : P (List SVModuleItem) := do
                   | some item => pure [item]
                   | none =>
                     -- Skip past the always block by matching begin/end balance
-                    keyword "always"
-                    let _ ← attempt (matchStr "_ff")
-                    let _ ← attempt (matchStr "_comb")
-                    ws
+                    match ← attempt (keyword "always_ff") with
+                    | some _ => pure ()
+                    | none => match ← attempt (keyword "always_comb") with
+                      | some _ => pure ()
+                      | none => keyword "always"
                     let _ ← attempt at_
                     -- Skip sensitivity list
                     match ← attempt lparen with

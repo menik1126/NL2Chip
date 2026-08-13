@@ -33,6 +33,8 @@ instance : Inhabited Sparkle.IR.AST.Port := ⟨{ name := "default", ty := .bit }
 /-- Compiler state tracking variable mappings and context -/
 structure CompilerState where
   varMap : List (FVarId × String) := []  -- Map Lean variables to wire names
+  dimMap : List (FVarId × DimExpr) := [] -- Top-level Nat binders retained as SV parameters
+  parameterDefaults : List (String × Nat) := []
   clockWire : Option String := none       -- Name of clock wire (if any)
   resetWire : Option String := none       -- Name of reset wire (if any)
 
@@ -50,10 +52,21 @@ def lookupVar (fvarId : FVarId) : CompilerM (Option String) := do
   let s ← getCompilerState
   return s.varMap.lookup fvarId
 
+/-- Look up the symbolic hardware dimension associated with a Lean Nat binder. -/
+def lookupDim (fvarId : FVarId) : CompilerM (Option DimExpr) := do
+  let s ← getCompilerState
+  return s.dimMap.lookup fvarId
+
 /-- Execute an action with an additional variable mapping in scope -/
 def withVarMapping {α : Type} (fvarId : FVarId) (wireName : String) (k : CompilerM α) : CompilerM α := do
   let oldState ← getCompilerState
   let newState := { oldState with varMap := (fvarId, wireName) :: oldState.varMap }
+  withReader (fun _ => newState) k
+
+/-- Execute an action with an additional symbolic dimension mapping in scope. -/
+def withDimMapping {α : Type} (fvarId : FVarId) (dim : DimExpr) (k : CompilerM α) : CompilerM α := do
+  let oldState ← getCompilerState
+  let newState := { oldState with dimMap := (fvarId, dim) :: oldState.dimMap }
   withReader (fun _ => newState) k
 
 /-- Execute an action with a new local declaration in MetaM scope -/
@@ -95,6 +108,17 @@ def addInput (name : String) (ty : HWType) : CompilerM Unit := do
   let ((), cs') := CircuitM.addInput name ty cs
   set cs'
 
+/-- Add a module input exactly once.  Hierarchical sequential instances share
+    the parent's clock/reset ports, so multiple children must not duplicate
+    those declarations. -/
+def ensureInput (name : String) (ty : HWType) : CompilerM Unit := do
+  let cs ← get
+  match cs.module.inputs.find? (fun port => port.name == name) with
+  | some port =>
+      unless port.ty == ty do
+        liftMetaM $ throwError m!"Conflicting types for propagated input '{name}' in module '{cs.module.name}'."
+  | none => addInput name ty
+
 
 def addOutput (name : String) (ty : HWType) : CompilerM Unit := do
   let cs ← get
@@ -102,42 +126,71 @@ def addOutput (name : String) (ty : HWType) : CompilerM Unit := do
   set cs'
 
 /-- Look up the HW width of a wire by name (from wires, inputs, or outputs) -/
-def getWireWidth (wireName : String) : CompilerM Nat := do
+def getWireWidth (wireName : String) : CompilerM DimExpr := do
   let cs ← get
   let allPorts := cs.module.wires ++ cs.module.inputs ++ cs.module.outputs
   match allPorts.find? (fun p => p.name == wireName) with
-  | some p => return match p.ty with | .bitVector w => w | .bit => 1 | _ => 8
-  | none => return 8
+  | some p => return p.ty.width
+  | none => CompilerM.liftMetaM $ throwError
+      s!"Internal Sparkle compiler error: wire '{wireName}' has no declared hardware type; refusing to assume an 8-bit width."
 
-def emitRegister (hint : String) (clk : String) (rst : String) (input : Sparkle.IR.AST.Expr) (initVal : Nat) (ty : HWType) (named : Bool := false) : CompilerM String := do
+def emitRegister (hint : String) (clk : String) (rst : String) (input : Sparkle.IR.AST.Expr) (initVal : Int) (ty : HWType) (named : Bool := false) : CompilerM String := do
   let cs ← get
   let (name, cs') := CircuitM.emitRegister hint clk rst input initVal ty named cs
   set cs'
   return name
 
-def emitMemory (hint : String) (addrWidth dataWidth : Nat) (clk : String)
+def emitMemory (hint : String) (addrWidth dataWidth : DimExpr) (clk : String)
     (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr) (named : Bool := false) : CompilerM String := do
   let cs ← get
   let (name, cs') := CircuitM.emitMemory hint addrWidth dataWidth clk writeAddr writeData writeEnable readAddr named cs
   set cs'
   return name
 
-def emitMemoryComboRead (hint : String) (addrWidth dataWidth : Nat) (clk : String)
+def emitMemoryComboRead (hint : String) (addrWidth dataWidth : DimExpr) (clk : String)
     (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr) (named : Bool := false) : CompilerM String := do
   let cs ← get
   let (name, cs') := CircuitM.emitMemoryComboRead hint addrWidth dataWidth clk writeAddr writeData writeEnable readAddr named cs
   set cs'
   return name
 
-def emitInstance (moduleName : String) (instName : String) (connections : List (String × Sparkle.IR.AST.Expr)) : CompilerM Unit := do
+def emitInstance (moduleName : String) (instName : String)
+    (connections : List (String × Sparkle.IR.AST.Expr))
+    (parameterOverrides : List (String × DimExpr) := []) : CompilerM Unit := do
   let cs ← get
-  let ((), cs') := CircuitM.emitInstance moduleName instName connections cs
+  let ((), cs') := CircuitM.emitInstance moduleName instName connections parameterOverrides cs
   set cs'
+
+def freshInstanceName (moduleName : String) : CompilerM String := do
+  let cs ← get
+  let (name, cs') := CircuitM.freshName s!"inst_{moduleName}" false cs
+  set cs'
+  return name
+
+def addParameter (name : String) (defaultValue : Nat) : CompilerM Unit := do
+  let cs ← get
+  let m := cs.module
+  if m.parameters.any (fun p => p.name == name) then
+    return
+  let m := m.addParameter { name := name, defaultValue := defaultValue }
+  set { cs with module := m }
+
+private def sameParameterizedModuleShape
+    (lhs rhs : Sparkle.IR.AST.Module) : Bool :=
+  let eraseDefaults (m : Sparkle.IR.AST.Module) :=
+    { m with parameters := m.parameters.map fun (parameter : Sparkle.IR.AST.Parameter) =>
+        { parameter with defaultValue := 0 } }
+  eraseDefaults lhs == eraseDefaults rhs
 
 def addModuleToDesign (m : Sparkle.IR.AST.Module) : CompilerM Unit := do
   let cs ← get
-  let ((), cs') := CircuitM.addModuleToDesign m cs
-  set cs'
+  match cs.design.modules.find? (fun existing => existing.name == m.name) with
+  | some existing =>
+      unless sameParameterizedModuleShape existing m do
+        CompilerM.liftMetaM $ throwError m!"Conflicting hardware modules named '{m.name}' were produced while lowering hierarchy. Parameterized child modules instantiated at different values must retain one symbolic module shape."
+  | none =>
+      let ((), cs') := CircuitM.addModuleToDesign m cs
+      set cs'
 
 end CompilerM
 
@@ -196,113 +249,460 @@ def isPrimitive (name : Name) : Bool :=
 def getOperator (name : Name) : Option Operator :=
   primitiveRegistry.lookup name
 
-partial def inferHWType (type : Lean.Expr) : MetaM (Option HWType) := do
-  let type ← whnf type
+/-- Require a concrete natural number for a non-dimensional compiler value. -/
+partial def requireConcreteNat (role : String) (expr : Lean.Expr) : MetaM Nat := do
+  let expr ← instantiateMVars expr
+  let normalized ← whnf expr
+  match normalized with
+  | .lit (.natVal n) => return n
+  | _ =>
+    let fn := normalized.getAppFn
+    let args := normalized.getAppArgs
+    if fn.isConstOf ``OfNat.ofNat && args.size >= 2 then
+      requireConcreteNat role args[1]!
+    else if fn.isConstOf ``Fin.mk && args.size >= 2 then
+      requireConcreteNat role args[1]!
+    else
+      let rendered ← ppExpr expr
+      throwError m!"Cannot synthesize unresolved {role} {rendered}; this value must be compile-time concrete."
+
+/--
+Require a positive compile-time hardware dimension. This check is deliberately
+separate from `requireConcreteNat`: zero is a valid literal value and slice
+offset, but it cannot be represented as a zero-width packed value or zero-length
+array by the current SystemVerilog backend (`[0:0]` denotes one bit).
+-/
+def requirePositiveConcreteNat (role : String) (expr : Lean.Expr) : MetaM Nat := do
+  let n ← requireConcreteNat role expr
+  if n == 0 then
+    throwError m!"Cannot synthesize hardware with zero {role}.\n\n\
+      Sparkle's current SystemVerilog backend cannot represent zero-width values \
+      or zero-length arrays; a range such as [0:0] denotes one bit. Use a \
+      positive compile-time dimension instead."
+  return n
+
+/-- Read Lean's `(W : Nat := n)` defaults from a declaration type.  Command
+    defaults may override these values; ordinary `{W : Nat}` binders remain
+    intentionally default-free and must be listed by the synthesis command. -/
+partial def collectDeclaredNatDefaults (type : Lean.Expr)
+    : MetaM (List (String × Nat)) := do
+  match type with
+  | .forallE binderName binderType body _ =>
+    let fn := binderType.getAppFn
+    let args := binderType.getAppArgs
+    let rest ← collectDeclaredNatDefaults body
+    if fn.isConstOf ``optParam && args.size >= 2 then
+      let valueType ← whnf args[args.size - 2]!
+      if valueType.isConstOf ``Nat then
+        if args.back!.hasLooseBVars then
+          throwError m!"Dependent default for Nat parameter '{binderName}' is not supported by native SystemVerilog parameter emission.\n\n\
+            Express derived hardware dimensions directly from earlier parameters \
+            (for example, `BitVec (W + 1)`), or supply an independent concrete \
+            default. Sparkle refuses to freeze a dependent default at one \
+            elaboration value because a later parameter override would change its semantics."
+        let defaultValue ← requireConcreteNat
+          s!"default value of Nat parameter '{binderName}'" args.back!
+        return (binderName.toString, defaultValue) :: rest
+    return rest
+  | _ => return []
+
+private def mergeParameterDefaults
+    (declared supplied : List (String × Nat)) : List (String × Nat) :=
+  let withOverrides := declared.map fun (name, value) =>
+    (name, supplied.lookup name |>.getD value)
+  supplied.foldl (fun defaults entry =>
+    if defaults.any (fun existing => existing.1 == entry.1) then defaults
+    else defaults ++ [entry]) withOverrides
+
+/-- Lower a Lean Nat expression into the symbolic dimension language of the IR. -/
+partial def lowerDimExpr (role : String) (expr : Lean.Expr) : CompilerM DimExpr := do
+  let expr ← CompilerM.liftMetaM (instantiateMVars expr)
+  if let .fvar fvarId := expr then
+    if let some dim ← CompilerM.lookupDim fvarId then
+      return dim
+    let value? ← CompilerM.liftMetaM do
+      return (← getLCtx).find? fvarId |>.bind (·.value?)
+    if let some value := value? then
+      return ← lowerDimExpr role value
+    let rendered ← CompilerM.liftMetaM (ppExpr expr)
+    CompilerM.liftMetaM $ throwError m!"Unresolved {role} {rendered} is not a declared module parameter.\n\n\
+      Give the top-level Nat binder a SystemVerilog default in the synthesis \
+      command, for example: #synthesizeVerilog circuit parameters [W := 8]. \
+      Parameter defaults may be zero, but every derived hardware width and \
+      array length must be positive."
+
+  match expr with
+  | .lit (.natVal n) => return .literal n
+  | .letE _ _ value body _ => return ← lowerDimExpr role (body.instantiate1 value)
+  | _ =>
+    -- Inspect surface arithmetic before reduction.  `whnf` can expand Nat
+    -- subtraction/min/max into recursors that no longer expose a stable
+    -- constant-expression shape.
+    let fn := expr.getAppFn
+    let args := expr.getAppArgs
+    let lowerBinary (ctor : DimExpr → DimExpr → DimExpr) : CompilerM DimExpr := do
+      if args.size < 2 then
+        CompilerM.liftMetaM $ throwError m!"Malformed {role}: expected two operands"
+      return ctor
+        (← lowerDimExpr role args[args.size - 2]!)
+        (← lowerDimExpr role args[args.size - 1]!)
+    if fn.isConstOf ``OfNat.ofNat && args.size >= 2 then
+      return ← lowerDimExpr role args[1]!
+    if fn.isConstOf ``Fin.mk && args.size >= 2 then
+      return ← lowerDimExpr role args[1]!
+    if fn.isConstOf ``Nat.succ && args.size >= 1 then
+      return (← lowerDimExpr role args.back!) + 1
+    if fn.isConstOf ``HAdd.hAdd || fn.isConstOf ``Nat.add then
+      return ← lowerBinary DimExpr.mkAdd
+    if fn.isConstOf ``HSub.hSub || fn.isConstOf ``Nat.sub then
+      return ← lowerBinary DimExpr.mkSub
+    if fn.isConstOf ``HMul.hMul || fn.isConstOf ``Nat.mul then
+      return ← lowerBinary DimExpr.mkMul
+    if fn.isConstOf ``HDiv.hDiv || fn.isConstOf ``Nat.div then
+      return ← lowerBinary DimExpr.mkDiv
+    if fn.isConstOf ``HMod.hMod || fn.isConstOf ``Nat.mod then
+      return ← lowerBinary DimExpr.mkMod
+    if fn.isConstOf ``HPow.hPow || fn.isConstOf ``Nat.pow then
+      return ← lowerBinary DimExpr.mkPow
+    if fn.isConstOf ``Min.min || fn.isConstOf ``Nat.min then
+      return ← lowerBinary DimExpr.mkMin
+    if fn.isConstOf ``Max.max || fn.isConstOf ``Nat.max then
+      return ← lowerBinary DimExpr.mkMax
+
+    let normalized ← CompilerM.liftMetaM do
+      withTransparency .reducible (whnf expr)
+    if normalized != expr then
+      return ← lowerDimExpr role normalized
+
+    let rendered ← CompilerM.liftMetaM (ppExpr expr)
+    CompilerM.liftMetaM $ throwError m!"Cannot lower {role} {rendered} to a SystemVerilog constant expression.\n\n\
+      Supported symbolic dimension operations are addition, natural subtraction, \
+      multiplication, division, remainder, power, min, and max."
+
+/-- Lower a hardware dimension and reject a statically known zero. -/
+def lowerPositiveDimExpr (role : String) (expr : Lean.Expr) : CompilerM DimExpr := do
+  let dim ← lowerDimExpr role expr
+  if dim.toNat? == some 0 then
+    CompilerM.liftMetaM $ throwError m!"Cannot synthesize hardware with zero {role}.\n\n\
+      Packed hardware widths and array lengths must be positive."
+  return dim
+
+def hwTypeFromDim (width : DimExpr) : HWType :=
+  match width with
+  | .literal 1 => .bit
+  | _ => .bitVector width
+
+partial def inferHWType (type : Lean.Expr) : CompilerM (Option HWType) := do
+  let type ← CompilerM.liftMetaM (whnf type)
   match type with
   | .app (.const ``BitVec _) width =>
-    -- Width can be direct literal or OfNat wrapper
-    let w ← extractWidth width
-    return some (if w == 1 then .bit else .bitVector w)
+    let w ← lowerPositiveDimExpr "BitVec width" width
+    return some (hwTypeFromDim w)
   | .const ``Bool _ =>
     return some .bit
   | .app (.app (.const ``Prod _) ty1) ty2 =>
     -- Product type: concatenate the two types
     match ← inferHWType ty1, ← inferHWType ty2 with
-    | some (.bitVector w1), some (.bitVector w2) => return some (.bitVector (w1 + w2))
-    | some .bit, some (.bitVector w2) => return some (.bitVector (1 + w2))
-    | some (.bitVector w1), some .bit => return some (.bitVector (w1 + 1))
-    | some .bit, some .bit => return some (.bitVector 2)
+    | some hwType1, some hwType2 =>
+      return some (hwTypeFromDim (hwType1.width + hwType2.width))
     | _, _ => return none
   | .app (.app (.const ``Sparkle.Core.Vector.HWVector _) elemType) size =>
     -- HWVector α n: extract element type and size
-    let n ← extractWidth size
+    let n ← lowerPositiveDimExpr "HWVector size" size
     match ← inferHWType elemType with
     | some hwElemType => return some (.array n hwElemType)
     | none => return none
   | _ =>
     return none
-where
-  extractWidth (e : Lean.Expr) : MetaM Nat := do
-    let e ← whnf e
-    match e with
-    | .lit (.natVal n) => return n
-    | .app fn _arg =>
-      let fnConst := fn.getAppFn
-      if fnConst.isConstOf ``OfNat.ofNat then
-        -- OfNat.ofNat Type n inst -> extract n
-        let args := e.getAppArgs
-        if args.size >= 2 then
-          extractWidth args[1]!
-        else
-          return 8
-      else
-        return 8
-    | _ => return 8
 
 
-def inferHWTypeFromSignal (signalType : Lean.Expr) : CompilerM HWType := do
+def inferHWTypeFromSignal? (signalType : Lean.Expr) : CompilerM (Option HWType) := do
   let signalType ← CompilerM.liftMetaM (whnf signalType)
   match signalType with
   | .app (.app signalConstr _dom) innerType =>
     match signalConstr with
     | .const name _ =>
       if name.toString.endsWith "Signal" then
-        match ← CompilerM.liftMetaM (inferHWType innerType) with
-        | some hwType => return hwType
-        | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {innerType}"
+        inferHWType innerType
       else
-        match ← CompilerM.liftMetaM (inferHWType signalType) with
-        | some hwType => return hwType
-        | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
-    | _ =>
-      match ← CompilerM.liftMetaM (inferHWType signalType) with
-      | some hwType => return hwType
-      | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
-  | _ =>
-    match ← CompilerM.liftMetaM (inferHWType signalType) with
-    | some hwType => return hwType
-    | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
+        inferHWType signalType
+    | _ => inferHWType signalType
+  | _ => inferHWType signalType
+
+def inferHWTypeFromSignal (signalType : Lean.Expr) : CompilerM HWType := do
+  match ← inferHWTypeFromSignal? signalType with
+  | some hwType => return hwType
+  | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
 
 /-- Helper to extract a Nat literal or OfNat.ofNat wrap. -/
 partial def extractNat (e : Lean.Expr) : CompilerM Nat := do
-  let e ← CompilerM.liftMetaM (whnf e)
-  let fn := e.getAppFn
-  let args := e.getAppArgs
-  match fn with
-  | .const name _ =>
-    if name == ``OfNat.ofNat && args.size >= 2 then
-       match args[1]! with
-       | .lit (.natVal n) => return n
-       | _ => CompilerM.liftMetaM $ throwError s!"Expected Nat literal in OfNat, got: {args[1]!}"
-    else if name == ``Fin.mk && args.size >= 2 then
-       extractNat args[1]!
-    else
-       CompilerM.liftMetaM $ throwError s!"Expected Nat literal, got constant: {name}"
-  | .lit (.natVal n) => return n
-  | _ => CompilerM.liftMetaM $ throwError s!"Expected Nat, got: {e}"
+  CompilerM.liftMetaM (requireConcreteNat "compile-time Nat" e)
 
-def extractBitVecLiteral (expr : Lean.Expr) : CompilerM (Nat × Nat) := do
-  let expr ← CompilerM.liftMetaM (whnf expr)
+/-- Extract a concrete, positive dimension used to construct hardware. -/
+def extractPositiveNat (role : String) (e : Lean.Expr) : CompilerM Nat := do
+  CompilerM.liftMetaM (requirePositiveConcreteNat role e)
+
+/-- Extract a positive concrete or parameterized hardware dimension. -/
+def extractPositiveDim (role : String) (e : Lean.Expr) : CompilerM DimExpr :=
+  lowerPositiveDimExpr role e
+
+/-- Evaluate a retained hardware dimension using the module's declared
+    SystemVerilog parameter defaults.  A parameterized module must have a
+    concrete, valid default elaboration even though downstream users may
+    override those defaults. -/
+def evalDefaultDim (m : Sparkle.IR.AST.Module) (role : String) (dim : DimExpr) : MetaM Nat := do
+  let lookup (name : String) : Option Nat :=
+    (m.parameters.find? (fun parameter => parameter.name == name)).map (·.defaultValue)
+  match dim.eval? lookup with
+  | some value => return value
+  | none => throwError m!"Cannot evaluate {role} '{dim}' in module '{m.name}' under its parameter defaults."
+
+def validatePositiveDefaultDim (m : Sparkle.IR.AST.Module) (role : String) (dim : DimExpr) : MetaM Unit := do
+  let value ← evalDefaultDim m role dim
+  if value == 0 then
+    throwError m!"The default parameter configuration of module '{m.name}' gives zero {role} ('{dim}').\n\n\
+      Packed hardware widths and array lengths must be positive. Choose defaults \
+      whose derived hardware dimensions are all greater than zero."
+
+partial def validateHWTypeDefaults (m : Sparkle.IR.AST.Module) (role : String) : HWType → MetaM Unit
+  | .bit => pure ()
+  | .bitVector width => validatePositiveDefaultDim m s!"{role} width" width
+  | .array size elemType => do
+      validatePositiveDefaultDim m s!"{role} array length" size
+      validateHWTypeDefaults m s!"{role} element" elemType
+
+partial def validateExprDefaults (m : Sparkle.IR.AST.Module) (role : String) : Sparkle.IR.AST.Expr → MetaM Unit
+  | .const _ width => validatePositiveDefaultDim m s!"{role} constant width" width
+  | .ref _ => pure ()
+  | .op _ args | .concat args =>
+      args.forM (validateExprDefaults m role)
+  | .slice expr hi lo => do
+      validateExprDefaults m role expr
+      let hiValue ← evalDefaultDim m s!"{role} slice high index" hi
+      let loValue ← evalDefaultDim m s!"{role} slice low index" lo
+      if hiValue < loValue then
+        throwError m!"The default parameter configuration of module '{m.name}' gives an empty or reversed slice {hi}:{lo} in {role}."
+  | .index array index => do
+      validateExprDefaults m role array
+      validateExprDefaults m role index
+
+def validateStmtDefaults (m : Sparkle.IR.AST.Module) : Stmt → MetaM Unit
+  | .assign lhs rhs => validateExprDefaults m s!"assignment to '{lhs}'" rhs
+  | .register output _ _ input _ => validateExprDefaults m s!"register '{output}' input" input
+  | .memory name addrWidth dataWidth _ writeAddr writeData writeEnable readAddr _ _ => do
+      validatePositiveDefaultDim m s!"memory '{name}' address width" addrWidth
+      validatePositiveDefaultDim m s!"memory '{name}' data width" dataWidth
+      [writeAddr, writeData, writeEnable, readAddr].forM
+        (validateExprDefaults m s!"memory '{name}' expression")
+  | .inst _ instName connections _ =>
+      connections.forM fun (_, expr) => validateExprDefaults m s!"instance '{instName}' connection" expr
+
+private def systemVerilogKeywords : List String :=
+  ["accept_on", "alias", "always", "always_comb", "always_ff", "always_latch",
+   "and", "assert", "assign", "assume", "automatic", "before", "begin", "bind",
+   "bins", "binsof", "bit", "break", "buf", "bufif0", "bufif1", "byte", "case",
+   "casex", "casez", "cell", "chandle", "checker", "class", "clocking", "cmos",
+   "config", "const", "constraint", "context", "continue", "cover", "covergroup",
+   "coverpoint", "cross", "deassign", "default", "defparam", "design", "disable",
+   "dist", "do", "edge", "else", "end", "endcase", "endchecker", "endclass",
+   "endclocking", "endconfig", "endfunction", "endgenerate", "endgroup", "endinterface",
+   "endmodule", "endpackage", "endprimitive", "endprogram", "endproperty", "endspecify",
+   "endsequence", "endtable", "endtask", "enum", "event", "eventually", "expect",
+   "export", "extends", "extern", "final", "first_match", "for", "force", "foreach",
+   "forever", "fork", "forkjoin", "function", "generate", "genvar", "global", "highz0",
+   "highz1", "if", "iff", "ifnone", "ignore_bins", "illegal_bins", "implements",
+   "implies", "import", "incdir", "include", "initial", "inout", "input", "inside",
+   "instance", "int", "integer", "interconnect", "interface", "intersect", "join",
+   "join_any", "join_none", "large", "let", "liblist", "library", "local", "localparam",
+   "logic", "longint", "macromodule", "matches", "medium", "modport", "module", "nand",
+   "negedge", "nettype", "new", "nexttime", "nmos", "nor", "noshowcancelled", "not",
+   "notif0", "notif1", "null", "or", "output", "package", "packed", "parameter",
+   "pmos", "posedge", "primitive", "priority", "program", "property", "protected",
+   "pull0", "pull1", "pulldown", "pullup", "pulsestyle_ondetect", "pulsestyle_onevent",
+   "pure", "rand", "randc", "randcase", "randsequence", "rcmos", "real", "realtime",
+   "ref", "reg", "reject_on", "release", "repeat", "restrict", "return", "rnmos",
+   "rpmos", "rtran", "rtranif0", "rtranif1", "s_always", "s_eventually", "s_nexttime",
+   "s_until", "s_until_with", "scalared", "sequence", "shortint", "shortreal", "showcancelled",
+   "signed", "small", "solve", "specify", "specparam", "static", "string", "strong",
+   "strong0", "strong1", "struct", "super", "supply0", "supply1", "sync_accept_on",
+   "sync_reject_on", "table", "tagged", "task", "this", "throughout", "time",
+   "timeprecision", "timeunit", "tran", "tranif0", "tranif1", "tri", "tri0", "tri1",
+   "triand", "trior", "trireg", "type", "typedef", "union", "unique", "unique0",
+   "unsigned", "until", "until_with", "untyped", "use", "uwire", "var", "vectored",
+   "virtual", "void", "wait", "wait_order", "wand", "weak", "weak0", "weak1",
+   "while", "wildcard", "wire", "with", "within", "wor", "xnor", "xor"]
+
+private def isLegalSystemVerilogIdentifier (name : String) : Bool :=
+  match name.toList with
+  | [] => false
+  | first :: rest =>
+      (first.isAlpha || first == '_' || first == '$') &&
+        rest.all (fun c => c.isAlphanum || c == '_' || c == '$') &&
+        !systemVerilogKeywords.contains name
+
+/-- Validate facts that SystemVerilog itself cannot express in a parameter
+    declaration: emitted-name uniqueness and a legal default elaboration. -/
+def validateParameterizedModule (m : Sparkle.IR.AST.Module) : MetaM Unit := do
+  for parameter in m.parameters do
+    let emittedName := Sparkle.Backend.Verilog.sanitizeName parameter.name
+    unless isLegalSystemVerilogIdentifier emittedName do
+      throwError m!"Lean parameter '{parameter.name}' emits as invalid or reserved SystemVerilog identifier '{emittedName}' in module '{m.name}'. Rename the binder."
+    let conflicts := m.parameters.filter fun (other : Sparkle.IR.AST.Parameter) =>
+      other.name != parameter.name &&
+        Sparkle.Backend.Verilog.sanitizeName other.name == emittedName
+    if let conflict :: _ := conflicts then
+      throwError m!"SystemVerilog parameter names '{parameter.name}' and '{conflict.name}' both emit as '{emittedName}' in module '{m.name}'. Rename one binder."
+    let hardwareNames := (m.inputs ++ m.outputs ++ m.wires).map (fun port =>
+      (port.name, Sparkle.Backend.Verilog.sanitizeName port.name))
+    if let some (sourceName, _) := hardwareNames.find? (fun entry => entry.2 == emittedName) then
+      throwError m!"SystemVerilog parameter '{parameter.name}' and hardware name '{sourceName}' both emit as '{emittedName}' in module '{m.name}'. Rename the parameter binder."
+  for input in m.inputs do
+    validateHWTypeDefaults m s!"input '{input.name}'" input.ty
+  for output in m.outputs do
+    validateHWTypeDefaults m s!"output '{output.name}'" output.ty
+  for wire in m.wires do
+    validateHWTypeDefaults m s!"wire '{wire.name}'" wire.ty
+  for stmt in m.body do
+    validateStmtDefaults m stmt
+
+def validateDesignForEmission (design : Sparkle.IR.AST.Design) : MetaM Unit := do
+  for module in design.modules do
+    let emittedName := Sparkle.Backend.Verilog.sanitizeName module.name
+    if let some conflict := design.modules.find? fun other =>
+        other.name != module.name &&
+          Sparkle.Backend.Verilog.sanitizeName other.name == emittedName then
+      throwError m!"Module names '{module.name}' and '{conflict.name}' both emit as '{emittedName}' in SystemVerilog. Rename one definition or namespace."
+  for module in design.modules do
+    validateParameterizedModule module
+  for module in design.modules do
+    for stmt in module.body do
+      match stmt with
+      | .inst childName instName _ parameterOverrides =>
+          let child ← match design.findModule childName with
+            | some child => pure child
+            | none => throwError m!"Instance '{instName}' in module '{module.name}' refers to missing child module '{childName}'."
+          for (parameterName, _) in parameterOverrides do
+            unless child.parameters.any (fun parameter => parameter.name == parameterName) do
+              throwError m!"Instance '{instName}' overrides undeclared parameter '{parameterName}' of child module '{childName}'."
+      | _ => pure ()
+
+/-- Pair the natural-number binders of a called definition with the fully
+    elaborated arguments at that call site.  These pairs are used only when a
+    definition cannot be inlined and must remain a parameterized submodule. -/
+partial def collectNatCallArguments (type : Lean.Expr) (args : Array Lean.Expr)
+    (index : Nat := 0) : MetaM (List (String × Lean.Expr)) := do
+  if h : index < args.size then
+    let type ← whnf type
+    match type with
+    | .forallE binderName binderType body _ =>
+      let arg := args[index]
+      let rest ← collectNatCallArguments (body.instantiate1 arg) args (index + 1)
+      let binderType ← whnf binderType
+      if binderType.isConstOf ``Nat then
+        return (binderName.toString, arg) :: rest
+      return rest
+    | _ => return []
+  else
+    return []
+
+def extractBitVecLiteral? (expr : Lean.Expr) : CompilerM (Option (Nat × DimExpr)) := do
+  let inspect (candidate : Lean.Expr) : CompilerM (Option (Nat × DimExpr)) := do
+    let fn := candidate.getAppFn
+    let args := candidate.getAppArgs
+    match fn with
+    | .const name _ =>
+      if name == ``OfNat.ofNat && args.size >= 3 then
+        let literalType ← CompilerM.liftMetaM (whnf args[0]!)
+        match literalType with
+        | .app (.const ``BitVec _) widthExpr =>
+          let w ← extractPositiveDim "BitVec literal width" widthExpr
+          let v ← extractNat args[1]!
+          return some (v, w)
+        | _ => return none
+      else if name == ``BitVec.ofNat && args.size >= 2 then
+        let w ← extractPositiveDim "BitVec literal width" args[args.size - 2]!
+        let v ← extractNat args[args.size - 1]!
+        return some (v, w)
+      else if name == ``BitVec.ofFin && args.size >= 2 then
+        let w ← extractPositiveDim "BitVec literal width" args[0]!
+        let v ← extractNat args[1]!
+        return some (v, w)
+      else if name == ``Bool.false then
+        return some (0, 1)
+      else if name == ``Bool.true then
+        return some (1, 1)
+      else
+        return none
+    | _ => return none
+
+  -- Preserve `BitVec.ofNat W value` before reduction: whnf turns it into a
+  -- modulo expression whose value depends on W even when `value` is concrete.
+  if let some literal ← inspect expr then
+    return some literal
+  let reduced ← CompilerM.liftMetaM (whnf expr)
+  if reduced == expr then return none
+  inspect reduced
+
+def extractBitVecLiteral (expr : Lean.Expr) : CompilerM (Nat × DimExpr) := do
+  match ← extractBitVecLiteral? expr with
+  | some literal => return literal
+  | none => CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
+
+/-- Recognize an all-ones `BitVec` whose value depends on its retained width.
+
+`BitVec.ofNat W (2 ^ W - 1)` cannot be converted to a compile-time `Int` when
+`W` is a native SystemVerilog parameter.  Its hardware meaning is nevertheless
+width-polymorphic and exact: it is the bitwise complement of the `W`-bit zero
+value.  Keep that meaning in the ordinary expression IR instead of evaluating
+the source Nat at Lean elaboration time.
+
+The bounded unfolding handles small transparent helpers such as
+`Sparkle.Library.RTL.onesBV` without allowing arbitrary value-level Nat
+programs to leak into the hardware constant-expression subset. -/
+partial def extractSymbolicAllOnes? (expr : Lean.Expr) (fuel : Nat := 4)
+    : CompilerM (Option DimExpr) := do
+  let expr ← CompilerM.liftMetaM (instantiateMVars expr)
   let fn := expr.getAppFn
   let args := expr.getAppArgs
-  match fn with
-  | .const name _ =>
-    if name == ``BitVec.ofNat && args.size >= 3 then
-      let w ← extractNat args[0]!
-      let v ← extractNat args[2]!
-      return (v, w)
-    else if name == ``BitVec.ofFin && args.size >= 2 then
-      let w ← extractNat args[0]!
-      let v ← extractNat args[1]!
-      return (v, w)
-    else if name == ``Bool.false then
-      return (0, 1)
-    else if name == ``Bool.true then
-      return (1, 1)
-    else
-      CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got application of {name}"
-  | _ =>
-    CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
+  if fn.isConstOf ``BitVec.allOnes && args.size >= 1 then
+    try
+      return some (← extractPositiveDim "BitVec all-ones width" args.back!)
+    catch _ =>
+      -- This recognizer must not replace the established literal diagnostic
+      -- when the width itself is invalid or was not declared as a parameter.
+      return none
+  if fn.isConstOf ``BitVec.ofNat && args.size >= 2 then
+    try
+      let width ← extractPositiveDim "BitVec all-ones width" args[args.size - 2]!
+      let valueDim ← lowerDimExpr "BitVec symbolic constant value" args.back!
+      let expected := DimExpr.mkSub (DimExpr.mkPow 2 width) 1
+      return if valueDim == expected then some width else none
+    catch _ =>
+      return none
+  if fuel == 0 then return none
+  let unfolded? ← CompilerM.liftMetaM (Lean.Meta.unfoldDefinition? expr)
+  match unfolded? with
+  | some unfolded => extractSymbolicAllOnes? unfolded (fuel - 1)
+  | none => return none
+
+/-- Extract a constant BitVec as hardware IR.  Concrete literals retain the
+existing `.const` representation; the common width-dependent all-ones mask is
+represented as `~0` at the same symbolic width. -/
+def extractBitVecConstant (expr : Lean.Expr)
+    : CompilerM (Sparkle.IR.AST.Expr × DimExpr) := do
+  if let some width ← extractSymbolicAllOnes? expr then
+    return (.op .not [.const 0 width], width)
+  let (value, width) ← extractBitVecLiteral expr
+  return (.const (Int.ofNat value) width, width)
+
+/-- Register reset values are stored as an `Int` in the current IR.  `-1` is
+the exact width-independent encoding of an all-ones reset because the backend
+casts it to the register's retained packed width. -/
+def extractBitVecResetValue (expr : Lean.Expr) : CompilerM (Int × DimExpr) := do
+  if let some width ← extractSymbolicAllOnes? expr then
+    return (-1, width)
+  let (value, width) ← extractBitVecLiteral expr
+  return (Int.ofNat value, width)
 
 /-- Extract a Nat literal from an expression -/
 def extractNatLiteral (expr : Lean.Expr) : CompilerM (Nat × Unit) := do
@@ -310,7 +710,7 @@ def extractNatLiteral (expr : Lean.Expr) : CompilerM (Nat × Unit) := do
   return (n, ())
 
 /-- Extract values from a List (BitVec n) expression into an array of (value, width) pairs -/
-partial def extractBitVecList (expr : Lean.Expr) : CompilerM (Array (Nat × Nat)) := do
+partial def extractBitVecList (expr : Lean.Expr) : CompilerM (Array (Nat × DimExpr)) := do
   let expr ← CompilerM.liftMetaM (whnf expr)
   let fn := expr.getAppFn
   let args := expr.getAppArgs
@@ -330,7 +730,7 @@ partial def extractBitVecList (expr : Lean.Expr) : CompilerM (Array (Nat × Nat)
     CompilerM.liftMetaM $ throwError s!"Expected List expression, got: {expr}"
 
 /-- Extract values from an Array (BitVec n) expression -/
-def extractBitVecArray (expr : Lean.Expr) : CompilerM (Array (Nat × Nat)) := do
+def extractBitVecArray (expr : Lean.Expr) : CompilerM (Array (Nat × DimExpr)) := do
   let expr ← CompilerM.liftMetaM (Lean.Meta.reduce expr (skipTypes := true) (skipProofs := true))
   let fn := expr.getAppFn
   let args := expr.getAppArgs
@@ -410,20 +810,21 @@ mutual
             let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
             let hwType ← inferHWTypeFromSignal exprType
             let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-            -- For mixed Signal/BitVec: use extractBitVecLiteral for the constant arg
+            -- Mixed Signal/BitVec operands may contain a retained-width
+            -- constant such as `(2 ^ width - 1)#width`.
             let wireA ← if isSignal1 then
               translateExprToWire arg1 "op_a" (isTopLevel := false)
             else
-              let (cVal, cWidth) ← extractBitVecLiteral arg1
+              let (constant, cWidth) ← extractBitVecConstant arg1
               let constWire ← CompilerM.makeWire "op_const" (.bitVector cWidth)
-              CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+              CompilerM.emitAssign constWire constant
               pure constWire
             let wireB ← if isSignal2 then
               translateExprToWire arg2 "op_b" (isTopLevel := false)
             else
-              let (cVal, cWidth) ← extractBitVecLiteral arg2
+              let (constant, cWidth) ← extractBitVecConstant arg2
               let constWire ← CompilerM.makeWire "op_const" (.bitVector cWidth)
-              CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+              CompilerM.emitAssign constWire constant
               pure constWire
             CompilerM.emitAssign resWire (.op op [.ref wireA, .ref wireB])
             return resWire
@@ -453,15 +854,15 @@ mutual
           if isSignal1 then
             -- Signal ++ BitVec: arg1 is signal, arg2 is constant
             let wireA ← translateExprToWire arg1 "concat_hi" (isTopLevel := false)
-            let (cVal, cWidth) ← extractBitVecLiteral arg2
+            let (constant, cWidth) ← extractBitVecConstant arg2
             let constWire ← CompilerM.makeWire "concat_const" (.bitVector cWidth)
-            CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+            CompilerM.emitAssign constWire constant
             CompilerM.emitAssign resWire (.concat [.ref wireA, .ref constWire])
           else
             -- BitVec ++ Signal: arg1 is constant, arg2 is signal
-            let (cVal, cWidth) ← extractBitVecLiteral arg1
+            let (constant, cWidth) ← extractBitVecConstant arg1
             let constWire ← CompilerM.makeWire "concat_const" (.bitVector cWidth)
-            CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+            CompilerM.emitAssign constWire constant
             let wireB ← translateExprToWire arg2 "concat_lo" (isTopLevel := false)
             CompilerM.emitAssign resWire (.concat [.ref constWire, .ref wireB])
           return resWire
@@ -473,9 +874,9 @@ mutual
         if name == ``OfNat.ofNat && args.size >= 3 then
           let type ← CompilerM.liftMetaM (whnf args[0]!)
           if let .app (.const ``BitVec _) widthExpr := type then
-            let w ← extractNat widthExpr
+            let w ← extractPositiveDim "BitVec literal width" widthExpr
             let v ← extractNat args[1]!
-            let resWire ← CompilerM.makeWire hint (if w == 1 then .bit else .bitVector w) (named := isNamed)
+            let resWire ← CompilerM.makeWire hint (hwTypeFromDim w) (named := isNamed)
             CompilerM.emitAssign resWire (.const v w)
             return resWire
 
@@ -530,17 +931,24 @@ mutual
              match ← CompilerM.lookupVar fvarId with
              | some wireName => return wireName
              | none => pure ()
-           -- Try to extract the BitVec literal value
-           let (value, width) ← try
-             extractBitVecLiteral constValue
-           catch _ =>
-             -- If not a BitVec literal, try to reduce and check again
-             let reduced ← CompilerM.liftMetaM (reduce constValue)
-             try
-               extractBitVecLiteral reduced
-             catch _ =>
-               -- Last resort: try translateExprToWire (handles OfNat.ofNat, etc.)
-               return ← translateExprToWire constValue hint (isNamed := isNamed)
+           -- Retain the common width-dependent all-ones mask as `~0` rather
+           -- than trying to evaluate `2 ^ width - 1` in Lean.
+           if let some width ← extractSymbolicAllOnes? constValue then
+             let resWire ← CompilerM.makeWire hint (.bitVector width) (named := isNamed)
+             CompilerM.emitAssign resWire (.op .not [.const 0 width])
+             return resWire
+           -- Shape mismatches can fall through to general expression lowering,
+           -- but errors in a recognized literal (such as a symbolic width) must
+           -- propagate instead of being swallowed by a catch-all fallback.
+           let literal? ← extractBitVecLiteral? constValue
+           let literal? ← match literal? with
+             | some literal => pure (some literal)
+             | none => do
+               let reduced ← CompilerM.liftMetaM (reduce constValue)
+               extractBitVecLiteral? reduced
+           let (value, width) ← match literal? with
+             | some literal => pure literal
+             | none => return ← translateExprToWire constValue hint (isNamed := isNamed)
            let resWire ← CompilerM.makeWire hint (.bitVector width) (named := isNamed)
            CompilerM.emitAssign resWire (.const value width)
            return resWire
@@ -566,7 +974,7 @@ mutual
                let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
                let hwType ← inferHWTypeFromSignal exprType
                let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-               let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+               let width := hwType.width
                CompilerM.emitAssign resWire (.slice (.ref wireS) (totalWidth - 1) (totalWidth - width))
                return resWire
            if fFn.isConstOf ``Prod.snd then
@@ -574,7 +982,7 @@ mutual
                let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
                let hwType ← inferHWTypeFromSignal exprType
                let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-               let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+               let width := hwType.width
                CompilerM.emitAssign resWire (.slice (.ref wireS) (width - 1) 0)
                return resWire
 
@@ -586,8 +994,8 @@ mutual
                if opName == ``BitVec.extractLsb' then
                  let bodyArgs := body.getAppArgs
                  if bodyArgs.size >= 4 then
-                   let start ← extractNat bodyArgs[bodyArgs.size - 3]!
-                   let len ← extractNat bodyArgs[bodyArgs.size - 2]!
+                   let start ← lowerDimExpr "BitVec slice offset" bodyArgs[bodyArgs.size - 3]!
+                   let len ← extractPositiveDim "BitVec slice width" bodyArgs[bodyArgs.size - 2]!
                    let wireS ← translateExprToWire s "s" (isTopLevel := false)
                    let resWire ← CompilerM.makeWire hint (.bitVector len) (named := isNamed)
                    CompilerM.emitAssign resWire (.slice (.ref wireS) (start + len - 1) start)
@@ -653,15 +1061,15 @@ mutual
               -- Infer component types from the continuation lambda types
               let (ty1, ty2) ← match cont with
                 | .lam _ t1 (.lam _ t2 _ _) _ => pure (t1, t2)
-                | .lam _ t1 _ _ =>
-                  -- Single lambda, need to infer second type from first lambda body
-                  pure (t1, t1) -- Fallback: assume same types
+                | .lam _ _ _ _ =>
+                  CompilerM.liftMetaM $ throwError
+                    "Cannot infer the second component type while lowering Prod.rec; refusing to guess a tuple width."
                 | _ => CompilerM.liftMetaM $ throwError "Expected lambda in Prod.rec continuation"
 
               let hwType1 ← inferHWTypeFromSignal ty1
               let hwType2 ← inferHWTypeFromSignal ty2
-              let width1 := match hwType1 with | .bitVector w => w | .bit => 1 | _ => 8
-              let width2 := match hwType2 with | .bitVector w => w | .bit => 1 | _ => 8
+              let width1 := hwType1.width
+              let width2 := hwType2.width
 
               -- Extract the two components
               let wire1 ← CompilerM.makeWire (hint ++ "_fst") hwType1
@@ -788,8 +1196,8 @@ mutual
                  if opName == ``BitVec.extractLsb' then
                    let bodyArgs := bodyApp.getAppArgs
                    if bodyArgs.size >= 4 then
-                     let start ← extractNat bodyArgs[bodyArgs.size - 3]!
-                     let len ← extractNat bodyArgs[bodyArgs.size - 2]!
+                     let start ← lowerDimExpr "BitVec slice offset" bodyArgs[bodyArgs.size - 3]!
+                     let len ← extractPositiveDim "BitVec slice width" bodyArgs[bodyArgs.size - 2]!
                      let wireA ← translateExprToWire a "a" (isTopLevel := false)
                      let resWire ← CompilerM.makeWire hint (.bitVector len) (named := isNamed)
                      CompilerM.emitAssign resWire (.slice (.ref wireA) (start + len - 1) start)
@@ -822,17 +1230,17 @@ mutual
                        let hwType ← inferHWTypeFromSignal exprType
                        if arg1HasBVar then
                          -- (fun d => d ++ const) — signal is high bits
-                         let (cVal, cWidth) ← extractBitVecLiteral arg2
+                         let (constant, cWidth) ← extractBitVecConstant arg2
                          let constWire ← CompilerM.makeWire "lambda_const" (.bitVector cWidth)
-                         CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+                         CompilerM.emitAssign constWire constant
                          let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
                          CompilerM.emitAssign resWire (.concat [.ref wireA, .ref constWire])
                          return resWire
                        else
                          -- (fun d => const ++ d) — signal is low bits
-                         let (cVal, cWidth) ← extractBitVecLiteral arg1
+                         let (constant, cWidth) ← extractBitVecConstant arg1
                          let constWire ← CompilerM.makeWire "lambda_const" (.bitVector cWidth)
-                         CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+                         CompilerM.emitAssign constWire constant
                          let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
                          CompilerM.emitAssign resWire (.concat [.ref constWire, .ref wireA])
                          return resWire
@@ -842,17 +1250,17 @@ mutual
                        let hwType ← inferHWTypeFromSignal exprType
                        if arg1HasBVar then
                          -- (fun x => x + const)
-                         let (cVal, cWidth) ← extractBitVecLiteral arg2
+                         let (constant, cWidth) ← extractBitVecConstant arg2
                          let constWire ← CompilerM.makeWire "lambda_const" (.bitVector cWidth)
-                         CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+                         CompilerM.emitAssign constWire constant
                          let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
                          CompilerM.emitAssign resWire (.op op [.ref wireA, .ref constWire])
                          return resWire
                        else
                          -- (fun x => const + x)
-                         let (cVal, cWidth) ← extractBitVecLiteral arg1
+                         let (constant, cWidth) ← extractBitVecConstant arg1
                          let constWire ← CompilerM.makeWire "lambda_const" (.bitVector cWidth)
-                         CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
+                         CompilerM.emitAssign constWire constant
                          let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
                          CompilerM.emitAssign resWire (.op op [.ref constWire, .ref wireA])
                          return resWire
@@ -926,7 +1334,7 @@ mutual
       let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
       let hwType ← inferHWTypeFromSignal exprType
       let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-      let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+      let width := hwType.width
       let lo := (1 - idx) * width
       let hi := lo + width - 1
       CompilerM.emitAssign resWire (.slice (.ref wireS) hi lo)
@@ -936,7 +1344,7 @@ mutual
       -- Infer result type from the expression type
       let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
       let hwType ← inferHWTypeFromSignal exprType
-      let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+      let width := hwType.width
       let wire ← CompilerM.makeWire hint hwType (named := isNamed)
       CompilerM.emitAssign wire (.const (Int.ofNat n) width)
       return wire
@@ -951,13 +1359,7 @@ mutual
 
     | .letE name type value body _ => do
       -- For any let binding, just use normal let handling
-      let isHW ← try
-        let _ ← inferHWTypeFromSignal type
-        pure true
-      catch _ =>
-        pure false
-
-      if isHW then
+      if let some _ ← inferHWTypeFromSignal? type then
         -- Hardware let: translate value to wire
         let valueWire ← translateExprToWire value name.toString (isTopLevel := false) (isNamed := true)
         CompilerM.withLocalDecl name type fun fvar => do
@@ -973,13 +1375,8 @@ mutual
           translateExprToWire bodyInst hint isTopLevel isNamed
 
     | .lam binderName binderType body _ => do
-      let isHWArg ← try
-        let _ ← inferHWTypeFromSignal binderType
-        pure true
-      catch _ => pure false
-
-      if isHWArg then
-          let hwType ← inferHWTypeFromSignal binderType
+      match ← inferHWTypeFromSignal? binderType with
+      | some hwType =>
           let paramWire ← CompilerM.makeWire binderName.toString hwType (named := true)
           -- Only add as input if this is a top-level function parameter
           if isTopLevel then
@@ -992,11 +1389,30 @@ mutual
               let bodyInst := body.instantiate1 fvar
               -- Nested lambdas are also top-level if they're part of the function signature
               translateExprToWire bodyInst hint isTopLevel isNamed
-      else
-          -- Logic argument (e.g. config): add to context but no wire/input
-          CompilerM.withLocalDecl binderName binderType fun fvar => do
-            let bodyInst := body.instantiate1 fvar
-            translateExprToWire bodyInst hint isTopLevel isNamed
+      | none =>
+          let binderTypeWhnf ← CompilerM.liftMetaM (whnf binderType)
+          let parameterName := binderName.toString
+          let compilerState ← CompilerM.getCompilerState
+          if isTopLevel && binderTypeWhnf.isConstOf ``Nat then
+            match compilerState.parameterDefaults.lookup parameterName with
+            | some defaultValue =>
+              CompilerM.addParameter parameterName defaultValue
+              CompilerM.withLocalDecl binderName binderType fun fvar => do
+                let bodyInst := body.instantiate1 fvar
+                CompilerM.withDimMapping fvar.fvarId! (.param parameterName) do
+                  translateExprToWire bodyInst hint isTopLevel isNamed
+            | none =>
+              -- Preserve old behavior for unused logic parameters.  If this
+              -- binder reaches a hardware dimension, lowerDimExpr reports the
+              -- missing explicit SystemVerilog default at that use site.
+              CompilerM.withLocalDecl binderName binderType fun fvar => do
+                let bodyInst := body.instantiate1 fvar
+                translateExprToWire bodyInst hint isTopLevel isNamed
+          else
+            -- Logic argument (e.g. clock-domain config): no wire/input.
+            CompilerM.withLocalDecl binderName binderType fun fvar => do
+              let bodyInst := body.instantiate1 fvar
+              translateExprToWire bodyInst hint isTopLevel isNamed
 
 
     | _ =>
@@ -1036,7 +1452,7 @@ mutual
       let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
       let hwType ← inferHWTypeFromSignal exprType
       let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-      let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+      let width := hwType.width
       CompilerM.emitAssign resWire (.slice (.ref wireS) (totalWidth - 1) (totalWidth - width))
       return some resWire
 
@@ -1048,7 +1464,7 @@ mutual
       let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
       let hwType ← inferHWTypeFromSignal exprType
       let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-      let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+      let width := hwType.width
       CompilerM.emitAssign resWire (.slice (.ref wireS) (width - 1) 0)
       return some resWire
 
@@ -1066,7 +1482,7 @@ mutual
         let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
         let hwType ← inferHWTypeFromSignal exprType
         let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-        let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+        let width := hwType.width
         CompilerM.emitAssign resWire (.slice (.ref wireS) (totalWidth - 1) (totalWidth - width))
         return some resWire
       if f.isConstOf ``Prod.snd then
@@ -1075,7 +1491,7 @@ mutual
         let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
         let hwType ← inferHWTypeFromSignal exprType
         let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-        let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
+        let width := hwType.width
         CompilerM.emitAssign resWire (.slice (.ref wireS) (width - 1) 0)
         return some resWire
 
@@ -1146,8 +1562,8 @@ mutual
     -- BitVec.extractLsb': bit slice extraction
     if name == ``BitVec.extractLsb' && args.size >= 4 then
       trace[sparkle.compiler] "→ extractLsb'"
-      let start ← extractNat args[args.size - 3]!
-      let len ← extractNat args[args.size - 2]!
+      let start ← lowerDimExpr "BitVec slice offset" args[args.size - 3]!
+      let len ← extractPositiveDim "BitVec slice width" args[args.size - 2]!
       let bvWire ← translateExprToWire args[args.size - 1]! "slice_src"
       let resWire ← CompilerM.makeWire hint (.bitVector len) (named := isNamed)
       CompilerM.emitAssign resWire (.slice (.ref bvWire) (start + len - 1) start)
@@ -1157,7 +1573,7 @@ mutual
     -- getLsb x i  ≡  extractLsb' i 1 x  (returns Bool, we emit a 1-bit slice)
     if name == ``BitVec.getLsb && args.size >= 3 then
       trace[sparkle.compiler] "→ getLsb"
-      let idx ← extractNat args[args.size - 1]!
+      let idx ← lowerDimExpr "BitVec bit index" args[args.size - 1]!
       let bvWire ← translateExprToWire args[args.size - 2]! "getlsb_src"
       let resWire ← CompilerM.makeWire hint .bit (named := isNamed)
       CompilerM.emitAssign resWire (.slice (.ref bvWire) idx idx)
@@ -1194,18 +1610,13 @@ mutual
     -- BitVec.zeroExtend / BitVec.setWidth: zero-extend to wider width
     if (name == ``BitVec.zeroExtend || name == ``BitVec.setWidth) && args.size >= 2 then
       trace[sparkle.compiler] "→ zeroExtend"
-      let targetWidth ← extractNat args[args.size - 2]!
+      let targetWidth ← extractPositiveDim "BitVec target width" args[args.size - 2]!
       let srcWire ← translateExprToWire args[args.size - 1]! "zext_src"
-      let srcWidth ← CompilerM.getWireWidth srcWire
       let resWire ← CompilerM.makeWire hint (.bitVector targetWidth) (named := isNamed)
-      if targetWidth > srcWidth then
-        let padWidth := targetWidth - srcWidth
-        let padWire ← CompilerM.makeWire "zext_pad" (.bitVector padWidth)
-        CompilerM.emitAssign padWire (.const 0 padWidth)
-        CompilerM.emitAssign resWire (.concat [.ref padWire, .ref srcWire])
-      else
-        -- Same width or narrower: just slice (truncate)
-        CompilerM.emitAssign resWire (.slice (.ref srcWire) (targetWidth - 1) 0)
+      -- SystemVerilog assignment applies the destination packed width: an
+      -- unsigned source is zero-extended or truncated without requiring a
+      -- compile-time comparison between symbolic dimensions.
+      CompilerM.emitAssign resWire (.ref srcWire)
       return some resWire
 
     -- isPrimitive dispatch
@@ -1242,7 +1653,7 @@ mutual
       trace[sparkle.compiler] "→ register"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let (initVal, _) ← extractBitVecResetValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
@@ -1254,7 +1665,7 @@ mutual
       trace[sparkle.compiler] "→ registerNeg"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let (initVal, _) ← extractBitVecResetValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
@@ -1267,7 +1678,7 @@ mutual
       trace[sparkle.compiler] "→ registerNoReset"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let (initVal, _) ← extractBitVecResetValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
@@ -1281,7 +1692,7 @@ mutual
       let init := args[args.size-3]!
       let en := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let (initVal, _) ← extractBitVecResetValue init
       let enWire ← translateExprToWire en "reg_en"
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
@@ -1307,7 +1718,7 @@ mutual
         let (_, dataWidth) := tableValues[0]!
         let indexType ← CompilerM.liftMetaM (Lean.Meta.inferType indexArg)
         let indexHwType ← inferHWTypeFromSignal indexType
-        let indexWidth := indexHwType.bitWidth
+        let indexWidth := indexHwType.width
         let indexWire ← translateExprToWire indexArg "lut_idx"
         let mut resultWire ← CompilerM.makeWire (hint ++ "_d") hwType
         CompilerM.emitAssign resultWire (.const tableValues[0]!.1 dataWidth)
@@ -1344,8 +1755,8 @@ mutual
       trace[sparkle.compiler] "→ memory (sync)"
       let addrWidthArg := args[args.size-6]!
       let dataWidthArg := args[args.size-5]!
-      let (addrWidth, _) ← extractNatLiteral addrWidthArg
-      let (dataWidth, _) ← extractNatLiteral dataWidthArg
+      let addrWidth ← extractPositiveDim "memory address width" addrWidthArg
+      let dataWidth ← extractPositiveDim "memory data width" dataWidthArg
       let writeAddr := args[args.size-4]!
       let writeData := args[args.size-3]!
       let writeEnable := args[args.size-2]!
@@ -1363,8 +1774,8 @@ mutual
       trace[sparkle.compiler] "→ memory (combo read)"
       let addrWidthArg := args[args.size-6]!
       let dataWidthArg := args[args.size-5]!
-      let (addrWidth, _) ← extractNatLiteral addrWidthArg
-      let (dataWidth, _) ← extractNatLiteral dataWidthArg
+      let addrWidth ← extractPositiveDim "memory address width" addrWidthArg
+      let dataWidth ← extractPositiveDim "memory data width" dataWidthArg
       let writeAddr := args[args.size-4]!
       let writeData := args[args.size-3]!
       let writeEnable := args[args.size-2]!
@@ -1460,7 +1871,26 @@ mutual
 
     -- Fallback: sub-module synthesis
     trace[sparkle.compiler] "→ sub-module synthesis {name}"
-    let (subModule, subDesign) ← CompilerM.liftMetaM $ synthesizeCombinational name
+    let declarationType ← CompilerM.liftMetaM do
+      return (← getConstInfo name).type
+    let natCallArguments ← CompilerM.liftMetaM $
+      collectNatCallArguments declarationType args
+    let parentState ← CompilerM.getCompilerState
+    let parentDefault (parameterName : String) : Option Nat :=
+      parentState.parameterDefaults.lookup parameterName
+    let mut subParameterDefaults : List (String × Nat) := []
+    let mut parameterOverrides : List (String × DimExpr) := []
+    for (parameterName, argument) in natCallArguments do
+      let override ← lowerDimExpr s!"instance parameter '{parameterName}'" argument
+      let defaultValue ← match override.eval? parentDefault with
+        | some value => pure value
+        | none => CompilerM.liftMetaM $ throwError m!"Cannot determine a concrete default for parameter '{parameterName}' of submodule '{name}'.\n\n\
+            Parameterized hierarchy requires every child default to be evaluable \
+            under the parent module's declared defaults."
+      subParameterDefaults := subParameterDefaults ++ [(parameterName, defaultValue)]
+      parameterOverrides := parameterOverrides ++ [(parameterName, override)]
+    let (subModule, subDesign) ← CompilerM.liftMetaM $
+      synthesizeCombinational name subParameterDefaults
     for m in subDesign.modules do CompilerM.addModuleToDesign m
     CompilerM.addModuleToDesign subModule
 
@@ -1474,12 +1904,23 @@ mutual
        let argWire ← translateExprToWire argExpr s!"arg{i}"
        connections := (inputPorts[i]!.name, Sparkle.IR.AST.Expr.ref argWire) :: connections
 
+    -- A parameterized child may remain as a real module instance rather than
+    -- being inlined.  Propagate its implicit sequential interface through the
+    -- parent and connect every instance to the shared clock/reset nets.
+    if subModule.inputs.any (fun port => port.name == "clk") then
+      CompilerM.ensureInput "clk" .bit
+      connections := ("clk", .ref "clk") :: connections
+    if subModule.inputs.any (fun port => port.name == "rst") then
+      CompilerM.ensureInput "rst" .bit
+      connections := ("rst", .ref "rst") :: connections
+
     let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
     let hwType ← inferHWTypeFromSignal exprType
     let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
     connections := ("out", Sparkle.IR.AST.Expr.ref resWire) :: connections
 
-    CompilerM.emitInstance subModule.name s!"inst_{subModule.name}" connections.reverse
+    let instanceName ← CompilerM.freshInstanceName subModule.name
+    CompilerM.emitInstance subModule.name instanceName connections.reverse parameterOverrides
     return some resWire
 
   -- ===========================================================================
@@ -1539,7 +1980,7 @@ mutual
     let n ← extractNat natExpr'
     let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType bvExpr)
     let bvHwType ← inferHWTypeFromSignal exprType
-    let width := match bvHwType with | .bitVector w => w | .bit => 1 | _ => 32
+    let width := bvHwType.width
     let constWire ← CompilerM.makeWire "shift_const" (.bitVector width)
     CompilerM.emitAssign constWire (.const (Int.ofNat n) width)
     return constWire
@@ -1553,32 +1994,38 @@ mutual
       | .const name _ => return name
       | _ => CompilerM.liftMetaM $ throwError s!"Could not identify primitive in lambda body: {e}"
 
-  partial def synthesizeCombinational (declName : Name) : MetaM (Sparkle.IR.AST.Module × Sparkle.IR.AST.Design) := do
+  partial def synthesizeCombinational (declName : Name)
+      (parameterDefaults : List (String × Nat) := [])
+      : MetaM (Sparkle.IR.AST.Module × Sparkle.IR.AST.Design) := do
+    for (name, _) in parameterDefaults do
+      if parameterDefaults.countP (fun entry => entry.1 == name) > 1 then
+        throwError m!"Duplicate SystemVerilog parameter default for '{name}'."
     let constInfo ← getConstInfo declName
     match constInfo with
     | .defnInfo defnInfo =>
+      let declaredDefaults ← collectDeclaredNatDefaults defnInfo.type
+      let parameterDefaults := mergeParameterDefaults declaredDefaults parameterDefaults
       let body := defnInfo.value
       let compiler : CompilerM String := do
         let resultWire ← translateExprToWire body "result" (isTopLevel := true)
         -- Look up the actual wire type that was created
         let cs ← get
         let resultWireDecl := cs.module.wires.find? (fun (p : Port) => p.name == resultWire)
-        let outputType := match resultWireDecl with
-          | some decl =>
-            -- DEBUG: Found wire with correct type
-            decl.ty
+        let outputType ← match resultWireDecl with
+          | some decl => pure decl.ty
           | none =>
-            -- DEBUG: Wire not found, using fallback
-            -- This happens when result is input wire, not internal wire
-            -- Try to infer from inputs
             match cs.module.inputs.find? (fun p => p.name == resultWire) with
-            | some inputPort => inputPort.ty
-            | none => .bitVector 8  -- True fallback
+            | some inputPort => pure inputPort.ty
+            | none => CompilerM.liftMetaM $ throwError
+                s!"Internal Sparkle compiler error: result wire '{resultWire}' has no declaration; refusing to assume an 8-bit output."
         CompilerM.addOutput "out" outputType
         CompilerM.emitAssign "out" (.ref resultWire)
         return resultWire
       let circuitState := CircuitM.init declName.toString
-      let compilerState : CompilerState := { varMap := [], clockWire := none, resetWire := none }
+      let compilerState : CompilerState := {
+        varMap := [], dimMap := [], parameterDefaults := parameterDefaults,
+        clockWire := none, resetWire := none
+      }
       let (_, finalCircuitState) ← (compiler.run compilerState).run circuitState
       let mut module := finalCircuitState.module
       let hasRegisters := module.body.any (fun stmt =>
@@ -1595,9 +2042,15 @@ mutual
         | _ => false
       )
       if hasRegisters then
-        module := module.addInput { name := "clk", ty := .bit }
+        unless module.inputs.any (fun port => port.name == "clk") do
+          module := module.addInput { name := "clk", ty := .bit }
         if hasResetRegisters then
-          module := module.addInput { name := "rst", ty := .bit }
+          unless module.inputs.any (fun port => port.name == "rst") do
+            module := module.addInput { name := "rst", ty := .bit }
+      for (name, _) in parameterDefaults do
+        unless module.parameters.any (fun p => p.name == name) do
+          throwError m!"No top-level Nat binder named '{name}' was found in {declName}."
+      validateParameterizedModule module
       return (module, finalCircuitState.design)
     | _ =>
       throwError s!"Cannot synthesize {declName}: not a definition"
@@ -1618,6 +2071,23 @@ def printModule (m : Sparkle.IR.AST.Module) : MetaM Unit := do
   for stmt in m.body do
     IO.println s!"  {stmt}"
 
+declare_syntax_cat sparkleParameterDefault
+syntax ident " := " num : sparkleParameterDefault
+
+private def parseParameterDefaults
+    (defaults : Array (TSyntax `sparkleParameterDefault))
+    : CommandElabM (List (String × Nat)) := do
+  let mut result : List (String × Nat) := []
+  for defaultSyntax in defaults do
+    let raw := defaultSyntax.raw
+    unless raw.getNumArgs == 3 do
+      throwError "Malformed SystemVerilog parameter default"
+    let args := Lean.Syntax.getArgs raw
+    let name : TSyntax `ident := ⟨args[0]!⟩
+    let value : TSyntax `num := ⟨args[2]!⟩
+    result := result ++ [(name.getId.toString, value.getNat)]
+  return result
+
 elab "#synthesize" id:ident : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
     Lean.resolveGlobalConstNoOverload id
@@ -1626,11 +2096,30 @@ elab "#synthesize" id:ident : command => do
     printModule module
     IO.println "\n-- IR successfully generated!"
 
+elab "#synthesize" id:ident "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    let (module, _) ← synthesizeCombinational declName parameterDefaults
+    printModule module
+    IO.println "\n-- Parameterized IR successfully generated!"
+
 def runDesignDRC (design : Sparkle.IR.AST.Design) : MetaM Unit := do
   for m in design.modules do
     let warnings := Sparkle.Compiler.DRC.checkRegisteredOutputs m
     for w in warnings do
       Lean.logWarning m!"{w}"
+
+def emitVerilogChecked (module : Sparkle.IR.AST.Module) : MetaM String :=
+  match Sparkle.Backend.Verilog.toVerilogChecked module with
+  | .ok verilog => pure verilog
+  | .error message => throwError message
+
+def emitVerilogDesignChecked (design : Sparkle.IR.AST.Design) : MetaM String := do
+  match Sparkle.Backend.Verilog.toVerilogDesignChecked design with
+  | .ok verilog => pure verilog
+  | .error message => throwError message
 
 elab "#synthesizeVerilog" id:ident : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
@@ -1640,13 +2129,28 @@ elab "#synthesizeVerilog" id:ident : command => do
     let warnings := Sparkle.Compiler.DRC.checkRegisteredOutputs module
     for w in warnings do
       Lean.logWarning m!"{w}"
-    let verilog := toVerilog module
+    let verilog ← emitVerilogChecked module
     IO.println verilog
     IO.println "\n-- Verilog successfully generated!"
 
-def synthesizeHierarchical (declName : Name) : MetaM Sparkle.IR.AST.Design := do
-  let (module, design) ← synthesizeCombinational declName
+elab "#synthesizeVerilog" id:ident "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    let (module, _) ← synthesizeCombinational declName parameterDefaults
+    let warnings := Sparkle.Compiler.DRC.checkRegisteredOutputs module
+    for w in warnings do
+      Lean.logWarning m!"{w}"
+    let verilog ← emitVerilogChecked module
+    IO.println verilog
+    IO.println "\n-- Parameterized Verilog successfully generated!"
+
+def synthesizeHierarchical (declName : Name)
+    (parameterDefaults : List (String × Nat) := []) : MetaM Sparkle.IR.AST.Design := do
+  let (module, design) ← synthesizeCombinational declName parameterDefaults
   let design' := if (design.modules.any (·.name == module.name)) then design else design.addModule module
+  validateDesignForEmission design'
   return design'
 
 elab "#synthesizeDesign" id:ident : command => do
@@ -1658,15 +2162,36 @@ elab "#synthesizeDesign" id:ident : command => do
       printModule m
     IO.println "\n-- Hierarchical IR successfully generated!"
 
+elab "#synthesizeDesign" id:ident "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    let design ← synthesizeHierarchical declName parameterDefaults
+    for m in design.modules do
+      printModule m
+    IO.println "\n-- Parameterized hierarchical IR successfully generated!"
+
 elab "#synthesizeVerilogDesign" id:ident : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
     Lean.resolveGlobalConstNoOverload id
   Lean.Elab.Command.liftTermElabM do
     let design ← synthesizeHierarchical declName
     runDesignDRC design
-    let verilog := toVerilogDesign design
+    let verilog ← emitVerilogDesignChecked design
     IO.println verilog
     IO.println "\n-- Hierarchical Verilog successfully generated!"
+
+elab "#synthesizeVerilogDesign" id:ident "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    let design ← synthesizeHierarchical declName parameterDefaults
+    runDesignDRC design
+    let verilog ← emitVerilogDesignChecked design
+    IO.println verilog
+    IO.println "\n-- Parameterized hierarchical Verilog successfully generated!"
 
 elab "#writeVerilogDesign" id:ident str:str : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
@@ -1674,12 +2199,26 @@ elab "#writeVerilogDesign" id:ident str:str : command => do
   Lean.Elab.Command.liftTermElabM do
     let design ← synthesizeHierarchical declName
     runDesignDRC design
-    let verilog := toVerilogDesign design
+    let verilog ← emitVerilogDesignChecked design
     let path := str.getString
     if let some dir := (System.FilePath.mk path).parent then
       IO.FS.createDirAll dir
     IO.FS.writeFile path verilog
     IO.println s!"Written {design.modules.length} modules to {path}"
+
+elab "#writeVerilogDesign" id:ident str:str "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    let design ← synthesizeHierarchical declName parameterDefaults
+    runDesignDRC design
+    let verilog ← emitVerilogDesignChecked design
+    let path := str.getString
+    if let some dir := (System.FilePath.mk path).parent then
+      IO.FS.createDirAll dir
+    IO.FS.writeFile path verilog
+    IO.println s!"Written {design.modules.length} parameterized modules to {path}"
 
 elab "#writeCppSimDesign" id:ident str:str : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
@@ -1687,7 +2226,25 @@ elab "#writeCppSimDesign" id:ident str:str : command => do
   Lean.Elab.Command.liftTermElabM do
     let design ← synthesizeHierarchical declName
     let optimized := Sparkle.IR.Optimize.optimizeDesign design
-    let cpp := Sparkle.Backend.CppSim.toCppSimDesign optimized
+    let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized with
+      | .ok cpp => pure cpp
+      | .error message => throwError message
+    let path := str.getString
+    if let some dir := (System.FilePath.mk path).parent then
+      IO.FS.createDirAll dir
+    IO.FS.writeFile path cpp
+    IO.println s!"Written C++ simulation ({optimized.modules.length} modules) to {path}"
+
+elab "#writeCppSimDesign" id:ident str:str "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    let design ← synthesizeHierarchical declName parameterDefaults
+    let optimized := Sparkle.IR.Optimize.optimizeDesign design
+    let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized with
+      | .ok cpp => pure cpp
+      | .error message => throwError m!"{message}. Use #writeVerilogDesign for native parameterized output, or synthesize a concrete wrapper before requesting CppSim."
     let path := str.getString
     if let some dir := (System.FilePath.mk path).parent then
       IO.FS.createDirAll dir
@@ -1705,26 +2262,34 @@ private opaque evalStringArray (name : Name) : TermElabM (Array String)
 
 /-- Core implementation for #writeDesign -/
 private def writeDesignCore (declName : Name) (svPath cppPath : String)
-    (observableWires : Option (List String)) : TermElabM Unit := do
-  let design ← synthesizeHierarchical declName
+    (observableWires : Option (List String))
+    (parameterDefaults : List (String × Nat) := []) : TermElabM Unit := do
+  let design ← synthesizeHierarchical declName parameterDefaults
   runDesignDRC design
+  -- Generate both concrete-only artifacts before writing either one.  This
+  -- prevents a parameterized invocation from leaving a partial SV artifact
+  -- when the fixed-width CppSim ABI rejects the design.
+  let optimized := Sparkle.IR.Optimize.optimizeDesign design
+  let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized with
+    | .ok cpp => pure cpp
+    | .error message => throwError m!"{message}. #writeDesign includes a fixed-width C++ simulator; use #writeVerilogDesign for native parameterized output, or synthesize a concrete wrapper."
+  let jitOptimized := Sparkle.IR.Optimize.optimizeDesign design observableWires
+  let jitCpp ← match Sparkle.Backend.CppSim.toCppSimJITChecked jitOptimized observableWires with
+    | .ok cpp => pure cpp
+    | .error message => throwError message
   -- Ensure output directories exist
   if let some svDir := (System.FilePath.mk svPath).parent then
     IO.FS.createDirAll svDir
   if let some cppDir := (System.FilePath.mk cppPath).parent then
     IO.FS.createDirAll cppDir
   -- Verilog (unoptimized)
-  let verilog := toVerilogDesign design
+  let verilog ← emitVerilogDesignChecked design
   IO.FS.writeFile svPath verilog
   IO.println s!"Written {design.modules.length} modules to {svPath}"
   -- CppSim (optimized, no observableWires — keep all _gen_ as members for header)
-  let optimized := Sparkle.IR.Optimize.optimizeDesign design
-  let cpp := Sparkle.Backend.CppSim.toCppSimDesign optimized
   IO.FS.writeFile cppPath cpp
   IO.println s!"Written C++ simulation ({optimized.modules.length} modules) to {cppPath}"
   -- JIT wrapper (optimized with observableWires — demote non-observable to locals)
-  let jitOptimized := Sparkle.IR.Optimize.optimizeDesign design observableWires
-  let jitCpp := Sparkle.Backend.CppSim.toCppSimJIT jitOptimized observableWires
   let jitPath := cppPath.replace "_cppsim.h" "_jit.cpp"
   IO.FS.writeFile jitPath jitCpp
   IO.println s!"Written JIT wrapper to {jitPath}"
@@ -1736,6 +2301,13 @@ elab "#writeDesign" id:ident svPath:str cppPath:str : command => do
   Lean.Elab.Command.liftTermElabM do
     writeDesignCore declName svPath.getString cppPath.getString none
 
+elab "#writeDesign" id:ident svPath:str cppPath:str "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    writeDesignCore declName svPath.getString cppPath.getString none parameterDefaults
+
 /-- Combined command with observable wires: emit both Verilog and optimized C++ simulation,
     with JIT code restricted to only the specified observable wires -/
 elab "#writeDesign" id:ident svPath:str cppPath:str wiresId:ident : command => do
@@ -1745,5 +2317,15 @@ elab "#writeDesign" id:ident svPath:str cppPath:str wiresId:ident : command => d
     let wiresName ← Lean.resolveGlobalConstNoOverload wiresId
     let wiresArr ← evalStringArray wiresName
     writeDesignCore declName svPath.getString cppPath.getString (some wiresArr.toList)
+
+elab "#writeDesign" id:ident svPath:str cppPath:str wiresId:ident "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  let parameterDefaults ← parseParameterDefaults defaults
+  Lean.Elab.Command.liftTermElabM do
+    let wiresName ← Lean.resolveGlobalConstNoOverload wiresId
+    let wiresArr ← evalStringArray wiresName
+    writeDesignCore declName svPath.getString cppPath.getString (some wiresArr.toList)
+      parameterDefaults
 
 end Sparkle.Compiler.Elab

@@ -38,7 +38,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from coding_agent import CodingAgent, create_message_with_retries, load_env
 from dataset import Dataset, ProblemInfo
-from evaluator import Evaluator, _rename_module_declaration, parse_module_ports
+from evaluator import (
+    CVDP_PARAMETERIZATION_UNSUPPORTED,
+    Evaluator,
+    _cvdp_parameter_overrides,
+    _module_parameters,
+    _rename_module_declaration,
+    parse_module_ports,
+)
 from lean_repl import LeanREPLPool
 from report import generate_report
 
@@ -704,6 +711,12 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
         design_name = _parse_env_value(env_text, "TOPLEVEL") or design_name
         harness_usage = _parse_cvdp_harness_usage(harness_files)
         harness_usage = _apply_prompt_parameters(harness_usage, info.prompt_text or "")
+        harness_usage["params"].update(
+            parameter.name
+            for parameter in _module_parameters(info.ref_code or "", design_name)
+        )
+        for key in ("ports", "inputs", "outputs"):
+            harness_usage[key].difference_update(harness_usage["params"])
         param_values, param_combos = _cvdp_parse_parameter_sweeps(harness_files, harness_usage["params"])
     else:
         param_values, param_combos = {}, []
@@ -719,7 +732,10 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
     if verilog_sources:
         lines.append(f"- Benchmark RTL source target(s): {', '.join(str(s) for s in verilog_sources)}")
     if harness_usage["params"]:
-        lines.append(f"- Benchmark parameters referenced by harness: {', '.join(sorted(harness_usage['params']))}")
+        lines.append(
+            "- Benchmark parameters required by reference/harness: "
+            + ", ".join(sorted(harness_usage["params"]))
+        )
         if param_values:
             value_text = "; ".join(
                 f"{name}={{{', '.join(values[:8])}{', ...' if len(values) > 8 else ''}}}"
@@ -734,8 +750,10 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
             lines.append(f"- Observed parameter combinations: {', '.join(rendered)}{suffix}")
         lines.append(
             "- Parameterization requirement: cocotb rebuilds/instantiates the DUT with these parameter values; "
-            "do not merely expose Verilog parameters in the wrapper while keeping the Sparkle core fixed to one width/depth. "
-            "If true generic Sparkle is not possible, cover every observed test value explicitly or choose a representation that safely handles the largest tested width/depth."
+            "a fixed Sparkle core behind a parameterized wrapper is not a valid implementation. "
+            "Use a top-level Lean `Nat` binder with the exact benchmark parameter name and synthesize it with "
+            "`#synthesizeVerilog <design> parameters [PARAM := <nonnegative-default>]`. Sparkle then emits a native "
+            "SystemVerilog module parameter that must actually occur in the affected ports, state, memories, or logic."
         )
 
     inputs = [p for p in expected_ports if p[0] == "input"]
@@ -927,6 +945,20 @@ def classify_failure_record(record: dict) -> dict[str, str]:
             "failure_stage": "generation",
             "failure_category": "agent_error",
             "failure_family": "other",
+        }
+
+    if record.get("terminal_capability_error"):
+        return {
+            "failure_stage": "capability",
+            "failure_category": "unsupported_parameterization",
+            "failure_family": "unsupported",
+        }
+
+    if record.get("unsupported_parameterization"):
+        return {
+            "failure_stage": "simulation",
+            "failure_category": "parameterization_contract",
+            "failure_family": "interface",
         }
 
     detail = str(record.get("detail", "") or record.get("error_msg", "")).lower()
@@ -1937,6 +1969,21 @@ def build_synth_generation_feedback(
     return "\n".join(lines)
 
 
+def _should_run_synth_feedback(
+    args: argparse.Namespace,
+    agent_stats: dict | None,
+    result: dict,
+) -> bool:
+    """Return whether a real synthesis failure should enter the repair loop."""
+    return bool(
+        args.synth_feedback
+        and agent_stats is not None
+        and result.get("sim_status") == "sim_pass"
+        and not result.get("synth_pass")
+        and not result.get("parameterized_ppa_unsupported")
+    )
+
+
 def ppa_improved(old: dict, new: dict) -> bool:
     """Check if PPA improved: any metric >5% better, none >20% worse."""
     dominated_metrics = {"area_um2": -1, "cell_count": -1, "wns_ns": -1, "power_uw": -1}
@@ -2096,6 +2143,72 @@ def build_sv_ppa_feedback(
     return "\n".join(lines)
 
 
+def _cvdp_direct_sv_requires_parameter_sweep(
+    info: ProblemInfo,
+    evaluator: Evaluator,
+    sv_code: str | None = None,
+) -> bool:
+    """Return whether CVDP may elaborate the DUT with native parameters.
+
+    A single synthesis run cannot represent PPA for a parameter sweep.  Treat
+    unresolved parameter dictionaries conservatively: simulation may execute
+    the benchmark's own build matrix, but PPA must remain unset until the flow
+    can synthesize and report every concrete configuration separately.
+    """
+    if evaluator.dataset_name != "cvdp":
+        return False
+    harness_files = (info.metadata or {}).get("harness_files", {})
+    has_overrides, _parameter_names, unresolved = _cvdp_parameter_overrides(
+        harness_files
+    )
+    reference_has_parameters = bool(
+        _module_parameters(info.ref_code or "", info.design_name)
+    )
+    top_has_parameters = bool(
+        sv_code and _module_parameters(sv_code, info.design_name)
+    )
+    return (
+        has_overrides
+        or unresolved
+        or reference_has_parameters
+        or top_has_parameters
+    )
+
+
+def _mark_parameterized_ppa_unsupported(result: dict) -> dict:
+    """Mark PPA as intentionally skipped without changing simulation status."""
+    result.update({
+        "parameterized_ppa_unsupported": True,
+        "synth_status": "not_run_parameterized_sweep",
+        "ppa_status": "unsupported_parameter_sweep",
+        "ppa_error": (
+            "PPA was not run: the CVDP reference, harness, or generated top "
+            "uses native SystemVerilog parameters, while the current backend "
+            "would synthesize only the module defaults. Per-configuration synthesis and reporting are "
+            "required before these metrics are meaningful."
+        ),
+        "synth_pass": False,
+        "synth_error": None,
+        "pnr_pass": False,
+        "pnr_error": None,
+        "gds_generated": False,
+        "drc_pass": None,
+        "drc_violations": None,
+        "drc_error": None,
+        "lvs_pass": None,
+        "lvs_error": None,
+        "gls_synth_status": "not_run",
+        "gls_synth_mismatches": -1,
+        "gls_pnr_status": "not_run",
+        "gls_pnr_mismatches": -1,
+        "area_um2": None,
+        "cell_count": None,
+        "wns_ns": None,
+        "power_uw": None,
+    })
+    return result
+
+
 def evaluate_verilog_candidate(
     prob_id: str,
     info: ProblemInfo,
@@ -2116,10 +2229,30 @@ def evaluate_verilog_candidate(
         "cell_count": None,
         "wns_ns": None,
         "power_uw": None,
+        "unsupported_parameterization": False,
+        "terminal_capability_error": False,
+        "repairable_parameterization_error": False,
+        "parameterized_ppa_unsupported": False,
+        "unsupported_reason": None,
         "detail": "",
     }
 
-    sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
+    parameterized_ppa_unsupported = _cvdp_direct_sv_requires_parameter_sweep(
+        info, evaluator, sv_code
+    )
+
+    requested_module = (
+        info.design_name if evaluator.dataset_name == "cvdp" else None
+    )
+    sparkle_mod_name, sparkle_ports = parse_module_ports(
+        sv_code, module_name=requested_module
+    )
+    if requested_module and sparkle_mod_name != requested_module:
+        result["detail"] = (
+            f"Could not find generated SystemVerilog top module "
+            f"'{requested_module}'"
+        )
+        return result
     if not sparkle_mod_name:
         result["detail"] = "Could not parse generated SystemVerilog module name"
         return result
@@ -2141,17 +2274,34 @@ def evaluate_verilog_candidate(
     sv_file.write_text(sv_code)
     result["lint_pass"] = evaluator._run_lint(sv_file)
 
-    sim_status, mismatches, detail = evaluator._run_sim(
-        prob_id, sv_code, sparkle_mod_name, sparkle_ports, eval_dir
-    )
+    if evaluator.dataset_name == "cvdp":
+        sim_status, mismatches, detail = evaluator._run_sim_cvdp(
+            prob_id,
+            sv_code,
+            sparkle_mod_name,
+            sparkle_ports,
+            eval_dir,
+            direct_top=True,
+        )
+    else:
+        sim_status, mismatches, detail = evaluator._run_sim(
+            prob_id, sv_code, sparkle_mod_name, sparkle_ports, eval_dir
+        )
     result["sim_status"] = sim_status
     result["sim_mismatches"] = mismatches
     result["detail"] = detail
+    if CVDP_PARAMETERIZATION_UNSUPPORTED in detail:
+        result["unsupported_parameterization"] = True
+        result["terminal_capability_error"] = False
+        result["repairable_parameterization_error"] = True
+        result["unsupported_reason"] = detail
     result["compile_pass"] = result["lint_pass"] and not (
         sim_status == "sim_error" and "compile failed" in detail.lower()
     )
 
-    if evaluator.enable_synth and result["sim_status"] == "sim_pass":
+    if parameterized_ppa_unsupported:
+        _mark_parameterized_ppa_unsupported(result)
+    elif evaluator.enable_synth and result["sim_status"] == "sim_pass":
         synth_result = evaluator._run_synthesis(
             prob_id, sv_code, sparkle_mod_name or info.design_name, eval_dir
         )
@@ -2176,6 +2326,9 @@ def run_verilog_ppa_loop(
     stats: dict,
 ) -> tuple[dict, list[dict]]:
     """Run PPA optimization directly on exported SystemVerilog instead of Lean."""
+    if _cvdp_direct_sv_requires_parameter_sweep(info, evaluator):
+        return _mark_parameterized_ppa_unsupported(result), []
+
     env = load_env(PROJECT_ROOT / "key.env")
     api_key = env.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
     base_url = env.get("ANTHROPIC_BASE_URL", os.environ.get("ANTHROPIC_BASE_URL"))
@@ -2442,22 +2595,55 @@ def print_summary_table(stats: dict, elapsed: float, synth_enabled: bool = False
     if stats.get("sim_not_run"):
         table.add_row("Sim not run", f"[yellow]{stats['sim_not_run']}[/yellow]")
     if synth_enabled:
-        synth_rate = f"{stats['synth_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+        parameterized_ppa_skipped = stats.get("parameterized_ppa_skipped", 0)
+        synth_eligible = max(attempted - parameterized_ppa_skipped, 0)
+        synth_rate = (
+            f"{stats['synth_pass']/synth_eligible*100:.1f}%"
+            if synth_eligible > 0 else "N/A"
+        )
         table.add_row("Synth pass", f"[green]{stats['synth_pass']}[/green] ({synth_rate})")
+        if parameterized_ppa_skipped:
+            table.add_row(
+                "Synth skipped",
+                f"[yellow]{parameterized_ppa_skipped} parameter sweep[/yellow]",
+            )
     if pnr_enabled:
-        pnr_rate = f"{stats['pnr_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+        parameterized_ppa_skipped = stats.get("parameterized_ppa_skipped", 0)
+        pnr_eligible = max(attempted - parameterized_ppa_skipped, 0)
+        pnr_rate = (
+            f"{stats['pnr_pass']/pnr_eligible*100:.1f}%"
+            if pnr_eligible > 0 else "N/A"
+        )
         table.add_row("P&R pass", f"[green]{stats['pnr_pass']}[/green] ({pnr_rate})")
     if drc_enabled:
-        drc_rate = f"{stats['drc_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+        parameterized_ppa_skipped = stats.get("parameterized_ppa_skipped", 0)
+        drc_eligible = max(attempted - parameterized_ppa_skipped, 0)
+        drc_rate = (
+            f"{stats['drc_pass']/drc_eligible*100:.1f}%"
+            if drc_eligible > 0 else "N/A"
+        )
         table.add_row("DRC pass", f"[green]{stats['drc_pass']}[/green] ({drc_rate})")
     if lvs_enabled:
-        lvs_rate = f"{stats['lvs_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+        parameterized_ppa_skipped = stats.get("parameterized_ppa_skipped", 0)
+        lvs_eligible = max(attempted - parameterized_ppa_skipped, 0)
+        lvs_rate = (
+            f"{stats['lvs_pass']/lvs_eligible*100:.1f}%"
+            if lvs_eligible > 0 else "N/A"
+        )
         table.add_row("LVS pass", f"[green]{stats['lvs_pass']}[/green] ({lvs_rate})")
     if gls_enabled:
-        gls_s_rate = f"{stats['gls_synth_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+        parameterized_ppa_skipped = stats.get("parameterized_ppa_skipped", 0)
+        gls_eligible = max(attempted - parameterized_ppa_skipped, 0)
+        gls_s_rate = (
+            f"{stats['gls_synth_pass']/gls_eligible*100:.1f}%"
+            if gls_eligible > 0 else "N/A"
+        )
         table.add_row("GLS synth pass", f"[green]{stats['gls_synth_pass']}[/green] ({gls_s_rate})")
         if pnr_enabled:
-            gls_p_rate = f"{stats['gls_pnr_pass']/attempted*100:.1f}%" if attempted > 0 else "N/A"
+            gls_p_rate = (
+                f"{stats['gls_pnr_pass']/gls_eligible*100:.1f}%"
+                if gls_eligible > 0 else "N/A"
+            )
             table.add_row("GLS PnR pass", f"[green]{stats['gls_pnr_pass']}[/green] ({gls_p_rate})")
     if synth_feedback_enabled:
         table.add_row("Synth feedback", f"[yellow]{stats['synth_feedback_fixed']}[/yellow] fixed ({stats['synth_feedback_attempts']} iters)")
@@ -2684,7 +2870,12 @@ def _process_one_problem_inner(
     sim_feedback_turns_remaining = 0
 
     # Phase 2a: optional Verilog-side compile/simulation feedback.
-    if args.sim_feedback and agent_stats is not None and result["sim_status"] != "sim_pass":
+    if (
+        args.sim_feedback
+        and agent_stats is not None
+        and result["sim_status"] != "sim_pass"
+        and not result.get("terminal_capability_error")
+    ):
         lean_file = GENERATED_DIR / f"{prob_id}.lean"
         messages = agent_stats.get("messages", []) if args.full_history_repair else []
         best_code = read_current_lean(prob_id)
@@ -2861,7 +3052,7 @@ def _process_one_problem_inner(
                 "result_summary": summarize_eval_result(result),
             })
 
-    if args.sim_feedback and needs_backend_eval:
+    if args.sim_feedback and needs_backend_eval and not result.get("terminal_capability_error"):
         current_progress.update(
             agent_task,
             description=f"[cyan]{prob_id}[/cyan]  Backend evaluation...",
@@ -2874,12 +3065,7 @@ def _process_one_problem_inner(
     # This is separate from --ppa-opt: it only tries to repair designs that
     # already pass functional simulation but fail synthesis.
     synth_feedback_history = []
-    if (
-        args.synth_feedback
-        and agent_stats is not None
-        and result["sim_status"] == "sim_pass"
-        and not result.get("synth_pass")
-    ):
+    if _should_run_synth_feedback(args, agent_stats, result):
         lean_file = GENERATED_DIR / f"{prob_id}.lean"
         messages = agent_stats.get("messages", [])
         best_code = lean_file.read_text() if lean_file.exists() else ""
@@ -3275,7 +3461,11 @@ def _process_one_problem_inner(
 
     # Build synth/PPA suffix
     synth_str = ""
-    if args.synth and result.get("synth_pass"):
+    if args.synth and result.get("parameterized_ppa_unsupported"):
+        with _stats_lock:
+            stats["parameterized_ppa_skipped"] += 1
+        synth_str = "  [yellow]S skipped (parameter sweep)[/yellow]"
+    elif args.synth and result.get("synth_pass"):
         with _stats_lock:
             stats["synth_pass"] += 1
         ppa_parts = []
@@ -3502,6 +3692,7 @@ def main():
         "sim_not_run": 0,
         "agent_error": 0,
         "synth_pass": 0,
+        "parameterized_ppa_skipped": 0,
         "pnr_pass": 0,
         "drc_pass": 0,
         "lvs_pass": 0,
@@ -3607,6 +3798,7 @@ def main():
         "agent_error": stats["agent_error"],
         "sim_rate": sim_rate,
         "synth_pass": stats["synth_pass"],
+        "parameterized_ppa_skipped": stats["parameterized_ppa_skipped"],
         "pnr_pass": stats["pnr_pass"],
         "drc_pass": stats["drc_pass"],
         "lvs_pass": stats["lvs_pass"],

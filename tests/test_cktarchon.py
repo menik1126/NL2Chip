@@ -279,6 +279,9 @@ def test_system_prompt_contains_sparkle_hazard_rules():
     assert "avoid Lean `||` and `&&` over signals" in prompt
     assert "do not destructure with `let (a, b) := ...`" in prompt
     assert "Do not use `bundleAll!` to build a packed bit-vector result" in prompt
+    assert "#synthesizeVerilog <design> parameters [PARAM := <nonnegative-default>]" in prompt
+    assert "exact benchmark parameter name" in prompt
+    assert "evaluator rejects declaration-only parameters" in prompt
     assert "Every inline `code` check must include" in prompt
     assert "The harness automatically saves" in prompt
 

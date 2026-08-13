@@ -89,6 +89,16 @@ def isNameUsed (name : String) : CircuitM Bool := do
 def reserveName (name : String) : CircuitM Unit := do
   modify fun s => { s with usedNames := name :: s.usedNames }
 
+/-- Add a SystemVerilog elaboration parameter to the current module. -/
+def addParameter (name : String) (defaultValue : Nat := 1) : CircuitM Unit := do
+  let cleanName := sanitizeName name
+  reserveName cleanName
+  let m ← getModule
+  -- Keep the source name in the IR so `DimExpr.param name` and the declaration
+  -- use one namespace.  Backends sanitize both consistently; only the builder's
+  -- used-name set needs the emitted spelling.
+  setModule (m.addParameter { name := name, defaultValue := defaultValue })
+
 /--
   Create a new wire with the given type.
   Returns the unique name of the wire.
@@ -139,7 +149,7 @@ def emitRegister (hint : String) (clock : String) (reset : String)
   - writeEnable: Write enable expression
   - readAddr: Read address expression
 -/
-def emitMemory (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+def emitMemory (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr) (clock : String)
     (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
@@ -155,7 +165,7 @@ def emitMemory (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : Stri
   Emit a memory with combinational (same-cycle) read.
   Returns the name of the read data output wire.
 -/
-def emitMemoryComboRead (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+def emitMemoryComboRead (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr) (clock : String)
     (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
@@ -169,9 +179,10 @@ def emitMemoryComboRead (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clo
   Emit a module instantiation.
 -/
 def emitInstance (moduleName : String) (instName : String)
-    (connections : List (String × Expr)) : CircuitM Unit := do
+    (connections : List (String × Expr))
+    (parameterOverrides : List (String × DimExpr) := []) : CircuitM Unit := do
   let m ← getModule
-  setModule (m.addStmt (.inst moduleName instName connections))
+  setModule (m.addStmt (.inst moduleName instName connections parameterOverrides))
 
 /--
   Add an input port to the module.

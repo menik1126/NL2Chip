@@ -184,6 +184,41 @@ Write high-level Lean code, get production-ready SystemVerilog:
 #synthesizeVerilog myDesign  -- One command, complete module!
 ```
 
+#### Native SystemVerilog parameters
+
+Top-level `Nat` binders can be retained as real SystemVerilog parameters instead
+of being specialized to one Lean width:
+
+```lean
+def genericAdd {dom : DomainConfig} {W : Nat}
+    (a b : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  a + b
+
+#synthesizeVerilog genericAdd parameters [W := 8]
+```
+
+This emits one module with `parameter W = 8` and ports whose
+ranges depend on `W`. A downstream tool can instantiate that same module with,
+for example, `#(.W(3))` and `#(.W(17))`; the command value is the SystemVerilog
+default, not a Lean-side specialization. Derived dimensions such as `W + 1`,
+register widths, slices, and memory address/data widths remain symbolic as
+well. Concrete constants can be cast to a retained width, and the common
+all-ones forms `BitVec.ofNat W (2 ^ W - 1)` and `BitVec.allOnes W` are
+supported. This is not general value-level symbolic evaluation: an expression
+such as `BitVec.ofNat W (W + 1)` is deliberately rejected instead of being
+frozen at the default value. Parameter overrides must keep every resulting
+hardware width and array length positive.
+
+Native parameters are supported by `#synthesize`, `#synthesizeVerilog`, the
+corresponding hierarchical `*Design` commands, and `#writeVerilogDesign`.
+CppSim and `#writeDesign` remain concrete-width paths and reject retained
+parameters; use a closed, fixed-width Lean wrapper rather than merely supplying
+a parameter default. The current SV-to-Lean verification-model generator also
+requires such a concrete module. Source-level Lean theorems may still be
+written directly over a generic definition. For CVDP, functional simulation
+for parameter overrides is supported, but per-configuration synthesis/PPA is
+not yet run, so PPA is reported as skipped for parameterized designs.
+
 ### 🔒 Formal Verification Ready
 
 Prove correctness properties about your hardware using Lean's powerful theorem prover:

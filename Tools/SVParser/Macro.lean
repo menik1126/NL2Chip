@@ -36,14 +36,26 @@ elab "verilog!" src:str : command => do
     match design.modules.head? with
     | none => throwError "verilog!: no module found"
     | some m =>
-      let model : SemanticModel := extractModel m
+      let model : SemanticModel ← match extractModel m with
+        | .ok model => pure model
+        | .error message => throwError m!"verilog!: {message}"
       let assigns := collectAssigns m.body
       let model : SemanticModel := { model with
         registers := model.registers.map fun r =>
           { r with nextExpr := inlineAssigns assigns r.nextExpr }
       }
-      let wireWidths := m.wires.map fun w => (w.name, w.ty.bitWidth)
-      let portWidths := m.inputs.map fun p => (p.name, p.ty.bitWidth)
+      let requireWidth := fun (role : String) (ty : Sparkle.IR.Type.HWType) =>
+        match ty.requireBitWidth role with
+        | .ok width => pure width
+        | .error message => throwError m!"verilog!: {message}"
+      let mut wireWidths := []
+      for wire in m.wires do
+        wireWidths := wireWidths ++ [(wire.name,
+          ← requireWidth s!"wire '{wire.name}'" wire.ty)]
+      let mut portWidths := []
+      for port in m.inputs do
+        portWidths := portWidths ++ [(port.name,
+          ← requireWidth s!"input '{port.name}'" port.ty)]
       let regWidths := model.registers.map fun r => (r.name, r.width)
       let inputWidths := model.inputs.map fun i => (i.name, i.width)
       let allWidths := regWidths ++ inputWidths ++ wireWidths ++ portWidths
@@ -93,7 +105,7 @@ elab "verilog!" src:str : command => do
           try
             elabStr s!"theorem {assertName} (s : State) (i : Input) : let ns := nextState s i; {condStr} != (0 : BitVec 1) := by simp [nextState]"
           catch _ =>
-            elabStr s!"theorem {assertName} (s : State) (i : Input) : let ns := nextState s i; {condStr} != (0 : BitVec 1) := by sorry"
+            throwError m!"verilog!: could not prove generated assertion '{assertName}' without introducing an unchecked placeholder"
 
       -- 5. Type-safe JIT simulation wrappers
 
@@ -106,8 +118,13 @@ elab "verilog!" src:str : command => do
 
       -- SimOutput (from module output ports)
       let outputPorts := m.outputs
+      let mut outputWidths := []
+      for port in outputPorts do
+        outputWidths := outputWidths ++ [(port.name,
+          ← requireWidth s!"output '{port.name}'" port.ty)]
       let simOutputFields := String.intercalate "\n" <|
-        outputPorts.map fun p => s!"  {leanName p.name} : BitVec {p.ty.bitWidth}"
+        outputWidths.map fun (name, width) =>
+          s!"  {leanName name} : BitVec {width}"
       elabStr s!"structure SimOutput where\n{simOutputFields}\n  deriving DecidableEq, Repr, BEq, Inhabited"
 
       -- Simulator structure
@@ -121,13 +138,12 @@ elab "verilog!" src:str : command => do
       elabStr s!"def Simulator.step (sim : Simulator) (i : SimInput) : IO Unit := do\n{stepBody}\n  JIT.evalTick sim.handle"
 
       -- read: get all outputs by index, convert to BitVec
-      let outputsIndexed := (List.range outputPorts.length).zip outputPorts
-      let readFields := outputsIndexed.map fun (idx, p) =>
-        let w := p.ty.bitWidth
-        s!"  let v{idx} ← JIT.getOutput sim.handle {idx}\n  let {leanName p.name} := BitVec.ofNat {w} v{idx}.toNat"
+      let outputsIndexed := (List.range outputWidths.length).zip outputWidths
+      let readFields := outputsIndexed.map fun (idx, name, width) =>
+        s!"  let v{idx} ← JIT.getOutput sim.handle {idx}\n  let {leanName name} := BitVec.ofNat {width} v{idx}.toNat"
       let readBody := String.intercalate "\n" readFields
       let readReturn := String.intercalate ", " <|
-        outputPorts.map fun p => s!"{leanName p.name}"
+        outputWidths.map fun (name, _) => s!"{leanName name}"
       elabStr s!"def Simulator.read (sim : Simulator) : IO SimOutput := do\n{readBody}\n  pure {lb} {readReturn} {rb}"
 
       -- reset

@@ -91,7 +91,7 @@ def test_hwtype_array_basics : IO TestSeq := do
   let vecType := HWType.bitVector 8
 
   pure (
-    test "HWType.array bitWidth calculation" (arrayType.bitWidth == 32) $  -- 4 * 8 = 32
+    test "HWType.array bitWidth calculation" (arrayType.bitWidth == some 32) $  -- 4 * 8 = 32
     test "HWType.isArray predicate" arrayType.isArray $
     test "HWType.bitVector is not array" (not vecType.isArray) $
     test "HWType.bit is not array" (not HWType.bit.isArray)
@@ -101,7 +101,7 @@ def test_hwtype_array_nested : IO TestSeq := do
   let nestedArray := HWType.array 2 (.array 4 (.bitVector 8))
 
   pure (
-    test "Nested array bitWidth" (nestedArray.bitWidth == 64) $  -- 2 * 4 * 8 = 64
+    test "Nested array bitWidth" (nestedArray.bitWidth == some 64) $  -- 2 * 4 * 8 = 64
     test "Nested array is array" nestedArray.isArray
   )
 
@@ -111,9 +111,9 @@ def test_hwtype_array_sizes : IO TestSeq := do
   let arr256x8 := HWType.array 256 (.bitVector 8)
 
   pure (
-    test "8x16 array bitWidth" (arr8x16.bitWidth == 128) $  -- 8 * 16 = 128
-    test "2x4 array bitWidth" (arr2x4.bitWidth == 8) $      -- 2 * 4 = 8
-    test "256x8 array bitWidth" (arr256x8.bitWidth == 2048)  -- 256 * 8 = 2048
+    test "8x16 array bitWidth" (arr8x16.bitWidth == some 128) $  -- 8 * 16 = 128
+    test "2x4 array bitWidth" (arr2x4.bitWidth == some 8) $      -- 2 * 4 = 8
+    test "256x8 array bitWidth" (arr256x8.bitWidth == some 2048)  -- 256 * 8 = 2048
   )
 
 def test_hwtype_array_toString : IO TestSeq := do

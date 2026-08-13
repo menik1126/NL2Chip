@@ -51,6 +51,11 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
     sim_fail = summary.get("sim_fail", sum(1 for r in results if r.get("sim_status") == "sim_fail"))
     sim_error = summary.get("sim_error", sum(1 for r in results if r.get("sim_status") not in ("sim_pass", "sim_fail", "not_run")))
     synth_pass = summary.get("synth_pass", sum(1 for r in results if r.get("synth_pass")))
+    parameterized_ppa_skipped = summary.get(
+        "parameterized_ppa_skipped",
+        sum(1 for r in results if r.get("parameterized_ppa_unsupported")),
+    )
+    ppa_eligible = max(attempted - parameterized_ppa_skipped, 0)
     synth_enabled = summary.get("synth_enabled", any(r.get("synth_pass") for r in results))
     pnr_pass = summary.get("pnr_pass", sum(1 for r in results if r.get("pnr_pass")))
     drc_pass = summary.get("drc_pass", sum(1 for r in results if r.get("drc_pass")))
@@ -78,6 +83,9 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
         sim_st = r.get("sim_status", "not_run")
         mismatch = r.get("sim_mismatches", -1)
         s_pass = r.get("synth_pass", False)
+        parameterized_ppa_unsupported = r.get(
+            "parameterized_ppa_unsupported", False
+        )
         p_pass = r.get("pnr_pass", False)
         d_pass = r.get("drc_pass", False)
         d_violations = r.get("drc_violations", -1)
@@ -105,8 +113,13 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
 
         synth_cell = ""
         if synth_enabled:
+            synth_badge = (
+                '<span class="badge na">Skipped</span>'
+                if parameterized_ppa_unsupported
+                else badge(s_pass)
+            )
             synth_cell = f"""
-            <td>{badge(s_pass)}</td>
+            <td>{synth_badge}</td>
             <td class="num">{f'{area:.1f}' if area else '-'}</td>
             <td class="num">{cells if cells else '-'}</td>
             <td class="num">{f'{wns:.3f}' if wns is not None else '-'}</td>
@@ -118,8 +131,13 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
             drc_cls = 'ok' if d_pass else ('na' if not p_pass else 'fail')
             lvs_label = 'Pass' if l_pass else (escape(l_error[:20]) if l_error else 'Fail')
             lvs_cls = 'ok' if l_pass else ('warn' if l_error else ('na' if not p_pass else 'fail'))
+            pnr_badge = (
+                '<span class="badge na">Skipped</span>'
+                if parameterized_ppa_unsupported
+                else badge(p_pass)
+            )
             pnr_cell = f"""
-            <td>{badge(p_pass)}</td>
+            <td>{pnr_badge}</td>
             <td><span class="badge {drc_cls}">{drc_label if p_pass else 'N/A'}</span></td>
             <td><span class="badge {lvs_cls}">{lvs_label if p_pass else 'N/A'}</span></td>"""
 
@@ -184,46 +202,56 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
     # ── Synth summary card ──
     synth_card = ""
     if synth_enabled:
+        synth_rate = synth_pass / max(ppa_eligible, 1) * 100 if ppa_eligible else 0
         synth_card = f"""
         <div class="card">
-            <div class="card-value">{synth_pass}<small>/{attempted}</small></div>
+            <div class="card-value">{synth_pass}<small>/{ppa_eligible}</small></div>
             <div class="card-label">Synth Pass</div>
-            <div class="card-bar"><div class="bar synth" style="width:{synth_pass/max(attempted,1)*100:.0f}%"></div></div>
+            <div class="card-bar"><div class="bar synth" style="width:{synth_rate:.0f}%"></div></div>
         </div>"""
 
     # ── PNR/DRC/LVS summary cards ──
     pnr_cards = ""
     if pnr_enabled:
+        pnr_rate = pnr_pass / max(ppa_eligible, 1) * 100 if ppa_eligible else 0
+        drc_rate = drc_pass / max(ppa_eligible, 1) * 100 if ppa_eligible else 0
+        lvs_rate = lvs_pass / max(ppa_eligible, 1) * 100 if ppa_eligible else 0
         pnr_cards = f"""
         <div class="card">
-            <div class="card-value">{pnr_pass}<small>/{attempted}</small></div>
+            <div class="card-value">{pnr_pass}<small>/{ppa_eligible}</small></div>
             <div class="card-label">P&R Pass</div>
-            <div class="card-bar"><div class="bar" style="width:{pnr_pass/max(attempted,1)*100:.0f}%;background:var(--blue)"></div></div>
+            <div class="card-bar"><div class="bar" style="width:{pnr_rate:.0f}%;background:var(--blue)"></div></div>
         </div>
         <div class="card">
-            <div class="card-value">{drc_pass}<small>/{attempted}</small></div>
+            <div class="card-value">{drc_pass}<small>/{ppa_eligible}</small></div>
             <div class="card-label">DRC Pass</div>
-            <div class="card-bar"><div class="bar" style="width:{drc_pass/max(attempted,1)*100:.0f}%;background:var(--green)"></div></div>
+            <div class="card-bar"><div class="bar" style="width:{drc_rate:.0f}%;background:var(--green)"></div></div>
         </div>
         <div class="card">
-            <div class="card-value">{lvs_pass}<small>/{attempted}</small></div>
+            <div class="card-value">{lvs_pass}<small>/{ppa_eligible}</small></div>
             <div class="card-label">LVS Pass</div>
-            <div class="card-bar"><div class="bar" style="width:{lvs_pass/max(attempted,1)*100:.0f}%;background:var(--yellow)"></div></div>
+            <div class="card-bar"><div class="bar" style="width:{lvs_rate:.0f}%;background:var(--yellow)"></div></div>
         </div>"""
 
     # ── GLS summary cards ──
     gls_cards = ""
     if gls_enabled:
+        gls_synth_rate = (
+            gls_synth_pass / max(ppa_eligible, 1) * 100 if ppa_eligible else 0
+        )
+        gls_pnr_rate = (
+            gls_pnr_pass / max(ppa_eligible, 1) * 100 if ppa_eligible else 0
+        )
         gls_cards = f"""
         <div class="card">
-            <div class="card-value">{gls_synth_pass}<small>/{attempted}</small></div>
+            <div class="card-value">{gls_synth_pass}<small>/{ppa_eligible}</small></div>
             <div class="card-label">GLS Synth Pass</div>
-            <div class="card-bar"><div class="bar" style="width:{gls_synth_pass/max(attempted,1)*100:.0f}%;background:var(--blue)"></div></div>
+            <div class="card-bar"><div class="bar" style="width:{gls_synth_rate:.0f}%;background:var(--blue)"></div></div>
         </div>
         <div class="card">
-            <div class="card-value">{gls_pnr_pass}<small>/{attempted}</small></div>
+            <div class="card-value">{gls_pnr_pass}<small>/{ppa_eligible}</small></div>
             <div class="card-label">GLS PnR Pass</div>
-            <div class="card-bar"><div class="bar" style="width:{gls_pnr_pass/max(attempted,1)*100:.0f}%;background:var(--blue)"></div></div>
+            <div class="card-bar"><div class="bar" style="width:{gls_pnr_rate:.0f}%;background:var(--blue)"></div></div>
         </div>"""
 
     # ── PPA distribution (only if synth enabled) ──

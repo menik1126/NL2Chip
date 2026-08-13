@@ -39,7 +39,7 @@ def main : IO UInt32 := do
     IO.eprintln "ERROR: no modules found"
     return 1
   | some m =>
-    let leanSrc := moduleToLean m
+    let leanSrc ← IO.ofExcept (moduleToLean m)
     let outPath := "Sparkle/Verification/Generated/Counter8.lean"
     IO.FS.createDirAll "Sparkle/Verification/Generated"
     IO.FS.writeFile outPath leanSrc

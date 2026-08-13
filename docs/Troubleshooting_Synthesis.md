@@ -106,6 +106,69 @@ def example_BEST {dom : DomainConfig} (x : Signal dom (BitVec 16)) : Signal dom 
 
 ---
 
+## Generic Widths and SystemVerilog Parameters
+
+Sparkle can retain a top-level Lean `Nat` binder as a native SystemVerilog
+module parameter. Give every exported parameter a nonnegative default either
+with a Lean optional binder such as `(width : Nat := 8)` or in the synthesis
+command, and keep its Lean name identical to the benchmark parameter:
+
+```lean
+def genericIdentity {dom : DomainConfig} {width : Nat}
+    (x : Signal dom (BitVec width)) : Signal dom (BitVec width) :=
+  x
+
+#synthesizeVerilog genericIdentity parameters [width := 8]
+```
+
+Zero is valid for a `Nat` offset or index parameter; every expression used as
+a packed width or array length must nevertheless evaluate to a positive value.
+
+This emits a module header such as `parameter width = 8`, while
+the port range remains a symbolic expression of `width` and is guarded against
+invalid zero-width overrides. Expressions such as
+`BitVec (width + 1)` and symbolic `HWVector` sizes are retained as dimension
+expressions as well.
+
+This support is for hardware dimensions, not arbitrary value-level evaluation
+of Lean `Nat` programs. A concrete value may have a symbolic result width, for
+example `BitVec.ofNat width 1`. The common all-ones forms
+`BitVec.ofNat width (2 ^ width - 1)` and `BitVec.allOnes width` are also lowered
+without freezing `width`. Other parameter-dependent constant values, such as
+`BitVec.ofNat width (width + 1)`, currently fail compilation. This fail-closed
+behavior prevents a module from silently changing its ports while retaining a
+constant computed only for the default configuration.
+
+The parameter suffix is available on the IR and SystemVerilog entry points:
+`#synthesize`, `#synthesizeVerilog`, `#synthesizeDesign`,
+`#synthesizeVerilogDesign`, and `#writeVerilogDesign`. CppSim has a
+fixed-width C++ ABI. Consequently, `#writeCppSimDesign` and the combined
+`#writeDesign` command reject a design that still has native parameters, even
+if a `parameters [...]` default list was supplied. Define a closed wrapper that
+instantiates the generic Lean definition at concrete widths before requesting
+those outputs; a SystemVerilog default is not a specialization.
+
+The SV-to-Lean verification-model generator is likewise concrete-width today
+and rejects a retained-parameter module rather than guessing widths. This does
+not prevent manually stated source-level Lean theorems from quantifying over a
+generic circuit definition; it only limits automatic verification-model
+extraction from parameterized IR/SystemVerilog.
+
+The parameter must actually determine the relevant ports, state, memories, or
+logic. Merely adding `parameter WIDTH = 8` to a wrapper or to an otherwise
+fixed 8-bit core does not implement a sweep; changing the wrapper parameter
+would still leave the inner datapath fixed. The CVDP evaluator rejects both
+missing parameters and declaration-only/fixed-port parameterization.
+
+Concrete wrappers remain useful when a separate fixed module is desired, but
+they are not a substitute for a benchmark that rebuilds one DUT over multiple
+parameter values. Functional simulation can exercise a native parameter
+sweep. The current PPA backend does not yet synthesize every configuration
+separately, so parameterized designs report PPA as skipped rather than
+attaching module-default metrics to the entire sweep.
+
+---
+
 ## Signal Operator Quick Reference
 
 All operators work between `Signal ↔ Signal`, `Signal ↔ BitVec`, and `BitVec ↔ Signal` (both directions):

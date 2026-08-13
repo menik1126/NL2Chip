@@ -50,7 +50,7 @@ def test_extract_model : IO TestSeq := do
     match design.modules.head? with
     | none => return test "model extraction: has module" false
     | some m =>
-      let model := extractModel m
+      let model ← IO.ofExcept (extractModel m)
       return test "model extraction: module name" (model.moduleName == "counter8_en") ++
              test "model extraction: has registers" (!model.registers.isEmpty) ++
              test "model extraction: has inputs" (!model.inputs.isEmpty) ++
@@ -68,7 +68,7 @@ def test_generate_lean : IO TestSeq := do
     match design.modules.head? with
     | none => return test "lean generation: has module" false
     | some m =>
-      let leanSrc := moduleToLean m
+      let leanSrc ← IO.ofExcept (moduleToLean m)
       return test "lean generation: contains State structure"
                (hasSubstr leanSrc "structure State") ++
              test "lean generation: contains Input structure"

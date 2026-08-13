@@ -26,28 +26,43 @@ namespace Tools.SVParser.Lower
 -- Type conversion
 -- ============================================================================
 
+/-- Convert a Verilog `[hi:lo]` range to its packed width.  Canonicalize the
+    overwhelmingly common `[base-1:0]` form to `base`; expanding it as
+    `(base-1)+1` would incorrectly turn the invalid Nat override `base=0` into
+    a one-bit declaration because subtraction is saturating. -/
+def rangeWidth : DimExpr → DimExpr → DimExpr
+  | .sub base (.literal 1), .literal 0 => base
+  | hi, lo => hi - lo + 1
+
 /-- Convert Verilog bit range to HWType -/
-def widthToHWType : Option (Nat × Nat) → HWType
+def widthToHWType : Option (DimExpr × DimExpr) → HWType
   | none => .bit
-  | some (hi, lo) => .bitVector (hi - lo + 1)
+  | some (hi, lo) => .bitVector (rangeWidth hi lo)
 
 /-- Get bit width from SV port/decl width -/
-def widthToBits : Option (Nat × Nat) → Nat
-  | none => 1
-  | some (hi, lo) => hi - lo + 1
+def widthToBits : Option (DimExpr × DimExpr) → Option Nat
+  | none => some 1
+  | some (hi, lo) => (rangeWidth hi lo).toNat?
+
+def specializeWidth (parameterValues : List (String × Nat))
+    (width : Option (DimExpr × DimExpr)) : Option (DimExpr × DimExpr) :=
+  width.map fun (hi, lo) =>
+    let substitute := fun name => parameterValues.find? (fun entry => entry.1 == name)
+      |>.map fun entry => DimExpr.literal entry.2
+    (hi.substitute substitute, lo.substitute substitute)
 
 -- ============================================================================
 -- Environment for tracking declarations
 -- ============================================================================
 
 structure LowerEnv where
-  portWidths : List (String × Option (Nat × Nat))  -- port name → width
-  wireWidths : List (String × Option (Nat × Nat))  -- wire name → width
+  portWidths : List (String × Option (DimExpr × DimExpr))  -- port name → width
+  wireWidths : List (String × Option (DimExpr × DimExpr))  -- wire name → width
   regNames   : List String                          -- names declared as reg
 
 def LowerEnv.empty : LowerEnv := { portWidths := [], wireWidths := [], regNames := [] }
 
-def LowerEnv.getWidth (env : LowerEnv) (name : String) : Option (Nat × Nat) :=
+def LowerEnv.getWidth (env : LowerEnv) (name : String) : Option (DimExpr × DimExpr) :=
   (env.portWidths.find? (·.1 == name) |>.map (·.2)).join <|>
   (env.wireWidths.find? (·.1 == name) |>.map (·.2)).join
 
@@ -73,6 +88,7 @@ def lowerBinOp : SVBinOp → Operator
   | .add    => .add
   | .sub    => .sub
   | .mul    => .mul
+  | .pow    => .mul  -- only used in dimensions; data-path use is rejected below
   | .bitAnd => .and
   | .bitOr  => .or
   | .bitXor => .xor
@@ -118,12 +134,14 @@ private partial def svExprToNat : SVExpr → Option Nat
   | .binary .add a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va + vb)
   | .binary .sub a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va - vb)
   | .binary .mul a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va * vb)
+  | .binary .pow a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va ^ vb)
   | .unary .neg a => do let va ← svExprToNat a; some (0 - va)
+  | .sizedCast _ value => svExprToNat value
   | _ => none
 
 private def concatWidth : SVExpr → Nat
   | .concat args => args.foldl (fun acc a => acc + concatWidth a) 0
-  | .slice _ hi lo => hi - lo + 1
+  | .slice _ hi lo => (hi - lo + 1).toNat?.getD 1
   | .partSelectPlus _ _ widthExpr => svExprToNat widthExpr |>.getD 1
   | .index _ _ => 1  -- single bit select
   | .lit (.decimal (some w) _) => w
@@ -132,6 +150,7 @@ private def concatWidth : SVExpr → Nat
   | .lit (.decimal none _) => 32
   | .lit (.hex none _) => 32
   | .lit (.binary none _) => 1
+  | .sizedCast width _ => width.toNat?.getD 0
   | _ => 32  -- default: assume 32-bit
 
 partial def lowerExpr (e : SVExpr) : Expr :=
@@ -139,9 +158,9 @@ partial def lowerExpr (e : SVExpr) : Expr :=
   | .lit l => literalToConst l
   | .ident name => .ref name
   | .unary .reductAnd arg =>
-    -- Reduction AND: &x → all bits set → (x XOR 0xFF...FF) == 0
-    -- Use XOR with -1 (all ones) for bitwise inversion, then compare with 0
-    .op .eq [.op .xor [lowerExpr arg, .const (-1) 32], .const 0 32]
+    -- Reduction AND: &x iff the width-preserving complement is zero.  A
+    -- fixed 32-bit all-ones XOR mask silently fails for native widths > 32.
+    .op .eq [.op .not [lowerExpr arg], .const 0 32]
   | .unary .reductOr arg =>
     -- Reduction OR: |x → any bit set → x != 0
     .op .not [.op .eq [lowerExpr arg, .const 0 32]]
@@ -149,8 +168,9 @@ partial def lowerExpr (e : SVExpr) : Expr :=
     -- Logical NOT: !x → (x == 0) — reduces multi-bit to bool
     .op .eq [lowerExpr arg, .const 0 32]
   | .unary .bitNot arg =>
-    -- Bitwise NOT: ~x → XOR with all-ones (avoids confusion with logical NOT in IR)
-    .op .xor [lowerExpr arg, .const (-1) 32]
+    -- IR `.not` is a width-preserving bitwise complement.  A fixed 32-bit
+    -- XOR mask corrupts native widths above 32 bits.
+    .op .not [lowerExpr arg]
   | .unary .signed arg =>
     -- $signed(x): sign-extend concat immediates from their natural width to 32.
     -- For single wire refs (already 32-bit), pass through unchanged.
@@ -208,7 +228,7 @@ partial def lowerExpr (e : SVExpr) : Expr :=
         | .lit (.decimal (some w) _) => w
         | .lit (.hex (some w) _) => w
         | .lit (.binary (some w) _) => w
-        | .slice _ hi lo => hi - lo + 1
+        | .slice _ hi lo => (hi - lo + 1).toNat?.getD 1
         | .ident _ => 0  -- unknown width: use concat path
         | _ => 1  -- default: assume 1-bit
       if elemWidth == 1 then
@@ -219,6 +239,15 @@ partial def lowerExpr (e : SVExpr) : Expr :=
       else
         -- Multi-bit or unknown width: build concat of N copies
         .concat (List.replicate n valExpr)
+  | .sizedCast width value =>
+    match value with
+    | .lit (.decimal _ v) | .lit (.hex _ v) | .lit (.binary _ v) =>
+      .const (Int.ofNat v) width
+    | .unary .neg (.lit (.decimal _ v))
+    | .unary .neg (.lit (.hex _ v))
+    | .unary .neg (.lit (.binary _ v)) =>
+      .const (-(Int.ofNat v)) width
+    | _ => lowerExpr value
 
 -- ============================================================================
 -- Extract target name from LHS expression
@@ -251,7 +280,7 @@ def concatLhsName : SVExpr → Option String
 /-- A register assignment found inside an always block -/
 structure RegInfo where
   name      : String
-  initValue : Nat
+  initValue : Int
   dataExpr  : Expr
   deriving Repr
 
@@ -260,9 +289,13 @@ structure RegInfo where
     else begin reg <= expr; end -/
 def extractRegisters (resetBranch dataBranch : List SVStmt) : List RegInfo :=
   let initMap := resetBranch.filterMap fun s => match s with
-    | .nonblockAssign lhs (.lit (.decimal _ v)) => (exprToName lhs).map (·, v)
-    | .nonblockAssign lhs (.lit (.hex _ v))     => (exprToName lhs).map (·, v)
-    | .nonblockAssign lhs (.lit (.binary _ v))  => (exprToName lhs).map (·, v)
+    | .nonblockAssign lhs (.lit (.decimal _ v)) => (exprToName lhs).map (·, Int.ofNat v)
+    | .nonblockAssign lhs (.lit (.hex _ v))     => (exprToName lhs).map (·, Int.ofNat v)
+    | .nonblockAssign lhs (.lit (.binary _ v))  => (exprToName lhs).map (·, Int.ofNat v)
+    | .nonblockAssign lhs (.unary .neg (.lit (.decimal _ v))) =>
+      (exprToName lhs).map (·, -(Int.ofNat v))
+    | .nonblockAssign lhs (.sizedCast _ (.unary .neg (.lit (.decimal _ v)))) =>
+      (exprToName lhs).map (·, -(Int.ofNat v))
     | _ => none
   let dataMap := dataBranch.filterMap fun s => match s with
     | .nonblockAssign lhs rhs => (exprToName lhs).map (·, lowerExpr rhs)
@@ -329,8 +362,11 @@ private def isDontCare : SVExpr → Bool
 private def lowerConcatLhsAssign (lhs : SVExpr) (rhs : SVExpr) : Option (String × Expr) :=
   match lhs, concatLhsName lhs with
   | .concat elems, some name =>
-    let fields := elems.filterMap fun e => match e with
-      | .slice (.ident _) hi lo => some (hi, lo)
+    let fields : List (Nat × Nat) := elems.filterMap fun e => match e with
+      | .slice (.ident _) hi lo => do
+          let hi' ← hi.toNat?
+          let lo' ← lo.toNat?
+          some (hi', lo')
       | .index (.ident _) (.lit (.decimal _ idx)) => some (idx, idx)
       | .ident _ => some (31, 0)
       | _ => none
@@ -361,7 +397,10 @@ private def decomposeMultiConcatLhs (lhs : SVExpr) (rhs : SVExpr) : List (String
   | .concat elems =>
     -- Compute field widths and target names for each element
     let fields : List (String × Nat × Nat) := elems.filterMap fun e => match e with
-      | .slice (.ident name) hi lo => some (name, hi - lo + 1, lo)
+      | .slice (.ident name) hi lo => do
+          let hi' ← hi.toNat?
+          let lo' ← lo.toNat?
+          some (name, hi' - lo' + 1, lo')
       | .index (.ident name) idxExpr =>
         -- Evaluate index expression (may be constant expr like 0+4-1=3)
         match svExprToNat idxExpr with
@@ -663,7 +702,12 @@ partial def collectByteLaneWrites (arrName : String) (stmts : List SVStmt)
     : List ByteLaneWrite :=
   stmts.flatMap fun s => match s with
     | .nonblockAssign (.slice (.index (.ident name) addr) hi lo) rhs =>
-      if name == arrName then [{ addr, data := rhs, cond := .lit (.decimal none 1), hi, lo }] else []
+      if name == arrName then
+        match hi.toNat?, lo.toNat? with
+        | some hi', some lo' =>
+          [{ addr, data := rhs, cond := .lit (.decimal none 1), hi := hi', lo := lo' }]
+        | _, _ => []
+      else []
     | .ifElse cond thenB elseB =>
       -- Recurse into both branches, propagating condition for then-branch
       let thenWrites := (collectByteLaneWrites arrName thenB).map
@@ -994,6 +1038,16 @@ partial def evalConstExpr (paramVals : List (String × Nat)) : SVExpr → Option
   | .lit (.hex _ v) => some v
   | .lit (.binary _ v) => some v
   | .ident name => paramVals.find? (·.1 == name) |>.map (·.2)
+  | .binary .add a b => return (← evalConstExpr paramVals a) + (← evalConstExpr paramVals b)
+  | .binary .sub a b => return (← evalConstExpr paramVals a) - (← evalConstExpr paramVals b)
+  | .binary .mul a b => return (← evalConstExpr paramVals a) * (← evalConstExpr paramVals b)
+  | .binary .pow a b => return (← evalConstExpr paramVals a) ^ (← evalConstExpr paramVals b)
+  | .binary .eq a b => return if (← evalConstExpr paramVals a) == (← evalConstExpr paramVals b) then 1 else 0
+  | .binary .neq a b => return if (← evalConstExpr paramVals a) != (← evalConstExpr paramVals b) then 1 else 0
+  | .binary .lt a b => return if (← evalConstExpr paramVals a) < (← evalConstExpr paramVals b) then 1 else 0
+  | .binary .le a b => return if (← evalConstExpr paramVals a) <= (← evalConstExpr paramVals b) then 1 else 0
+  | .binary .gt a b => return if (← evalConstExpr paramVals a) > (← evalConstExpr paramVals b) then 1 else 0
+  | .binary .ge a b => return if (← evalConstExpr paramVals a) >= (← evalConstExpr paramVals b) then 1 else 0
   | .binary .logOr a b => do
     let va ← evalConstExpr paramVals a
     let vb ← evalConstExpr paramVals b
@@ -1009,27 +1063,24 @@ partial def evalConstExpr (paramVals : List (String × Nat)) : SVExpr → Option
   | .unary .logNot a => do
     let va ← evalConstExpr paramVals a
     some (if va == 0 then 1 else 0)
+  | .sizedCast _ value => evalConstExpr paramVals value
   | _ => none
 
 /-- Extract parameter default values as (name, value) pairs -/
 def extractParamDefaults (svMod : SVModule) : List (String × Nat) :=
-  let fromParams := svMod.params.filterMap fun p =>
-    match p.value with
-    | .lit (.decimal _ v) => some (p.name, v)
-    | .lit (.hex _ v) => some (p.name, v)
-    | .lit (.binary _ v) => some (p.name, v)
-    | _ => none
-  let fromItems := svMod.items.filterMap fun item =>
-    match item with
-    | .paramDecl p => match p.value with
-      | .lit (.decimal _ v) => some (p.name, v)
-      | .lit (.hex _ v) => some (p.name, v)
-      | .lit (.binary _ v) => some (p.name, v)
-      | _ => none
-    | _ => none
-  fromParams ++ fromItems
+  let declarations := svMod.params ++ svMod.items.filterMap fun item =>
+    match item with | .paramDecl p => some p | _ => none
+  declarations.foldl (fun values parameter =>
+    match evalConstExpr values parameter.value with
+    | some value => values ++ [(parameter.name, value)]
+    | none => values) []
 
 /-- Substitute parameter references with constant values in SV expressions -/
+def substituteDimFromSV (params : List (String × SVExpr)) (dimension : DimExpr) : DimExpr :=
+  dimension.substitute fun name => do
+    let (_, value) ← params.find? (fun entry => entry.1 == name)
+    Tools.SVParser.Parser.exprToDimExpr? value
+
 partial def substParamExpr (params : List (String × SVExpr)) : SVExpr → SVExpr
   | .ident name => match params.find? fun (n, _) => n == name with
     | some (_, v) => v | none => .ident name
@@ -1037,9 +1088,12 @@ partial def substParamExpr (params : List (String × SVExpr)) : SVExpr → SVExp
   | .binary op a b => .binary op (substParamExpr params a) (substParamExpr params b)
   | .ternary c t e => .ternary (substParamExpr params c) (substParamExpr params t) (substParamExpr params e)
   | .index a i => .index (substParamExpr params a) (substParamExpr params i)
-  | .slice e hi lo => .slice (substParamExpr params e) hi lo
+  | .slice e hi lo => .slice (substParamExpr params e)
+      (substituteDimFromSV params hi) (substituteDimFromSV params lo)
   | .partSelectPlus e base w => .partSelectPlus (substParamExpr params e) (substParamExpr params base) (substParamExpr params w)
   | .concat es => .concat (es.map (substParamExpr params))
+  | .sizedCast width value =>
+    .sizedCast (substituteDimFromSV params width) (substParamExpr params value)
   | e => e
 
 partial def substParamStmt (params : List (String × SVExpr)) : SVStmt → SVStmt
@@ -1064,17 +1118,154 @@ private partial def collectReadNamesExpr : SVExpr → List String
   | .binary _ a b => collectReadNamesExpr a ++ collectReadNamesExpr b
   | .ternary c t e => collectReadNamesExpr c ++ collectReadNamesExpr t ++ collectReadNamesExpr e
   | .index a i => collectReadNamesExpr a ++ collectReadNamesExpr i
-  | .slice e _ _ => collectReadNamesExpr e
+  | .slice e hi lo => collectReadNamesExpr e ++ hi.parameters ++ lo.parameters
   | .partSelectPlus e base _ => collectReadNamesExpr e ++ collectReadNamesExpr base
   | .concat es => es.flatMap collectReadNamesExpr
+  | .sizedCast width value => width.parameters ++ collectReadNamesExpr value
   | _ => []
 
 private partial def collectReadNamesStmt : List SVStmt → List String
   | stmts => stmts.flatMap fun s => match s with
-    | .blockAssign _ rhs => collectReadNamesExpr rhs
+    | .blockAssign lhs rhs | .nonblockAssign lhs rhs =>
+      collectReadNamesExpr lhs ++ collectReadNamesExpr rhs
     | .ifElse c t e => collectReadNamesExpr c ++ collectReadNamesStmt t ++ collectReadNamesStmt e
-    | .forLoop _ _ _ body => collectReadNamesStmt body
-    | _ => []
+    | .caseStmt selector arms default_ =>
+      collectReadNamesExpr selector ++ arms.flatMap (fun arm =>
+        arm.1.flatMap collectReadNamesExpr ++ collectReadNamesStmt arm.2) ++
+        (default_.map collectReadNamesStmt).getD []
+    | .forLoop init condition step body =>
+      collectReadNamesStmt [init, step] ++ collectReadNamesExpr condition ++ collectReadNamesStmt body
+    | .assertStmt condition => collectReadNamesExpr condition
+
+/-- Does a procedural loop require elaboration using a retained module
+    parameter?  Such a loop cannot be unrolled at the default while still
+    advertising a working native override. -/
+private partial def hasParameterizedFor (parameterNames : List String) : List SVStmt → Bool
+  | statements => statements.any fun statement => match statement with
+    | .forLoop init condition step body =>
+      let references := collectReadNamesExpr condition ++ collectReadNamesStmt [init, step]
+      references.any parameterNames.contains || hasParameterizedFor parameterNames body
+    | .ifElse _ then_ else_ =>
+      hasParameterizedFor parameterNames then_ || hasParameterizedFor parameterNames else_
+    | .caseStmt _ arms default_ =>
+      arms.any (fun arm => hasParameterizedFor parameterNames arm.2) ||
+        default_.any (hasParameterizedFor parameterNames)
+    | _ => false
+
+private partial def hasParameterizedGenerate (parameterNames : List String)
+    (items : List SVModuleItem) : Bool :=
+  items.any fun item => match item with
+  | .generateBlock condition body elseBody =>
+    (collectReadNamesExpr condition).any parameterNames.contains ||
+      hasParameterizedGenerate parameterNames body ||
+      hasParameterizedGenerate parameterNames elseBody
+  | .alwaysBlock _ statements => hasParameterizedFor parameterNames statements
+  | _ => false
+
+/-- Detect expression forms whose current lowering needs a concrete repeat,
+    part-select, or sign-extension width.  Native parameters may still be used
+    freely in declaration dimensions and ordinary arithmetic. -/
+private partial def hasUnsupportedParameterizedExpr (parameterNames : List String) : SVExpr → Bool
+  | .unary .signed argument =>
+    -- `lowerExpr` has no signed-cast node.  In particular, dropping
+    -- `$signed(x)` changes arithmetic-right-shift and comparison semantics
+    -- when `x` has a retained width, even though the expression text itself
+    -- does not mention the width parameter.
+    !parameterNames.isEmpty || hasUnsupportedParameterizedExpr parameterNames argument
+  | .unary _ argument => hasUnsupportedParameterizedExpr parameterNames argument
+  | .binary _ lhs rhs =>
+    hasUnsupportedParameterizedExpr parameterNames lhs ||
+      hasUnsupportedParameterizedExpr parameterNames rhs
+  | .ternary condition then_ else_ =>
+    hasUnsupportedParameterizedExpr parameterNames condition ||
+      hasUnsupportedParameterizedExpr parameterNames then_ ||
+      hasUnsupportedParameterizedExpr parameterNames else_
+  | .index array index =>
+    hasUnsupportedParameterizedExpr parameterNames array ||
+      hasUnsupportedParameterizedExpr parameterNames index
+  | .slice expression hi lo =>
+    (hi.parameters ++ lo.parameters).any parameterNames.contains ||
+      hasUnsupportedParameterizedExpr parameterNames expression
+  | .partSelectPlus expression base width =>
+    (collectReadNamesExpr width).any parameterNames.contains ||
+      hasUnsupportedParameterizedExpr parameterNames expression ||
+      hasUnsupportedParameterizedExpr parameterNames base
+  | .concat expressions => expressions.any (hasUnsupportedParameterizedExpr parameterNames)
+  | .repeat_ count value =>
+    (collectReadNamesExpr count).any parameterNames.contains ||
+      hasUnsupportedParameterizedExpr parameterNames value
+  | .sizedCast _width value =>
+    -- Literal casts lower to an IR constant carrying `width` and therefore
+    -- retain a native parameter exactly.  For a nonliteral value, however,
+    -- `lowerExpr` currently has no resize/cast node and would drop the cast.
+    -- Reject every nonliteral cast instead of silently changing concat,
+    -- extension, or truncation semantics. This is required even for a
+    -- concrete cast width: `(3)'(x)` can truncate `x` before a concat, whereas
+    -- dropping the cast lets the enclosing assignment truncate differently.
+    let isLiteralValue := match value with
+      | .lit _ | .unary .neg (.lit _) => true
+      | _ => false
+    !isLiteralValue ||
+      hasUnsupportedParameterizedExpr parameterNames value
+  | _ => false
+
+private def hasUnsupportedNativeLhs (parameterNames : List String) (lhs : SVExpr) : Bool :=
+  !parameterNames.isEmpty && !(match lhs with | .ident _ => true | _ => false)
+
+private partial def hasBlockingAssignment : List SVStmt → Bool
+  | statements => statements.any fun statement => match statement with
+    | .blockAssign _ _ => true
+    | .ifElse _ then_ else_ =>
+      hasBlockingAssignment then_ || hasBlockingAssignment else_
+    | .caseStmt _ arms default_ =>
+      arms.any (fun arm => hasBlockingAssignment arm.2) ||
+        default_.any hasBlockingAssignment
+    | .forLoop init _ step body =>
+      hasBlockingAssignment [init, step] || hasBlockingAssignment body
+    | _ => false
+
+private partial def hasUnsupportedParameterizedStmt (parameterNames : List String) : SVStmt → Bool
+  | .blockAssign lhs rhs | .nonblockAssign lhs rhs =>
+    hasUnsupportedNativeLhs parameterNames lhs ||
+      hasUnsupportedParameterizedExpr parameterNames lhs ||
+      hasUnsupportedParameterizedExpr parameterNames rhs
+  | .ifElse condition then_ else_ =>
+    hasUnsupportedParameterizedExpr parameterNames condition ||
+      then_.any (hasUnsupportedParameterizedStmt parameterNames) ||
+      else_.any (hasUnsupportedParameterizedStmt parameterNames)
+  | .caseStmt selector arms default_ =>
+    hasUnsupportedParameterizedExpr parameterNames selector ||
+      arms.any (fun arm => arm.1.any (hasUnsupportedParameterizedExpr parameterNames) ||
+        arm.2.any (hasUnsupportedParameterizedStmt parameterNames)) ||
+      default_.any (fun statements => statements.any (hasUnsupportedParameterizedStmt parameterNames))
+  | .forLoop init condition step body =>
+    hasUnsupportedParameterizedStmt parameterNames init ||
+      hasUnsupportedParameterizedExpr parameterNames condition ||
+      hasUnsupportedParameterizedStmt parameterNames step ||
+      body.any (hasUnsupportedParameterizedStmt parameterNames)
+  | .assertStmt condition => hasUnsupportedParameterizedExpr parameterNames condition
+
+private def hasUnsupportedParameterizedConstruct (parameterNames : List String)
+    (items : List SVModuleItem) : Bool :=
+  items.any fun item => match item with
+  | .contAssign lhs rhs =>
+    hasUnsupportedNativeLhs parameterNames lhs ||
+      hasUnsupportedParameterizedExpr parameterNames lhs ||
+      hasUnsupportedParameterizedExpr parameterNames rhs
+  | .alwaysBlock .star _ =>
+    -- The current SSA lowering gives temporary wires a concrete 64-bit type.
+    -- Retaining a module parameter here would silently truncate W>64 values.
+    !parameterNames.isEmpty
+  | .alwaysBlock (.posedge _) statements =>
+    (!parameterNames.isEmpty && hasBlockingAssignment statements) ||
+      statements.any (hasUnsupportedParameterizedStmt parameterNames)
+  | .alwaysBlock _ statements =>
+    statements.any (hasUnsupportedParameterizedStmt parameterNames)
+  | .wireDecl _ _ init => init.any (hasUnsupportedParameterizedExpr parameterNames)
+  | .instantiation _ _ connections overrides =>
+    connections.any (fun connection => hasUnsupportedParameterizedExpr parameterNames connection.2) ||
+      overrides.any (fun override => hasUnsupportedParameterizedExpr parameterNames override.2)
+  | _ => false
 
 /-- Collect all variable names written in blocking assignments (including concat-LHS). -/
 private partial def collectWriteNames : List SVStmt → List String
@@ -1103,6 +1294,7 @@ private partial def renameExpr (oldName newName : String) : SVExpr → SVExpr
   | .slice e hi lo => .slice (renameExpr oldName newName e) hi lo
   | .partSelectPlus e base w => .partSelectPlus (renameExpr oldName newName e) (renameExpr oldName newName base) (renameExpr oldName newName w)
   | .concat es => .concat (es.map (renameExpr oldName newName))
+  | .sizedCast width value => .sizedCast width (renameExpr oldName newName value)
   | e => e
 
 /-- Rename all occurrences of `oldName` to `newName` in an SVStmt. -/
@@ -1221,34 +1413,52 @@ partial def unrollForLoops (paramVals : List (String × Nat)) (depth : Nat := 0)
       (dflt.map (unrollForLoops paramVals depth))]
   | other => [other]
 
-def substituteParamsInItem (params : List (String × SVExpr)) (paramVals : List (String × Nat))
-    : SVModuleItem → SVModuleItem
+def prepareParameterizedItem (paramVals : List (String × Nat)) : SVModuleItem → SVModuleItem
   | .alwaysBlock sens stmts =>
-    let substituted := stmts.map (substParamStmt params)
-    let unrolled := unrollForLoops paramVals 0 substituted
+    let unrolled := unrollForLoops paramVals 0 stmts
     .alwaysBlock sens unrolled
-  | .contAssign lhs rhs => .contAssign (substParamExpr params lhs) (substParamExpr params rhs)
+  | item => item
+
+def specializeItem (parameters : List (String × SVExpr))
+    (parameterValues : List (String × Nat)) : SVModuleItem → SVModuleItem
+  | .alwaysBlock sensitivity statements =>
+    .alwaysBlock sensitivity <| unrollForLoops parameterValues 0
+      (statements.map (substParamStmt parameters))
+  | .contAssign lhs rhs =>
+    .contAssign (substParamExpr parameters lhs) (substParamExpr parameters rhs)
+  | .wireDecl name width init =>
+    .wireDecl name width (init.map (substParamExpr parameters))
+  | .instantiation moduleName instanceName connections overrides =>
+    .instantiation moduleName instanceName
+      (connections.map fun connection => (connection.1, substParamExpr parameters connection.2))
+      (overrides.map fun override => (override.1, substParamExpr parameters override.2))
   | item => item
 
 /-- Expand generate blocks by evaluating conditions against parameter defaults.
     Returns the items from the selected branch (recursively for nested generates). -/
 partial def expandGenerateBlocks (paramVals : List (String × Nat))
-    (items : List SVModuleItem) : List SVModuleItem :=
-  items.flatMap fun item =>
+    (items : List SVModuleItem) : Except String (List SVModuleItem) := do
+  let mut result : List SVModuleItem := []
+  for item in items do
     match item with
     | .generateBlock cond ifItems elseItems =>
-      let condVal := evalConstExpr paramVals cond |>.getD 0
+      let condVal ← match evalConstExpr paramVals cond with
+        | some value => pure value
+        | none => throw s!"unsupported generate condition; cannot safely choose a branch: {repr cond}"
       let selectedItems := if condVal != 0 then ifItems else elseItems
-      -- Recursively expand in case of nested generate blocks
-      expandGenerateBlocks paramVals selectedItems
-    | other => [other]
+      result := result ++ (← expandGenerateBlocks paramVals selectedItems)
+    | other => result := result ++ [other]
+  pure result
 
 -- ============================================================================
 -- Module lowering
 -- ============================================================================
 
-/-- Lower a single SVModule to Sparkle IR Module, optionally overriding parameters. -/
-def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := []) : Except String Module := do
+/-- Lower a single SVModule.  `retainParameters` selects the native symbolic
+    path; the legacy SV simulation path specializes declared parameters at
+    their defaults (or explicit overrides) before lowering. -/
+def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
+    (retainParameters : Bool := false) : Except String Module := do
   -- Expand generate blocks using parameter defaults + overrides
   let paramDefaults := extractParamDefaults svMod
   -- Overrides take priority: replace defaults with overridden values
@@ -1256,17 +1466,56 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     match paramOverrides.find? fun (on, _) => on == n with
     | some (_, ov) => (n, ov)
     | none => (n, v)
-  let expandedItems := expandGenerateBlocks paramVals svMod.items
-  -- Replace parameter references with constants in all SV expressions
-  let paramLits : List (String × SVExpr) := paramVals.map fun (n, v) =>
-    (n, .lit (.decimal (some 32) v))
-  let expandedItems := expandedItems.map (substituteParamsInItem paramLits paramVals)
-  -- Also substitute in module-level params
-  let svParams := svMod.params.map fun p =>
-    match paramVals.find? fun (n, _) => n == p.name with
-    | some (_, v) => { p with value := .lit (.decimal (some 32) v) }
-    | none => p
-  let svMod := { svMod with items := expandedItems, params := svParams }
+  let parameterDecls := svMod.params ++ svMod.items.filterMap fun item =>
+    match item with
+    | .paramDecl parameter => if parameter.isLocal then none else some parameter
+    | _ => none
+  let parameterNames := parameterDecls.map (·.name)
+  if retainParameters then
+    let mut priorNames : List String := []
+    for parameter in parameterDecls do
+      if (collectReadNamesExpr parameter.value).any priorNames.contains then
+        throw s!"module parameter '{parameter.name}' has a default that depends on another parameter; native dependent defaults are not yet representable"
+      priorNames := priorNames ++ [parameter.name]
+  if retainParameters && hasParameterizedGenerate parameterNames svMod.items then
+    throw "parameter-dependent generate/procedural-for elaboration cannot be retained as a native override; specialize the module explicitly"
+  if retainParameters && hasUnsupportedParameterizedConstruct parameterNames svMod.items then
+    throw "parameter-dependent slice/repeat/part-select/sign-extension, signed/nonliteral sized-cast, complex assignment target, or procedural-combinational lowering is not supported for native overrides; specialize the module explicitly"
+  let mut moduleParameters : List Sparkle.IR.AST.Parameter := []
+  if retainParameters then
+    for parameter in parameterDecls do
+      let defaultValue ← match paramDefaults.find? (fun entry => entry.1 == parameter.name) with
+        | some (_, value) => pure value
+        | none => throw s!"module parameter '{parameter.name}' does not have a supported natural-number default"
+      moduleParameters := moduleParameters ++ [{ name := parameter.name, defaultValue }]
+  let expandedItems ← expandGenerateBlocks paramVals svMod.items
+  -- Preserve parameter references in ordinary expressions.  Only loop/generate
+  -- control is evaluated here; replacing data-path references with defaults
+  -- would make a later SystemVerilog parameter override semantically inert.
+  let expandedItems := if retainParameters then
+      expandedItems.map (prepareParameterizedItem paramVals)
+    else
+      let paramLits : List (String × SVExpr) := paramVals.map fun (name, value) =>
+        (name, .lit (.decimal (some 32) value))
+      expandedItems.map (specializeItem paramLits paramVals)
+  let svParams := if retainParameters then svMod.params else svMod.params.map fun parameter =>
+    match paramVals.find? (fun entry => entry.1 == parameter.name) with
+    | some (_, value) => { parameter with value := .lit (.decimal (some 32) value) }
+    | none => parameter
+  let svPorts := if retainParameters then svMod.ports else svMod.ports.map fun port =>
+    { port with width := specializeWidth paramVals port.width }
+  let expandedItems := if retainParameters then expandedItems else expandedItems.map fun item =>
+    match item with
+    | .wireDecl name width init => .wireDecl name (specializeWidth paramVals width) init
+    | .regDecl name width arraySize =>
+      let arraySize := arraySize.map fun size => size.substitute fun parameter =>
+        paramVals.find? (fun entry => entry.1 == parameter)
+          |>.map fun entry => DimExpr.literal entry.2
+      .regDecl name (specializeWidth paramVals width) arraySize
+    | .paramDecl parameter =>
+      .paramDecl { parameter with width := specializeWidth paramVals parameter.width }
+    | other => other
+  let svMod := { svMod with items := expandedItems, params := svParams, ports := svPorts }
 
   -- Build environment
   let mut env := LowerEnv.empty
@@ -1308,20 +1557,19 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     | .integerDecl name => wires := wires ++ [{ name, ty := .bitVector 32 }]
     | _ => pure ()
 
-  -- Add parameters as constant wires (track names to avoid duplicates)
+  -- Local parameters are implementation constants.  Module parameters live in
+  -- `Module.parameters` and must not be redeclared as hardware wires.
   let mut paramNames : List String := []
-  for p in svMod.params do
-    let ty := widthToHWType p.width
-    if !(paramNames.any (· == p.name)) then
-      wires := wires ++ [{ name := p.name, ty }]
-      paramNames := paramNames ++ [p.name]
   for item in svMod.items do
     match item with
     | .paramDecl param =>
-      let ty := widthToHWType param.width
-      if !(paramNames.any (· == param.name)) then
-        wires := wires ++ [{ name := param.name, ty }]
-        paramNames := paramNames ++ [param.name]
+      if param.isLocal then
+        let ty := widthToHWType param.width
+        if !(paramNames.any (· == param.name)) then
+          wires := wires ++ [{ name := param.name, ty }]
+          paramNames := paramNames ++ [param.name]
+      else
+        pure ()
     | _ => pure ()
 
   -- Build body statements
@@ -1329,20 +1577,18 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
   -- All always @* blocks now use MUX mode (SSA handles loop dependencies)
 
   -- Emit parameter values as constant assigns (with overrides applied)
-  let paramWidth (w : Option (Nat × Nat)) : Nat :=
+  let paramWidth (w : Option (DimExpr × DimExpr)) : DimExpr :=
     match w with | some (hi, lo) => hi - lo + 1 | none => 32
-  for p in svMod.params do
-    let val := match paramVals.find? fun (n, _) => n == p.name with
-      | some (_, v) => .const (Int.ofNat v) (paramWidth p.width)
-      | none => lowerExpr p.value
-    body := body ++ [.assign p.name val]
   for item in svMod.items do
     match item with
     | .paramDecl param =>
-      let val := match paramVals.find? fun (n, _) => n == param.name with
-        | some (_, v) => .const (Int.ofNat v) (paramWidth param.width)
-        | none => lowerExpr param.value
-      body := body ++ [.assign param.name val]
+      if param.isLocal then
+        let val := match paramVals.find? fun (n, _) => n == param.name with
+          | some (_, v) => .const (Int.ofNat v) (paramWidth param.width)
+          | none => lowerExpr param.value
+        body := body ++ [.assign param.name val]
+      else
+        pure ()
     | _ => pure ()
 
   for item in svMod.items do
@@ -1356,7 +1602,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
       -- Detect reset pattern: find first if/else that looks like a reset check
       -- PicoRV32 has flat assigns before the reset check, so we scan for it
       let mut resetName := "rst"
-      let mut initMap : List (String × Nat) := []
+      let mut initMap : List (String × Int) := []
       let resetCheck := stmts.findSome? fun s => match s with
         | .ifElse cond thenB elseB => detectReset cond thenB elseB
         | _ => none
@@ -1369,9 +1615,12 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
         initMap := initBranch.filterMap fun s => match s with
           | .nonblockAssign lhs rhs =>
             match exprToName lhs with
-            | some n => match evalConstExpr paramVals rhs with
-              | some v => some (n, v)
-              | none => none
+            | some n => match rhs with
+              | .unary .neg (.lit (.decimal _ v)) => some (n, -(Int.ofNat v))
+              | .sizedCast _ (.unary .neg (.lit (.decimal _ v))) => some (n, -(Int.ofNat v))
+              | _ => match evalConstExpr paramVals rhs with
+                | some v => some (n, Int.ofNat v)
+                | none => none
             | none => none
           | _ => none
       | none => pure ()
@@ -1417,7 +1666,12 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     | .regDecl name width (some arraySize) =>
       -- Array reg → Stmt.memory for JIT memory access
       -- Do NOT add to wires list — Stmt.memory creates the class member.
-      let dataWidth := widthToBits width
+      let dataWidth ← match widthToBits width with
+        | some value => pure value
+        | none => throw s!"memory '{name}' has a symbolic data width; specialize it before concrete memory lowering"
+      let arraySize ← match arraySize.toNat? with
+        | some value => pure value
+        | none => throw s!"memory '{name}' has a symbolic depth; specialize it before concrete memory lowering"
       let addrWidth := Nat.log2 arraySize + (if Nat.isPowerOfTwo arraySize then 0 else 1)
       -- Extract array writes from always blocks
       let mut writeAddr : Expr := .const 0 addrWidth
@@ -1455,10 +1709,15 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
         writeAddr writeData writeEnable
         (.const 0 addrWidth) s!"{name}_rdata" true]
       wires := wires ++ [{ name := s!"{name}_rdata", ty := widthToHWType width }]
-    | .instantiation modName instName conns _paramOvr =>
-      -- Module instantiation → Stmt.inst (parameter overrides resolved at flatten time)
+    | .instantiation modName instName conns paramOvr =>
       let irConns := conns.map fun (portName, expr) => (portName, lowerExpr expr)
-      body := body ++ [.inst modName instName irConns]
+      let mut irOverrides : List (String × DimExpr) := []
+      for (name, value) in paramOvr do
+        let dimension ← match Tools.SVParser.Parser.exprToDimExpr? value with
+          | some dimension => pure dimension
+          | none => throw s!"instance '{instName}' parameter override '{name}' is not a supported dimension expression"
+        irOverrides := irOverrides ++ [(name, dimension)]
+      body := body ++ [.inst modName instName irConns irOverrides]
     | _ => pure ()
 
   -- Deduplicate wires
@@ -1540,8 +1799,9 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
         assertIdx := assertIdx + 1
     | _ => pure ()
 
-  pure {
+  let result : Module := {
     name := svMod.name
+    parameters := moduleParameters
     inputs := inputs
     outputs := outputs
     wires := dedupWires
@@ -1549,6 +1809,8 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     assertions := assertions
     isPrimitive := false
   }
+  result.validateDimensions
+  pure result
 
 /-- Prefix all wire/register names in an expression -/
 partial def prefixExprNames (pfx : String) (nameSet : List String) : Expr → Expr
@@ -1572,7 +1834,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
     for stmt in top.body do
       match stmt with
-      | .inst modName instName conns =>
+      | .inst modName instName conns parameterOverrides =>
         -- Find the sub-module
         match moduleMap.find? fun (m : Module) => m.name == modName with
         | none =>
@@ -1582,13 +1844,15 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
           -- Find the SV AST for this instantiation to get parameter overrides
           -- Walk the SV top module items to find the matching instantiation
           let svTopMod? := svDesign.modules.find? fun m => m.name == design.topModule
-          let paramOvr : List (String × Nat) := match svTopMod? with
+          let astParamOvr : List (String × Nat) := match svTopMod? with
             | some svTop =>
-              let expanded := expandGenerateBlocks (extractParamDefaults svTop) svTop.items
+              let expanded := match expandGenerateBlocks (extractParamDefaults svTop) svTop.items with
+                | .ok items => items
+                | .error _ => []
               match expanded.findSome? fun item =>
                 match item with
-                | .instantiation mn _ _ pOvr =>
-                  if mn == modName then
+                | .instantiation mn svInstName _ pOvr =>
+                  if mn == modName && svInstName == instName then
                     some (pOvr.filterMap fun (name, expr) =>
                       match expr with
                       | .lit (.decimal _ v) => some (name, v)
@@ -1601,6 +1865,10 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
               | some ovr => ovr
               | none => []
             | none => []
+          let paramOvr : List (String × Nat) := if parameterOverrides.isEmpty then
+              astParamOvr
+            else
+              parameterOverrides.filterMap fun (name, value) => value.toNat?.map (name, ·)
 
           -- Re-lower the sub-module with parameter overrides applied
           -- This ensures generate-if blocks are expanded with the correct values
@@ -1611,6 +1879,17 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
               | .ok m => pure m
               | .error _ => pure subMod
             | none => pure subMod
+
+          -- Native Sparkle hierarchy stores parameter overrides directly in
+          -- `Stmt.inst`.  Substitute them (or the child's declared defaults)
+          -- into every child dimension before copying the child into the
+          -- parent.  Overrides may themselves refer to parent parameters, so
+          -- the resulting flattened dimensions can remain symbolic.
+          let effectiveSubMod := effectiveSubMod.substituteDimensions fun name =>
+            match parameterOverrides.find? (fun override => override.1 == name) with
+            | some (_, value) => some value
+            | none => effectiveSubMod.parameters.find? (fun parameter => parameter.name == name)
+                |>.map fun parameter => .literal parameter.defaultValue
 
           -- Collect all internal names in sub-module (including memory names)
           let memNames := effectiveSubMod.body.filterMap fun s => match s with
@@ -1658,10 +1937,11 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
               | .register name clk rst input init =>
                 .register s!"{instName}_{name}" s!"{instName}_{clk}" s!"{instName}_{rst}"
                   (prefixExprNames instName subNames input) init
-              | .inst subModName subInstName subConns =>
+              | .inst subModName subInstName subConns subParameterOverrides =>
                 -- Keep nested .inst with prefixed names — will be flattened in next iteration
                 .inst subModName s!"{instName}_{subInstName}"
                   (subConns.map fun (pn, e) => (pn, prefixExprNames instName subNames e))
+                  subParameterOverrides
               | .memory name aw dw clk wa wd we ra rd combo =>
                 .memory s!"{instName}_{name}" aw dw s!"{instName}_{clk}"
                   (prefixExprNames instName subNames wa)
@@ -1690,16 +1970,19 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
     let genBody := flatBody.map fun s => match s with
       | .assign n rhs => .assign (addGen n) (genExpr rhs)
       | .register n clk rst input init => .register n clk rst (genExpr input) init
-      | .inst mn in_ conns => .inst mn in_ (conns.map fun (p, e) => (p, genExpr e))
+      | .inst mn in_ conns parameterOverrides =>
+        .inst mn in_ (conns.map fun (p, e) => (p, genExpr e)) parameterOverrides
       | .memory n aw dw clk wa wd we ra rd combo =>
         .memory n aw dw clk (genExpr wa) (genExpr wd) (genExpr we) (genExpr ra) rd combo
 
     let flatModule : Module := {
       name := top.name
+      parameters := top.parameters
       inputs := top.inputs
       outputs := top.outputs
       wires := genWires
       body := topoSortBody genBody
+      assertions := top.assertions
       isPrimitive := false
     }
     return { topModule := design.topModule, modules := [flatModule] }
@@ -1714,14 +1997,20 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
       | e => e
 
 /-- Lower a full SV design to Sparkle IR -/
-def lowerDesign (svDesign : SVDesign) : Except String Design := do
+def lowerDesign (svDesign : SVDesign) (retainParameters : Bool := false) : Except String Design := do
   let mut modules : List Module := []
   for m in svDesign.modules do
-    let lowered ← lowerModule m
+    let lowered ← lowerModule m [] retainParameters
     modules := modules ++ [lowered]
-  let topName := match svDesign.modules.head? with
-    | some m => m.name
-    | none => "top"
+  let instantiatedNames := svDesign.modules.flatMap fun module_ =>
+    module_.items.filterMap fun item => match item with
+      | .instantiation moduleName _ _ _ => some moduleName
+      | _ => none
+  let roots := svDesign.modules.filter fun module_ => !instantiatedNames.contains module_.name
+  let topName ← match roots with
+    | [root] => pure root.name
+    | [] => throw "cannot determine a top module: every parsed module is instantiated"
+    | _ => throw s!"cannot determine a unique top module; candidates: {roots.map (·.name)}"
   pure { topModule := topName, modules }
 
 -- ============================================================================
@@ -1745,6 +2034,12 @@ def extractReadMemH (svDesign : SVDesign) : List ReadMemHInfo :=
 def parseAndLower (input : String) : Except String Design := do
   let svDesign ← Tools.SVParser.Parser.parse input
   lowerDesign svDesign
+
+/-- Parse and retain supported SystemVerilog parameters as native symbolic IR
+    dimensions. Unsupported parameter-dependent elaboration fails closed. -/
+def parseAndLowerNative (input : String) : Except String Design := do
+  let svDesign ← Tools.SVParser.Parser.parse input
+  lowerDesign svDesign true
 
 def parseAndLowerFlat (input : String) : Except String Design := do
   let svDesign ← Tools.SVParser.Parser.parse input

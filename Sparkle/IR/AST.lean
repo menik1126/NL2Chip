@@ -11,6 +11,14 @@ namespace Sparkle.IR.AST
 
 open Sparkle.IR.Type
 
+/-- A SystemVerilog-elaboration parameter retained by the hardware IR. -/
+structure Parameter where
+  name : String
+  /-- A nonnegative default used when a downstream tool supplies no override.
+      Positivity is checked only at uses that denote hardware widths/lengths. -/
+  defaultValue : Nat := 1
+  deriving Repr, BEq, Inhabited
+
 /-- Port declaration (input/output of a module) -/
 structure Port where
   name : String
@@ -86,11 +94,11 @@ end Operator
   - Op: Application of an operator to arguments
 -/
 inductive Expr where
-  | const (value : Int) (width : Nat) : Expr
+  | const (value : Int) (width : DimExpr) : Expr
   | ref (name : String) : Expr
   | op (operator : Operator) (args : List Expr) : Expr
   | concat (args : List Expr) : Expr
-  | slice (expr : Expr) (hi lo : Nat) : Expr
+  | slice (expr : Expr) (hi lo : DimExpr) : Expr
   | index (array : Expr) (idx : Expr) : Expr
   deriving Repr, BEq, Inhabited
 
@@ -115,6 +123,38 @@ def eq (a b : Expr) : Expr := .op .eq [a, b]
 def lt_u (a b : Expr) : Expr := .op .lt_u [a, b]
 def lt_s (a b : Expr) : Expr := .op .lt_s [a, b]
 def mux (cond then_ else_ : Expr) : Expr := .op .mux [cond, then_, else_]
+
+/-- Replace module parameters in every expression dimension.  Slice bounds are
+    substituted as constant expressions but are not treated as positive
+    hardware dimensions: zero is a valid bit offset. -/
+partial def substituteDimensions (lookup : String → Option DimExpr) : Expr → Expr
+  | .const value width => .const value (width.substitute lookup)
+  | .ref name => .ref name
+  | .op operator args => .op operator (args.map (substituteDimensions lookup))
+  | .concat args => .concat (args.map (substituteDimensions lookup))
+  | .slice expr hi lo =>
+      .slice (expr.substituteDimensions lookup) (hi.substitute lookup) (lo.substitute lookup)
+  | .index array idx =>
+      .index (array.substituteDimensions lookup) (idx.substituteDimensions lookup)
+
+/-- All dimension expressions occurring in an expression, including legal-zero
+    slice bounds.  This is used to reject references to undeclared parameters. -/
+partial def dimensionExpressions : Expr → List DimExpr
+  | .const _ width => [width]
+  | .ref _ => []
+  | .op _ args | .concat args => args.flatMap dimensionExpressions
+  | .slice expr hi lo => expr.dimensionExpressions ++ [hi, lo]
+  | .index array idx => array.dimensionExpressions ++ idx.dimensionExpressions
+
+/-- Dimensions that denote an actual packed value and therefore must be
+    positive.  Slice indexes are intentionally excluded. -/
+partial def positiveDimensions (role : String) : Expr → List (String × DimExpr)
+  | .const _ width => [(s!"{role} constant width", width)]
+  | .ref _ => []
+  | .op _ args | .concat args => args.flatMap (positiveDimensions role)
+  | .slice expr _ _ => expr.positiveDimensions role
+  | .index array idx =>
+      array.positiveDimensions role ++ idx.positiveDimensions role
 
 /-- Convert expression to string (for debugging) -/
 partial def toString : Expr → String
@@ -151,8 +191,8 @@ inductive Stmt where
       : Stmt
   | memory
       (name : String)         -- Memory instance name
-      (addrWidth : Nat)       -- Address width (size = 2^addrWidth)
-      (dataWidth : Nat)       -- Data width
+      (addrWidth : DimExpr)   -- Address width (size = 2^addrWidth)
+      (dataWidth : DimExpr)   -- Data width
       (clock : String)        -- Clock signal
       (writeAddr : Expr)      -- Write address port
       (writeData : Expr)      -- Write data port
@@ -165,10 +205,54 @@ inductive Stmt where
       (moduleName : String)   -- Name of module to instantiate
       (instName : String)     -- Instance name
       (connections : List (String × Expr))  -- Port connections
+      (parameterOverrides : List (String × DimExpr) := [])
       : Stmt
   deriving Repr, BEq
 
 namespace Stmt
+
+/-- Replace module parameters throughout a statement. -/
+def substituteDimensions (lookup : String → Option DimExpr) : Stmt → Stmt
+  | .assign lhs rhs => .assign lhs (rhs.substituteDimensions lookup)
+  | .register output clock reset input initValue =>
+      .register output clock reset (input.substituteDimensions lookup) initValue
+  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable
+      readAddr readData comboRead =>
+    .memory name (addrWidth.substitute lookup) (dataWidth.substitute lookup) clock
+      (writeAddr.substituteDimensions lookup) (writeData.substituteDimensions lookup)
+      (writeEnable.substituteDimensions lookup) (readAddr.substituteDimensions lookup)
+      readData comboRead
+  | .inst moduleName instName connections parameterOverrides =>
+    .inst moduleName instName
+      (connections.map fun (portName, expr) =>
+        (portName, expr.substituteDimensions lookup))
+      (parameterOverrides.map fun (name, value) =>
+        (name, value.substitute lookup))
+
+/-- All dimension expressions occurring in a statement. -/
+def dimensionExpressions : Stmt → List DimExpr
+  | .assign _ rhs => rhs.dimensionExpressions
+  | .register _ _ _ input _ => input.dimensionExpressions
+  | .memory _ addrWidth dataWidth _ writeAddr writeData writeEnable readAddr _ _ =>
+      [addrWidth, dataWidth] ++
+        [writeAddr, writeData, writeEnable, readAddr].flatMap Expr.dimensionExpressions
+  | .inst _ _ connections parameterOverrides =>
+      connections.flatMap (fun (_, expr) => expr.dimensionExpressions) ++
+        parameterOverrides.map (·.2)
+
+/-- Dimensions in a statement that must elaborate to positive values. -/
+def positiveDimensions (role : String) : Stmt → List (String × DimExpr)
+  | .assign lhs rhs => rhs.positiveDimensions s!"{role} assignment '{lhs}'"
+  | .register output _ _ input _ =>
+      input.positiveDimensions s!"{role} register '{output}'"
+  | .memory name addrWidth dataWidth _ writeAddr writeData writeEnable readAddr _ _ =>
+      [(s!"{role} memory '{name}' address width", addrWidth),
+       (s!"{role} memory '{name}' data width", dataWidth)] ++
+        [writeAddr, writeData, writeEnable, readAddr].flatMap
+          (Expr.positiveDimensions s!"{role} memory '{name}'")
+  | .inst _ instName connections _ =>
+      connections.flatMap fun (_, expr) =>
+        expr.positiveDimensions s!"{role} instance '{instName}'"
 
 /-- Convert statement to string (for debugging) -/
 def toString : Stmt → String
@@ -179,9 +263,12 @@ def toString : Stmt → String
       let readKind := if comboRead then "combo_read" else "read"
       s!"memory {name}[2^{addrWidth}][{dataWidth}] @(posedge {clock}) " ++
       s!"write({writeAddr}, {writeData}, {writeEnable}) {readKind}({readAddr}) => {readData}"
-  | inst modName instName conns =>
+  | inst modName instName conns parameterOverrides =>
+      let paramStr := if parameterOverrides.isEmpty then "" else
+        " #(" ++ String.intercalate ", "
+          (parameterOverrides.map fun (name, value) => s!".{name}({value})") ++ ")"
       let connStr := String.intercalate ", " (conns.map fun (p, e) => s!".{p}({e})")
-      s!"{modName} {instName}({connStr})"
+      s!"{modName}{paramStr} {instName}({connStr})"
 
 instance : ToString Stmt where
   toString := Stmt.toString
@@ -198,6 +285,7 @@ end Stmt
 -/
 structure Module where
   name        : String
+  parameters  : List Parameter := []
   inputs      : List Port
   outputs     : List Port
   wires       : List Port    -- Internal wires (ignored for primitives)
@@ -211,6 +299,7 @@ namespace Module
 /-- Create an empty module -/
 def empty (name : String) : Module :=
   { name := name
+  , parameters := []
   , inputs := []
   , outputs := []
   , wires := []
@@ -221,6 +310,7 @@ def empty (name : String) : Module :=
 /-- Create a primitive (blackbox) module with specified interface -/
 def primitive (name : String) (inputs : List Port) (outputs : List Port) : Module :=
   { name := name
+  , parameters := []
   , inputs := inputs
   , outputs := outputs
   , wires := []
@@ -231,6 +321,10 @@ def primitive (name : String) (inputs : List Port) (outputs : List Port) : Modul
 /-- Add an input port -/
 def addInput (m : Module) (p : Port) : Module :=
   { m with inputs := m.inputs ++ [p] }
+
+/-- Add an elaboration parameter to the module in source-binder order. -/
+def addParameter (m : Module) (p : Parameter) : Module :=
+  { m with parameters := m.parameters ++ [p] }
 
 /-- Add an output port -/
 def addOutput (m : Module) (p : Port) : Module :=
@@ -244,13 +338,85 @@ def addWire (m : Module) (p : Port) : Module :=
 def addStmt (m : Module) (s : Stmt) : Module :=
   { m with body := m.body ++ [s] }
 
+/-- Replace dimensions throughout a module body and interface.  Parameter
+    declarations themselves are left intact so callers can choose whether they
+    are specializing a child module or rewriting one in place. -/
+def substituteDimensions (m : Module) (lookup : String → Option DimExpr) : Module :=
+  { m with
+    inputs := m.inputs.map fun p =>
+      { p with ty := p.ty.substituteDimensions lookup }
+    outputs := m.outputs.map fun p =>
+      { p with ty := p.ty.substituteDimensions lookup }
+    wires := m.wires.map fun p =>
+      { p with ty := p.ty.substituteDimensions lookup }
+    body := m.body.map (Stmt.substituteDimensions lookup)
+    assertions := m.assertions.map fun (name, expr) =>
+      (name, expr.substituteDimensions lookup) }
+
+/-- Every expression that may refer to a module parameter. -/
+def dimensionExpressions (m : Module) : List DimExpr :=
+  let portExprs := (m.inputs ++ m.outputs ++ m.wires).flatMap fun port =>
+    (port.ty.dimensions s!"port '{port.name}'").map (·.2)
+  portExprs ++ m.body.flatMap Stmt.dimensionExpressions ++
+    m.assertions.flatMap (fun (_, expr) => expr.dimensionExpressions)
+
+/-- Every hardware width/length that must be positive. -/
+def positiveDimensions (m : Module) : List (String × DimExpr) :=
+  let portDimensions := (m.inputs ++ m.outputs ++ m.wires).flatMap fun port =>
+    port.ty.dimensions s!"module '{m.name}' port/wire '{port.name}'"
+  portDimensions ++ m.body.flatMap (Stmt.positiveDimensions s!"module '{m.name}'") ++
+    m.assertions.flatMap fun (name, expr) =>
+      expr.positiveDimensions s!"module '{m.name}' assertion '{name}'"
+
+/-- Validate the dimension contract of a module under its declared default
+    parameter environment.  This catches both literal zero widths and derived
+    zero widths such as `W - 8` with a default `W = 4`. -/
+def validateDimensions (m : Module) : Except String Unit := do
+  for parameter in m.parameters do
+    if m.parameters.countP (fun other => other.name == parameter.name) > 1 then
+      throw s!"module '{m.name}' declares duplicate parameter '{parameter.name}'"
+  let declared := m.parameters.map (·.name)
+  for expr in m.dimensionExpressions do
+    for name in expr.parameters do
+      unless declared.contains name do
+        throw s!"module '{m.name}' dimension '{expr}' references undeclared parameter '{name}'"
+  let lookupDefault := fun name =>
+    m.parameters.find? (fun parameter => parameter.name == name)
+      |>.map (·.defaultValue)
+  for (role, expr) in m.positiveDimensions do
+    match expr.eval? lookupDefault with
+    | some 0 => throw s!"{role} evaluates to zero under the module's default parameters"
+    | some _ => pure ()
+    | none =>
+      throw s!"{role} '{expr}' cannot be evaluated under the module's default parameters"
+
+/-- Validate names after applying the backend's identifier sanitization.  SV
+    parameters and ports share declaration scopes closely enough that a
+    sanitized collision is ambiguous and must not be emitted. -/
+def validateSanitizedNames (m : Module) (sanitize : String → String) : Except String Unit := do
+  let declarations :=
+    (m.parameters.map fun parameter => ("parameter", parameter.name)) ++
+    ((m.inputs ++ m.outputs ++ m.wires).map fun port => ("port/wire", port.name))
+  let distinctDeclarations := declarations.foldl (fun result declaration =>
+    if result.any (fun existing => existing == declaration) then result
+    else result ++ [declaration]) []
+  for (kind, name) in distinctDeclarations do
+    let sanitized := sanitize name
+    if sanitized.isEmpty then
+      throw s!"module '{m.name}' {kind} '{name}' sanitizes to an empty SystemVerilog identifier"
+    if distinctDeclarations.countP (fun (_, otherName) => sanitize otherName == sanitized) > 1 then
+      throw s!"module '{m.name}' has colliding SystemVerilog identifier '{sanitized}' after sanitizing {kind} '{name}'"
+
 /-- Convert module to string (for debugging) -/
 def toString (m : Module) : String :=
+  let parameterStr := String.intercalate ", "
+    (m.parameters.map fun p => s!"{p.name}={p.defaultValue}")
   let inputStr := String.intercalate ", " (m.inputs.map fun p => s!"{p.name}: {p.ty}")
   let outputStr := String.intercalate ", " (m.outputs.map fun p => s!"{p.name}: {p.ty}")
   let wireStr := String.intercalate ", " (m.wires.map fun p => s!"{p.name}: {p.ty}")
   let bodyStr := String.intercalate "\n  " (m.body.map Stmt.toString)
   s!"module {m.name}\n" ++
+  s!"  parameters: {parameterStr}\n" ++
   s!"  inputs:  {inputStr}\n" ++
   s!"  outputs: {outputStr}\n" ++
   s!"  wires:   {wireStr}\n" ++

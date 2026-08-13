@@ -241,7 +241,7 @@ def build_system_prompt(
         + f"- Write only `Generated/{prob_id}.lean` using the `write_file`/`edit_file` tools.\n"
         + design_rule
         + "- Treat the user's `Benchmark Interface Contract` as authoritative over guesses from examples or file names.\n"
-        + "- For CVDP parameters, inspect the listed sweep values and make the implementation work across those values; do not create fake Verilog parameters around a fixed-width Sparkle core.\n"
+        + "- For CVDP parameters, use a top-level Lean `Nat` binder with the exact benchmark parameter name and `#synthesizeVerilog <design> parameters [PARAM := <nonnegative-default>]`. Sparkle emits the native SystemVerilog module parameter; it must actually determine the relevant datapath, state, memory, or logic. Defaults may be zero for offsets, but every derived hardware width and array length must remain positive. The evaluator rejects declaration-only parameters and fixed-width cores hidden behind an adapter.\n"
         + "- Match benchmark output names exactly. If you must return a packed output internally, construct an explicit named MSB-to-LSB concat so the CVDP wrapper can recover each output field.\n"
         + "- Preserve benchmark clock, reset polarity, and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
         + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and `#synthesizeVerilog`; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
@@ -600,6 +600,7 @@ def process_problem_guided(
     while (
         args.sim_feedback
         and result.get("sim_status") != "sim_pass"
+        and not result.get("terminal_capability_error")
         and budget.remaining > 0
         and sim_feedback_iterations < max(0, args.sim_feedback_max_iters)
     ):
@@ -954,6 +955,7 @@ def process_problem(
         and not args.eval_only
         and not agent_error
         and result.get("sim_status") != "sim_pass"
+        and not result.get("terminal_capability_error")
     ):
         best_result = result
         best_code = generated_target.read_text(errors="replace") if generated_target.exists() else None
@@ -966,6 +968,7 @@ def process_problem(
         sim_iter = 0
         while (
             result.get("sim_status") != "sim_pass"
+            and not result.get("terminal_capability_error")
             and sim_feedback_turns_remaining > 0
             and sim_iter < max(0, args.sim_feedback_max_iters)
         ):

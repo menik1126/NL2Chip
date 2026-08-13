@@ -25,7 +25,7 @@ instance : Inhabited Expr := ⟨.const 0 0⟩
 
 /-- O(1) lookup maps built from module data -/
 abbrev DefMap := HashMap String Expr
-abbrev WidthMap := HashMap String Nat
+abbrev WidthMap := HashMap String DimExpr
 
 /-- Build a name → defining-expression map from assign statements -/
 def buildDefMap (stmts : List Stmt) : DefMap :=
@@ -38,11 +38,11 @@ def buildDefMap (stmts : List Stmt) : DefMap :=
 /-- Build name → bit-width map from module ports and wires -/
 def buildWidthMap (m : Module) : WidthMap :=
   let addPorts (wm : WidthMap) (ports : List Port) :=
-    ports.foldl (fun acc p => acc.insert p.name p.ty.bitWidth) wm
+    ports.foldl (fun acc p => acc.insert p.name p.ty.width) wm
   addPorts (addPorts (addPorts {} m.inputs) m.outputs) m.wires
 
-/-- Infer the bit-width of an expression -/
-partial def inferWidth (wm : WidthMap) : Expr → Nat
+/-- Infer the possibly-symbolic bit-width of an expression. -/
+partial def inferWidth (wm : WidthMap) : Expr → DimExpr
   | .const _ w => w
   | .ref name => wm.getD name 0
   | .slice _ hi lo => hi - lo + 1
@@ -100,30 +100,43 @@ def resolveSliceOfConcat (args : List Expr) (widths : List Nat)
     3. Concat args:   X = {a, b}  → a (if slice matches exactly)
     Depth-limited to prevent infinite recursion on malformed IR. -/
 partial def resolveSlice (dm : DefMap) (wm : WidthMap)
-    (name : String) (hi lo : Nat) (fuel : Nat) : Expr :=
+    (name : String) (hi lo : DimExpr) (fuel : Nat) : Expr :=
   if fuel == 0 then .slice (.ref name) hi lo
-  else match dm.get? name with
-    | some (.ref otherName) =>
-      resolveSlice dm wm otherName hi lo (fuel - 1)
-    | some (.slice innerExpr innerHi innerLo) =>
-      let newHi := innerLo + hi
-      let newLo := innerLo + lo
-      if newHi ≤ innerHi then
-        match innerExpr with
-        | .ref innerName =>
-          resolveSlice dm wm innerName newHi newLo (fuel - 1)
-        | _ => .slice innerExpr newHi newLo
-      else .slice (.ref name) hi lo
-    | some (.concat args) =>
-      let widths := args.map (inferWidth wm)
-      if widths.any (· == 0) then .slice (.ref name) hi lo
-      else match resolveSliceOfConcat args widths hi lo with
-        | some (.ref resolvedName) => .ref resolvedName
-        | some (.slice (.ref innerName) innerHi innerLo) =>
-          resolveSlice dm wm innerName innerHi innerLo (fuel - 1)
-        | some other => other
+  else
+    -- Ordering and containment of symbolic ranges cannot in general be
+    -- decided by this local optimizer.  Preserve them for SystemVerilog
+    -- elaboration, and apply the legacy rewrite only to concrete ranges.
+    match hi.toNat?, lo.toNat? with
+    | some concreteHi, some concreteLo =>
+      match dm.get? name with
+      | some (.ref otherName) =>
+        resolveSlice dm wm otherName hi lo (fuel - 1)
+      | some (.slice innerExpr innerHi innerLo) =>
+        match innerHi.toNat?, innerLo.toNat? with
+        | some concreteInnerHi, some concreteInnerLo =>
+          let newHi := concreteInnerLo + concreteHi
+          let newLo := concreteInnerLo + concreteLo
+          if newHi ≤ concreteInnerHi then
+            match innerExpr with
+            | .ref innerName =>
+              resolveSlice dm wm innerName newHi newLo (fuel - 1)
+            | _ => .slice innerExpr newHi newLo
+          else .slice (.ref name) hi lo
+        | _, _ => .slice (.ref name) hi lo
+      | some (.concat args) =>
+        let widths := args.map (inferWidth wm)
+        match widths.mapM (fun width => width.toNat?) with
+        | some concreteWidths =>
+          if concreteWidths.any (· == 0) then .slice (.ref name) hi lo
+          else match resolveSliceOfConcat args concreteWidths concreteHi concreteLo with
+            | some (.ref resolvedName) => .ref resolvedName
+            | some (.slice (.ref innerName) innerHi innerLo) =>
+              resolveSlice dm wm innerName innerHi innerLo (fuel - 1)
+            | some other => other
+            | none => .slice (.ref name) hi lo
         | none => .slice (.ref name) hi lo
-    | _ => .slice (.ref name) hi lo
+      | _ => .slice (.ref name) hi lo
+    | _, _ => .slice (.ref name) hi lo
 
 /-- Fold constant expressions -/
 def foldConstants : Expr → Expr
@@ -144,13 +157,17 @@ def foldConstants : Expr → Expr
   | .op .and [_, .const 0 w] => .const 0 w
   -- slice of constant
   | .slice (.const v w) hi lo =>
-    if hi < w then
-      let modulus := (2 : Int) ^ w
-      let unsigned := ((v % modulus) + modulus) % modulus
-      let shifted := unsigned.toNat / (2 ^ lo)
-      let mask := 2 ^ (hi - lo + 1) - 1
-      .const (Int.ofNat (shifted &&& mask)) (hi - lo + 1)
-    else .slice (.const v w) hi lo
+    match w.toNat?, hi.toNat?, lo.toNat? with
+    | some concreteWidth, some concreteHi, some concreteLo =>
+      if concreteHi < concreteWidth then
+        let modulus := (2 : Int) ^ concreteWidth
+        let unsigned := ((v % modulus) + modulus) % modulus
+        let shifted := unsigned.toNat / (2 ^ concreteLo)
+        let resultWidth := concreteHi - concreteLo + 1
+        let mask := 2 ^ resultWidth - 1
+        .const (Int.ofNat (shifted &&& mask)) resultWidth
+      else .slice (.const v w) hi lo
+    | _, _, _ => .slice (.const v w) hi lo
   | e => e
 
 /-- Optimize a single expression by resolving slice chains and folding constants -/
@@ -181,7 +198,7 @@ def countAllUses (stmts : List Stmt) : HashMap String Nat :=
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
-    | .inst _ _ conns =>
+    | .inst _ _ conns _ =>
       conns.foldl (fun acc (_, e) => countExprUses e acc) counts
   ) {}
 
@@ -194,8 +211,9 @@ def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
     .memory name aw dw clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
       (optimizeExpr dm wm we) (optimizeExpr dm wm ra) rd cr
-  | .inst modName instName conns =>
+  | .inst modName instName conns parameterOverrides =>
     .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e))
+      parameterOverrides
 
 /-- Recursively substitute inlinable references with their defining expressions -/
 partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
@@ -261,8 +279,10 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
       .memory name aw dw clk
         (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
         (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
-    | .inst modName instName conns =>
-      .inst modName instName (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
+    | .inst modName instName conns parameterOverrides =>
+      .inst modName instName
+        (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
+        parameterOverrides
 
   -- Remove inlined assignments
   let filteredBody := inlinedBody.filter fun stmt =>
