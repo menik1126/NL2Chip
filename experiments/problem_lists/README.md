@@ -4,9 +4,19 @@ This directory records public benchmark problem identifiers used by the rebuttal
 
 ## CVDP 72-task subset
 
-`cvdp72_rebuttal_subset.txt` contains the 72 CVDP `prob_id`s used for the CktArchon Lean/Sparkle and Verilog baseline comparison runs.
+`cvdp72_rebuttal_subset.txt` contains the 72 CVDP `prob_id`s used for the CktArchon Lean/Sparkle and Verilog baseline comparison runs. It is a subset of `cvdp168_mainline_intersection.txt`.
 
-Example:
+## CVDP 168-task mainline set
+
+`cvdp168_mainline_intersection.txt` contains the 168 unique CVDP `prob_id`s used as the mainline CVDP full-set口径 in the rebuttal experiments. This list was checked against the three historical source runs:
+
+- `/home/sgli/work/nl2chip_main_cvdp_source`
+- `/home/sgli/work/nl2chip_cvdp_plain_backend_align`
+- `/home/sgli/work/nl2chip_baseline_cvdp_source_lab`
+
+Each source run has 168 unique tasks, and their intersection is 168/168.
+
+Example for the 72-task subset:
 
 ```bash
 python -m cktarchon.run \
@@ -25,4 +35,10 @@ python -m cktarchon.run \
   --candidate-stagnation-patience 2 \
   --workers 16 \
   --results-dir /path/to/results
+```
+
+For the 168-task set, replace the `--problem-file` value with:
+
+```bash
+--problem-file experiments/problem_lists/cvdp168_mainline_intersection.txt
 ```
