@@ -215,6 +215,9 @@ class AnthropicHarnessRunner:
     extra_write_globs: tuple[str, ...] = ()
     tool_counts: dict[str, int] = field(default_factory=dict)
     compile_checks: int = 0
+    _tool_sequence: int = field(default=0, init=False, repr=False)
+    _last_complete_code: str | None = field(default=None, init=False, repr=False)
+    _last_complete_sequence: int = field(default=-1, init=False, repr=False)
 
     def __post_init__(self) -> None:
         ensure_runtime_env()
@@ -248,15 +251,20 @@ class AnthropicHarnessRunner:
             "max_tokens": self.max_tokens,
         })
         append_jsonl(self.log_path, {"event": "prompt", "prompt": prompt})
+        self._seed_compile_safe_candidate()
 
         for turn in range(max_turns):
-            response = self._create_message_with_retries(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=self.system_prompt,
-                tools=TOOLS,
-                messages=messages,
-            )
+            try:
+                response = self._create_message_with_retries(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    system=self.system_prompt,
+                    tools=TOOLS,
+                    messages=messages,
+                )
+            except Exception:
+                self._autosave_last_complete_candidate()
+                raise
             usage = {
                 "input_tokens": getattr(response.usage, "input_tokens", 0),
                 "output_tokens": getattr(response.usage, "output_tokens", 0),
@@ -279,6 +287,7 @@ class AnthropicHarnessRunner:
                     continue
                 name = block.name
                 tool_input = dict(block.input or {})
+                self._tool_sequence += 1
                 self.tool_counts[name] = self.tool_counts.get(name, 0) + 1
                 if name == "lean_check" or (name == "bash" and "lake" in str(tool_input.get("command", ""))):
                     self.compile_checks += 1
@@ -304,6 +313,7 @@ class AnthropicHarnessRunner:
                 break
             messages.append({"role": "user", "content": tool_results})
 
+        self._autosave_last_complete_candidate()
         stats.tool_counts = dict(self.tool_counts)
         stats.compile_checks = self.compile_checks
         append_jsonl(self.log_path, {
@@ -442,6 +452,53 @@ class AnthropicHarnessRunner:
         path.write_text(text.replace(old, new, 1))
         return f"Edited {rel_path}: replaced {len(old)} chars with {len(new)} chars"
 
+    def _is_generated_target(self, rel_path: str) -> bool:
+        normalized = rel_path.strip().lstrip("./")
+        return normalized == f"Generated/{self.prob_id}.lean"
+
+    def _autosave_last_complete_candidate(self) -> None:
+        if self._last_complete_code is None:
+            return
+        rel_path = f"Generated/{self.prob_id}.lean"
+        path = self.guard.require_write_allowed(rel_path)
+        content = _with_sparkle_prelude(self._last_complete_code)
+        if path.exists() and path.read_text(errors="replace") == content:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        append_jsonl(self.log_path, {
+            "event": "auto_saved_candidate",
+            "path": rel_path,
+            "source": "last_complete_lean_check",
+            "chars": len(content),
+            "tool_sequence": self._last_complete_sequence,
+        })
+
+    def _seed_compile_safe_candidate(self) -> None:
+        if self.lean_repl is None:
+            return
+        rel_path = f"Generated/{self.prob_id}.lean"
+        path = self.guard.resolve(rel_path)
+        if not path.exists() or not path.is_file():
+            return
+        try:
+            code = path.read_text(errors="replace")
+            result = self.lean_repl.check_file(path)
+        except Exception as exc:
+            append_jsonl(self.log_path, {
+                "event": "compile_safe_seed_error",
+                "path": rel_path,
+                "error": f"{type(exc).__name__}: {exc}"[:1000],
+            })
+            return
+        self._remember_complete_candidate(code, result)
+        if self._last_complete_code is not None:
+            append_jsonl(self.log_path, {
+                "event": "seeded_compile_safe_candidate",
+                "path": rel_path,
+                "chars": len(code),
+            })
+
     def _grep(self, pattern: str, rel_path: str, include: Any = None) -> str:
         root = self.guard.resolve(rel_path)
         if not root.exists():
@@ -507,6 +564,8 @@ class AnthropicHarnessRunner:
         if self.lean_repl is not None:
             try:
                 result = self.lean_repl.check_file(path)
+                if self._is_generated_target(rel_path):
+                    self._remember_complete_candidate(path.read_text(errors="replace"), result)
                 return self._format_lean_result(result)
             except Exception as exc:
                 return f"REPL failed, falling back unavailable in-tool: {type(exc).__name__}: {exc}"
@@ -517,6 +576,7 @@ class AnthropicHarnessRunner:
         if self.lean_repl is not None:
             try:
                 result = self.lean_repl.check_code(_with_repl_opens(code))
+                self._remember_complete_candidate(code, result)
                 return self._format_lean_result(result)
             except Exception as exc:
                 return f"Error: REPL failed: {type(exc).__name__}: {exc}"
@@ -525,6 +585,19 @@ class AnthropicHarnessRunner:
         temp_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path.write_text(_with_sparkle_prelude(code), encoding="utf-8")
         return self._bash(f"lake env lean {shlex.quote(temp_rel)}")
+
+    def _remember_complete_candidate(self, code: str, result: Any) -> None:
+        generated_verilog = str(getattr(result, "verilog", "") or "")
+        if not (
+            bool(getattr(result, "passed", False))
+            and bool(getattr(result, "complete", False))
+            and "#synthesizeVerilog" in code
+            and generated_verilog.strip()
+        ):
+            return
+        self._last_complete_code = code
+        self._last_complete_sequence = self._tool_sequence
+        self._autosave_last_complete_candidate()
 
     @staticmethod
     def _format_lean_result(result: Any) -> str:
@@ -559,6 +632,126 @@ class AnthropicHarnessRunner:
             lines.append("=== Generated Verilog ===")
             lines.append(str(verilog)[:5000])
         return "\n".join(lines)
+
+
+@dataclass
+class AnthropicTextRunner:
+    """One-shot text-only runner for public-spec planning within the turn budget."""
+
+    model: str
+    role: str
+    log_base: Path
+    system_prompt: str
+    max_tokens: int = 8192
+    api_timeout: float | None = 300.0
+
+    def __post_init__(self) -> None:
+        ensure_runtime_env()
+        kwargs: dict[str, Any] = {}
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        if api_key:
+            kwargs["api_key"] = api_key
+        if base_url:
+            kwargs["base_url"] = base_url
+        if self.api_timeout is not None:
+            kwargs["timeout"] = self.api_timeout
+        self.client = anthropic.Anthropic(**kwargs)
+
+    @property
+    def log_path(self) -> Path:
+        return Path(str(self.log_base) + ".jsonl")
+
+    def run(self, prompt: str, *, max_turns: int = 1) -> tuple[str, AgentStats]:
+        if max_turns <= 0:
+            return "", AgentStats()
+        started = time.monotonic()
+        append_jsonl(self.log_path, {
+            "event": "session_start",
+            "role": self.role,
+            "model": self.model,
+            "max_turns": 1,
+            "max_tokens": self.max_tokens,
+        })
+        append_jsonl(self.log_path, {"event": "prompt", "prompt": prompt})
+        response = self._messages_create_with_retries(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=self.system_prompt,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "\n".join(
+            str(getattr(block, "text", ""))
+            for block in response.content
+            if getattr(block, "type", None) == "text"
+        ).strip()
+        usage = {
+            "input_tokens": getattr(response.usage, "input_tokens", 0),
+            "output_tokens": getattr(response.usage, "output_tokens", 0),
+        }
+        stats = AgentStats(
+            input_tokens=int(usage["input_tokens"] or 0),
+            output_tokens=int(usage["output_tokens"] or 0),
+            turns=1,
+        )
+        append_jsonl(self.log_path, {
+            "event": "assistant",
+            "turn": 0,
+            "stop_reason": response.stop_reason,
+            "usage": usage,
+            "content": _jsonable_blocks(response.content),
+        })
+        append_jsonl(self.log_path, {
+            "event": "session_end",
+            "role": self.role,
+            "turns": 1,
+            "usage": usage,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        })
+        return text, stats
+
+    def _messages_create_with_retries(self, **kwargs: Any) -> Any:
+        last_exc: Exception | None = None
+        for attempt in range(API_MAX_RETRIES):
+            try:
+                return self._messages_create_with_alarm(**kwargs)
+            except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError, RequestTimeoutError) as exc:
+                last_exc = exc
+                if not isinstance(exc, RequestTimeoutError) and not _is_retriable_api_error(exc):
+                    raise
+                if attempt == API_MAX_RETRIES - 1:
+                    raise
+                delay = _retry_delay_seconds(attempt)
+                append_jsonl(self.log_path, {
+                    "event": "api_retry",
+                    "attempt": attempt + 1,
+                    "delay_seconds": delay,
+                    "error_type": type(exc).__name__,
+                    "status_code": getattr(exc, "status_code", None),
+                    "error_preview": str(exc)[:1000],
+                })
+                time.sleep(delay)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("client.messages.create failed without raising an exception")
+
+    def _messages_create_with_alarm(self, **kwargs: Any) -> Any:
+        if self.api_timeout is None or self.api_timeout <= 0:
+            return self.client.messages.create(**kwargs)
+        try:
+            old_handler = signal.getsignal(signal.SIGALRM)
+            old_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, _raise_request_timeout)
+            signal.setitimer(signal.ITIMER_REAL, float(self.api_timeout))
+        except ValueError:
+            return self.client.messages.create(**kwargs)
+        try:
+            return self.client.messages.create(**kwargs)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+            if old_timer[0] > 0:
+                signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
 
 
 def _jsonable_blocks(blocks: Any) -> list[dict[str, Any]]:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import shutil
@@ -15,6 +17,22 @@ from .harness import AnthropicHarnessRunner
 from .logs import AgentStats, append_jsonl, parse_agent_log
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_MAGE_PROMPTS = Path(
+    "/home/sgli/work/external_baselines/"
+    "MAGE-A-Multi-Agent-Engine-for-Automated-RTL-Code-Generation/"
+    "src/mage/prompts.py"
+)
+
+MAGE_ALIGNED_RTL_RULES = """## MAGE-Aligned RTL Generation Guidance
+- Think through circuit behavior, cycle latency, reset semantics, and parameterization before writing RTL.
+- The module interface must exactly match the benchmark interface contract.
+- Declare ports and internal signals as logic.
+- Use localparam, reg, or logic for state; do not use state_t parameters.
+- Use always @(*) for combinational always blocks.
+- Do not use reverse part-selects, inside, unique, or unique0.
+- Return a complete synthesizable SystemVerilog module in the required candidate file.
+"""
 
 
 VERILOG_ARCHON_SKILL = """You are an expert hardware designer using an Archon-style agent harness to implement RTL directly in SystemVerilog.
@@ -64,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--key-env", default=str(PROJECT_ROOT / "key.env"))
     p.add_argument("--resume", action="store_true")
     p.add_argument("--resume-mode", choices=["passed", "completed"], default="completed")
-    p.add_argument("--workers", type=int, default=1, help="Reserved for compatibility; runner is serial.")
+    p.add_argument("--workers", type=int, default=1, help="Number of problems to run concurrently.")
     p.add_argument("--api-timeout", type=float, default=300.0)
     p.add_argument("--sim-feedback", action="store_true")
     p.add_argument("--sim-feedback-max-iters", type=int, default=3)
@@ -72,6 +90,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim-feedback-turns-per-iter", type=int, default=None)
     p.add_argument("--sim-feedback-patience", type=int, default=2)
     p.add_argument("--feedback-mode", choices=["compile-sim", "compile-only"], default="compile-sim")
+    p.add_argument(
+        "--prompt-profile",
+        choices=["archon", "mage-aligned"],
+        default="archon",
+        help="Prompt-only ablation; mage-aligned adds MAGE RTL rules and 4-shot examples.",
+    )
+    p.add_argument("--mage-prompts-file", default=str(DEFAULT_MAGE_PROMPTS))
     return p.parse_args()
 
 
@@ -119,8 +144,21 @@ def truncate(text: str, limit: int, keep: str = "tail") -> str:
     return f"... [truncated, {len(text)} chars total]\n" + text[-limit:]
 
 
-def build_system_prompt(prob_id: str, info: Any) -> str:
-    return (
+def load_mage_rtl_examples(path: Path) -> str:
+    tree = ast.parse(path.read_text(errors="replace"), filename=str(path))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "RTL_4_SHOT_EXAMPLES" for target in node.targets):
+            continue
+        value = ast.literal_eval(node.value)
+        if isinstance(value, str):
+            return value.strip()
+    raise RuntimeError(f"RTL_4_SHOT_EXAMPLES not found in {path}")
+
+
+def build_system_prompt(prob_id: str, info: Any, args: argparse.Namespace) -> str:
+    prompt = (
         VERILOG_ARCHON_SKILL.rstrip()
         + "\n\n## Harness Rules\n"
         + f"- Problem ID: `{prob_id}`.\n"
@@ -130,6 +168,10 @@ def build_system_prompt(prob_id: str, info: Any) -> str:
         + "- The outer evaluator will run the official compile/simulation harness after you stop.\n"
         + "- This H20 host may not have `rg`; use `grep` and `find` if you need searches.\n"
     )
+    if args.prompt_profile == "mage-aligned":
+        examples = load_mage_rtl_examples(Path(args.mage_prompts_file))
+        prompt += f"\n{MAGE_ALIGNED_RTL_RULES}\n## MAGE RTL Demonstrations\n{examples}\n"
+    return prompt
 
 
 def build_initial_prompt(prob_id: str, info: Any, dataset_name: str) -> str:
@@ -149,29 +191,19 @@ def build_initial_prompt(prob_id: str, info: Any, dataset_name: str) -> str:
     )
 
 
-def build_feedback_prompt(prob_id: str, info: Any, dataset_name: str, iteration: int, current_sv: str, result: dict, history: list[dict]) -> str:
-    import search
-
-    contract = search.format_benchmark_interface_contract(info)
-    history_lines = []
-    for item in history[-4:]:
-        history_lines.append(
-            f"- iter {item.get('iteration')}: sim={item.get('sim_status')} "
-            f"compile={item.get('compile_pass')} mismatches={item.get('sim_mismatches')}"
-        )
-    history_text = "\n".join(history_lines) if history_lines else "(none)"
+def build_feedback_prompt(
+    prob_id: str,
+    info: Any,
+    dataset_name: str,
+    iteration: int,
+    structured_feedback: str,
+) -> str:
     return (
         f"## Direct SystemVerilog Simulation Feedback - Iteration {iteration}\n\n"
         f"The current candidate for `{prob_id}` failed evaluation. Repair the SystemVerilog directly.\n\n"
         f"### Dataset / Top Module\n\n- Dataset: `{dataset_name}`\n- Top module: `{info.design_name}`\n\n"
-        f"### Benchmark Interface Contract\n\n{contract or '(no extra contract available)'}\n\n"
-        f"### Current Evaluation Summary\n\n"
-        f"- compile_pass: {result.get('compile_pass')}\n"
-        f"- sim_status: {result.get('sim_status')}\n"
-        f"- sim_mismatches: {result.get('sim_mismatches')}\n\n"
-        f"### Simulator / Compiler Feedback\n\n```text\n{truncate(str(result.get('detail') or ''), 5000, keep='tail')}\n```\n\n"
-        f"### Current SystemVerilog Candidate\n\n```systemverilog\n{truncate(current_sv, 30000, keep='middle')}\n```\n\n"
-        f"### Recent Attempts\n\n{history_text}\n\n"
+        f"### Natural Language Specification\n\n{truncate(info.prompt_text, 30000, keep='head')}\n\n"
+        f"### Structured Simulator / Compiler Feedback\n\n{structured_feedback}\n\n"
         f"### Required Action\n\n"
         f"Overwrite `cktarchon_work/{prob_id}/candidate.sv` with the complete corrected SystemVerilog module. "
         f"Do not output Lean or Sparkle.\n"
@@ -285,7 +317,7 @@ def make_runner(args: argparse.Namespace, prob_id: str, role: str, log_base: Pat
         model=model_alias(args.model),
         role=role,
         log_base=log_base,
-        system_prompt=build_system_prompt(prob_id, info),
+        system_prompt=build_system_prompt(prob_id, info, args),
         max_tokens=args.max_tokens,
         lean_repl=None,
         api_timeout=args.api_timeout,
@@ -294,6 +326,8 @@ def make_runner(args: argparse.Namespace, prob_id: str, role: str, log_base: Pat
 
 
 def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir: Path) -> dict[str, Any]:
+    import search
+
     info = ds.load_problem(prob_id)
     t_problem = time.monotonic()
     work_path = candidate_path(prob_id)
@@ -342,14 +376,22 @@ def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir:
     ):
         sim_feedback_iterations += 1
         current_sv = code or ""
+        structured_feedback = search.build_sim_feedback(
+            prob_id=prob_id,
+            result=result,
+            iteration=sim_feedback_iterations - 1,
+            history=sim_feedback_history,
+            run_dir=run_dir,
+            info=info,
+            repair_target="verilog",
+            current_sv=current_sv,
+        )
         prompt = build_feedback_prompt(
             prob_id,
             info,
             args.dataset,
             sim_feedback_iterations,
-            current_sv,
-            result,
-            sim_feedback_history,
+            structured_feedback,
         )
         repair_log_base = run_dir / "logs" / prob_id / f"sim_feedback_iter_{sim_feedback_iterations}"
         repair_turns = feedback_turns_remaining
@@ -382,8 +424,6 @@ def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir:
             "remaining_turns": feedback_turns_remaining,
         }
         sim_feedback_history.append(hist)
-
-        import search
 
         if search.eval_progress_key(new_result) > search.eval_progress_key(best_result):
             best_result = dict(new_result)
@@ -502,41 +542,59 @@ def main() -> None:
     records: list[dict[str, Any]] = []
     skipped = 0
     results_path = run_dir / "results.jsonl"
-    print(f"CktArchon-Verilog: {len(problems)} problems, model={model_alias(args.model)}, run_dir={run_dir}", flush=True)
+    num_workers = max(1, args.workers)
+    print(
+        f"CktArchon-Verilog: {len(problems)} problems, model={model_alias(args.model)}, "
+        f"workers={num_workers}, run_dir={run_dir}",
+        flush=True,
+    )
+
+    indexed_problems: list[tuple[int, str]] = []
+    for idx, prob_id in enumerate(problems, 1):
+        if args.resume and already_done(run_parent, prob_id, args.resume_mode):
+            skipped += 1
+            print(f"[{idx}/{len(problems)}] {prob_id}: skipped", flush=True)
+        else:
+            indexed_problems.append((idx, prob_id))
+
+    def _run_one(idx: int, prob_id: str) -> tuple[int, str, dict[str, Any]]:
+        print(f"[{idx}/{len(problems)}] {prob_id}: start", flush=True)
+        try:
+            record = process_problem(prob_id, args=args, ds=ds, run_dir=run_dir)
+        except Exception as exc:
+            record = {
+                "prob_id": prob_id,
+                "dataset": args.dataset,
+                "model": model_alias(args.model),
+                "harness": "cktarchon-anthropic-verilog",
+                "agent_error": f"{type(exc).__name__}: {exc}",
+                "compile_pass": False,
+                "sim_status": "sim_error",
+                "sim_mismatches": -1,
+                "detail": str(exc),
+                "timestamp": datetime.now().isoformat(),
+            }
+        return idx, prob_id, record
 
     try:
-        for idx, prob_id in enumerate(problems, 1):
-            if args.resume and already_done(run_parent, prob_id, args.resume_mode):
-                skipped += 1
-                print(f"[{idx}/{len(problems)}] {prob_id}: skipped", flush=True)
-                continue
-            print(f"[{idx}/{len(problems)}] {prob_id}: start", flush=True)
-            try:
-                record = process_problem(prob_id, args=args, ds=ds, run_dir=run_dir)
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                record = {
-                    "prob_id": prob_id,
-                    "dataset": args.dataset,
-                    "model": model_alias(args.model),
-                    "harness": "cktarchon-anthropic-verilog",
-                    "agent_error": f"{type(exc).__name__}: {exc}",
-                    "compile_pass": False,
-                    "sim_status": "sim_error",
-                    "sim_mismatches": -1,
-                    "detail": str(exc),
-                    "timestamp": datetime.now().isoformat(),
-                }
-            records.append(record)
-            append_jsonl(results_path, record)
-            update_summary(run_dir, len(problems), records, skipped)
-            print(
-                f"    compile={record.get('compile_pass')} sim={record.get('sim_status')} "
-                f"feedback={record.get('sim_feedback_iterations')} "
-                f"tok={record.get('agent_input_tokens', 0)}+{record.get('agent_output_tokens', 0)}",
-                flush=True,
-            )
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_map = {
+                executor.submit(_run_one, idx, prob_id): (idx, prob_id)
+                for idx, prob_id in indexed_problems
+            }
+            for future in as_completed(future_map):
+                idx, prob_id = future_map[future]
+                _, _, record = future.result()
+                records.append(record)
+                append_jsonl(results_path, record)
+                update_summary(run_dir, len(problems), records, skipped)
+                print(
+                    f"[{idx}/{len(problems)}] {prob_id}: done "
+                    f"compile={record.get('compile_pass')} sim={record.get('sim_status')} "
+                    f"feedback={record.get('sim_feedback_iterations')} "
+                    f"tok={record.get('agent_input_tokens', 0)}+{record.get('agent_output_tokens', 0)}",
+                    flush=True,
+                )
     finally:
         summary = update_summary(run_dir, len(problems), records, skipped)
         print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)

@@ -307,7 +307,7 @@ def eval_direct_verilog(
             )
         elif dataset_name == "cvdp":
             sim_status, mismatches, detail = evaluator._run_sim_cvdp(
-                info.prob_id, code, mod_name, ports, run_dir
+                info.prob_id, code, mod_name, ports, run_dir, direct_top=True
             )
         elif dataset_name == "resbench":
             sim_status, mismatches, detail = evaluator._run_sim_resbench(

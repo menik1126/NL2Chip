@@ -734,11 +734,67 @@ def _cvdp_signal_type_lookup(
     return lookup
 
 
+def _cvdp_internal_unpacked_arrays(
+    sv_code: str,
+    module_name: str | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Return internal unpacked arrays as name -> (element type, range)."""
+    _, _, body = _first_module_record(sv_code, module_name)
+    clean = _strip_sv_comments(body)
+    arrays: dict[str, tuple[str, str]] = {}
+    for match in re.finditer(
+        r"\b(?:logic|wire|reg)\s*(?:signed\s*)?"
+        r"(?P<packed>\[[^\]]+\])?\s*"
+        r"(?P<name>[A-Za-z_]\w*)\s*"
+        r"(?P<unpacked>\[[^\]]+\])\s*;",
+        clean,
+        re.DOTALL,
+    ):
+        arrays[match.group("name")] = (
+            _cvdp_normalize_type(match.group("packed") or ""),
+            match.group("unpacked"),
+        )
+    return arrays
+
+
+def _cvdp_match_internal_array(
+    name: str,
+    generated_arrays: dict[str, tuple[str, str]],
+    used: set[str],
+) -> str | None:
+    """Conservatively match a benchmark-visible internal array to Sparkle RTL."""
+    candidates = [candidate for candidate in generated_arrays if candidate not in used]
+    exact = [candidate for candidate in candidates if _ports_equivalent(candidate, name)]
+    if len(exact) == 1:
+        return exact[0]
+    # Generated Sparkle names often describe the memory's read value rather
+    # than the reference array. A unique memory is still unambiguous.
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _cvdp_unpacked_loop_bounds(unpacked_range: str) -> tuple[str, str] | None:
+    """Return ascending loop bounds for common unpacked array declarations."""
+    match = re.fullmatch(r"\[\s*(.+?)\s*:\s*(.+?)\s*\]", unpacked_range or "")
+    if not match:
+        return None
+    left, right = (part.strip() for part in match.groups())
+    if left == "0":
+        return "0", right
+    if right == "0":
+        return "0", left
+    if left.isdigit() and right.isdigit():
+        low, high = sorted((int(left), int(right)))
+        return str(low), str(high)
+    return None
+
+
 def _cvdp_name_forms(name: str) -> set[str]:
     base = _base_port_name(name)
     forms = {base, re.sub(r"[^a-z0-9]", "", base)}
-    variants = {base}
-    for prefix in ("o_", "out_", "output_", "predict_branch_", "predict_"):
+    variants = {base, re.sub(r"_\d+$", "", base)}
+    for prefix in ("o_", "out_", "output_", "predict_branch_", "predict_", "dmem_", "saved_", "req_"):
         if base.startswith(prefix):
             variants.add(base[len(prefix):])
     for suffix in ("_bit", "_flag", "_val", "_value", "_out", "_output", "_bv", "_signal", "_reg", "_r", "_o"):
@@ -784,6 +840,12 @@ def _cvdp_match_output_for_field(
             score = 65
         elif "pc" in out_forms and any(form.endswith("pc") for form in field_forms):
             score = 60
+        # Saved request registers are Sparkle state names; CVDP exposes the
+        # corresponding dmem_req_* observation ports.
+        elif field_compact.startswith("saved"):
+            semantic = re.sub(r"\d+$", "", field_compact[len("saved"):])
+            if any(form.startswith("req") and semantic in form for form in out_forms):
+                score = 75
         if score:
             scored.append((score, cand))
 
@@ -861,6 +923,59 @@ def _cvdp_infer_bundled_output_mapping(
     return mapping
 
 
+def _cvdp_assign_bundled_output_slices(
+    *,
+    sp_out_name: str,
+    sp_out_type: str,
+    remaining_outputs: list[tuple[str, str, str]],
+    sv_code: str,
+    sparkle_ports: list[tuple[str, str, str]],
+) -> list[tuple[str, int, int]]:
+    """Map a packed Sparkle tuple to every benchmark output when provable.
+
+    Sparkle lowers tuples MSB-first. Prefer a semantic field-name match, but
+    generated names such as _gen_enc1 often have no benchmark spelling.
+    In that case declaration order is safe only when all remaining field and
+    port widths agree exactly; otherwise leave the output unmapped.
+    """
+    sp_width = _cvdp_numeric_width(sp_out_type)
+    fields = _cvdp_infer_concat_fields(sv_code, sp_out_name) or []
+    if sp_width is None or not fields:
+        return []
+    type_lookup = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
+    field_widths = [_cvdp_expr_numeric_width(field, type_lookup) for field in fields]
+    if any(width is None for width in field_widths) or sum(field_widths) != sp_width:
+        return []
+
+    offset = sp_width
+    slices: list[tuple[str, int, int]] = []
+    used: set[str] = set()
+    unresolved: list[tuple[int, int, int]] = []
+    for field, field_width in zip(fields, field_widths):
+        high, low = offset - 1, offset - field_width
+        matched = _cvdp_match_output_for_field(field, remaining_outputs, used)
+        if matched and _cvdp_numeric_width(matched[1]) == field_width:
+            slices.append((matched[2], high, low))
+            used.add(matched[2])
+        else:
+            unresolved.append((field_width, high, low))
+        offset -= field_width
+
+    remaining = [port for port in remaining_outputs if port[2] not in used]
+    if len(remaining) == len(unresolved) and all(
+        _cvdp_numeric_width(port[1]) == field_width
+        for port, (field_width, _, _) in zip(remaining, unresolved)
+    ):
+        slices.extend(
+            (port[2], high, low)
+            for port, (_, high, low) in zip(remaining, unresolved)
+        )
+    # A subset can still be a sound semantic mapping (for example a bundle
+    # also carries an unobserved valid bit). The caller emits fallbacks only
+    # for genuinely unmapped benchmark outputs.
+    return slices
+
+
 def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
     """Infer CVDP top-level ports/parameters touched by cocotb harnesses."""
     py_files = {
@@ -872,6 +987,10 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
         content
         for path, content in py_files.items()
         if Path(path).name != "harness_library.py"
+    )
+    helper_py_text = "\n\n".join(
+        content for path, content in py_files.items()
+        if Path(path).name == "harness_library.py"
     )
     param_py_text = "\n\n".join(py_files.values())
     id_names = set(re.findall(r"\bdut\._id\s*\(\s*[\"']([A-Za-z_]\w*)[\"']", port_py_text))
@@ -894,6 +1013,40 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
     assigned.update(
         re.findall(r"\bdut\s*\[\s*[\"']([A-Za-z_]\w*)[\"']\s*\]\s*<=", port_py_text)
     )
+    # CVDP helper classes frequently drive interfaces through
+    # getattr(dut, f"{name}_suffix"). Recover literal helper prefixes and
+    # suffixes so those ports are not silently tied to zero in the wrapper.
+    for name_var, suffix in re.findall(
+        r"getattr\s*\(\s*dut\s*,\s*f[\"']\{([A-Za-z_]\w*)\}_([A-Za-z_]\w*)[\"']\s*\)",
+        param_py_text,
+    ):
+        prefixes = set(re.findall(
+            rf"\b{name_var}\s*=\s*[\"']([A-Za-z_]\w*)[\"']", param_py_text
+        ))
+        recovered = {f"{prefix}_{suffix}" for prefix in prefixes}
+        all_names.update(recovered)
+        assigned.update(recovered)
+    # Helpers can dynamically access bus ports using getattr(dut,
+    # f"{name}_suffix"). Pair each helper class's suffixes with prefixes from
+    # calls to that *same* class; cross-producting all helper prefixes creates
+    # fictitious DUT ports such as ex_if_req_addr_o.
+    for class_match in re.finditer(
+        r"\bclass\s+([A-Za-z_]\w*).*?(?=\nclass\s+|\Z)",
+        helper_py_text,
+        re.DOTALL,
+    ):
+        class_name, class_body = class_match.group(1), class_match.group(0)
+        suffixes = set(re.findall(
+            r"getattr\s*\(\s*dut\s*,\s*f[\"']\{name\}_([A-Za-z_]\w*)[\"']\s*\)",
+            class_body,
+        ))
+        prefixes = set(re.findall(
+            rf"\b{re.escape(class_name)}\s*\(\s*dut\s*,\s*[\"']([A-Za-z_]\w*)[\"']",
+            port_py_text,
+        ))
+        recovered = {f"{prefix}_{suffix}" for prefix in prefixes for suffix in suffixes}
+        all_names.update(recovered)
+        assigned.update(name for name in recovered if name.endswith(("_i", "_in")))
     clocked = set(re.findall(r"\bClock\s*\(\s*dut\.([A-Za-z_]\w*)\b", port_py_text))
 
     params: set[str] = set()
@@ -1035,6 +1188,12 @@ def generate_cvdp_wrapper(
 
     by_name = {n: (d, t, n) for d, t, n in ref_ports}
     expected_ports = list(ref_ports)
+    ref_internal_arrays = _cvdp_internal_unpacked_arrays(ref_code, design_name)
+    observed_internal_arrays = {
+        name: ref_internal_arrays[name]
+        for name in sorted(usage["ports"] - set(by_name))
+        if name in ref_internal_arrays
+    }
     sp_inputs = [(d, t, n) for d, t, n in sparkle_ports if d == "input"]
     sp_outputs = [(d, t, n) for d, t, n in sparkle_ports if d == "output"]
     bundled_type_by_output: dict[str, str] = {}
@@ -1055,6 +1214,8 @@ def generate_cvdp_wrapper(
     for name in sorted(usage["ports"]):
         if name in by_name:
             continue
+        if name in observed_internal_arrays:
+            continue
         sp_match = _cvdp_match_port(name, sparkle_ports)
         if sp_match:
             typ = sp_match[1]
@@ -1074,6 +1235,23 @@ def generate_cvdp_wrapper(
             (d, bundled_type_by_output.get(n, t) if d == "output" else t, n)
             for d, t, n in expected_ports
         ]
+
+    if len(sp_outputs) == 1:
+        bundle_fields = _cvdp_infer_concat_fields(sv_code, sp_outputs[0][2]) or []
+        bundle_types = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
+        inferred = [
+            _cvdp_expr_numeric_width(field, bundle_types) for field in bundle_fields
+        ]
+        missing = [p for p in expected_ports if p[0] == "output" and p[2] not in bundled_type_by_output]
+        if len(missing) == len(inferred) and all(width is not None for width in inferred):
+            inferred_by_name = {
+                port[2]: ("logic" if width == 1 else f"logic [{width - 1}:0]")
+                for port, width in zip(missing, inferred)
+            }
+            expected_ports = [
+                (d, inferred_by_name.get(n, t) if d == "output" else t, n)
+                for d, t, n in expected_ports
+            ]
 
     if not expected_ports or not sparkle_mod_name:
         return None
@@ -1147,6 +1325,11 @@ def generate_cvdp_wrapper(
     if sp_outputs:
         lines.append("")
 
+    for name, (element_type, unpacked_range) in observed_internal_arrays.items():
+        lines.append(f"    {element_type} {name} {unpacked_range};")
+    if observed_internal_arrays:
+        lines.append("")
+
     lines.append(f"    {sparkle_mod_name} sparkle_dut (")
     inst_conns = []
     for d, _, sn in sparkle_ports:
@@ -1166,6 +1349,41 @@ def generate_cvdp_wrapper(
     lines.append("    );")
     lines.append("")
 
+    generated_arrays = _cvdp_internal_unpacked_arrays(sv_code, sparkle_mod_name)
+    used_generated_arrays: set[str] = set()
+    for ref_name, (_, unpacked_range) in observed_internal_arrays.items():
+        generated_name = _cvdp_match_internal_array(
+            ref_name,
+            generated_arrays,
+            used_generated_arrays,
+        )
+        loop_bounds = _cvdp_unpacked_loop_bounds(unpacked_range)
+        if generated_name is None or loop_bounds is None:
+            reason = (
+                "could not be mapped uniquely to a Sparkle memory"
+                if generated_name is None
+                else f"has unsupported unpacked range {unpacked_range}"
+            )
+            lines.append(
+                f"    // CVDP adapter diagnostic: internal array {ref_name} was observed by the harness "
+                f"but {reason}."
+            )
+            continue
+        used_generated_arrays.add(generated_name)
+        loop_low, loop_high = loop_bounds
+        bridge_index = f"_cvdp_bridge_{ref_name}_i"
+        lines.extend([
+            "    generate",
+            f"        for (genvar {bridge_index} = {loop_low}; "
+            f"{bridge_index} <= {loop_high}; {bridge_index}++) begin : "
+            f"_cvdp_bridge_{ref_name}",
+            f"            assign {ref_name}[{bridge_index}] = "
+            f"sparkle_dut.{generated_name}[{bridge_index}];",
+            "        end",
+            "    endgenerate",
+            "",
+        ])
+
     assigned_outputs: set[str] = set()
     for _, _, rn in expected_outputs:
         sp_match = _cvdp_match_port(rn, sp_outputs, direction="output")
@@ -1176,58 +1394,29 @@ def generate_cvdp_wrapper(
     if len(sp_outputs) == 1:
         sp_out_d, sp_out_t, sp_out_n = sp_outputs[0]
         remaining = [(d, t, n) for d, t, n in expected_outputs if n not in assigned_outputs]
-        if len(remaining) == 1:
-            lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
-            assigned_outputs.add(remaining[0][2])
-        elif remaining:
+        if remaining:
             sp_w = _cvdp_numeric_width(sp_out_t)
             ref_widths = [(_cvdp_numeric_width(t), n) for _, t, n in remaining]
-            fields = _cvdp_infer_concat_fields(sv_code, sp_out_n) or []
-            type_lookup = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
-            field_assigned = False
-            if sp_w is not None and fields:
-                offset = sp_w
-                used_for_fields: set[str] = set()
-                field_assigns: list[tuple[str, int, int]] = []
-                unmatched_field_slices: list[tuple[str, int, int, int]] = []
-                all_widths_known = True
-                for field in fields:
-                    field_width = _cvdp_expr_numeric_width(field, type_lookup)
-                    if field_width is None:
-                        all_widths_known = False
-                        break
-                    high = offset - 1
-                    low = offset - field_width
-                    matched_out = _cvdp_match_output_for_field(
-                        field,
-                        remaining,
-                        used_for_fields,
-                    )
-                    matched_width = _cvdp_numeric_width(matched_out[1]) if matched_out else None
-                    if matched_out and (matched_width is None or matched_width == field_width):
-                        field_assigns.append((matched_out[2], high, low))
-                        used_for_fields.add(matched_out[2])
-                    else:
-                        unmatched_field_slices.append((field, high, low, field_width))
-                    offset -= field_width
-                if all_widths_known and offset == 0:
-                    for _, high, low, field_width in unmatched_field_slices:
-                        width_matches = [
-                            p for p in remaining
-                            if p[2] not in used_for_fields
-                            and _cvdp_numeric_width(p[1]) == field_width
-                        ]
-                        if len(width_matches) == 1:
-                            out_port = width_matches[0]
-                            field_assigns.append((out_port[2], high, low))
-                            used_for_fields.add(out_port[2])
-                    for n, high, low in field_assigns:
-                        if high == low:
-                            lines.append(f"    assign {n} = {sp_out_n}_wire[{low}];")
-                        else:
-                            lines.append(f"    assign {n} = {sp_out_n}_wire[{high}:{low}];")
-                        assigned_outputs.add(n)
-                    field_assigned = bool(field_assigns)
+            field_assigns = _cvdp_assign_bundled_output_slices(
+                sp_out_name=sp_out_n,
+                sp_out_type=sp_out_t,
+                remaining_outputs=remaining,
+                sv_code=sv_code,
+                sparkle_ports=sparkle_ports,
+            )
+            field_assigned = bool(field_assigns)
+            for n, high, low in field_assigns:
+                if high == low:
+                    lines.append(f"    assign {n} = {sp_out_n}_wire[{low}];")
+                else:
+                    lines.append(f"    assign {n} = {sp_out_n}_wire[{high}:{low}];")
+                assigned_outputs.add(n)
+            # A scalar/normal single output has no tuple concat to unpack.
+            # Preserve direct wiring for this established CVDP case.
+            if len(remaining) == 1 and not field_assigned and not _cvdp_infer_concat_fields(sv_code, sp_out_n):
+                lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
+                assigned_outputs.add(remaining[0][2])
+                field_assigned = True
 
             if (
                 not field_assigned
@@ -1680,6 +1869,8 @@ class Evaluator:
         sparkle_mod_name: str,
         sparkle_ports: list[tuple[str, str, str]],
         run_dir: Path,
+        *,
+        direct_top: bool = False,
     ) -> tuple[str, int, str]:
         """Run a CVDP cocotb harness in its Docker simulation image."""
         if self.dataset_obj is None:
@@ -1708,29 +1899,30 @@ class Evaluator:
             out_path.write_text(str(content))
 
         target_mod_name, target_ports = parse_module_ports(sv_code, module_name=design_name)
-        if target_mod_name == design_name:
-            sparkle_mod_name, sparkle_ports = target_mod_name, target_ports
-        elif not sparkle_mod_name:
-            sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
+        if not (direct_top and target_mod_name == design_name):
+            if target_mod_name == design_name:
+                sparkle_mod_name, sparkle_ports = target_mod_name, target_ports
+            elif not sparkle_mod_name:
+                sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
 
-        if sparkle_mod_name:
-            inner_name = sparkle_mod_name
-            if sparkle_mod_name == design_name:
-                inner_name = f"{design_name}_sparkle_inner"
-                sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, inner_name)
+            if sparkle_mod_name:
+                inner_name = sparkle_mod_name
+                if sparkle_mod_name == design_name:
+                    inner_name = f"{design_name}_sparkle_inner"
+                    sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, inner_name)
 
-            wrapper = generate_cvdp_wrapper(
-                design_name=design_name,
-                sparkle_mod_name=inner_name,
-                sparkle_ports=sparkle_ports,
-                ref_code=info.ref_code,
-                harness_files=harness_files,
-                sv_code=sv_code,
-            )
-            if wrapper:
-                sv_code = f"{sv_code.rstrip()}\n\n{wrapper}\n"
-            elif sparkle_mod_name != design_name:
-                sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, design_name)
+                wrapper = generate_cvdp_wrapper(
+                    design_name=design_name,
+                    sparkle_mod_name=inner_name,
+                    sparkle_ports=sparkle_ports,
+                    ref_code=info.ref_code,
+                    harness_files=harness_files,
+                    sv_code=sv_code,
+                )
+                if wrapper:
+                    sv_code = f"{sv_code.rstrip()}\n\n{wrapper}\n"
+                elif sparkle_mod_name != design_name:
+                    sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, design_name)
 
         def local_source_path(source: str) -> Path:
             if source.startswith("/code/"):

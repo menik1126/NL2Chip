@@ -463,9 +463,9 @@ def _prompt_size_to_type(size_text: str) -> str:
     if not size:
         return "logic"
     lower = size.lower()
-    if re.search(r"\b1\s*(?:bit|bits?)?\b", lower) and not re.search(r"[\w$]\s*[*+:-]", size):
+    if re.search(r"\b1\s*-?\s*(?:bit|bits?)?\b", lower) and not re.search(r"[\w$]\s*[*+:-]", size):
         return "logic"
-    m = re.search(r"\b(\d+)\s*(?:bit|bits?)\b", lower)
+    m = re.search(r"\b(\d+)\s*-?\s*(?:bit|bits?)\b", lower)
     if m:
         width = int(m.group(1))
         return "logic" if width <= 1 else f"logic [{width - 1}:0]"
@@ -476,44 +476,181 @@ def _prompt_size_to_type(size_text: str) -> str:
     return f"logic [{expr}-1:0]"
 
 
+def _prompt_heading(line: str) -> tuple[bool, str]:
+    stripped = str(line or "").strip()
+    heading = _clean_prompt_cell(stripped).lower().strip("# :-")
+    is_heading = stripped.startswith("#") or bool(
+        re.fullmatch(r"(?:inputs?|outputs?|parameters?)", heading)
+    )
+    return is_heading, heading
+
+
+def _parse_prompt_declaration(text: str) -> tuple[str, str] | None:
+    declaration = _clean_prompt_cell(text)
+    match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)\s*(\[[^\]]+\])\s*$", declaration)
+    if match:
+        name, packed_range = match.groups()
+        return f"logic {packed_range}", name
+    match = re.search(r"(?:(\[[^\]]+\])\s*)?([A-Za-z_][A-Za-z0-9_$]*)\s*$", declaration)
+    if not match:
+        return None
+    packed_range, name = match.groups()
+    typ = f"logic {packed_range}" if packed_range else "logic"
+    return typ, name
+
+
+def _parse_parameters_from_prompt(prompt_text: str) -> set[str]:
+    """Extract public module-parameter names from markdown tables and bullets."""
+    parameters: set[str] = set()
+    in_parameters = False
+    for raw_line in str(prompt_text or "").splitlines():
+        line = raw_line.strip()
+        is_heading, heading = _prompt_heading(line)
+        if is_heading:
+            in_parameters = bool(
+                re.fullmatch(
+                    r"(?:(?:module|design)\s+)?parameters?|parameter table",
+                    heading,
+                )
+            )
+            continue
+        if not in_parameters:
+            continue
+
+        candidate = ""
+        if "|" in line:
+            cells = [_clean_prompt_cell(cell) for cell in line.strip("|").split("|")]
+            cells = [cell for cell in cells if cell]
+            if not cells:
+                continue
+            candidate = cells[0]
+            if candidate.lower() in {"parameter", "name"} or re.match(r"^:?-{2,}:?$", candidate):
+                continue
+        else:
+            bullet = re.match(r"^\s*[-*+]\s+(?:\*\*)?`([^`]+)`", raw_line)
+            if not bullet:
+                continue
+            candidate = bullet.group(1)
+
+        names = re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", candidate)
+        names = [name for name in names if name.lower() not in {"parameter", "int", "integer", "logic"}]
+        if names:
+            parameters.add(names[-1])
+    return parameters
+
+
+def _apply_prompt_parameters(
+    harness_usage: dict[str, set[str]], prompt_text: str
+) -> dict[str, set[str]]:
+    usage = {key: set(values) for key, values in harness_usage.items()}
+    usage.setdefault("params", set()).update(_parse_parameters_from_prompt(prompt_text))
+    for key in ("ports", "inputs", "outputs"):
+        usage.setdefault(key, set()).difference_update(usage["params"])
+    return usage
+
+
 def _parse_ports_from_prompt(prompt_text: str) -> list[tuple[str, str, str]]:
-    """Extract benchmark-declared ports from common CVDP markdown tables.
+    """Extract benchmark-declared ports from CVDP markdown tables and bullets.
 
     This intentionally reads only public problem text, not hidden simulator
     assertions. It is used when CVDP has no public reference RTL.
     """
     ports: list[tuple[str, str, str]] = []
+    direction_table_ports: list[tuple[str, str, str]] = []
     direction: str | None = None
     seen: set[tuple[str, str]] = set()
+    direction_table_seen: set[tuple[str, str]] = set()
+    table_header: list[str] | None = None
     for raw_line in str(prompt_text or "").splitlines():
         line = raw_line.strip()
-        heading = line.lower().strip("# :-")
-        is_heading = line.startswith("#") or bool(re.match(r"^(?:inputs?|outputs?)\s*:?\s*$", heading))
+        is_heading, heading = _prompt_heading(line)
         if is_heading:
+            table_header = None
             if re.fullmatch(r"(?:inputs?|input ports?)", heading):
                 direction = "input"
                 continue
             if re.fullmatch(r"(?:outputs?|output ports?)", heading):
                 direction = "output"
                 continue
-        if not direction or "|" not in line:
+            direction = None
             continue
-        cells = [_clean_prompt_cell(cell) for cell in line.strip("|").split("|")]
-        cells = [cell for cell in cells if cell]
-        if len(cells) < 2:
+        if re.fullmatch(r"-{3,}", line):
+            direction = None
+            table_header = None
             continue
-        first_cell = cells[0].lower()
-        if first_cell in {"port", "signal", "name"} or re.match(r"^:?-{2,}:?$", first_cell):
+
+        if "|" in line:
+            cells = [_clean_prompt_cell(cell) for cell in line.strip("|").split("|")]
+            cells = [cell for cell in cells if cell]
+            if len(cells) < 2:
+                continue
+            normalized = [cell.lower() for cell in cells]
+            if all(re.fullmatch(r":?-{2,}:?", cell) for cell in normalized):
+                continue
+            if any(cell in {"direction", "dir"} for cell in normalized) and any(
+                cell in {"port", "port name", "signal", "signal name", "name"}
+                for cell in normalized
+            ):
+                table_header = normalized
+                continue
+            if table_header is None:
+                if normalized[0] in {"port", "port name", "signal", "signal name", "name"}:
+                    table_header = normalized
+                continue
+
+            def column_index(names: set[str]) -> int | None:
+                return next((idx for idx, value in enumerate(table_header or []) if value in names), None)
+
+            name_idx = column_index({"port", "port name", "signal", "signal name", "name"})
+            width_idx = column_index({"width", "size", "bits", "bit width"})
+            direction_idx = column_index({"direction", "dir"})
+            if name_idx is None or name_idx >= len(cells):
+                continue
+            row_direction = direction
+            if direction_idx is not None and direction_idx < len(cells):
+                value = cells[direction_idx].strip().lower()
+                if value in {"input", "in"}:
+                    row_direction = "input"
+                elif value in {"output", "out"}:
+                    row_direction = "output"
+                else:
+                    continue
+            if not row_direction:
+                continue
+            name = cells[name_idx].strip()
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_$]*$", name):
+                continue
+            typ = _prompt_size_to_type(cells[width_idx]) if width_idx is not None and width_idx < len(cells) else "logic"
+            target = direction_table_ports if direction_idx is not None else ports
+            target_seen = direction_table_seen if direction_idx is not None else seen
+        else:
+            if not direction:
+                continue
+            bullet = re.match(r"^\s*[-*+]\s+(?:\*\*)?`([^`]+)`", raw_line)
+            if not bullet:
+                continue
+            parsed = _parse_prompt_declaration(bullet.group(1))
+            if not parsed:
+                continue
+            typ, name = parsed
+            remainder = raw_line[bullet.end():]
+            explicit_width = re.search(
+                r"(?:\(|\b)(\d+)\s*-?\s*(?:bit|bits)\b",
+                remainder,
+                flags=re.IGNORECASE,
+            )
+            if explicit_width:
+                typ = _prompt_size_to_type(f"{explicit_width.group(1)} bit")
+            row_direction = direction
+            target = ports
+            target_seen = seen
+
+        key = (row_direction, name)
+        if key in target_seen:
             continue
-        name = cells[0].strip()
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_$]*$", name):
-            continue
-        key = (direction, name)
-        if key in seen:
-            continue
-        seen.add(key)
-        ports.append((direction, _prompt_size_to_type(cells[1]), name))
-    return ports
+        target_seen.add(key)
+        target.append((row_direction, typ, name))
+    return direction_table_ports or ports
 
 
 def _benchmark_expected_ports(info: ProblemInfo | None) -> list[tuple[str, str, str]]:
@@ -524,11 +661,19 @@ def _benchmark_expected_ports(info: ProblemInfo | None) -> list[tuple[str, str, 
     if metadata.get("dataset") == "cvdp":
         harness_files = metadata.get("harness_files", {}) or {}
         harness_usage = _parse_cvdp_harness_usage(harness_files)
+        harness_usage = _apply_prompt_parameters(harness_usage, info.prompt_text or "")
 
-    _, ref_ports = parse_module_ports(info.ref_code or "")
+    ref_mod, ref_ports = parse_module_ports(info.ref_code or "", module_name=info.design_name or None)
+    if info.design_name and ref_mod != info.design_name:
+        ref_ports = []
     prompt_ports = _parse_ports_from_prompt(info.prompt_text or "")
-    source_ports = ref_ports or prompt_ports
-    by_name = {name: (direction, typ, name) for direction, typ, name in source_ports}
+    if ref_ports:
+        # A parsed target-module declaration is authoritative. Cocotb can also
+        # access internal hierarchy, so harness-only names are not necessarily
+        # top-level ports and must not be appended here.
+        return ref_ports
+
+    source_ports = prompt_ports
 
     expected_ports: list[tuple[str, str, str]] = []
     if source_ports:
@@ -540,11 +685,8 @@ def _benchmark_expected_ports(info: ProblemInfo | None) -> list[tuple[str, str, 
         return expected_ports
 
     for name in sorted(harness_usage["ports"]):
-        if name in by_name:
-            expected_ports.append(by_name[name])
-        else:
-            direction = "input" if name in harness_usage["inputs"] or _port_kind(name) in {"clock", "reset"} else "output"
-            expected_ports.append((direction, "logic", name))
+        direction = "input" if name in harness_usage["inputs"] or _port_kind(name) in {"clock", "reset"} else "output"
+        expected_ports.append((direction, "logic", name))
     return expected_ports
 
 
@@ -561,6 +703,7 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
         env_text = str(harness_files.get("src/.env", ""))
         design_name = _parse_env_value(env_text, "TOPLEVEL") or design_name
         harness_usage = _parse_cvdp_harness_usage(harness_files)
+        harness_usage = _apply_prompt_parameters(harness_usage, info.prompt_text or "")
         param_values, param_combos = _cvdp_parse_parameter_sweeps(harness_files, harness_usage["params"])
     else:
         param_values, param_combos = {}, []
@@ -661,11 +804,11 @@ def build_user_message(
     if has_repl:
         compile_instructions = (
             f"3. Use the `lean_check` tool to verify your code instantly (~0.1s)\n"
-            f"   - Pass your COMPLETE Lean 4 code (WITHOUT import/open lines) to `lean_check`\n"
+            f"   - Pass your COMPLETE Lean 4 code (WITHOUT import/open lines), including `#synthesizeVerilog {func_name}`, to `lean_check`\n"
+            f"   - Treat the check as successful only when it returns generated Verilog; the harness automatically saves that compile-safe candidate\n"
             f"   - This is much faster than `lake build` — use it for every iteration\n"
             f"4. Fix any errors iteratively until it compiles and generates correct Verilog\n"
-            f"5. Once `lean_check` passes, write the final code to `Generated/{prob_id}.lean`\n"
-            f"6. Check the generated Verilog looks correct"
+            f"5. Check the generated Verilog looks correct, then stop"
         )
     else:
         compile_instructions = (
@@ -913,6 +1056,9 @@ COMPACT_REF_CHARS = 7000
 COMPACT_CONTEXT_CHARS = 5000
 COMPACT_CODE_CHARS = 18000
 COMPACT_FEEDBACK_CHARS = 8000
+COMPACT_ASSERTION_CHARS = 3600
+COMPACT_DIAGNOSTIC_CHARS = 2800
+COMPACT_INTERFACE_CHARS = 1200
 COMPACT_ATTEMPT_CHARS = 1600
 COMPACT_RECENT_ATTEMPTS = 3
 SIM_DIAGNOSTIC_CHARS = 3500
@@ -1435,6 +1581,53 @@ def format_context_files(info: ProblemInfo | None) -> str:
     return "\n\n".join(blocks) if blocks else "No extra context files."
 
 
+def compact_repair_feedback(feedback: str) -> str:
+    """Keep semantic evidence ahead of verbose generated-SystemVerilog text.
+
+    ``build_sim_feedback`` may include a large synthesized SV dump after the
+    simulator assertions. A tail-only truncation silently dropped the first
+    DUT/expected/actual evidence in compact Lean repair sessions. Preserve the
+    structured failure sections explicitly and omit the full SV dump: the agent
+    can reproduce it with ``lean_check`` after changing the Lean source.
+    """
+    text = str(feedback or "").strip()
+    if not text:
+        return "No simulator feedback was captured. Re-check the contract and current Lean behavior."
+
+    heading_re = re.compile(r"(?m)^### ([^\n]+)\n")
+    matches = list(heading_re.finditer(text))
+    blocks: dict[str, str] = {}
+    preamble_end = matches[0].start() if matches else len(text)
+    preamble = text[:preamble_end].strip()
+    for idx, match in enumerate(matches):
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        blocks[match.group(1).strip()] = text[match.start():end].strip()
+
+    selected: list[str] = []
+    if preamble:
+        selected.append(truncate_text(preamble, 900, keep="head"))
+    for heading, limit in (
+        ("First Failing Assertions", COMPACT_ASSERTION_CHARS),
+        ("Waveform Context", COMPACT_ASSERTION_CHARS),
+        ("Cleaned Simulator Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
+        ("Current Evaluation Summary", 900),
+        ("Interface Diagnostics", COMPACT_INTERFACE_CHARS),
+        ("Benchmark Interface Contract", COMPACT_INTERFACE_CHARS),
+    ):
+        block = blocks.get(heading)
+        if block:
+            selected.append(truncate_text(block, limit, keep="head"))
+
+    if not selected:
+        return truncate_text(text, COMPACT_FEEDBACK_CHARS, keep="head")
+    selected.append(
+        "Do not infer a root cause from a packed `out` port alone: the CVDP adapter may unpack tuple outputs. "
+        "Prioritize the first failing assertion's expected/actual values, parameter setting, and timing. "
+        "The full generated SV is intentionally omitted here; run `lean_check` to inspect a fresh extraction after edits."
+    )
+    return truncate_text("\n\n".join(selected), COMPACT_FEEDBACK_CHARS, keep="head")
+
+
 def build_compact_repair_prompt(
     *,
     prob_id: str,
@@ -1453,7 +1646,7 @@ def build_compact_repair_prompt(
     ref_code = info.ref_code if info else "(no reference Verilog available)"
     func_name = prob_id.lower() if dataset_name == "verilogeval" else lean_identifier(design_name)
     check_instruction = (
-        "Use the `lean_check` tool on the complete Lean body before writing the final file."
+        f"Use `lean_check` on the complete Lean body including `#synthesizeVerilog {func_name}`; require generated Verilog. The harness saves the latest compile-safe check automatically."
         if has_repl else
         f"Run `lake build Generated.{prob_id}` before ending the repair."
     )
@@ -1491,7 +1684,7 @@ def build_compact_repair_prompt(
         f"### Current Lean Candidate\n\n"
         f"```lean\n{truncate_text(current_lean, COMPACT_CODE_CHARS, keep='middle')}\n```\n\n"
         f"### Latest Feedback To Fix\n\n"
-        f"{truncate_text(latest_feedback, COMPACT_FEEDBACK_CHARS, keep='tail')}\n\n"
+        f"{compact_repair_feedback(latest_feedback)}\n\n"
         f"### Recent Attempts Summary\n\n"
         f"{summarize_recent_attempts(recent_attempts)}\n\n"
         f"### Required Constraints\n\n"
@@ -1535,15 +1728,34 @@ def build_sim_feedback(
     history: list[dict],
     run_dir: Path,
     info: ProblemInfo | None = None,
+    repair_target: str = "lean",
+    current_sv: str | None = None,
 ) -> str:
+    direct_verilog = repair_target == "verilog"
+    if direct_verilog:
+        evaluation_summary = "\n".join([
+            f"- SystemVerilog compile: {bool_status(result.get('compile_pass'))}",
+            f"- RTL sim: {result.get('sim_status', 'unknown')}",
+            f"- RTL sim mismatches: {result.get('sim_mismatches', 'unknown')}",
+        ])
+        implementation_summary = (
+            f"The current direct SystemVerilog implementation for `{prob_id}` did not pass the full RTL evaluation."
+        )
+        repair_summary = "Repair the SystemVerilog candidate directly."
+    else:
+        evaluation_summary = summarize_eval_result(result)
+        implementation_summary = (
+            f"The current Lean implementation for `{prob_id}` did not pass the full RTL evaluation."
+        )
+        repair_summary = "Repair the Lean code, not the generated SystemVerilog directly."
     lines = [
         f"## RTL Simulation Feedback - Iteration {iteration + 1}",
         "",
-        f"The current Lean implementation for `{prob_id}` did not pass the full RTL evaluation.",
-        "Repair the Lean code, not the generated SystemVerilog directly.",
+        implementation_summary,
+        repair_summary,
         "",
         "### Current Evaluation Summary",
-        summarize_eval_result(result),
+        evaluation_summary,
     ]
     simulator_output = read_simulator_output(prob_id, run_dir)
     combined_detail = "\n".join(
@@ -1585,7 +1797,7 @@ def build_sim_feedback(
             waveform_context,
             "```",
         ])
-    sv_code = read_current_sv(prob_id, run_dir)
+    sv_code = current_sv if current_sv is not None else read_current_sv(prob_id, run_dir)
     interface_diagnostics = build_interface_diagnostics(
         {**result, "detail": combined_detail},
         sv_code,
@@ -1606,7 +1818,11 @@ def build_sim_feedback(
         lines.extend([
             "",
             "### Latest Generated SystemVerilog",
-            "Use this only to diagnose the Lean-to-Verilog behavior and interface.",
+            (
+                "This is the current candidate to repair directly."
+                if direct_verilog
+                else "Use this only to diagnose the Lean-to-Verilog behavior and interface."
+            ),
             "```systemverilog",
             truncate_text(sv_code, COMPACT_REF_CHARS, keep="middle"),
             "```",
@@ -1617,15 +1833,22 @@ def build_sim_feedback(
             "### Previous Simulation Repair Attempts",
             summarize_recent_attempts(history),
         ])
-    lines.extend([
-        "",
-        "### Repair Guidance",
-        "- If Lean compile failed, fix the Lean type/API error first.",
-        "- If Verilog compile failed, inspect generated module names, ports, widths, signedness, and reset/clock wiring.",
-        "- If RTL simulation mismatched, compare the current behavior against the natural language spec, reference/interface context, and testbench expectations.",
-        "- Keep the target module interface stable. Do not edit benchmark testbenches or reference files.",
-        "- Stop when the candidate compiles, extracts SystemVerilog, and passes RTL simulation.",
-    ])
+    lines.extend(["", "### Repair Guidance"])
+    if direct_verilog:
+        lines.extend([
+            "- If Verilog compile failed, fix syntax, module names, ports, widths, signedness, and reset/clock wiring first.",
+            "- If RTL simulation mismatched, compare the current behavior against the natural language spec, interface contract, and simulator diagnostics.",
+            "- Keep the target module interface stable. Do not edit benchmark testbenches or reference files.",
+            "- Stop after writing the complete corrected SystemVerilog candidate.",
+        ])
+    else:
+        lines.extend([
+            "- If Lean compile failed, fix the Lean type/API error first.",
+            "- If Verilog compile failed, inspect generated module names, ports, widths, signedness, and reset/clock wiring.",
+            "- If RTL simulation mismatched, compare the current behavior against the natural language spec, reference/interface context, and testbench expectations.",
+            "- Keep the target module interface stable. Do not edit benchmark testbenches or reference files.",
+            "- Stop when the candidate compiles, extracts SystemVerilog, and passes RTL simulation.",
+        ])
     return "\n".join(lines)
 
 
