@@ -84,6 +84,58 @@ def sanitizeName (name : String) : String :=
     |>.replace "'" "_prime"
     |>.replace "#" ""
 
+/-- Strict validation used when native parameters have just been specialized.
+    The legacy CppSim emitter represents packed values above 64 bits as word
+    arrays but does not yet implement general assignments or arithmetic over
+    those arrays.  Reject such operations instead of accepting a specialization
+    whose generated C++ would contain a `// skipped` assignment. -/
+def validateSpecializedDesign (d : Design) : Except String Unit := do
+  for module_ in d.modules do
+    if d.modules.countP (fun other => other.name == module_.name) > 1 then
+      throw s!"Sparkle CppSim design contains duplicate module name '{module_.name}'"
+    if let some conflict := d.modules.find? fun other =>
+        other.name != module_.name && sanitizeName other.name == sanitizeName module_.name then
+      throw s!"Sparkle CppSim module names '{module_.name}' and '{conflict.name}' both emit as C++ class '{sanitizeName module_.name}'"
+    if module_.isPrimitive then
+      throw s!"Sparkle CppSim cannot execute primitive/blackbox module '{module_.name}'"
+    for port in module_.inputs ++ module_.outputs ++ module_.wires do
+      let rec validateType : HWType → Except String Unit
+        | .bit => pure ()
+        | .bitVector width =>
+            match width.toNat? with
+            | some concreteWidth =>
+                if concreteWidth > 64 then
+                  throw s!"Sparkle CppSim cannot execute {concreteWidth}-bit value '{module_.name}.{port.name}'; native packed values above 64 bits are not implemented"
+                else
+                  pure ()
+            | none =>
+                throw s!"Sparkle CppSim value '{module_.name}.{port.name}' still has a symbolic width"
+        | .array _ elementType => validateType elementType
+      validateType port.ty
+    let typeMap := buildTypeMap module_
+    for statement in module_.body do
+      match statement with
+      | .assign lhs _ =>
+          let width := lookupWidth typeMap lhs
+          if width > 64 then
+            throw s!"Sparkle CppSim cannot execute {width}-bit assignment '{module_.name}.{lhs}'; native wide-value operations above 64 bits are not implemented"
+      | .register output _ _ _ _ =>
+          let width := lookupWidth typeMap output
+          if width > 64 then
+            throw s!"Sparkle CppSim cannot execute {width}-bit register '{module_.name}.{output}'; native wide-value operations above 64 bits are not implemented"
+      | .memory name addrWidth dataWidth .. =>
+          match addrWidth.toNat?, dataWidth.toNat? with
+          | some concreteAddrWidth, some concreteDataWidth =>
+              if concreteAddrWidth >= 64 || concreteDataWidth > 64 then
+                throw s!"Sparkle CppSim cannot execute memory '{module_.name}.{name}' with AW={concreteAddrWidth}, DW={concreteDataWidth}; native values above 64 bits are not implemented"
+          | _, _ =>
+              throw s!"Sparkle CppSim memory '{module_.name}.{name}' still has symbolic dimensions"
+      | .inst childName instanceName _ overrides =>
+          unless overrides.isEmpty do
+            throw s!"Sparkle CppSim instance '{module_.name}.{instanceName}' still has parameter overrides"
+          unless d.modules.any (fun child => child.name == childName) do
+            throw s!"Sparkle CppSim instance '{module_.name}.{instanceName}' refers to missing module '{childName}'"
+
 /-- Convert HWType to C++ type string -/
 def emitCppType : HWType → String
   | .bit => "uint8_t"

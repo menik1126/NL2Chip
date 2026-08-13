@@ -13,6 +13,7 @@ import Sparkle.Data.BitPack
 import Sparkle.Backend.Verilog
 import Sparkle.Backend.CppSim
 import Sparkle.IR.Optimize
+import Sparkle.IR.Specialize
 import Sparkle.Compiler.DRC
 import Sparkle.Core.Signal
 import Sparkle.Core.Vector
@@ -2224,7 +2225,14 @@ elab "#writeCppSimDesign" id:ident str:str : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
     Lean.resolveGlobalConstNoOverload id
   Lean.Elab.Command.liftTermElabM do
-    let design ← synthesizeHierarchical declName
+    let parameterizedDesign ← synthesizeHierarchical declName
+    let design ← match Sparkle.IR.Specialize.specializeDesign parameterizedDesign [] with
+      | .ok design => pure design
+      | .error message => throwError message
+    if parameterizedDesign.modules.any (fun module_ => !module_.parameters.isEmpty) then
+      match Sparkle.Backend.CppSim.validateSpecializedDesign design with
+      | .ok _ => pure ()
+      | .error message => throwError message
     let optimized := Sparkle.IR.Optimize.optimizeDesign design
     let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized with
       | .ok cpp => pure cpp
@@ -2240,7 +2248,15 @@ elab "#writeCppSimDesign" id:ident str:str "parameters" "[" defaults:sparklePara
     Lean.resolveGlobalConstNoOverload id
   let parameterDefaults ← parseParameterDefaults defaults
   Lean.Elab.Command.liftTermElabM do
-    let design ← synthesizeHierarchical declName parameterDefaults
+    let parameterizedDesign ← synthesizeHierarchical declName parameterDefaults
+    let design ← match Sparkle.IR.Specialize.specializeDesign
+        parameterizedDesign parameterDefaults with
+      | .ok design => pure design
+      | .error message => throwError message
+    if parameterizedDesign.modules.any (fun module_ => !module_.parameters.isEmpty) then
+      match Sparkle.Backend.CppSim.validateSpecializedDesign design with
+      | .ok _ => pure ()
+      | .error message => throwError message
     let optimized := Sparkle.IR.Optimize.optimizeDesign design
     let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized with
       | .ok cpp => pure cpp
@@ -2264,11 +2280,18 @@ private opaque evalStringArray (name : Name) : TermElabM (Array String)
 private def writeDesignCore (declName : Name) (svPath cppPath : String)
     (observableWires : Option (List String))
     (parameterDefaults : List (String × Nat) := []) : TermElabM Unit := do
-  let design ← synthesizeHierarchical declName parameterDefaults
+  let parameterizedDesign ← synthesizeHierarchical declName parameterDefaults
+  let design ← match Sparkle.IR.Specialize.specializeDesign
+      parameterizedDesign parameterDefaults with
+    | .ok design => pure design
+    | .error message => throwError message
+  if parameterizedDesign.modules.any (fun module_ => !module_.parameters.isEmpty) then
+    match Sparkle.Backend.CppSim.validateSpecializedDesign design with
+    | .ok _ => pure ()
+    | .error message => throwError message
   runDesignDRC design
-  -- Generate both concrete-only artifacts before writing either one.  This
-  -- prevents a parameterized invocation from leaving a partial SV artifact
-  -- when the fixed-width CppSim ABI rejects the design.
+  -- Generate every artifact from the same concrete specialization so that
+  -- the Verilog, CppSim, and JIT models cannot silently disagree about widths.
   let optimized := Sparkle.IR.Optimize.optimizeDesign design
   let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized with
     | .ok cpp => pure cpp

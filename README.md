@@ -211,10 +211,16 @@ hardware width and array length positive.
 
 Native parameters are supported by `#synthesize`, `#synthesizeVerilog`, the
 corresponding hierarchical `*Design` commands, and `#writeVerilogDesign`.
-CppSim and `#writeDesign` remain concrete-width paths and reject retained
-parameters; use a closed, fixed-width Lean wrapper rather than merely supplying
-a parameter default. The current SV-to-Lean verification-model generator also
-requires such a concrete module. Source-level Lean theorems may still be
+`Sparkle.IR.Specialize.specializeDesign` converts a hierarchical design to one
+concrete parameter environment, cloning a child when different instances use
+different values. `#writeCppSimDesign` and `#writeDesign` apply that pass using
+the supplied `parameters [...]` values (or the declared defaults) before
+emitting concrete C++/JIT artifacts; `#writeDesign` emits its SystemVerilog from
+the same specialization. Since the present CppSim execution backend supports
+packed values only through 64 bits, wider specializations fail closed on the
+C++/JIT paths while concrete SystemVerilog remains available. The current
+SV-to-Lean verification-model generator
+also requires a concrete module. Source-level Lean theorems may still be
 written directly over a generic definition. For CVDP, functional simulation
 for parameter overrides is supported, but per-configuration synthesis/PPA is
 not yet run, so PPA is reported as skipped for parameterized designs.

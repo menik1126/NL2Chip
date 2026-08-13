@@ -141,12 +141,19 @@ constant computed only for the default configuration.
 
 The parameter suffix is available on the IR and SystemVerilog entry points:
 `#synthesize`, `#synthesizeVerilog`, `#synthesizeDesign`,
-`#synthesizeVerilogDesign`, and `#writeVerilogDesign`. CppSim has a
-fixed-width C++ ABI. Consequently, `#writeCppSimDesign` and the combined
-`#writeDesign` command reject a design that still has native parameters, even
-if a `parameters [...]` default list was supplied. Define a closed wrapper that
-instantiates the generic Lean definition at concrete widths before requesting
-those outputs; a SystemVerilog default is not a specialization.
+`#synthesizeVerilogDesign`, and `#writeVerilogDesign`. These commands retain
+native parameters, and their `parameters [...]` values remain SystemVerilog
+defaults. CppSim has a fixed-width C++ ABI, so `#writeCppSimDesign` and the
+combined `#writeDesign` command first call
+`Sparkle.IR.Specialize.specializeDesign`: their `parameters [...]` values select
+the concrete environment, while omitted values use the declarations' defaults.
+The pass recursively specializes reachable children, cloning a child when two
+instances use different parameter values, and rejects unknown, unresolved, or
+zero-valued hardware dimensions. A closed fixed-width Lean wrapper remains a
+convenient alternative when a separately named concrete module is desired.
+The current CppSim execution backend supports packed operations through 64
+bits; a wider specialization is accepted by the IR/SystemVerilog path but is
+explicitly rejected by the C++/JIT commands instead of emitting skipped logic.
 
 The SV-to-Lean verification-model generator is likewise concrete-width today
 and rejects a retained-parameter module rather than guessing widths. This does
