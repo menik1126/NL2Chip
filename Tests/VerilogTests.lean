@@ -1,6 +1,7 @@
 import Sparkle
 import Sparkle.Compiler.Elab
 import Tests.TestCircuits
+import Tests.SymbolicParameterCircuits
 import LSpec
 
 open Sparkle.Core.Domain
@@ -38,6 +39,12 @@ def synthesizeDesignToString (declName : Name) : Lean.MetaM String := do
   let design ← synthesizeHierarchical declName
   return toVerilogDesign design
 
+/-- Synthesize one native parameterized module without specializing its widths. -/
+def synthesizeParameterizedToString (declName : Name)
+    (parameters : List (String × Nat)) : Lean.MetaM String := do
+  let (module, _) ← synthesizeCombinationalWithParameters declName parameters
+  return toVerilog module
+
 /-- Extract a specific module from multi-module Verilog output -/
 def extractModule (verilog : String) (moduleName : String) : String :=
   let lines := verilog.splitOn "\n"
@@ -64,6 +71,8 @@ structure VerilogOutputs where
   muxVerilog : String
   flipflopVerilog : String
   hierarchicalVerilog : String
+  symbolicIdentityVerilog : String
+  symbolicXorVerilog : String
 
 /-- Synthesize all modules for testing -/
 def synthesizeAll : Lean.MetaM VerilogOutputs := do
@@ -72,7 +81,14 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
   let muxVerilog ← synthesizeToString `test_mux
   let flipflopVerilog ← synthesizeToString `test_flipflop
   let hierarchicalVerilog ← synthesizeDesignToString `test_hierarchical_alu
-  return { addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog }
+  let symbolicIdentityVerilog ←
+    synthesizeParameterizedToString `symbolicIdentity [("W", 8)]
+  let symbolicXorVerilog ←
+    synthesizeParameterizedToString `symbolicXor [("W", 8)]
+  return {
+    addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
+    symbolicIdentityVerilog, symbolicXorVerilog
+  }
 
 /-- Create test suite from synthesized outputs -/
 def makeTests (outputs : VerilogOutputs) : TestSeq :=
@@ -95,6 +111,28 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
       group "test_mux (Multiplexer)" (
         test "module declared" (outputs.muxVerilog.containsSubstr "module test_mux") $
         test "has ternary operator" (outputs.muxVerilog.containsSubstr " ? ")
+      )
+    ) ++
+    group "Native Symbolic Parameters" (
+      group "symbolicIdentity" (
+        test "module has a parameter list"
+          (outputs.symbolicIdentityVerilog.containsSubstr "module symbolicIdentity #(") $
+        test "retains W with its default"
+          (outputs.symbolicIdentityVerilog.containsSubstr "parameter integer W = 8") $
+        test "input width depends on W"
+          (outputs.symbolicIdentityVerilog.containsSubstr "input logic [W-1:0]") $
+        test "output width depends on W"
+          (outputs.symbolicIdentityVerilog.containsSubstr "output logic [W-1:0]") $
+        test "does not freeze the default width"
+          (!outputs.symbolicIdentityVerilog.containsSubstr "[7:0]")
+      ) ++
+      group "symbolicXor" (
+        test "retains W with its default"
+          (outputs.symbolicXorVerilog.containsSubstr "parameter integer W = 8") $
+        test "keeps generic ports"
+          (outputs.symbolicXorVerilog.containsSubstr "input logic [W-1:0]") $
+        test "emits XOR logic"
+          (outputs.symbolicXorVerilog.containsSubstr " ^ ")
       )
     ) ++
     group "Hierarchical Circuits" (
