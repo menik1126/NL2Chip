@@ -6,3 +6,4 @@ import Tests.SymbolicParameterCircuits
 #synthesizeParameterizedVerilog symbolicConcat [HI := 5, LO := 3]
 #synthesizeParameterizedVerilog symbolicSliceLow [W := 8]
 #synthesizeParameterizedVerilog symbolicZeroExtend [W := 8]
+#synthesizeParameterizedVerilog symbolicRegister [W := 8]

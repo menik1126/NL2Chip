@@ -86,6 +86,7 @@ structure VerilogOutputs where
   symbolicConcatVerilog : String
   symbolicSliceLowVerilog : String
   symbolicZeroExtendVerilog : String
+  symbolicRegisterVerilog : String
   rejectsUnretainedWidth : Bool
   rejectsMissingBinder : Bool
   rejectsDuplicateParameter : Bool
@@ -108,6 +109,8 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedToString `symbolicSliceLow [("W", 8)]
   let symbolicZeroExtendVerilog ←
     synthesizeParameterizedToString `symbolicZeroExtend [("W", 8)]
+  let symbolicRegisterVerilog ←
+    synthesizeParameterizedToString `symbolicRegister [("W", 8)]
   let rejectsUnretainedWidth ←
     parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
   let rejectsMissingBinder ←
@@ -122,7 +125,7 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
   return {
     addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
     symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
-    symbolicSliceLowVerilog, symbolicZeroExtendVerilog,
+    symbolicSliceLowVerilog, symbolicZeroExtendVerilog, symbolicRegisterVerilog,
     rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
     rejectsZeroWidthDefault
   }
@@ -183,6 +186,12 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           (outputs.symbolicSliceLowVerilog.containsSubstr "[(W - 1):0]") $
         test "extension output width remains W + 1"
           (outputs.symbolicZeroExtendVerilog.containsSubstr "logic [(W + 1)-1:0]")
+      ) ++
+      group "parameterized register" (
+        test "register storage retains W"
+          (outputs.symbolicRegisterVerilog.containsSubstr "logic [W-1:0]") $
+        test "register reset value is sized by W"
+          (outputs.symbolicRegisterVerilog.containsSubstr "<= W'(1);")
       ) ++
       group "fail-closed diagnostics" (
         test "rejects an unretained generic width" outputs.rejectsUnretainedWidth $

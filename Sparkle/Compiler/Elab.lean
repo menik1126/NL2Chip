@@ -378,9 +378,9 @@ def extractBitVecLiteral (expr : Lean.Expr) : CompilerM (Nat × Nat) := do
   let args := expr.getAppArgs
   match fn with
   | .const name _ =>
-    if name == ``BitVec.ofNat && args.size >= 3 then
-      let w ← extractNat args[0]!
-      let v ← extractNat args[2]!
+    if name == ``BitVec.ofNat && args.size >= 2 then
+      let w ← extractNat args[args.size - 2]!
+      let v ← extractNat args[args.size - 1]!
       return (v, w)
     else if name == ``BitVec.ofFin && args.size >= 2 then
       let w ← extractNat args[0]!
@@ -394,6 +394,34 @@ def extractBitVecLiteral (expr : Lean.Expr) : CompilerM (Nat × Nat) := do
       CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got application of {name}"
   | _ =>
     CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
+
+/-- Extract a register reset value while retaining a symbolic BitVec width.
+    The register's inferred HWType remains the source of truth for sizing. -/
+partial def extractBitVecInitValue (expr : Lean.Expr) : CompilerM Nat := do
+  let fn := expr.getAppFn
+  let args := expr.getAppArgs
+  let value? ← match fn with
+  | .const name _ =>
+    if name == ``BitVec.ofNat && args.size >= 2 then
+      let _ ← extractDimExpr args[args.size - 2]!
+      pure (some (← extractNat args[args.size - 1]!))
+    else if name == ``BitVec.ofFin && args.size >= 2 then
+      let _ ← extractDimExpr args[0]!
+      pure (some (← extractNat args[1]!))
+    else if name == ``Bool.false then
+      pure (some 0)
+    else if name == ``Bool.true then
+      pure (some 1)
+    else pure none
+  | _ => pure none
+  match value? with
+  | some value => return value
+  | none =>
+    let reduced ← CompilerM.liftMetaM (whnf expr)
+    if reduced != expr then
+      extractBitVecInitValue reduced
+    else
+      CompilerM.liftMetaM $ throwError s!"Expected register reset literal, got: {expr}"
 
 /-- Extract a Nat literal from an expression -/
 def extractNatLiteral (expr : Lean.Expr) : CompilerM (Nat × Unit) := do
@@ -1365,7 +1393,7 @@ mutual
       trace[sparkle.compiler] "→ register"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let initVal ← extractBitVecInitValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
@@ -1377,7 +1405,7 @@ mutual
       trace[sparkle.compiler] "→ registerNeg"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let initVal ← extractBitVecInitValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
@@ -1390,7 +1418,7 @@ mutual
       trace[sparkle.compiler] "→ registerNoReset"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let initVal ← extractBitVecInitValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
@@ -1404,7 +1432,7 @@ mutual
       let init := args[args.size-3]!
       let en := args[args.size-2]!
       let input := args[args.size-1]!
-      let (initVal, _) ← extractBitVecLiteral init
+      let initVal ← extractBitVecInitValue init
       let enWire ← translateExprToWire en "reg_en"
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)

@@ -23,3 +23,7 @@ def symbolicSliceLow {dom : DomainConfig} {W : Nat}
 def symbolicZeroExtend {dom : DomainConfig} {W : Nat}
     (x : Signal dom (BitVec W)) : Signal dom (BitVec (W + 1)) :=
   x.map (·.zeroExtend (W + 1))
+
+def symbolicRegister {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  Signal.register (BitVec.ofNat W 1) x

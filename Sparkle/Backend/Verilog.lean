@@ -131,6 +131,13 @@ partial def emitExpr (e : Expr) : String :=
         s!"({emitExpr arg1} {emitOperator operator} {emitExpr arg2})"
     | _ => s!"/* ERROR: operator {operator} with wrong arity */"
 
+/-- Emit a reset literal using the register's declared storage type. -/
+def emitTypedConstant (value : Int) : HWType → String
+  | .bit => emitExpr (.const value 1)
+  | .bitVector width => emitExpr (.const value width)
+  | .bitVectorDim width => s!"{emitDimExpr width}'({value})"
+  | ty => panic! s!"Register reset constants require a packed bit type, found {ty}"
+
 /-- Emit a single statement.
     The optional `wires` parameter provides wire declarations for register
     reset value width lookup. -/
@@ -142,13 +149,9 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
 
   | .register output clock reset input initValue =>
     -- Generate always_ff block for register
-    -- Look up output wire width for correct reset literal width
-    let resetWidth := match wires.find? (fun p => p.name == output) with
-      | some p => match p.ty with
-        | .bitVector w => w
-        | .bit => 1
-        | _ => 8
-      | none => 8
+    let resetValue := match wires.find? (fun p => p.name == output) with
+      | some port => emitTypedConstant initValue port.ty
+      | none => panic! s!"Missing declared register wire '{output}'"
     -- If clock name ends with "__neg", emit negedge trigger (no reset for negedge regs)
     if clock.endsWith "__neg" then
       let baseClock := clock.dropRight 5
@@ -164,7 +167,7 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
     else
       s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge {sanitizeName reset}) begin\n" ++
       s!"{indent}    if ({sanitizeName reset})\n" ++
-      s!"{indent}        {sanitizeName output} <= {emitExpr (.const initValue resetWidth)};\n" ++
+      s!"{indent}        {sanitizeName output} <= {resetValue};\n" ++
       s!"{indent}    else\n" ++
       s!"{indent}        {sanitizeName output} <= {emitExpr input};\n" ++
       s!"{indent}end"
