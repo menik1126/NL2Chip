@@ -17,6 +17,13 @@ module symbolic_parameter_behavior_tb;
     wire [16:0] reg17_out;
     logic [64:0] reg65_in;
     wire [64:0] reg65_out;
+    logic [2:0] derived8_in;
+    wire [2:0] derived8_out;
+    logic [3:0] derived12_in;
+    wire [3:0] derived12_out;
+    logic [3:0] derived16_in;
+    wire [3:0] derived16_out;
+
 
     logic [1:0] mem2_write_addr;
     logic [2:0] mem2_write_data;
@@ -75,6 +82,18 @@ module symbolic_parameter_behavior_tb;
         ._gen_x(reg65_in), .clk(clk), .rst(rst), .out(reg65_out)
     );
 
+    symbolicDerivedLoop #(.DEPTH(8)) derived8_dut (
+        ._gen_x(derived8_in), .clk(clk), .rst(rst), .out(derived8_out)
+    );
+
+    symbolicDerivedLoop #(.DEPTH(12)) derived12_dut (
+        ._gen_x(derived12_in), .clk(clk), .rst(rst), .out(derived12_out)
+    );
+
+    symbolicDerivedLoop #(.DEPTH(16)) derived16_dut (
+        ._gen_x(derived16_in), .clk(clk), .rst(rst), .out(derived16_out)
+    );
+
     symbolicMemory #(.ADDR_W(2), .DATA_W(3)) mem2_dut (
         ._gen_writeAddr(mem2_write_addr),
         ._gen_writeData(mem2_write_data),
@@ -125,6 +144,10 @@ module symbolic_parameter_behavior_tb;
         reg3_in = 3'b110;
         reg17_in = 17'b1_0101_1001_1110_0011;
         reg65_in = {1'b1, 64'h0123_4567_89ab_cdef};
+        derived8_in = 3'b101;
+        derived12_in = 4'b1101;
+        derived16_in = 4'b0110;
+
         mem2_write_addr = 2'd1;
         mem2_write_data = 3'b101;
         mem2_write_enable = 1'b0;
@@ -163,6 +186,9 @@ module symbolic_parameter_behavior_tb;
         #1;
         if (reg3_out !== 3'd1 || reg17_out !== 17'd1 || reg65_out !== 65'd1)
             $fatal(1, "symbolic register reset sizing failed");
+        if (derived8_out !== 3'd0 || derived12_out !== 4'd0 || derived16_out !== 4'd0)
+            $fatal(1, "symbolic clog2 loop reset sizing failed");
+
 
         rst = 1'b0;
         #1;
@@ -170,6 +196,9 @@ module symbolic_parameter_behavior_tb;
         #1;
         if (reg3_out !== reg3_in || reg17_out !== reg17_in || reg65_out !== reg65_in)
             $fatal(1, "symbolic register update failed");
+        if (derived8_out !== derived8_in || derived12_out !== derived12_in || derived16_out !== derived16_in)
+            $fatal(1, "symbolic clog2 loop update failed");
+
         clk = 1'b0;
 
         mem2_write_enable = 1'b1;

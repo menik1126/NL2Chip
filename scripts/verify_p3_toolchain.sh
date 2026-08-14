@@ -37,6 +37,7 @@ PY
 
 lake build Sparkle
 lake exe verilog-tests
+lake build Tests.SymbolicParameterEmit
 lake env lean p3_tests/CppSimSpecializations.lean
 bash scripts/verify_symbolic_parameters.sh
 

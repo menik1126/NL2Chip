@@ -28,6 +28,10 @@ def bv1ToBool (x : Signal dom (BitVec 1)) : Signal dom Bool :=
 /-- Constant zero with width inferred from the result type. -/
 def zeroBV (w : Nat) : BitVec w :=
   BitVec.ofNat w 0
+/-- Type-level ceiling log2 for parameter-derived hardware dimensions. -/
+def clog2 (value : Nat) : Nat :=
+  if value <= 1 then 0 else Nat.log2 (value - 1) + 1
+
 
 /-- Constant all-ones mask with width inferred from the result type. -/
 def onesBV (w : Nat) : BitVec w :=

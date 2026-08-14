@@ -53,3 +53,11 @@ def symbolicGenerateNot {dom : DomainConfig} {W : Nat}
 def symbolicLoopXor {dom : DomainConfig} {W : Nat}
     (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
   Signal.loop fun q => Signal.register (BitVec.ofNat W 0) (q ^^^ x)
+
+/-- A symbolic derived width used by depth-indexed state such as a FIFO pointer.
+    ceiling-log2 DEPTH is preserved as the backend's symbolic clog2 expression. -/
+def symbolicDerivedLoop {dom : DomainConfig} {DEPTH : Nat}
+    (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 DEPTH)))
+    : Signal dom (BitVec (Sparkle.Library.RTL.clog2 DEPTH)) :=
+  Signal.loop fun q =>
+    Signal.register (BitVec.ofNat (Sparkle.Library.RTL.clog2 DEPTH) 0) (q ^^^ x)

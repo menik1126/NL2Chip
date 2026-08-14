@@ -17,6 +17,7 @@ import Sparkle.IR.Specialize
 import Sparkle.Compiler.DRC
 import Sparkle.Core.Signal
 import Sparkle.Core.Vector
+import Sparkle.Library.RTL
 
 namespace Sparkle.Compiler.Elab
 
@@ -271,6 +272,11 @@ def getOperator (name : Name) : Option Operator :=
   primitiveRegistry.lookup name
 
 partial def extractDimExpr (expr : Lean.Expr) : CompilerM DimExpr := do
+  let rawFn := expr.getAppFn
+  let rawArgs := expr.getAppArgs
+  if rawFn.isConstOf (Lean.Name.str (Lean.Name.str (Lean.Name.str (Lean.Name.str Lean.Name.anonymous "Sparkle") "Library") "RTL") "clog2") && !rawArgs.isEmpty then
+    return .clog2 (← extractDimExpr rawArgs.back!)
+
   let expr ← CompilerM.liftMetaM (whnf expr)
   match expr with
   | .lit (.natVal value) => return .literal value

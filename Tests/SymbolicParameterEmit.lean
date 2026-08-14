@@ -10,4 +10,5 @@ import Tests.SymbolicParameterCircuits
 #synthesizeParameterizedVerilog symbolicMemory [ADDR_W := 3, DATA_W := 8]
 #synthesizeParameterizedVerilogDesign symbolicXorHierarchy [W := 8]
 #synthesizeParameterizedVerilog symbolicLoopXor [W := 8]
+#synthesizeParameterizedVerilog symbolicDerivedLoop [DEPTH := 8]
 #synthesizeParameterizedVerilog symbolicGenerateNot [W := 8]
