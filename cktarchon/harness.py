@@ -15,6 +15,7 @@ from typing import Any
 import anthropic
 
 from .env import ensure_runtime_env
+from .diagnostics import build_lean_diagnostics, format_lean_diagnostics
 from .logs import AgentStats, append_jsonl
 
 BASH_TIMEOUT = 180
@@ -751,14 +752,14 @@ class AnthropicHarnessRunner:
             else:
                 errors = getattr(result, "errors", []) or []
                 lines = [f"FAIL ({elapsed:.2f}s, {len(errors)} errors)"]
-        error_text = getattr(result, "error_text", "")
-        if error_text:
-            lines.append(str(error_text)[:4000])
-        for err in (getattr(result, "errors", []) or [])[:12]:
-            pos = err.get("pos", {}) if isinstance(err, dict) else {}
-            loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
-            data = err.get("data", err) if isinstance(err, dict) else err
-            lines.append(f"[error {loc}] {data}")
+        errors = getattr(result, "errors", []) or []
+        diagnostics = build_lean_diagnostics(errors, max_entries=12)
+        if diagnostics:
+            lines.append(format_lean_diagnostics(diagnostics))
+        else:
+            error_text = getattr(result, "error_text", "")
+            if error_text:
+                lines.append(str(error_text)[:4000])
         for warning in (getattr(result, "warnings", []) or [])[:8]:
             pos = warning.get("pos", {}) if isinstance(warning, dict) else {}
             loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"

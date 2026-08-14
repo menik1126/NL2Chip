@@ -49,6 +49,7 @@ from cvdp_native_parameters import (
 )
 from lean_repl import LeanREPLPool
 from report import generate_report
+from cktarchon.diagnostics import format_lean_diagnostics
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -2056,8 +2057,13 @@ def summarize_eval_result(result: dict | None) -> str:
         sim_diag = extract_sim_diagnostics(detail, 1100) if sim_status in {"sim_fail", "sim_error"} else ""
         if sim_diag:
             lines.append(f"- Key simulator diagnostics: {sim_diag}")
+        elif result.get("lean_diagnostics"):
+            lines.append(
+                "- Actionable Lean diagnostics:\n"
+                + format_lean_diagnostics(result["lean_diagnostics"], max_chars=1800)
+            )
         else:
-            lines.append(f"- Detail: {truncate_text(clean_diagnostic_text(detail), 900, keep='tail')}")
+            lines.append(f"- Detail: {truncate_text(clean_diagnostic_text(detail), 900, keep='head')}")
         counts = extract_sim_test_counts(detail)
         if counts:
             tests, passed, failed = counts
@@ -2142,6 +2148,7 @@ def compact_repair_feedback(feedback: str) -> str:
         ("First Failing Assertions", COMPACT_ASSERTION_CHARS),
         ("Waveform Context", COMPACT_ASSERTION_CHARS),
         ("Cleaned Simulator Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
+        ("Actionable Lean Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
         ("Current Evaluation Summary", 900),
         ("Interface Diagnostics", COMPACT_INTERFACE_CHARS),
         ("Benchmark Interface Contract", COMPACT_INTERFACE_CHARS),
@@ -2318,6 +2325,15 @@ def build_sim_feedback(
         "### Current Evaluation Summary",
         evaluation_summary,
     ]
+    if not direct_verilog and result.get("lean_diagnostics"):
+        lines.extend([
+            "",
+            "### Actionable Lean Diagnostics",
+            "Normalized from the full compiler output; internal elaborator terms are omitted. The raw output remains in the run diagnostics sidecar.",
+            "```text",
+            format_lean_diagnostics(result["lean_diagnostics"], max_chars=COMPACT_DIAGNOSTIC_CHARS),
+            "```",
+        ])
     simulator_output = read_simulator_output(prob_id, run_dir)
     combined_detail = "\n".join(
         part for part in [str(result.get("detail") or ""), simulator_output] if part.strip()

@@ -43,6 +43,12 @@ from parameter_backends import (
     run_ppa_parameter_policy,
 )
 from orfs_runner import run_docker_command
+from cktarchon.diagnostics import (
+    build_lean_diagnostics,
+    format_lean_diagnostics,
+    lean_diagnostic_signature,
+    parse_lean_error_text,
+)
 
 
 DATASET_DIR = Path("verilog-eval/dataset_spec-to-rtl")
@@ -100,6 +106,42 @@ def _lean_diagnostic_stage(detail: str) -> str:
         "symbolic_dimension_lowering"
         if any(marker in text for marker in symbolic_markers)
         else "lean_elaboration"
+    )
+
+
+def _record_lean_compile_failure(
+    result: dict,
+    *,
+    run_dir: Path,
+    prob_id: str,
+    raw_text: str,
+    errors: list[dict] | None = None,
+) -> None:
+    records = (
+        build_lean_diagnostics(errors or [])
+        if errors
+        else parse_lean_error_text(raw_text)
+    )
+    concise = format_lean_diagnostics(records)
+    detail = "Compile failed:\n" + (concise or "Lean compilation failed without a structured diagnostic.")
+    diagnostic_dir = run_dir / "diagnostics" / prob_id
+    raw_path: Path | None = None
+    try:
+        diagnostic_dir.mkdir(parents=True, exist_ok=True)
+        sequence = len(list(diagnostic_dir.glob("lean_compile_*.txt"))) + 1
+        raw_path = diagnostic_dir / f"lean_compile_{sequence:02d}.txt"
+        raw_path.write_text(str(raw_text or ""), encoding="utf-8")
+    except OSError:
+        raw_path = None
+    result["lean_diagnostics"] = records
+    result["diagnostic_signature"] = lean_diagnostic_signature(records)
+    if raw_path is not None:
+        result["raw_diagnostic_path"] = str(raw_path)
+    _record_failure(
+        result,
+        _lean_diagnostic_stage(raw_text),
+        detail,
+        code="lean_compile_failed",
     )
 
 
@@ -2610,12 +2652,12 @@ class Evaluator:
             # ── Fast path: use persistent REPL (~0.1s) ──
             repl_result = self.lean_repl.check_file(lean_file)
             if not repl_result.passed:
-                detail = f"Compile failed:\n{repl_result.error_text[:1000]}"
-                _record_failure(
+                _record_lean_compile_failure(
                     result,
-                    _lean_diagnostic_stage(detail),
-                    detail,
-                    code="lean_compile_failed",
+                    run_dir=run_dir,
+                    prob_id=prob_id,
+                    raw_text=repl_result.error_text,
+                    errors=list(getattr(repl_result, "errors", []) or []),
                 )
                 return result
             result["compile_pass"] = True
@@ -2650,12 +2692,11 @@ class Evaluator:
             build_output = comp.stdout + "\n" + comp.stderr
             has_error = comp.returncode != 0 or re.search(r"error:", build_output)
             if has_error:
-                detail = f"Compile failed:\n{build_output[:1000]}"
-                _record_failure(
+                _record_lean_compile_failure(
                     result,
-                    _lean_diagnostic_stage(detail),
-                    detail,
-                    code="lean_compile_failed",
+                    run_dir=run_dir,
+                    prob_id=prob_id,
+                    raw_text=build_output,
                 )
                 return result
 
