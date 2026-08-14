@@ -34,8 +34,10 @@ from cvdp_native_parameters import (
 )
 from cvdp_specialization import FiniteParameterPlan, plan_from_dict
 from parameter_backends import (
+    cppsim_policy_is_required_failure,
     evaluate_formal_parameter_policy,
     formal_policy_is_required_failure,
+    run_cppsim_parameter_policy,
 )
 
 
@@ -2033,6 +2035,69 @@ def _public_derived_parameter_value(
     return _safe_sv_int_expr(expr)
 
 
+def _cppsim_native_case_requests(
+    *,
+    plan: FiniteParameterPlan,
+    payload: dict,
+    info,
+    native_manifest: dict,
+) -> list[dict]:
+    """Build concrete CppSim requests and expose current ABI exclusions."""
+    expected_ports = [tuple(port) for port in payload.get("expected_ports", [])]
+    core_ports = [
+        tuple(port) for port in native_manifest.get("generated_core_ports", [])
+    ]
+    derived_names = list(payload.get("derived_parameter_names", []))
+    public_text = (
+        str(getattr(info, "ref_code", ""))
+        + "\n"
+        + str(getattr(info, "prompt_text", ""))
+        + "\n"
+        + "\n".join(
+            str(content)
+            for path, content in (
+                (getattr(info, "metadata", {}) or {}).get("harness_files", {})
+            ).items()
+            if str(path).endswith(".py")
+        )
+    )
+
+    requests = []
+    for case in plan.cases:
+        values = dict(case.values)
+        reasons: list[str] = []
+        for name in derived_names:
+            value = _public_derived_parameter_value(
+                parameter_name=name,
+                case_values=values,
+                public_text=public_text,
+            )
+            if value is None:
+                reasons.append(
+                    f"could not derive concrete CppSim value for parameter {name}"
+                )
+            else:
+                values[name] = value
+
+        for _, typ, port_name in [*expected_ports, *core_ports]:
+            concrete_type = _specialize_sv_type(typ, values)
+            width = _concrete_sv_width(concrete_type)
+            if width is None:
+                reasons.append(
+                    f"could not specialize CppSim port {port_name} type {typ}"
+                )
+            elif width > 64:
+                reasons.append(
+                    f"CppSim behavioral ABI supports packed ports up to 64 bits; "
+                    f"{port_name} specializes to {width} bits"
+                )
+        request = {"parameters": values}
+        if reasons:
+            request["unsupported_reason"] = "; ".join(dict.fromkeys(reasons))
+        requests.append(request)
+    return requests
+
+
 def _module_body(sv_code: str, module_name: str) -> str:
     return _first_module_record(sv_code, module_name)[2]
 
@@ -2278,6 +2343,8 @@ class Evaluator:
         dataset: str = "verilogeval",
         dataset_obj=None,
         parameter_formal_policy: str = "auto",
+        parameter_cppsim_policy: str = "off",
+        parameter_cppsim_required: bool = False,
     ):
         self.project_root = project_root.resolve()
         self.dataset_name = dataset.lower()
@@ -2291,6 +2358,8 @@ class Evaluator:
         self.enable_corners = enable_corners and self.enable_pnr  # corners require pnr
         self.lean_repl = lean_repl  # Optional LeanREPL instance for fast compilation
         self.parameter_formal_policy = parameter_formal_policy
+        self.parameter_cppsim_policy = parameter_cppsim_policy
+        self.parameter_cppsim_required = parameter_cppsim_required
 
         if self.enable_synth:
             # Add siliconcrew/src to path for synthesis tools
@@ -2551,6 +2620,48 @@ class Evaluator:
                     "unsupported_backend",
                     detail,
                     code="formal_parameter_policy_failed",
+                )
+                return result
+
+            cppsim_dir = run_dir / "cppsim" / prob_id
+            cppsim_manifest = run_cppsim_parameter_policy(
+                project_root=self.project_root,
+                lean_file=lean_file,
+                target_name=str(
+                    metadata.get("cppsim_target")
+                    or native_manifest.get("generated_core_module")
+                    or native_plan.design_name
+                ),
+                case_requests=_cppsim_native_case_requests(
+                    plan=native_plan,
+                    payload=native_payload or {},
+                    info=info,
+                    native_manifest=native_manifest,
+                ),
+                output_dir=cppsim_dir,
+                requested_policy=self.parameter_cppsim_policy,
+                required=self.parameter_cppsim_required,
+            )
+            cppsim_manifest_path = cppsim_dir / "manifest.json"
+            cppsim_manifest_path.write_text(
+                json.dumps(cppsim_manifest, indent=2), encoding="utf-8"
+            )
+            result.update({
+                "cppsim_parameter_manifest": str(cppsim_manifest_path),
+                "cppsim_parameter_policy": cppsim_manifest["effective_policy"],
+                "cppsim_status": cppsim_manifest["status"],
+                "cppsim_coverage": cppsim_manifest["coverage"],
+                "cppsim_family_covered": cppsim_manifest["family_covered"],
+            })
+            if cppsim_policy_is_required_failure(cppsim_manifest):
+                detail = "CppSim parameter policy failed: " + "; ".join(
+                    cppsim_manifest.get("diagnostics", [])
+                )
+                _record_failure(
+                    result,
+                    "unsupported_backend",
+                    detail,
+                    code="cppsim_parameter_policy_failed",
                 )
                 return result
 

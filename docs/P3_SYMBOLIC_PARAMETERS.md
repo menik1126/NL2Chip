@@ -120,3 +120,28 @@ sweep case. Explicit policies fail closed with `unsupported_backend`; `auto`
 uses a supplied contract but otherwise records the lack of a formal oracle and
 continues simulation. Each run writes `formal/<prob_id>/manifest.json` so
 default-width, partial-case, and full-family claims remain distinguishable.
+
+## CppSim Specialization Policy
+
+CppSim currently uses fixed C++ field/ABI types. Native symbolic IR is therefore
+specialized explicitly by `Sparkle.IR.Specialize` before C++ emission. The
+command
+
+```lean
+#writeParameterizedCppSimDesign design [WIDTH := 17] "design_cppsim.h"
+```
+
+evaluates symbolic port/wire/register/memory dimensions, unrolls symbolic
+per-bit generate loops, and removes hierarchical parameter bindings for exactly
+that configuration. Missing dimensions and conflicting hierarchy bindings fail
+closed.
+
+`--native-cppsim-policy per_configuration` runs this command for every public
+CVDP configuration, compiles each header with a C++17 compiler, executes a
+`reset/eval/tick` smoke program, and writes
+`cppsim/<prob_id>/manifest.json`. Its declared scope is backend build/smoke
+coverage, not CVDP functional correctness. The current behavioral ABI does not
+soundly support packed ports wider than 64 bits; such cases are explicitly
+`unsupported`, so partial coverage cannot become family coverage.
+`--require-native-cppsim` turns any failed/unsupported case into an
+`unsupported_backend` evaluation failure.

@@ -145,6 +145,20 @@ def parse_args() -> argparse.Namespace:
             "unsupported without treating Lean elaboration as a functional proof."
         ),
     )
+    p.add_argument(
+        "--native-cppsim-policy",
+        choices=["off", "per_configuration"],
+        default="per_configuration",
+        help=(
+            "CppSim policy for native parameter families. The supported mode "
+            "specializes, compiles, and smoke-runs one concrete C++ model per public case."
+        ),
+    )
+    p.add_argument(
+        "--require-native-cppsim",
+        action="store_true",
+        help="Fail evaluation when CppSim cannot cover every public parameter case.",
+    )
     p.add_argument("--workers", type=int, default=1, help="Concurrent problem workers; each receives an isolated Lean REPL.")
     p.add_argument("--archon-src", default=str(ARCHON_SRC), help="Official Archon src directory for codex-agent/archon-native harnesses.")
     p.add_argument("--codex-bin", default=None, help="Optional absolute path to the codex CLI for --harness codex-agent.")
@@ -1359,6 +1373,8 @@ def main() -> None:
                 dataset_obj=ds,
                 lean_repl=repl,
                 parameter_formal_policy=args.native_formal_policy,
+                parameter_cppsim_policy=args.native_cppsim_policy,
+                parameter_cppsim_required=args.require_native_cppsim,
             )
             print(f"[{idx}/{len(problems)}] run {prob_id}")
             record = process_problem(prob_id, args=args, ds=ds, evaluator=evaluator, run_dir=run_dir, skill=skill, repl=repl)

@@ -272,6 +272,22 @@ instance : Append StmtParts where
 def StmtParts.empty : StmtParts :=
   { declarations := [], evalBody := [], tickBody := [], resetBody := [], evalTickLocals := [] }
 
+/-- Emit one concrete bit update produced by an unrolled Signal.mapBits loop. -/
+def emitGeneratedBitAssignment (typeMap : List (String × HWType))
+    (target indexExpr : String) (rhs : Expr) : StmtParts :=
+  let width := lookupWidth typeMap target
+  let targetName := sanitizeName target
+  let valueExpr := emitExpr typeMap rhs
+  let updated :=
+    s!"(({targetName} & ~(1ULL << ({indexExpr}))) | " ++
+    s!"((({valueExpr}) & 1ULL) << ({indexExpr})))"
+  let masked := applyMask updated width
+  { declarations := []
+  , evalBody := [s!"        {targetName} = {masked};"]
+  , tickBody := []
+  , resetBody := []
+  , evalTickLocals := [] }
+
 /-- Emit a C++ constant expression for an init value with given width -/
 def emitInitValue (initValue : Int) (width : Nat) : String :=
   let cppType := emitCppType (.bitVector width)
@@ -304,8 +320,17 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       , resetBody := []
       , evalTickLocals := [] }
 
-  | .assignExpr .. =>
-    panic! "CppSim requires specialization before generated lvalue assignments"
+  | .assignExpr lhs rhs =>
+    match lhs with
+    | .index (.ref target) index =>
+      emitGeneratedBitAssignment typeMap target (emitExpr typeMap index) rhs
+    | .slice (.ref target) hi lo =>
+      if hi == lo then
+        emitGeneratedBitAssignment typeMap target (toString lo) rhs
+      else
+        panic! "CppSim generated lvalue slice must select exactly one bit"
+    | _ =>
+      panic! "CppSim supports only specialized per-bit generated lvalue assignments"
 
   | .generateFor label .. =>
     panic! s!"CppSim requires specialization of generate loop '{label}'"

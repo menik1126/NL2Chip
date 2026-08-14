@@ -13,6 +13,7 @@ import Sparkle.Data.BitPack
 import Sparkle.Backend.Verilog
 import Sparkle.Backend.CppSim
 import Sparkle.IR.Optimize
+import Sparkle.IR.Specialize
 import Sparkle.Compiler.DRC
 import Sparkle.Core.Signal
 import Sparkle.Core.Vector
@@ -2006,6 +2007,34 @@ elab_rules : command
           IO.println s!"// {warning}"
       IO.println (toVerilogDesign design)
       IO.println "\n// Native parameterized Verilog design successfully generated."
+
+syntax (name := writeParameterizedCppSimDesign)
+  "#writeParameterizedCppSimDesign " ident " [" sparkleParameterBinding,* "]" str : command
+
+/-- Specialize one native parameter configuration before invoking the fixed-ABI
+    CppSim backend. The output is deliberately one concrete C++ model. -/
+elab_rules : command
+  | `(#writeParameterizedCppSimDesign $id:ident [$bindings:sparkleParameterBinding,*] $path:str) => do
+    let mut parameters : List (String × Nat) := []
+    for binding in bindings.getElems do
+      match binding with
+      | `(sparkleParameterBinding| $name:ident := $value:num) =>
+        parameters := parameters ++ [(name.getId.toString, value.getNat)]
+      | _ => throwUnsupportedSyntax
+    let declName ← Lean.Elab.Command.liftCoreM do
+      Lean.resolveGlobalConstNoOverload id
+    Lean.Elab.Command.liftTermElabM do
+      let design ← synthesizeHierarchicalWithParameters declName parameters
+      let specialized ← match Sparkle.IR.Specialize.specializeDesign design parameters with
+        | .ok concrete => pure concrete
+        | .error message => throwError message
+      let optimized := Sparkle.IR.Optimize.optimizeDesign specialized
+      let cpp := Sparkle.Backend.CppSim.toCppSimDesign optimized
+      let outputPath := path.getString
+      if let some dir := (System.FilePath.mk outputPath).parent then
+        IO.FS.createDirAll dir
+      IO.FS.writeFile outputPath cpp
+      IO.println s!"Written specialized C++ simulation for {parameters} to {outputPath}"
 
 elab "#synthesizeDesign" id:ident : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
