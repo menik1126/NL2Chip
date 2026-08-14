@@ -27,6 +27,10 @@ open Sparkle.Backend.Verilog
 
 initialize registerTraceClass `sparkle.compiler
 
+initialize sparkleModuleAttr : TagAttribute ←
+  registerTagAttribute `sparkle_module
+    "Preserve this Sparkle definition as a SystemVerilog module boundary"
+
 instance : Inhabited Sparkle.IR.AST.Port := ⟨{ name := "default", ty := .bit }⟩
 
 
@@ -180,6 +184,14 @@ def emitMemoryComboReadDim (hint : String) (addrWidth dataWidth : DimExpr) (clk 
 def emitInstance (moduleName : String) (instName : String) (connections : List (String × Sparkle.IR.AST.Expr)) : CompilerM Unit := do
   let cs ← get
   let ((), cs') := CircuitM.emitInstance moduleName instName connections cs
+  set cs'
+
+def emitParameterizedInstance (moduleName : String) (instName : String)
+    (parameterBindings : List (String × DimExpr))
+    (connections : List (String × Sparkle.IR.AST.Expr)) : CompilerM Unit := do
+  let cs ← get
+  let ((), cs') := CircuitM.emitParameterizedInstance moduleName instName
+    parameterBindings connections cs
   set cs'
 
 def addModuleToDesign (m : Sparkle.IR.AST.Module) : CompilerM Unit := do
@@ -359,6 +371,39 @@ def isSignalBinderType (type : Lean.Expr) : CompilerM Bool := do
 partial def topLevelBinderNames : Lean.Expr → List String
   | .lam name _ body _ => name.toString :: topLevelBinderNames body
   | _ => []
+
+partial def topLevelBinderInfo : Lean.Expr → List (String × Bool)
+  | .lam name binderType body _ =>
+    (name.toString, binderType.isConstOf ``Nat) :: topLevelBinderInfo body
+  | _ => []
+
+def definitionParameterBindings (declName : Name) (args : Array Lean.Expr) :
+    CompilerM (List (String × Nat) × List (String × DimExpr)) := do
+  let binders ← CompilerM.liftMetaM do
+    let constInfo ← getConstInfo declName
+    match constInfo with
+    | .defnInfo info => return topLevelBinderInfo info.value
+    | _ => throwError s!"Cannot inspect module boundary {declName}"
+  if args.size < binders.length then
+    CompilerM.liftMetaM $ throwError
+      s!"Module boundary {declName} has {binders.length} binders but only {args.size} arguments"
+  let actuals := args.toList.drop (args.size - binders.length)
+  let compilerState ← CompilerM.getCompilerState
+  let mut defaults : List (String × Nat) := []
+  let mut bindings : List (String × DimExpr) := []
+  for ((binderName, isNat), actual) in binders.zip actuals do
+    if isNat then
+      let dimension ← extractDimExpr actual
+      let defaultValue ← match dimension.evaluate compilerState.parameterDefaults with
+        | some value => pure value
+        | none => CompilerM.liftMetaM $ throwError
+          s!"Cannot evaluate default for parameter '{binderName}' of module {declName}: {dimension}"
+      if defaultValue == 0 then
+        CompilerM.liftMetaM $ throwError
+          s!"Parameter '{binderName}' of module {declName} has a zero-width default"
+      defaults := defaults ++ [(binderName, defaultValue)]
+      bindings := bindings ++ [(binderName, dimension)]
+  return (defaults, bindings)
 
 /-- Build a concrete or symbolic IR slice without freezing either bound. -/
 def makeSliceExpr (source : Sparkle.IR.AST.Expr) (hi lo : DimExpr) :
@@ -1598,38 +1643,44 @@ mutual
 
     if !isValidDef then return none
 
-    trace[sparkle.compiler] "→ definition unfold {name}"
+    let preserveModuleBoundary ← CompilerM.liftMetaM do
+      return sparkleModuleAttr.hasTag (← getEnv) name
+
+    trace[sparkle.compiler] "→ definition unfold {name} preserveBoundary={preserveModuleBoundary}"
 
     -- First try to reduce the function call and translate inline.
     -- Use reducible transparency to avoid expanding HAdd/HAppend mixed instances
-    let eReduced ← CompilerM.liftMetaM do
-      match ← Lean.Meta.unfoldDefinition? e with
-        | some e' => return e'
-        | none => return e
-    if eReduced != e then
-      try
-        let w ← translateExprToWire eReduced hint (isNamed := isNamed)
-        return some w
-      catch _ex1 =>
-        -- Inline expansion failed (often due to mixed Signal/BitVec operators
-        -- inside the expanded body). Retry with reducible transparency to
-        -- prevent over-expansion of Signal.pure and OfNat instances.
+    if !preserveModuleBoundary then
+      let eReduced ← CompilerM.liftMetaM do
+        match ← Lean.Meta.unfoldDefinition? e with
+          | some e' => return e'
+          | none => return e
+      if eReduced != e then
         try
-          let eReduced2 ← CompilerM.liftMetaM do
-            Lean.Meta.withTransparency .reducible do
-              match ← Lean.Meta.unfoldDefinition? e with
-              | some e' => return e'
-              | none => return e
-          if eReduced2 != e then
-            let w ← translateExprToWire eReduced2 hint (isNamed := isNamed)
-            return some w
-        catch ex2 =>
-          let msg := ex2.toMessageData
-          CompilerM.liftMetaM $ throwError m!"Inline expansion failed for {name}:\n{msg}"
+          let w ← translateExprToWire eReduced hint (isNamed := isNamed)
+          return some w
+        catch _ex1 =>
+          -- Inline expansion failed (often due to mixed Signal/BitVec operators
+          -- inside the expanded body). Retry with reducible transparency to
+          -- prevent over-expansion of Signal.pure and OfNat instances.
+          try
+            let eReduced2 ← CompilerM.liftMetaM do
+              Lean.Meta.withTransparency .reducible do
+                match ← Lean.Meta.unfoldDefinition? e with
+                | some e' => return e'
+                | none => return e
+            if eReduced2 != e then
+              let w ← translateExprToWire eReduced2 hint (isNamed := isNamed)
+              return some w
+          catch ex2 =>
+            let msg := ex2.toMessageData
+            CompilerM.liftMetaM $ throwError m!"Inline expansion failed for {name}:\n{msg}"
 
     -- Fallback: sub-module synthesis
     trace[sparkle.compiler] "→ sub-module synthesis {name}"
-    let (subModule, subDesign) ← CompilerM.liftMetaM $ synthesizeCombinational name
+    let (childDefaults, parameterBindings) ← definitionParameterBindings name args
+    let (subModule, subDesign) ← CompilerM.liftMetaM $
+      synthesizeCombinationalWithParameters name childDefaults
     for m in subDesign.modules do CompilerM.addModuleToDesign m
     CompilerM.addModuleToDesign subModule
 
@@ -1648,7 +1699,8 @@ mutual
     let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
     connections := ("out", Sparkle.IR.AST.Expr.ref resWire) :: connections
 
-    CompilerM.emitInstance subModule.name s!"inst_{subModule.name}" connections.reverse
+    CompilerM.emitParameterizedInstance subModule.name s!"inst_{subModule.name}"
+      parameterBindings connections.reverse
     return some resWire
 
   -- ===========================================================================
@@ -1863,10 +1915,35 @@ elab_rules : command
       IO.println (toVerilog module)
       IO.println "\n// Native parameterized Verilog successfully generated."
 
-def synthesizeHierarchical (declName : Name) : MetaM Sparkle.IR.AST.Design := do
-  let (module, design) ← synthesizeCombinational declName
+def synthesizeHierarchicalWithParameters (declName : Name)
+    (parameters : List (String × Nat)) : MetaM Sparkle.IR.AST.Design := do
+  let (module, design) ← synthesizeCombinationalWithParameters declName parameters
   let design' := if (design.modules.any (·.name == module.name)) then design else design.addModule module
   return design'
+
+def synthesizeHierarchical (declName : Name) : MetaM Sparkle.IR.AST.Design :=
+  synthesizeHierarchicalWithParameters declName []
+
+syntax (name := synthesizeParameterizedVerilogDesign)
+  "#synthesizeParameterizedVerilogDesign " ident " [" sparkleParameterBinding,* "]" : command
+
+elab_rules : command
+  | `(#synthesizeParameterizedVerilogDesign $id:ident [$bindings:sparkleParameterBinding,*]) => do
+    let mut parameters : List (String × Nat) := []
+    for binding in bindings.getElems do
+      match binding with
+      | `(sparkleParameterBinding| $name:ident := $value:num) =>
+        parameters := parameters ++ [(name.getId.toString, value.getNat)]
+      | _ => throwUnsupportedSyntax
+    let declName ← Lean.Elab.Command.liftCoreM do
+      Lean.resolveGlobalConstNoOverload id
+    Lean.Elab.Command.liftTermElabM do
+      let design ← synthesizeHierarchicalWithParameters declName parameters
+      for module in design.modules do
+        for warning in Sparkle.Compiler.DRC.checkRegisteredOutputs module do
+          IO.println s!"// {warning}"
+      IO.println (toVerilogDesign design)
+      IO.println "\n// Native parameterized Verilog design successfully generated."
 
 elab "#synthesizeDesign" id:ident : command => do
   let declName ← Lean.Elab.Command.liftCoreM do

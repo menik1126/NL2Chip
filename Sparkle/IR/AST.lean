@@ -173,6 +173,7 @@ inductive Stmt where
       (moduleName : String)   -- Name of module to instantiate
       (instName : String)     -- Instance name
       (connections : List (String × Expr))  -- Port connections
+      (parameterBindings : List (String × DimExpr) := [])
       : Stmt
   deriving Repr, BEq
 
@@ -187,9 +188,12 @@ def toString : Stmt → String
       let readKind := if comboRead then "combo_read" else "read"
       s!"memory {name}[2^{addrWidth}][{dataWidth}] @(posedge {clock}) " ++
       s!"write({writeAddr}, {writeData}, {writeEnable}) {readKind}({readAddr}) => {readData}"
-  | inst modName instName conns =>
+  | inst modName instName conns parameterBindings =>
+      let parameterStr := if parameterBindings.isEmpty then "" else
+        let bindings := parameterBindings.map fun (name, value) => s!".{name}({value})"
+        s!" #({String.intercalate ", " bindings})"
       let connStr := String.intercalate ", " (conns.map fun (p, e) => s!".{p}({e})")
-      s!"{modName} {instName}({connStr})"
+      s!"{modName}{parameterStr} {instName}({connStr})"
 
 instance : ToString Stmt where
   toString := Stmt.toString

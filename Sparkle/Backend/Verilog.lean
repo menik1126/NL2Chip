@@ -200,11 +200,17 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
         s!"{indent}end"
       memDecl ++ "\n" ++ alwaysBlock
 
-  | .inst moduleName instName connections =>
+  | .inst moduleName instName connections parameterBindings =>
+    let parameterOverrides := if parameterBindings.isEmpty then "" else
+      let bindings := parameterBindings.map fun (name, value) =>
+        s!".{sanitizeName name}({emitDimExpr value})"
+      " #(\n" ++ indent ++ "    " ++
+        String.intercalate (",\n" ++ indent ++ "    ") bindings ++
+        "\n" ++ indent ++ ")"
     let connStrs := connections.map fun (portName, expr) =>
       s!".{sanitizeName portName}({emitExpr expr})"
     let connList := String.intercalate ", " connStrs
-    s!"{indent}{sanitizeName moduleName} {sanitizeName instName} ({connList});"
+    s!"{indent}{sanitizeName moduleName}{parameterOverrides} {sanitizeName instName} ({connList});"
 
 /-- Emit port declarations for module header -/
 def emitPortList (inputs : List Port) (outputs : List Port) : String :=

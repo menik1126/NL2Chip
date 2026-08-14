@@ -259,6 +259,7 @@ structure StmtParts where
   tickBody        : List String
   resetBody       : List String
   evalTickLocals  : List String   -- _next local decls for evalTick()
+  deriving Inhabited
 
 instance : Append StmtParts where
   append a b :=
@@ -346,29 +347,32 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       , resetBody := [s!"        {memName}.fill(0);"]
       , evalTickLocals := [] }
 
-  | .inst moduleName instName connections =>
-    let className := sanitizeName moduleName
-    let iName := sanitizeName instName
-    -- Look up sub-module in design to determine input/output ports
-    let subModule := design.bind fun (d : Design) => d.findModule moduleName
-    let outputPortNames : List String := match subModule with
-      | some sm => sm.outputs.map fun (p : Port) => p.name
-      | none => []
-    let inputConns := connections.filterMap fun (portName, expr) =>
-      if !outputPortNames.contains portName then
-        some s!"        {iName}.{sanitizeName portName} = {emitExpr typeMap expr};"
-      else none
-    let outputConns := connections.filterMap fun (portName, expr) =>
-      if outputPortNames.contains portName then
-        match expr with
-        | .ref wireName => some s!"        {sanitizeName wireName} = {iName}.{sanitizeName portName};"
-        | _ => none
-      else none
-    { declarations := [s!"    {className} {iName};"]
-    , evalBody := inputConns ++ [s!"        {iName}.eval();"] ++ outputConns
-    , tickBody := [s!"        {iName}.tick();"]
-    , resetBody := [s!"        {iName}.reset();"]
-    , evalTickLocals := [] }
+  | .inst moduleName instName connections parameterBindings =>
+    if !parameterBindings.isEmpty then
+      panic! s!"CppSim requires specialization of parameterized instance '{instName}'"
+    else
+      let className := sanitizeName moduleName
+      let iName := sanitizeName instName
+      -- Look up sub-module in design to determine input/output ports
+      let subModule := design.bind fun (d : Design) => d.findModule moduleName
+      let outputPortNames : List String := match subModule with
+        | some sm => sm.outputs.map fun (p : Port) => p.name
+        | none => []
+      let inputConns := connections.filterMap fun (portName, expr) =>
+        if !outputPortNames.contains portName then
+          some s!"        {iName}.{sanitizeName portName} = {emitExpr typeMap expr};"
+        else none
+      let outputConns := connections.filterMap fun (portName, expr) =>
+        if outputPortNames.contains portName then
+          match expr with
+          | .ref wireName => some s!"        {sanitizeName wireName} = {iName}.{sanitizeName portName};"
+          | _ => none
+        else none
+      { declarations := [s!"    {className} {iName};"]
+      , evalBody := inputConns ++ [s!"        {iName}.eval();"] ++ outputConns
+      , tickBody := [s!"        {iName}.tick();"]
+      , resetBody := [s!"        {iName}.reset();"]
+      , evalTickLocals := [] }
 
 /-- Collect all wire name references from an IR expression -/
 partial def collectExprRefs : Expr → List String

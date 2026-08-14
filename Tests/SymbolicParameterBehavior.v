@@ -30,6 +30,16 @@ module symbolic_parameter_behavior_tb;
     logic [3:0] mem4_read_addr;
     wire [16:0] mem4_read_data;
 
+    logic [2:0] hier3_lhs;
+    logic [2:0] hier3_rhs;
+    wire [2:0] hier3_out;
+    logic [16:0] hier17_lhs;
+    logic [16:0] hier17_rhs;
+    wire [16:0] hier17_out;
+    logic [64:0] hier65_lhs;
+    logic [64:0] hier65_rhs;
+    wire [64:0] hier65_out;
+
     symbolicConcat #(.HI(3), .LO(5)) concat_dut (
         ._gen_hi(concat_hi),
         ._gen_lo(concat_lo),
@@ -74,6 +84,18 @@ module symbolic_parameter_behavior_tb;
         .clk(clk), .rst(rst), .out(mem4_read_data)
     );
 
+    symbolicXorHierarchy #(.W(3)) hier3_dut (
+        ._gen_lhs(hier3_lhs), ._gen_rhs(hier3_rhs), .out(hier3_out)
+    );
+
+    symbolicXorHierarchy #(.W(17)) hier17_dut (
+        ._gen_lhs(hier17_lhs), ._gen_rhs(hier17_rhs), .out(hier17_out)
+    );
+
+    symbolicXorHierarchy #(.W(65)) hier65_dut (
+        ._gen_lhs(hier65_lhs), ._gen_rhs(hier65_rhs), .out(hier65_out)
+    );
+
     initial begin
         concat_hi = 3'b101;
         concat_lo = 5'b10011;
@@ -92,6 +114,12 @@ module symbolic_parameter_behavior_tb;
         mem4_write_data = 17'h1_2345;
         mem4_write_enable = 1'b0;
         mem4_read_addr = 4'd0;
+        hier3_lhs = 3'b101;
+        hier3_rhs = 3'b011;
+        hier17_lhs = 17'h1_5a3c;
+        hier17_rhs = 17'h0_0ff0;
+        hier65_lhs = {1'b1, 64'h0123_4567_89ab_cdef};
+        hier65_rhs = {1'b0, 64'hffff_0000_ffff_0000};
         #1;
 
         if (concat_out !== {concat_hi, concat_lo})
@@ -100,6 +128,10 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic slice failed: got %b", slice_out);
         if (zext_out !== {1'b0, zext_in})
             $fatal(1, "symbolic zero extension failed: got %b", zext_out);
+        if (hier3_out !== (hier3_lhs ^ hier3_rhs) ||
+            hier17_out !== (hier17_lhs ^ hier17_rhs) ||
+            hier65_out !== (hier65_lhs ^ hier65_rhs))
+            $fatal(1, "symbolic hierarchy parameter forwarding failed");
 
         rst = 1'b1;
         #1;

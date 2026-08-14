@@ -34,3 +34,12 @@ def symbolicMemory {dom : DomainConfig} {ADDR_W DATA_W : Nat}
     (writeEnable : Signal dom Bool)
     (readAddr : Signal dom (BitVec ADDR_W)) : Signal dom (BitVec DATA_W) :=
   Signal.memory writeAddr writeData writeEnable readAddr
+
+@[sparkle_module]
+def symbolicXorChild {dom : DomainConfig} {W : Nat}
+    (lhs rhs : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  lhs ^^^ rhs
+
+def symbolicXorHierarchy {dom : DomainConfig} {W : Nat}
+    (lhs rhs : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  symbolicXorChild lhs rhs

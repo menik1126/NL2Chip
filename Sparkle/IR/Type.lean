@@ -60,6 +60,28 @@ def mkMul : DimExpr → DimExpr → DimExpr
   | .literal lhs, .literal rhs => .literal (lhs * rhs)
   | lhs, rhs => .mul lhs rhs
 
+partial def evaluate (bindings : List (String × Nat)) : DimExpr → Option Nat
+  | .literal value => some value
+  | .parameter name => bindings.lookup name
+  | .add lhs rhs => do return (← evaluate bindings lhs) + (← evaluate bindings rhs)
+  | .sub lhs rhs => do return (← evaluate bindings lhs) - (← evaluate bindings rhs)
+  | .mul lhs rhs => do return (← evaluate bindings lhs) * (← evaluate bindings rhs)
+  | .div lhs rhs => do
+    let divisor ← evaluate bindings rhs
+    if divisor == 0 then none else return (← evaluate bindings lhs) / divisor
+  | .mod lhs rhs => do
+    let divisor ← evaluate bindings rhs
+    if divisor == 0 then none else return (← evaluate bindings lhs) % divisor
+  | .pow base exponent => do
+    return (← evaluate bindings base) ^ (← evaluate bindings exponent)
+  | .clog2 value => do
+    let value ← evaluate bindings value
+    if value ≤ 1 then some 0 else some (Nat.log2 (value - 1) + 1)
+  | .min lhs rhs => do
+    return Nat.min (← evaluate bindings lhs) (← evaluate bindings rhs)
+  | .max lhs rhs => do
+    return Nat.max (← evaluate bindings lhs) (← evaluate bindings rhs)
+
 partial def toString : DimExpr → String
   | .literal value => s!"{value}"
   | .parameter name => name

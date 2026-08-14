@@ -184,7 +184,7 @@ def countAllUses (stmts : List Stmt) : HashMap String Nat :=
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
-    | .inst _ _ conns =>
+    | .inst _ _ conns _ =>
       conns.foldl (fun acc (_, e) => countExprUses e acc) counts
   ) {}
 
@@ -197,8 +197,9 @@ def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
     .memory name aw dw clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
       (optimizeExpr dm wm we) (optimizeExpr dm wm ra) rd cr
-  | .inst modName instName conns =>
+  | .inst modName instName conns parameterBindings =>
     .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e))
+      parameterBindings
 
 /-- Recursively substitute inlinable references with their defining expressions -/
 partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
@@ -265,8 +266,10 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
       .memory name aw dw clk
         (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
         (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
-    | .inst modName instName conns =>
-      .inst modName instName (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
+    | .inst modName instName conns parameterBindings =>
+      .inst modName instName
+        (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
+        parameterBindings
 
   -- Remove inlined assignments
   let filteredBody := inlinedBody.filter fun stmt =>

@@ -17,7 +17,7 @@ def findDriver (body : List Stmt) (wireName : String) : Option Stmt :=
     | .assign lhs _ => lhs == wireName
     | .register output .. => output == wireName
     | .memory (readData := rd) .. => rd == wireName
-    | .inst _ instName _ => instName == wireName
+    | .inst _ instName _ _ => instName == wireName
 
 /-- Check that all output ports are driven by registers or synchronous memory reads.
     Returns a list of warning strings for violations. -/

@@ -45,6 +45,11 @@ def synthesizeParameterizedToString (declName : Name)
   let (module, _) ← synthesizeCombinationalWithParameters declName parameters
   return toVerilog module
 
+def synthesizeParameterizedDesignToString (declName : Name)
+    (parameters : List (String × Nat)) : Lean.MetaM String := do
+  let design ← synthesizeHierarchicalWithParameters declName parameters
+  return toVerilogDesign design
+
 /-- Check that a rejected parameter contract reports the intended reason. -/
 def parameterizedSynthesisRejectsWith (declName : Name)
     (parameters : List (String × Nat)) (needle : String) : Lean.MetaM Bool := do
@@ -88,6 +93,7 @@ structure VerilogOutputs where
   symbolicZeroExtendVerilog : String
   symbolicRegisterVerilog : String
   symbolicMemoryVerilog : String
+  symbolicHierarchyVerilog : String
   rejectsUnretainedWidth : Bool
   rejectsMissingBinder : Bool
   rejectsDuplicateParameter : Bool
@@ -114,6 +120,8 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedToString `symbolicRegister [("W", 8)]
   let symbolicMemoryVerilog ←
     synthesizeParameterizedToString `symbolicMemory [("ADDR_W", 3), ("DATA_W", 8)]
+  let symbolicHierarchyVerilog ←
+    synthesizeParameterizedDesignToString `symbolicXorHierarchy [("W", 8)]
   let rejectsUnretainedWidth ←
     parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
   let rejectsMissingBinder ←
@@ -129,7 +137,7 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
     symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
     symbolicSliceLowVerilog, symbolicZeroExtendVerilog, symbolicRegisterVerilog,
-    symbolicMemoryVerilog,
+    symbolicMemoryVerilog, symbolicHierarchyVerilog,
     rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
     rejectsZeroWidthDefault
   }
@@ -205,6 +213,14 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           (outputs.symbolicMemoryVerilog.containsSubstr "logic [DATA_W-1:0]") $
         test "memory depth retains ADDR_W"
           (outputs.symbolicMemoryVerilog.containsSubstr "[0:((2 ** ADDR_W) - 1)]")
+      ) ++
+      group "parameterized hierarchy" (
+        test "design emits the child module"
+          (outputs.symbolicHierarchyVerilog.containsSubstr "module symbolicXorChild #(") $
+        test "child retains W"
+          (outputs.symbolicHierarchyVerilog.containsSubstr "parameter integer W = 8") $
+        test "parent explicitly forwards W"
+          (outputs.symbolicHierarchyVerilog.containsSubstr ".W(W)")
       ) ++
       group "fail-closed diagnostics" (
         test "rejects an unretained generic width" outputs.rejectsUnretainedWidth $

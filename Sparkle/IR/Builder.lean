@@ -191,6 +191,12 @@ def emitInstance (moduleName : String) (instName : String)
   let m ← getModule
   setModule (m.addStmt (.inst moduleName instName connections))
 
+def emitParameterizedInstance (moduleName : String) (instName : String)
+    (parameterBindings : List (String × DimExpr))
+    (connections : List (String × Expr)) : CircuitM Unit := do
+  let m ← getModule
+  setModule (m.addStmt (.inst moduleName instName connections parameterBindings))
+
 /--
   Add an input port to the module.
 -/
