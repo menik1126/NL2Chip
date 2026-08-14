@@ -362,6 +362,9 @@ def _code_hash(code: str | None) -> str | None:
 def _diagnostic_signature(result: dict | None) -> str:
     if not result:
         return "no-result"
+    stable_signature = str(result.get("diagnostic_signature") or "").strip()
+    if stable_signature:
+        return "diagnostic:" + stable_signature
     detail = str(result.get("detail") or "")
     detail = re.sub(r"/[^\s:]+", "<path>", detail)
     detail = re.sub(r"\b\d+(?:\.\d+)?\s*(?:ns|us|ms|s)\b", "<time>", detail)

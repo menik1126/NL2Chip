@@ -849,3 +849,25 @@ def test_candidate_tracker_rewrites_only_after_repeated_diagnostic_signature(tmp
     final = tracker.observe({"rank": 0, "detail": "second error"}, "candidate A4", reason="repair")
     assert final.stagnation_count == 2
     assert tracker.is_stagnant
+
+
+def test_candidate_tracker_prefers_stable_evaluator_diagnostic_signature(tmp_path: Path):
+    tracker = CandidateTracker(
+        snapshot_root=tmp_path / "candidates",
+        prob_id="prob_c",
+        progress_key=_progress,
+        patience=2,
+    )
+    tracker.start_candidate(
+        {"rank": 0, "detail": "first rendered error", "diagnostic_signature": "stable-loop"},
+        "candidate A",
+        reason="initial",
+    )
+    observation = tracker.observe(
+        {"rank": 0, "detail": "different rendered context", "diagnostic_signature": "stable-loop"},
+        "candidate A1",
+        reason="repair",
+    )
+
+    assert observation.stagnation_count == 1
+    assert observation.stagnation_reason == "evaluation failure signature repeated"
