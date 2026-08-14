@@ -58,3 +58,4 @@ exec "${PYTHON_BIN}" -m cktarchon.run \
     --disable-guided-self-test \
     --candidate-search-max 3 \
     --candidate-stagnation-patience 2 \
+    --search-total-turn-budget 100
