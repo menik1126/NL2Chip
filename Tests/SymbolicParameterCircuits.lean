@@ -63,6 +63,13 @@ def symbolicLoopBundle {dom : DomainConfig} {W : Nat}
   let isZero : Signal dom Bool := q === BitVec.ofNat W 0
   let isOne : Signal dom Bool := q === BitVec.ofNat W 1
   bundle2 q (bundle2 isZero isOne)
+/-- Compare symbolic-width state against a retained parameter value. -/
+def symbolicDepthCompare {dom : DomainConfig} {DEPTH : Nat}
+    (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 (DEPTH + 1))))
+    : Signal dom Bool :=
+  let q := Signal.loop fun q =>
+    Signal.register (BitVec.ofNat (Sparkle.Library.RTL.clog2 (DEPTH + 1)) 0) x
+  q === BitVec.ofNat (Sparkle.Library.RTL.clog2 (DEPTH + 1)) DEPTH
 /-- A symbolic derived width used by depth-indexed state such as a FIFO pointer.
     ceiling-log2 DEPTH is preserved as the backend's symbolic clog2 expression. -/
 def symbolicDerivedLoop {dom : DomainConfig} {DEPTH : Nat}

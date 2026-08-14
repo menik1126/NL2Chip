@@ -10,3 +10,6 @@ import Tests.SymbolicParameterCircuits
 #writeParameterizedCppSimDesign symbolicGenerateNot [W := 17] "/tmp/p3_cppsim_generate_w17.h"
 #writeParameterizedCppSimDesign symbolicLoopBundle [W := 3] "/tmp/p3_cppsim_loop_bundle_w3.h"
 #writeParameterizedCppSimDesign symbolicLoopBundle [W := 17] "/tmp/p3_cppsim_loop_bundle_w17.h"
+#writeParameterizedCppSimDesign symbolicDepthCompare [DEPTH := 8] "/tmp/p3_cppsim_depth_compare_d8.h"
+#writeParameterizedCppSimDesign symbolicDepthCompare [DEPTH := 12] "/tmp/p3_cppsim_depth_compare_d12.h"
+#writeParameterizedCppSimDesign symbolicDepthCompare [DEPTH := 16] "/tmp/p3_cppsim_depth_compare_d16.h"

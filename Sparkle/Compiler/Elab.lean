@@ -521,6 +521,45 @@ partial def extractBitVecLiteralDim (expr : Lean.Expr) : CompilerM (Nat × DimEx
       extractBitVecLiteralDim reduced
     else
       CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
+/-- Extract a BitVec literal whose value may itself be a retained parameter. -/
+partial def extractBitVecLiteralValueDim
+    (expr : Lean.Expr) : CompilerM (Sparkle.IR.AST.Expr × DimExpr) := do
+  let fn := expr.getAppFn
+  let args := expr.getAppArgs
+  match fn with
+  | .const name _ =>
+    if name == ``BitVec.ofNat && args.size >= 2 then
+      let width ← extractDimExpr args[args.size - 2]!
+      let valueArg := args[args.size - 1]!
+      let value ← try
+        pure (.const (Int.ofNat (← extractNat valueArg)) 32)
+      catch _ =>
+        let valueDim ← extractDimExpr valueArg
+        match valueDim with
+        | .parameter parameterName => pure (.ref parameterName)
+        | _ => CompilerM.liftMetaM $ throwError
+          "A symbolic BitVec literal value must be a retained hardware parameter"
+      return (value, width)
+    else if name == ``BitVec.ofFin && args.size >= 2 then
+      let width ← extractDimExpr args[0]!
+      let valueArg := args[1]!
+      let value ← try
+        pure (.const (Int.ofNat (← extractNat valueArg)) 32)
+      catch _ =>
+        let valueDim ← extractDimExpr valueArg
+        match valueDim with
+        | .parameter parameterName => pure (.ref parameterName)
+        | _ => CompilerM.liftMetaM $ throwError
+          "A symbolic BitVec literal value must be a retained hardware parameter"
+      return (value, width)
+    else
+      CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got application of {name}"
+  | _ =>
+    let reduced ← CompilerM.liftMetaM (whnf expr)
+    if reduced != expr then
+      extractBitVecLiteralValueDim reduced
+    else
+      CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
 /-- Extract a Nat literal from an expression -/
 def extractNatLiteral (expr : Lean.Expr) : CompilerM (Nat × Unit) := do
   let n ← extractNat expr
@@ -749,14 +788,17 @@ mutual
              | none => pure ()
            -- Try to extract the BitVec literal value
            let literalDim? ← try
-             some <$> extractBitVecLiteralDim constValue
+             some <$> extractBitVecLiteralValueDim constValue
            catch _ => pure none
            match literalDim? with
            | some (value, width) =>
              let resWire ← CompilerM.makeWire hint (hwTypeFromDim width) (named := isNamed)
-             let literal := match width.toNat? with
-               | some concreteWidth => Sparkle.IR.AST.Expr.const (Int.ofNat value) concreteWidth
-               | none => Sparkle.IR.AST.Expr.constDim (Int.ofNat value) width
+             let literal := match value, width.toNat? with
+               | .const literalValue _, some concreteWidth =>
+                 Sparkle.IR.AST.Expr.const literalValue concreteWidth
+               | .const literalValue _, none =>
+                 Sparkle.IR.AST.Expr.constDim literalValue width
+               | expression, _ => expression
              CompilerM.emitAssign resWire literal
              return resWire
            | none => pure ()

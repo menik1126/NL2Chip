@@ -63,7 +63,10 @@ partial def specializeExpr (bindings : Bindings) (indices : Bindings) : Expr →
   | .ref name =>
     match indices.lookup name with
     | some value => return .const (Int.ofNat value) 32
-    | none => return .ref name
+    | none =>
+      match bindings.lookup name with
+      | some value => return .const (Int.ofNat value) 32
+      | none => return .ref name
   | .op operator args =>
     return .op operator (← args.mapM (specializeExpr bindings indices))
   | .concat args =>

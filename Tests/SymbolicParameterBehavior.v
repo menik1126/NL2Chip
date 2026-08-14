@@ -27,6 +27,12 @@ module symbolic_parameter_behavior_tb;
     wire [4:0] loop3_out;
     logic [16:0] loop17_in;
     wire [18:0] loop17_out;
+    logic [3:0] depth8_in;
+    wire depth8_out;
+    logic [3:0] depth12_in;
+    wire depth12_out;
+    logic [4:0] depth16_in;
+    wire depth16_out;
 
 
 
@@ -107,6 +113,18 @@ module symbolic_parameter_behavior_tb;
     symbolicLoopBundle #(.W(17)) loop17_dut (
         ._gen_x(loop17_in), .clk(clk), .rst(rst), .out(loop17_out)
     );
+    symbolicDepthCompare #(.DEPTH(8)) depth8_dut (
+        ._gen_x(depth8_in), .clk(clk), .rst(rst), .out(depth8_out)
+    );
+
+    symbolicDepthCompare #(.DEPTH(12)) depth12_dut (
+        ._gen_x(depth12_in), .clk(clk), .rst(rst), .out(depth12_out)
+    );
+
+    symbolicDepthCompare #(.DEPTH(16)) depth16_dut (
+        ._gen_x(depth16_in), .clk(clk), .rst(rst), .out(depth16_out)
+    );
+
 
     symbolicMemory #(.ADDR_W(2), .DATA_W(3)) mem2_dut (
         ._gen_writeAddr(mem2_write_addr),
@@ -164,6 +182,9 @@ module symbolic_parameter_behavior_tb;
         loop3_in = 3'b101;
         loop17_in = 17'h1_2345;
 
+        depth8_in = 4'd8;
+        depth12_in = 4'd12;
+        depth16_in = 5'd16;
         mem2_write_addr = 2'd1;
         mem2_write_data = 3'b101;
         mem2_write_enable = 1'b0;
@@ -204,6 +225,8 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic register reset sizing failed");
         if (derived8_out !== 3'd0 || derived12_out !== 4'd0 || derived16_out !== 4'd0)
             $fatal(1, "symbolic clog2 loop reset sizing failed");
+        if (depth8_out !== 1'b0 || depth12_out !== 1'b0 || depth16_out !== 1'b0)
+            $fatal(1, "parameter-valued symbolic comparison reset failed");
         if (loop3_out !== {3'd0, 1'b1, 1'b0} || loop17_out !== {17'd0, 1'b1, 1'b0})
             $fatal(1, "symbolic-width comparison reset flags failed");
 
@@ -220,6 +243,8 @@ module symbolic_parameter_behavior_tb;
         if (loop3_out !== {loop3_in, 1'b0, 1'b0} || loop17_out !== {loop17_in, 1'b0, 1'b0})
             $fatal(1, "symbolic-width comparison update flags failed");
 
+        if (depth8_out !== 1'b1 || depth12_out !== 1'b1 || depth16_out !== 1'b1)
+            $fatal(1, "parameter-valued symbolic comparison failed");
 
         clk = 1'b0;
 
