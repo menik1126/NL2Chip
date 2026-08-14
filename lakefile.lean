@@ -75,6 +75,10 @@ lean_exe «specialization-tests» where
   root := `Tests.SpecializeTests
   supportInterpreter := true
 
+lean_exe «sized-cast-tests» where
+  root := `Tests.SizedCastTests
+  supportInterpreter := true
+
 lean_exe «sparkle-bitnet-verilog-dump» where
   root := `Tests.BitNet.SparkleBitNetVerilogDump
 

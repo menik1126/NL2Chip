@@ -30,6 +30,7 @@ inductive SVUnaryOp where
   | reductAnd -- &x (reduction AND)
   | reductOr  -- |x (reduction OR)
   | signed    -- $signed(x)
+  | unsigned  -- $unsigned(x); IR packed values are intrinsically unsigned
   deriving Repr, BEq
 
 /-- Binary operators -/
@@ -90,6 +91,7 @@ inductive SVPortDir where
 structure SVPort where
   dir    : SVPortDir
   isReg  : Bool := false            -- output reg
+  isSigned : Bool := false          -- explicit `signed` declaration qualifier
   width  : Option (DimExpr × DimExpr) -- [hi:lo] or none for 1-bit
   name   : String
   deriving Repr, BEq
@@ -100,14 +102,17 @@ structure SVParam where
   width    : Option (DimExpr × DimExpr) -- optional [hi:lo]
   value    : SVExpr                 -- default value expression
   isLocal  : Bool := false          -- localparam vs parameter
+  isSigned : Bool := false          -- `integer` or explicit `signed`
   deriving Repr, BEq
 
 /-- Module-level items -/
 inductive SVModuleItem where
   | wireDecl      (name : String) (width : Option (DimExpr × DimExpr))
                   (initExpr : Option SVExpr)              -- wire [w] x = expr;
+                  (isSigned : Bool := false)
   | regDecl       (name : String) (width : Option (DimExpr × DimExpr))
                   (arraySize : Option DimExpr)            -- reg [w] x [0:N];
+                  (isSigned : Bool := false)
   | integerDecl   (name : String)                         -- integer i;
   | paramDecl     (param : SVParam)                       -- parameter/localparam
   | contAssign    (lhs rhs : SVExpr)                      -- assign lhs = rhs;

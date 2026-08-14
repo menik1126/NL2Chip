@@ -190,7 +190,7 @@ def generatedSequentialRoundTrip : Except String String := do
     "  input logic [(((W) > 0 ? (W) : 1) - 1):0] x, input logic clk, input logic rst,\n" ++
     "  output logic [(((W) > 0 ? (W) : 1) - 1):0] y);\n" ++
     "logic [(((W) > 0 ? (W) : 1) - 1):0] q;\n" ++
-    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= ((W) > 0 ? (W) : 1)'(0); else q <= x; end\n" ++
+    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= $unsigned(((W) > 0 ? (W) : 1)'(0)); else q <= x; end\n" ++
     "assign y = q; endmodule\n"
   let parsed ← Tools.SVParser.Lower.parseAndLowerNative source
   let module_ ← match parsed.modules with
@@ -208,7 +208,7 @@ def generatedAllOnesSequentialRoundTrip : Except String String := do
     "  input logic [(((W) > 0 ? (W) : 1) - 1):0] x, input logic clk, input logic rst,\n" ++
     "  output logic [(((W) > 0 ? (W) : 1) - 1):0] y);\n" ++
     "logic [(((W) > 0 ? (W) : 1) - 1):0] q;\n" ++
-    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= ((W) > 0 ? (W) : 1)'(-1); else q <= x; end\n" ++
+    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= $unsigned(((W) > 0 ? (W) : 1)'(-1)); else q <= x; end\n" ++
     "assign y = q; endmodule\n"
   let parsed ← Tools.SVParser.Lower.parseAndLowerNative source
   let module_ ← match parsed.modules with
@@ -221,6 +221,25 @@ def generatedAllOnesSequentialRoundTripOutput : String :=
   | .ok output => output
   | .error error => s!"/* ERROR: {error} */"
 
+def generatedPositiveSequentialRoundTrip : Except String String := do
+  let source := "module native_seq_positive #(parameter W = 8) (\n" ++
+    "  input logic [(((W) > 0 ? (W) : 1) - 1):0] x, input logic clk, input logic rst,\n" ++
+    "  output logic [(((W) > 0 ? (W) : 1) - 1):0] y);\n" ++
+    "logic [(((W) > 0 ? (W) : 1) - 1):0] q;\n" ++
+    "always_ff @(posedge clk or posedge rst) begin " ++
+    "if (rst) q <= $unsigned(((W) > 0 ? (W) : 1)'(511)); else q <= x; end\n" ++
+    "assign y = q; endmodule\n"
+  let parsed ← Tools.SVParser.Lower.parseAndLowerNative source
+  let module_ ← match parsed.modules with
+    | [module_] => pure module_
+    | _ => throw "expected exactly one positive-reset sequential module"
+  Sparkle.Backend.Verilog.toVerilogChecked module_
+
+def generatedPositiveSequentialRoundTripOutput : String :=
+  match generatedPositiveSequentialRoundTrip with
+  | .ok output => output
+  | .error error => s!"/* ERROR: {error} */"
+
 def symbolicMemoryFailsClosed : Bool :=
   let source := "module mem #(parameter AW = 4, parameter DW = 8) (input wire clk);\n" ++
     "reg [DW-1:0] storage [0:(2*AW)-1];\nendmodule\n"
@@ -228,11 +247,11 @@ def symbolicMemoryFailsClosed : Bool :=
 
 /-- A parameter-sized cast of a nonliteral value cannot be erased: inside a
     concat, dropping it changes field boundaries and therefore functionality. -/
-def symbolicNonliteralSizedCastFailsClosed : Bool :=
+def symbolicNonliteralSizedCastSupported : Bool :=
   let source := "module casted #(parameter W = 3) " ++
     "(input wire [W:0] x, output wire [(2*W)-1:0] y); " ++
     "assign y = {(W)'(x), (W)'(x)}; endmodule\n"
-  exceptIsError (Tools.SVParser.Lower.parseAndLowerNative source)
+  exceptIsOk (Tools.SVParser.Lower.parseAndLowerNative source)
 
 def parameterizedAlwaysCombFailsClosed : Bool :=
   let source := "module procedural #(parameter W = 257) " ++
@@ -246,11 +265,39 @@ def parameterizedSignedCastFailsClosed : Bool :=
     "assign y = $signed(x) >>> 1; endmodule\n"
   exceptIsError (Tools.SVParser.Lower.parseAndLowerNative source)
 
-def concreteNonliteralSizedCastFailsClosed : Bool :=
+def nativeSignedDeclarationsFailClosed : Bool :=
+  let sources :=
+    ["module signed_port (input logic signed [7:0] x, output logic [7:0] y); assign y = x; endmodule\n",
+     "module signed_param #(parameter signed [7:0] P = 1) (input logic x, output logic y); assign y = x; endmodule\n",
+     "module signed_wire (input logic [7:0] x, output logic [7:0] y); wire signed [7:0] w = x; assign y = w; endmodule\n",
+     "module signed_reg (input logic [7:0] x, output logic [7:0] y); reg signed [7:0] r; assign y = r; endmodule\n"]
+  sources.all fun source =>
+    exceptIsError (Tools.SVParser.Lower.parseAndLowerNative source)
+
+def legacySignedDeclarationStillAccepted : Bool :=
+  let source :=
+    "module legacy_signed (input logic signed [7:0] x, output logic [7:0] y); " ++
+    "assign y = x; endmodule\n"
+  exceptIsOk (Tools.SVParser.Lower.parseAndLower source)
+
+def signedOperandSizedCastFailsClosed : Bool :=
+  let source :=
+    "module signed_resize (input logic [31:0] x, output logic [63:0] y); " ++
+    "assign y = (64)'($signed(x)); endmodule\n"
+  exceptIsError (Tools.SVParser.Lower.parseAndLowerNative source) &&
+    exceptIsError (Tools.SVParser.Lower.parseAndLower source)
+
+def legacyStandaloneSignedStillAccepted : Bool :=
+  let source :=
+    "module standalone_signed (input logic [31:0] x, output logic [31:0] y); " ++
+    "assign y = $signed(x); endmodule\n"
+  exceptIsOk (Tools.SVParser.Lower.parseAndLower source)
+
+def concreteNonliteralSizedCastSupported : Bool :=
   let source := "module casted #(parameter W = 3) " ++
     "(input wire [W:0] x, output wire [(2*W)-1:0] y); " ++
     "assign y = {(3)'(x), (3)'(x)}; endmodule\n"
-  exceptIsError (Tools.SVParser.Lower.parseAndLowerNative source)
+  exceptIsOk (Tools.SVParser.Lower.parseAndLowerNative source)
 
 def parameterizedGenerateRejected : Bool :=
   let source := "module generated #(parameter W = 8) (input wire x, output wire y);\n" ++
@@ -332,7 +379,8 @@ def nativeHierarchyRoundTripOutput : String :=
 
 def nativeWideComplementRoundTrip : Except String String := do
   let source := "module wide_not #(parameter W = 257) " ++
-    "(output wire [W-1:0] y); assign y = ~(((W) > 0 ? (W) : 1)'(0)); endmodule\n"
+    "(output wire [W-1:0] y); " ++
+    "assign y = ~$unsigned(((W) > 0 ? (W) : 1)'(0)); endmodule\n"
   let design ← Tools.SVParser.Lower.parseAndLowerNative source
   let module_ ← match design.modules with
     | [module_] => pure module_
@@ -358,6 +406,43 @@ def nativeWideReductionAndRoundTripOutput : String :=
   | .ok output => output
   | .error error => s!"/* ERROR: {error} */"
 
+def symbolicSequentialResetSemantics : IO Bool := do
+  let tempDir := "/tmp/sparkle_verilog_tests"
+  let sourcePath := s!"{tempDir}/symbolic_sequential_resets.sv"
+  let executable := s!"{tempDir}/symbolic_sequential_resets.vvp"
+  let bench :=
+    "module tb;\n" ++
+    "logic clk, rst; logic [2:0] x3; logic [16:0] x17; logic [15:0] x16;\n" ++
+    "wire [2:0] ones3; wire [16:0] ones17; wire [15:0] positive16;\n" ++
+    "native_seq_ones #(.W(3)) d3 " ++
+    "(.x(x3), .clk(clk), .rst(rst), .y(ones3));\n" ++
+    "native_seq_ones #(.W(17)) d17 " ++
+    "(.x(x17), .clk(clk), .rst(rst), .y(ones17));\n" ++
+    "native_seq_positive #(.W(16)) d16 " ++
+    "(.x(x16), .clk(clk), .rst(rst), .y(positive16));\n" ++
+    "initial begin clk=0; rst=0; x3='0; x17='0; x16='0; #1; rst=1; #1;\n" ++
+    "  if (ones3 !== 3'b111) $fatal(1, \"W=3 all-ones reset failed\");\n" ++
+    "  if (ones17 !== 17'h1ffff) $fatal(1, \"W=17 all-ones reset failed\");\n" ++
+    "  if (positive16 !== 16'h01ff) $fatal(1, \"W=16 positive reset failed\");\n" ++
+    "  $display(\"PASS symbolic sequential resets\"); $finish;\n" ++
+    "end endmodule\n"
+  IO.FS.createDirAll tempDir
+  IO.FS.writeFile sourcePath
+    (generatedAllOnesSequentialRoundTripOutput ++ "\n" ++
+      generatedPositiveSequentialRoundTripOutput ++ "\n" ++ bench)
+  let compiled ← IO.Process.output {
+    cmd := "iverilog"
+    args := #["-g2012", "-s", "tb", "-o", executable, sourcePath]
+  }
+  if compiled.exitCode != 0 then
+    IO.eprintln s!"symbolic reset Icarus compile failed:\n{compiled.stderr}"
+    return false
+  let simulated ← IO.Process.output { cmd := "vvp", args := #[executable] }
+  if simulated.exitCode != 0 then
+    IO.eprintln s!"symbolic reset Icarus simulation failed:\n{simulated.stdout}{simulated.stderr}"
+    return false
+  return simulated.stdout.containsSubstr "PASS symbolic sequential resets"
+
 -- ============================================================================
 -- Test Suite
 -- ============================================================================
@@ -375,6 +460,9 @@ structure VerilogOutputs where
   nativeIdentityVerilog : String
   nativeAddVerilog : String
   nativeDerivedVerilog : String
+  nativeZeroExtendLambdaVerilog : String
+  nativeZeroExtendPartialVerilog : String
+  nativeSetWidthNarrowVerilog : String
   nativeConstantVerilog : String
   nativeRegisterVerilog : String
   nativeMemoryVerilog : String
@@ -392,6 +480,12 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
   let nativeIdentityVerilog ← synthesizeParameterizedToString `testGenericIdentity [("width", 8)]
   let nativeAddVerilog ← synthesizeParameterizedToString `testNativeAdd [("width", 8)]
   let nativeDerivedVerilog ← synthesizeParameterizedToString `testNativeDerivedWidth [("width", 8)]
+  let nativeZeroExtendLambdaVerilog ←
+    synthesizeParameterizedToString `testNativeZeroExtendLambda [("width", 8)]
+  let nativeZeroExtendPartialVerilog ←
+    synthesizeParameterizedToString `testNativeZeroExtendPartial [("width", 8)]
+  let nativeSetWidthNarrowVerilog ←
+    synthesizeParameterizedToString `testNativeSetWidthNarrow [("width", 8)]
   let nativeConstantVerilog ← synthesizeParameterizedToString `testNativeConstant [("width", 8)]
   let nativeRegisterVerilog ← synthesizeParameterizedToString `testNativeRegister [("width", 8)]
   let nativeMemoryVerilog ← synthesizeParameterizedToString `testNativeMemory
@@ -400,11 +494,14 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
     generic4Verilog, generic16Verilog, closedWidthVerilog,
     nativeIdentityVerilog, nativeAddVerilog, nativeDerivedVerilog,
+    nativeZeroExtendLambdaVerilog, nativeZeroExtendPartialVerilog,
+    nativeSetWidthNarrowVerilog,
     nativeConstantVerilog, nativeRegisterVerilog, nativeMemoryVerilog
   }
 
 /-- Create test suite from synthesized outputs -/
-def makeTests (outputs : VerilogOutputs) : TestSeq :=
+def makeTests (outputs : VerilogOutputs)
+    (symbolicResetSemantics : Bool) : TestSeq :=
   let addModule := extractModule outputs.addVerilog "test_add"
   let hierTopModule := extractModule outputs.hierarchicalVerilog "test_hierarchical_alu"
   let nativeIRVerilog := toVerilog nativeWidthIR
@@ -477,12 +574,21 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
       test "derived widths remain symbolic"
         (outputs.nativeDerivedVerilog.containsSubstr
           "logic [((((width + 1)) > 0 ? ((width + 1)) : 1) - 1):0]") $
+      test "zeroExtend lambda lowers to a native resize"
+        (outputs.nativeZeroExtendLambdaVerilog.containsSubstr "$unsigned(" &&
+          outputs.nativeZeroExtendLambdaVerilog.containsSubstr "width + 1") $
+      test "zeroExtend partial application lowers to a native resize"
+        (outputs.nativeZeroExtendPartialVerilog.containsSubstr "$unsigned(" &&
+          outputs.nativeZeroExtendPartialVerilog.containsSubstr "width + 1") $
+      test "setWidth narrowing lowers to a native resize"
+        (outputs.nativeSetWidthNarrowVerilog.containsSubstr "$unsigned(" &&
+          outputs.nativeSetWidthNarrowVerilog.containsSubstr "parameter width = 8") $
       test "parameter-sized constant uses an SV sized cast"
         (outputs.nativeConstantVerilog.containsSubstr
-          "((width) > 0 ? (width) : 1)'(1)") $
+          "$unsigned(((width) > 0 ? (width) : 1)'(1))") $
       test "parameter-sized reset uses an SV sized cast"
         (outputs.nativeRegisterVerilog.containsSubstr
-          "<= ((width) > 0 ? (width) : 1)'(0)") $
+          "<= $unsigned(((width) > 0 ? (width) : 1)'(0))") $
       test "memory exposes both native parameters"
         (outputs.nativeMemoryVerilog.containsSubstr "parameter addrWidth = 4") $
       test "memory depth and data width remain symbolic"
@@ -519,23 +625,32 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           generatedNativeRoundTripOutput.containsSubstr "((W) > 0 ? (W) : 1)") $
       test "backend logic declarations and parameter-sized constants round-trip"
         (generatedInternalWireRoundTripOutput.containsSubstr "logic" &&
-          generatedInternalWireRoundTripOutput.containsSubstr "'(1)") $
+          generatedInternalWireRoundTripOutput.containsSubstr "$unsigned(" &&
+          generatedInternalWireRoundTripOutput.containsSubstr "'(1))") $
       test "always_ff and parameter-sized reset constants round-trip"
         (generatedSequentialRoundTripOutput.containsSubstr "always_ff" &&
-          generatedSequentialRoundTripOutput.containsSubstr "'(0)") $
-      test "all-ones parameter-sized reset does not become zero"
-        (generatedAllOnesSequentialRoundTripOutput.containsSubstr "'(-1)" &&
-          !generatedAllOnesSequentialRoundTripOutput.containsSubstr "<= ((W) > 0 ? (W) : 1)'(0);") $
+          generatedSequentialRoundTripOutput.containsSubstr "$unsigned(" &&
+          generatedSequentialRoundTripOutput.containsSubstr "'(0))") $
+      test "symbolic reset constants drive the actual always_ff reset branch"
+        symbolicResetSemantics $
       test "symbolic unpacked memory depth fails closed"
         symbolicMemoryFailsClosed $
-      test "symbolic nonliteral sized casts fail closed instead of disappearing"
-        symbolicNonliteralSizedCastFailsClosed $
+      test "symbolic nonliteral sized casts lower to explicit resize nodes"
+        symbolicNonliteralSizedCastSupported $
       test "parameterized always_comb fails closed instead of narrowing SSA wires"
         parameterizedAlwaysCombFailsClosed $
       test "parameterized signed casts fail closed instead of losing signedness"
         parameterizedSignedCastFailsClosed $
-      test "concrete nonliteral sized casts fail closed instead of disappearing"
-        concreteNonliteralSizedCastFailsClosed $
+      test "native lowering rejects signed declarations instead of erasing signedness"
+        nativeSignedDeclarationsFailClosed $
+      test "legacy lowering remains compatible with signed declarations"
+        legacySignedDeclarationStillAccepted $
+      test "sized casts reject nested signed operands on every lowering path"
+        signedOperandSizedCastFailsClosed $
+      test "legacy standalone signed conversion remains accepted"
+        legacyStandaloneSignedStillAccepted $
+      test "concrete nonliteral sized casts lower to explicit resize nodes"
+        concreteNonliteralSizedCastSupported $
       test "parameter-dependent generate fails closed for native overrides"
         parameterizedGenerateRejected $
       test "parameter-dependent procedural for fails closed for native overrides"
@@ -558,6 +673,7 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           nativeHierarchyRoundTripOutput.containsSubstr ".W((N + 1))") $
       test "wide bitwise complement remains width preserving"
         (nativeWideComplementRoundTripOutput.containsSubstr "~" &&
+          nativeWideComplementRoundTripOutput.containsSubstr "$unsigned(" &&
           !nativeWideComplementRoundTripOutput.containsSubstr "32'hffffffff") $
       test "wide reduction AND uses a width-preserving complement"
         (nativeWideReductionAndRoundTripOutput.containsSubstr "~x" &&
@@ -601,5 +717,6 @@ def main : IO UInt32 := do
     coreState
 
   -- Create and run tests
-  let tests := makeTests outputs
+  let symbolicResetSemantics ← symbolicSequentialResetSemantics
+  let tests := makeTests outputs symbolicResetSemantics
   lspecIO (Std.HashMap.ofList [("verilog", [tests])]) []

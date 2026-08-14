@@ -83,6 +83,7 @@ def lowerUnaryOp : SVUnaryOp → Operator
   | .reductAnd => .and  -- reduction ops treated as bitwise for now
   | .reductOr  => .or
   | .signed    => .not  -- unreachable: handled in lowerExpr
+  | .unsigned  => .not  -- unreachable: handled in lowerExpr
 
 def lowerBinOp : SVBinOp → Operator
   | .add    => .add
@@ -104,13 +105,23 @@ def lowerBinOp : SVBinOp → Operator
   | .logAnd => .and  -- unreachable: handled in lowerExpr as (a!=0) & (b!=0)
   | .logOr  => .or   -- unreachable: handled in lowerExpr as (a!=0) | (b!=0)
 
+private def natBitLength (value : Nat) : Nat :=
+  if value == 0 then 1 else Nat.log2 value + 1
+
+/-- IEEE unsized literals are at least 32 bits, but grow when their value does
+    not fit.  Decimal literals retain a sign bit; based literals are unsigned. -/
+private def naturalLiteralWidth : SVLiteral → Nat
+  | .decimal (some width) _ | .hex (some width) _ | .binary (some width) _ => width
+  | .decimal none value => max 32 (natBitLength value + 1)
+  | .hex none value | .binary none value => max 32 (natBitLength value)
+
 def literalToConst : SVLiteral → Expr
   | .decimal (some w) v => .const (Int.ofNat v) w
-  | .decimal none v     => .const (Int.ofNat v) 32  -- Verilog default: 32 bits
+  | literal@(.decimal none v) => .const (Int.ofNat v) (naturalLiteralWidth literal)
   | .hex (some w) v     => .const (Int.ofNat v) w
-  | .hex none v         => .const (Int.ofNat v) 32
+  | literal@(.hex none v) => .const (Int.ofNat v) (naturalLiteralWidth literal)
   | .binary (some w) v  => .const (Int.ofNat v) w
-  | .binary none v      => .const (Int.ofNat v) 32
+  | literal@(.binary none v) => .const (Int.ofNat v) (naturalLiteralWidth literal)
 
 /-- Set of array-typed register names for distinguishing bit-select vs array access -/
 private def arrayNames : List String := []  -- populated per-module during lowering
@@ -126,17 +137,30 @@ private def isArrayName (name : String) : Bool :=
   name == "cpuregs" || name == "memory" || name == "mem" ||
   name.endsWith "_mem" || name.endsWith "_ram"
 
-/-- Evaluate a simple SVExpr to a Nat constant (handles literals, add, sub). -/
+private def truncateNatToWidth (width value : Nat) : Option Nat :=
+  if width == 0 then none else some (value % (2 ^ width))
+
+/-- Evaluate a simple SVExpr to a Nat constant (handles literals, add, sub).
+    Explicit literal widths and sized casts are applied instead of erased. -/
 private partial def svExprToNat : SVExpr → Option Nat
-  | .lit (.decimal _ v) => some v
-  | .lit (.hex _ v) => some v
-  | .lit (.binary _ v) => some v
+  | .lit (.decimal width v) | .lit (.hex width v) | .lit (.binary width v) =>
+      match width with
+      | some concreteWidth => truncateNatToWidth concreteWidth v
+      | none => some v
   | .binary .add a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va + vb)
-  | .binary .sub a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va - vb)
+  | .binary .sub a b => do
+      let va ← svExprToNat a
+      let vb ← svExprToNat b
+      -- Nat subtraction would otherwise silently saturate an unsupported
+      -- negative SystemVerilog constant to zero.
+      if vb <= va then some (va - vb) else none
   | .binary .mul a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va * vb)
   | .binary .pow a b => do let va ← svExprToNat a; let vb ← svExprToNat b; some (va ^ vb)
-  | .unary .neg a => do let va ← svExprToNat a; some (0 - va)
-  | .sizedCast _ value => svExprToNat value
+  | .unary .unsigned a => svExprToNat a
+  | .unary .neg _ => none
+  | .sizedCast width value => do
+      let concreteWidth ← width.toNat?
+      truncateNatToWidth concreteWidth (← svExprToNat value)
   | _ => none
 
 private def concatWidth : SVExpr → Nat
@@ -144,12 +168,7 @@ private def concatWidth : SVExpr → Nat
   | .slice _ hi lo => (hi - lo + 1).toNat?.getD 1
   | .partSelectPlus _ _ widthExpr => svExprToNat widthExpr |>.getD 1
   | .index _ _ => 1  -- single bit select
-  | .lit (.decimal (some w) _) => w
-  | .lit (.hex (some w) _) => w
-  | .lit (.binary (some w) _) => w
-  | .lit (.decimal none _) => 32
-  | .lit (.hex none _) => 32
-  | .lit (.binary none _) => 1
+  | .lit literal => naturalLiteralWidth literal
   | .sizedCast width _ => width.toNat?.getD 0
   | _ => 32  -- default: assume 32-bit
 
@@ -181,6 +200,11 @@ partial def lowerExpr (e : SVExpr) : Expr :=
       -- Sign extend: shift left then arithmetic shift right
       let shiftAmt := 32 - innerWidth
       .op .asr [.op .shl [lowered, .const (Int.ofNat shiftAmt) 32], .const (Int.ofNat shiftAmt) 32]
+  | .unary .unsigned arg =>
+    -- Sparkle IR packed values are unsigned by definition.  Keep this case
+    -- separate so a surrounding sized cast does not mistake `$unsigned(-1)`
+    -- for a sign-extending unsized negative literal.
+    lowerExpr arg
   | .unary op arg => .op (lowerUnaryOp op) [lowerExpr arg]
   | .binary .neq lhs rhs => .op .not [.op .eq [lowerExpr lhs, lowerExpr rhs]]
   | .binary .logAnd lhs rhs =>
@@ -220,18 +244,25 @@ partial def lowerExpr (e : SVExpr) : Expr :=
     -- {N{expr}}: replicate expr N times (bit replication)
     -- For 1-bit expr repeated N times: result = (0 - expr) & ((1 << N) - 1)
     -- For multi-bit expr: concatenate N copies via shift-and-OR.
-    let n := match svExprToNat count with | some v => v | none => 1
-    let valExpr := lowerExpr value
-    if n <= 1 then valExpr
-    else
-      let elemWidth := match value with
-        | .lit (.decimal (some w) _) => w
-        | .lit (.hex (some w) _) => w
-        | .lit (.binary (some w) _) => w
-        | .slice _ hi lo => (hi - lo + 1).toNat?.getD 1
-        | .ident _ => 0  -- unknown width: use concat path
-        | _ => 1  -- default: assume 1-bit
-      if elemWidth == 1 then
+    match svExprToNat count with
+    | none | some 0 =>
+      -- `lowerModule` rejects this case before expression lowering.  Keep an
+      -- invalid zero-width sentinel here so direct callers of `lowerExpr`
+      -- also fail dimension validation instead of silently assuming one copy.
+      .const 0 0
+    | some 1 => lowerExpr value
+    | some n =>
+      let valExpr := lowerExpr value
+      let elemIsProvablyOneBit := match value with
+        | .lit (.decimal (some 1) _)
+        | .lit (.hex (some 1) _)
+        | .lit (.binary (some 1) _) => true
+        | .index _ _ => true
+        | .slice _ hi lo => (hi - lo + 1).toNat? == some 1
+        | .partSelectPlus _ _ width => svExprToNat width == some 1
+        | .sizedCast width _ => width.toNat? == some 1
+        | _ => false
+      if elemIsProvablyOneBit then
         -- Special case: 1-bit replication → (0 - val) & mask
         let totalBits := n * 1
         let mask := (1 <<< totalBits) - 1
@@ -241,13 +272,33 @@ partial def lowerExpr (e : SVExpr) : Expr :=
         .concat (List.replicate n valExpr)
   | .sizedCast width value =>
     match value with
-    | .lit (.decimal _ v) | .lit (.hex _ v) | .lit (.binary _ v) =>
+    | .lit (.decimal none v) | .lit (.hex none v) | .lit (.binary none v) =>
+      -- Unsized integer literals may need more than 32 bits.  Casting the
+      -- mathematical value directly avoids the parser's generic 32-bit
+      -- fallback truncating values such as 4294967297 before a 64-bit cast.
       .const (Int.ofNat v) width
-    | .unary .neg (.lit (.decimal _ v))
-    | .unary .neg (.lit (.hex _ v))
-    | .unary .neg (.lit (.binary _ v)) =>
+    | .unary .unsigned (.lit (.decimal none v))
+    | .unary .unsigned (.lit (.hex none v))
+    | .unary .unsigned (.lit (.binary none v)) =>
+      -- `$unsigned` changes signing but not the literal's natural value width.
+      -- The generic literal lowerer uses legacy 32/1-bit fallbacks, which
+      -- would truncate 4294967297 or unsized 'b101 before the outer cast.
+      .const (Int.ofNat v) width
+    | .unary .neg (.lit (.decimal (some sourceWidth) v))
+    | .unary .neg (.lit (.hex (some sourceWidth) v))
+    | .unary .neg (.lit (.binary (some sourceWidth) v)) =>
+      -- Explicitly sized literals are truncated before unary minus receives
+      -- the cast context: `(16)'(-8'd511)` negates 8'hff and is 16'hff01.
+      let sourceValue := v % (2 ^ sourceWidth)
+      .const (-(Int.ofNat sourceValue)) width
+    | .unary .neg (.lit (.decimal none v))
+    | .unary .neg (.lit (.hex none v))
+    | .unary .neg (.lit (.binary none v)) =>
+      -- A sized cast supplies the evaluation context for a direct unary-minus
+      -- literal.  Materialize the mathematical negative at that width: for
+      -- example, `(16)'(-1)` evaluates to 16'hffff before signedness checks.
       .const (-(Int.ofNat v)) width
-    | _ => lowerExpr value
+    | _ => .resize width (lowerExpr value)
 
 -- ============================================================================
 -- Extract target name from LHS expression
@@ -284,26 +335,86 @@ structure RegInfo where
   dataExpr  : Expr
   deriving Repr
 
+/-- Interpret a literal after applying its own explicit source width. -/
+private def materializeSourceLiteral (literal : SVLiteral) : Except String Nat := do
+  let sourceValue ← match literal with
+    | .decimal width value | .hex width value | .binary width value =>
+        match width with
+        | none => pure value
+        | some sourceWidth => match truncateNatToWidth sourceWidth value with
+            | some truncated => pure truncated
+            | none => throw "reset cast has a zero-width source literal"
+  pure sourceValue
+
+/-- Materialize the unsigned target-width bit pattern of a direct literal
+    under a concrete sized cast.  For a negative literal, source truncation
+    happens before negation and target-width reduction. -/
+private def materializeSizedLiteral (target : DimExpr) (negative : Bool)
+    (literal : SVLiteral) : Except String Int := do
+  let targetWidth ← match target.toNat? with
+    | some width => pure width
+    | none => throw s!"literal reset cast has a symbolic target width: {target}"
+  if targetWidth == 0 then
+    throw "literal reset cast has zero target width"
+  let sourceValue ← materializeSourceLiteral literal
+  let modulus := 2 ^ targetWidth
+  let residue := sourceValue % modulus
+  if negative then
+    pure (Int.ofNat (if residue == 0 then 0 else modulus - residue))
+  else
+    pure (Int.ofNat residue)
+
+private def materializeSizedNegativeLiteral
+    (target : DimExpr) (literal : SVLiteral) : Except String Int :=
+  materializeSizedLiteral target true literal
+
+/-- A symbolic reset cast can be retained only when its target is exactly the
+    destination register width.  In that case the backend will materialize the
+    stored Int at that same symbolic width, so preserve the source-normalized
+    signed value instead of freezing the cast at the default parameter value. -/
+private def materializeDestinationWidthLiteral (target destinationWidth : DimExpr)
+    (negative : Bool) (literal : SVLiteral) : Except String Int := do
+  match target.toNat? with
+  | some _ => materializeSizedLiteral target negative literal
+  | none =>
+      if target != destinationWidth then
+        throw s!"symbolic literal reset cast width '{target}' is not exactly the destination width '{destinationWidth}'"
+      let sourceValue ← materializeSourceLiteral literal
+      pure (if negative then -(Int.ofNat sourceValue) else Int.ofNat sourceValue)
+
 /-- Extract register assignments from if/else reset pattern:
     if (!rst_n) begin reg <= init; end
     else begin reg <= expr; end -/
-def extractRegisters (resetBranch dataBranch : List SVStmt) : List RegInfo :=
-  let initMap := resetBranch.filterMap fun s => match s with
-    | .nonblockAssign lhs (.lit (.decimal _ v)) => (exprToName lhs).map (·, Int.ofNat v)
-    | .nonblockAssign lhs (.lit (.hex _ v))     => (exprToName lhs).map (·, Int.ofNat v)
-    | .nonblockAssign lhs (.lit (.binary _ v))  => (exprToName lhs).map (·, Int.ofNat v)
-    | .nonblockAssign lhs (.unary .neg (.lit (.decimal _ v))) =>
-      (exprToName lhs).map (·, -(Int.ofNat v))
-    | .nonblockAssign lhs (.sizedCast _ (.unary .neg (.lit (.decimal _ v)))) =>
-      (exprToName lhs).map (·, -(Int.ofNat v))
-    | _ => none
+def extractRegisters (resetBranch dataBranch : List SVStmt) : Except String (List RegInfo) := do
+  let mut initMap : List (String × Int) := []
+  for statement in resetBranch do
+    match statement with
+    | .nonblockAssign lhs rhs =>
+      match exprToName lhs with
+      | none => pure ()
+      | some name =>
+        let value? ← match rhs with
+          | .lit (.decimal _ value) | .lit (.hex _ value) | .lit (.binary _ value) =>
+              pure (some (Int.ofNat value))
+          | .unary .neg (.lit (.decimal _ value)) =>
+              pure (some (-(Int.ofNat value)))
+          | .sizedCast target (.unary .neg (.lit literal)) =>
+              pure (some (← materializeSizedNegativeLiteral target literal))
+          | .unary .unsigned (.sizedCast target (.lit literal)) =>
+              pure (some (← materializeSizedLiteral target false literal))
+          | .unary .unsigned (.sizedCast target (.unary .neg (.lit literal))) =>
+              pure (some (← materializeSizedLiteral target true literal))
+          | _ => pure none
+        for value in value?.toList do
+          initMap := initMap ++ [(name, value)]
+    | _ => pure ()
   let dataMap := dataBranch.filterMap fun s => match s with
     | .nonblockAssign lhs rhs => (exprToName lhs).map (·, lowerExpr rhs)
     | _ => none
-  initMap.filterMap fun (name, initVal) =>
+  pure (initMap.filterMap fun (name, initVal) =>
     match dataMap.find? (·.1 == name) with
     | some (_, dataExpr) => some { name, initValue := initVal, dataExpr }
-    | none => some { name, initValue := initVal, dataExpr := .ref name }
+    | none => some { name, initValue := initVal, dataExpr := .ref name })
 
 /-- Detect reset pattern in if/else:
     if (!rst_n) → active-low reset, returns (resetSignal, initBranch, dataBranch)
@@ -590,6 +701,7 @@ partial def collectRefs : Expr → List String
   | .ref name => [name]
   | .op _ args => args.flatMap collectRefs
   | .concat args => args.flatMap collectRefs
+  | .resize _ value => collectRefs value
   | .slice e _ _ => collectRefs e
   | .index a i => collectRefs a ++ collectRefs i
   | _ => []
@@ -648,6 +760,7 @@ def stmtsToMuxExprBlocking (sigName : String) (stmts : List SVStmt) : Expr :=
         | .ref n => if n == sigName then base else .ref n
         | .op o args => .op o (args.map substSelf)
         | .concat args => .concat (args.map substSelf)
+        | .resize width value => .resize width (substSelf value)
         | .slice inner hi lo => .slice (substSelf inner) hi lo
         | .index arr idx => .index (substSelf arr) (substSelf idx)
         | other => other
@@ -797,6 +910,7 @@ private partial def substExprEnv (env : SeqSSAEnv) : Expr → Expr
   | .ref name => .ref (seqEnvLookup env name)
   | .op o args => .op o (args.map (substExprEnv env))
   | .concat args => .concat (args.map (substExprEnv env))
+  | .resize width value => .resize width (substExprEnv env value)
   | .slice e hi lo => .slice (substExprEnv env e) hi lo
   | .index arr idx => .index (substExprEnv env arr) (substExprEnv env idx)
   | other => other
@@ -1034,9 +1148,10 @@ def topoSortBody (body : List Stmt) : List Stmt := Id.run do
 /-- Try to evaluate an SVExpr to a constant Nat using parameter values.
     Returns `none` if the expression is too complex to evaluate statically. -/
 partial def evalConstExpr (paramVals : List (String × Nat)) : SVExpr → Option Nat
-  | .lit (.decimal _ v) => some v
-  | .lit (.hex _ v) => some v
-  | .lit (.binary _ v) => some v
+  | .lit (.decimal width v) | .lit (.hex width v) | .lit (.binary width v) =>
+      match width with
+      | some concreteWidth => truncateNatToWidth concreteWidth v
+      | none => some v
   | .ident name => paramVals.find? (·.1 == name) |>.map (·.2)
   | .binary .add a b => return (← evalConstExpr paramVals a) + (← evalConstExpr paramVals b)
   | .binary .sub a b => return (← evalConstExpr paramVals a) - (← evalConstExpr paramVals b)
@@ -1060,10 +1175,14 @@ partial def evalConstExpr (paramVals : List (String × Nat)) : SVExpr → Option
     let va ← evalConstExpr paramVals a
     let vb ← evalConstExpr paramVals b
     some (va ||| vb)
+  | .unary .unsigned a => evalConstExpr paramVals a
   | .unary .logNot a => do
     let va ← evalConstExpr paramVals a
     some (if va == 0 then 1 else 0)
-  | .sizedCast _ value => evalConstExpr paramVals value
+  | .sizedCast width value => do
+      let concreteWidth ← width.eval? fun name =>
+        paramVals.find? (·.1 == name) |>.map (·.2)
+      truncateNatToWidth concreteWidth (← evalConstExpr paramVals value)
   | _ => none
 
 /-- Extract parameter default values as (name, value) pairs -/
@@ -1092,6 +1211,8 @@ partial def substParamExpr (params : List (String × SVExpr)) : SVExpr → SVExp
       (substituteDimFromSV params hi) (substituteDimFromSV params lo)
   | .partSelectPlus e base w => .partSelectPlus (substParamExpr params e) (substParamExpr params base) (substParamExpr params w)
   | .concat es => .concat (es.map (substParamExpr params))
+  | .repeat_ count value =>
+    .repeat_ (substParamExpr params count) (substParamExpr params value)
   | .sizedCast width value =>
     .sizedCast (substituteDimFromSV params width) (substParamExpr params value)
   | e => e
@@ -1136,6 +1257,452 @@ private partial def collectReadNamesStmt : List SVStmt → List String
     | .forLoop init condition step body =>
       collectReadNamesStmt [init, step] ++ collectReadNamesExpr condition ++ collectReadNamesStmt body
     | .assertStmt condition => collectReadNamesExpr condition
+
+/-- True when an expression contains an explicit `$signed` conversion.  The
+    unsigned Sparkle resize node cannot preserve the extension semantics of
+    such an operand. -/
+private partial def containsSignedConversion : SVExpr → Bool
+  | .unary .signed _ => true
+  | .unary _ argument => containsSignedConversion argument
+  | .binary _ lhs rhs =>
+      containsSignedConversion lhs || containsSignedConversion rhs
+  | .ternary condition then_ else_ =>
+      containsSignedConversion condition || containsSignedConversion then_ ||
+        containsSignedConversion else_
+  | .index array index =>
+      containsSignedConversion array || containsSignedConversion index
+  | .slice expression _ _ => containsSignedConversion expression
+  | .partSelectPlus expression base width =>
+      containsSignedConversion expression || containsSignedConversion base ||
+        containsSignedConversion width
+  | .concat expressions => expressions.any containsSignedConversion
+  | .repeat_ count value =>
+      containsSignedConversion count || containsSignedConversion value
+  | .sizedCast _ value => containsSignedConversion value
+  | .lit _ | .ident _ => false
+
+/-- Conservative SystemVerilog signedness for expressions whose declarations
+    are otherwise unsigned.  This is used only to reject signed operands at an
+    unsigned IR resize boundary; it is not a replacement for a signed IR type.
+    Unsized decimal literals are signed, unary arithmetic inherits its operand,
+    binary arithmetic is signed only when both operands are signed, shifts
+    inherit the left operand, and selects/concatenations are unsigned. -/
+private partial def expressionIsSigned (signedIdentifiers : List String) : SVExpr → Bool
+  | .lit (.decimal none _) => true
+  | .lit _ => false
+  | .ident name => signedIdentifiers.contains name
+  | .unary .signed _ => true
+  | .unary .unsigned _ | .unary .logNot _ | .unary .reductAnd _
+  | .unary .reductOr _ => false
+  | .unary .bitNot argument | .unary .neg argument =>
+      expressionIsSigned signedIdentifiers argument
+  | .binary .shl lhs _ | .binary .shr lhs _ | .binary .asr lhs _ =>
+      expressionIsSigned signedIdentifiers lhs
+  | .binary .add lhs rhs | .binary .sub lhs rhs | .binary .mul lhs rhs
+  | .binary .pow lhs rhs | .binary .bitAnd lhs rhs | .binary .bitOr lhs rhs
+  | .binary .bitXor lhs rhs =>
+      expressionIsSigned signedIdentifiers lhs && expressionIsSigned signedIdentifiers rhs
+  | .binary _ _ _ => false
+  | .ternary _ then_ else_ =>
+      expressionIsSigned signedIdentifiers then_ &&
+        expressionIsSigned signedIdentifiers else_
+  | .sizedCast _ value => expressionIsSigned signedIdentifiers value
+  | .index _ _ | .slice _ _ _ | .partSelectPlus _ _ _ | .concat _ | .repeat_ _ _ => false
+
+/-- Operations whose result bits depend on signedness that the unsigned
+    Sparkle IR cannot currently retain.  This scan is intentionally recursive:
+    a `$unsigned(...)` wrapper changes the wrapper's result signedness but does
+    not change how a signed comparison inside it is evaluated. -/
+private partial def containsUnsupportedSignedOperation
+    (signedIdentifiers : List String) : SVExpr → Bool
+  | .binary op lhs rhs =>
+      let bothSigned :=
+        expressionIsSigned signedIdentifiers lhs &&
+          expressionIsSigned signedIdentifiers rhs
+      let signedRelational :=
+        (op == .lt || op == .le || op == .gt || op == .ge) && bothSigned
+      -- Even equality and nominally unsigned-result arithmetic/bitwise nodes
+      -- can first sign-extend two signed operands to a common width.  That
+      -- extension is lost if an enclosing `$unsigned(size'(...))` is lowered
+      -- directly to the unsigned IR.
+      let signedWidthSensitive :=
+        (op == .add || op == .sub || op == .mul || op == .pow ||
+          op == .bitAnd || op == .bitOr || op == .bitXor ||
+          op == .eq || op == .neq) && bothSigned
+      let unsupportedShift := op == .asr
+      signedRelational || signedWidthSensitive || unsupportedShift ||
+        containsUnsupportedSignedOperation signedIdentifiers lhs ||
+        containsUnsupportedSignedOperation signedIdentifiers rhs
+  | .unary _ argument =>
+      containsUnsupportedSignedOperation signedIdentifiers argument
+  | .ternary condition then_ else_ =>
+      (expressionIsSigned signedIdentifiers then_ &&
+        expressionIsSigned signedIdentifiers else_) ||
+        containsUnsupportedSignedOperation signedIdentifiers condition ||
+        containsUnsupportedSignedOperation signedIdentifiers then_ ||
+        containsUnsupportedSignedOperation signedIdentifiers else_
+  | .index array index =>
+      containsUnsupportedSignedOperation signedIdentifiers array ||
+        containsUnsupportedSignedOperation signedIdentifiers index
+  | .slice expression _ _ =>
+      containsUnsupportedSignedOperation signedIdentifiers expression
+  | .partSelectPlus expression base width =>
+      containsUnsupportedSignedOperation signedIdentifiers expression ||
+        containsUnsupportedSignedOperation signedIdentifiers base ||
+        containsUnsupportedSignedOperation signedIdentifiers width
+  | .concat expressions =>
+      expressions.any (containsUnsupportedSignedOperation signedIdentifiers)
+  | .repeat_ count value =>
+      containsUnsupportedSignedOperation signedIdentifiers count ||
+        containsUnsupportedSignedOperation signedIdentifiers value
+  | .sizedCast _ value =>
+      containsUnsupportedSignedOperation signedIdentifiers value
+  | .lit _ | .ident _ => false
+
+/-- Reject only `$signed` conversions that occur inside the operand of a sized
+    cast.  A sized cast inherits its operand's signedness, which the unsigned
+    Sparkle IR cannot retain.  The one safe materialization boundary is an
+    immediate `$unsigned(size'(value))`: the inner cast first establishes its
+    width and `$unsigned` then explicitly discards its signedness. -/
+private partial def hasSignedSizedCastExpr (signedIdentifiers : List String) : SVExpr → Bool
+  | .unary .unsigned (.sizedCast _ value) =>
+      let exactlyMaterializedSignedOperand := match value with
+        | .lit _ | .unary .neg (.lit _) => true
+        | _ => false
+      containsSignedConversion value ||
+        containsUnsupportedSignedOperation signedIdentifiers value ||
+        (expressionIsSigned signedIdentifiers value &&
+          !exactlyMaterializedSignedOperand) ||
+        hasSignedSizedCastExpr signedIdentifiers value
+  | .sizedCast _ value =>
+      containsSignedConversion value ||
+        containsUnsupportedSignedOperation signedIdentifiers value ||
+        expressionIsSigned signedIdentifiers value ||
+        hasSignedSizedCastExpr signedIdentifiers value
+  | .unary _ argument => hasSignedSizedCastExpr signedIdentifiers argument
+  | .binary _ lhs rhs =>
+      hasSignedSizedCastExpr signedIdentifiers lhs ||
+        hasSignedSizedCastExpr signedIdentifiers rhs
+  | .ternary condition then_ else_ =>
+      hasSignedSizedCastExpr signedIdentifiers condition ||
+        hasSignedSizedCastExpr signedIdentifiers then_ ||
+        hasSignedSizedCastExpr signedIdentifiers else_
+  | .index array index =>
+      hasSignedSizedCastExpr signedIdentifiers array ||
+        hasSignedSizedCastExpr signedIdentifiers index
+  | .slice expression _ _ => hasSignedSizedCastExpr signedIdentifiers expression
+  | .partSelectPlus expression base width =>
+      hasSignedSizedCastExpr signedIdentifiers expression ||
+        hasSignedSizedCastExpr signedIdentifiers base ||
+        hasSignedSizedCastExpr signedIdentifiers width
+  | .concat expressions =>
+      expressions.any (hasSignedSizedCastExpr signedIdentifiers)
+  | .repeat_ count value =>
+      -- A replication multiplier is an elaboration-time Nat, not a packed
+      -- data-path value.  When its complete expression is exactly evaluable,
+      -- signed result metadata is irrelevant after conversion to that Nat.
+      (if (svExprToNat count).isSome then false
+       else hasSignedSizedCastExpr signedIdentifiers count) ||
+        hasSignedSizedCastExpr signedIdentifiers value
+  | .lit _ | .ident _ => false
+
+private partial def hasSignedSizedCastStmt (signedIdentifiers : List String) : SVStmt → Bool
+  | .blockAssign lhs rhs | .nonblockAssign lhs rhs =>
+      hasSignedSizedCastExpr signedIdentifiers lhs ||
+        hasSignedSizedCastExpr signedIdentifiers rhs
+  | .ifElse condition then_ else_ =>
+      hasSignedSizedCastExpr signedIdentifiers condition ||
+        then_.any (hasSignedSizedCastStmt signedIdentifiers) ||
+        else_.any (hasSignedSizedCastStmt signedIdentifiers)
+  | .caseStmt selector arms default_ =>
+      hasSignedSizedCastExpr signedIdentifiers selector ||
+        arms.any (fun arm =>
+          arm.1.any (hasSignedSizedCastExpr signedIdentifiers) ||
+            arm.2.any (hasSignedSizedCastStmt signedIdentifiers)) ||
+        default_.any (fun statements =>
+          statements.any (hasSignedSizedCastStmt signedIdentifiers))
+  | .forLoop init condition step body =>
+      hasSignedSizedCastStmt signedIdentifiers init ||
+        hasSignedSizedCastExpr signedIdentifiers condition ||
+        hasSignedSizedCastStmt signedIdentifiers step ||
+        body.any (hasSignedSizedCastStmt signedIdentifiers)
+  | .assertStmt condition => hasSignedSizedCastExpr signedIdentifiers condition
+
+private partial def hasSignedSizedCastItem (signedIdentifiers : List String) : SVModuleItem → Bool
+  | .wireDecl _ _ init _ => init.any (hasSignedSizedCastExpr signedIdentifiers)
+  | .paramDecl parameter => hasSignedSizedCastExpr signedIdentifiers parameter.value
+  | .contAssign lhs rhs =>
+      hasSignedSizedCastExpr signedIdentifiers lhs ||
+        hasSignedSizedCastExpr signedIdentifiers rhs
+  | .alwaysBlock _ statements =>
+      statements.any (hasSignedSizedCastStmt signedIdentifiers)
+  | .generateBlock condition body elseBody =>
+      hasSignedSizedCastExpr signedIdentifiers condition ||
+        body.any (hasSignedSizedCastItem signedIdentifiers) ||
+        elseBody.any (hasSignedSizedCastItem signedIdentifiers)
+  | .instantiation _ _ connections overrides =>
+      connections.any (fun connection =>
+        hasSignedSizedCastExpr signedIdentifiers connection.2) ||
+        overrides.any (fun override =>
+          hasSignedSizedCastExpr signedIdentifiers override.2)
+  | .taskDecl _ statements =>
+      statements.any (hasSignedSizedCastStmt signedIdentifiers)
+  | .validationGuard condition => hasSignedSizedCastExpr signedIdentifiers condition
+  | .regDecl .. | .integerDecl _ | .readmemh _ _ => false
+
+private partial def collectItemParameters : List SVModuleItem → List SVParam
+  | items => items.flatMap fun item => match item with
+    | .paramDecl parameter => [parameter]
+    | .generateBlock _ body elseBody =>
+        collectItemParameters body ++ collectItemParameters elseBody
+    | _ => []
+
+private def inferredSignedParameterNames (module_ : SVModule) : List String :=
+  (module_.params ++ collectItemParameters module_.items).foldl
+    (fun signedNames parameter =>
+      let inferredSigned := parameter.isSigned ||
+        (parameter.width.isNone && expressionIsSigned signedNames parameter.value)
+      if inferredSigned && !signedNames.contains parameter.name then
+        signedNames ++ [parameter.name]
+      else signedNames) []
+
+private def hasSignedSizedCast (module_ : SVModule) : Bool :=
+  let signedIdentifiers := inferredSignedParameterNames module_
+  module_.params.any (fun parameter =>
+      hasSignedSizedCastExpr signedIdentifiers parameter.value) ||
+    module_.items.any (hasSignedSizedCastItem signedIdentifiers)
+
+/-- Native symbolic lowering has no signed packed type.  Preserve the parser
+    fact in the AST, then fail closed instead of silently changing extension,
+    comparison, or shift semantics. -/
+private partial def hasSignedDeclarationItem : SVModuleItem → Bool
+  | .wireDecl _ _ _ isSigned | .regDecl _ _ _ isSigned => isSigned
+  | .integerDecl _ => true
+  | .paramDecl parameter => parameter.isSigned
+  | .generateBlock _ body elseBody =>
+      body.any hasSignedDeclarationItem || elseBody.any hasSignedDeclarationItem
+  | _ => false
+
+private def hasSignedDeclaration (module_ : SVModule) : Bool :=
+  module_.ports.any (·.isSigned) || module_.params.any (·.isSigned) ||
+    module_.items.any hasSignedDeclarationItem
+
+/-- Detect any sized cast in a module.  Signed declaration types are not yet
+    represented in Sparkle IR, so even a concrete cast can change from sign
+    extension to zero extension if lowering discards that declaration fact. -/
+private partial def containsSizedCastExpr : SVExpr → Bool
+  | .sizedCast _ _ => true
+  | .unary _ argument => containsSizedCastExpr argument
+  | .binary _ lhs rhs => containsSizedCastExpr lhs || containsSizedCastExpr rhs
+  | .ternary condition then_ else_ =>
+      containsSizedCastExpr condition || containsSizedCastExpr then_ ||
+        containsSizedCastExpr else_
+  | .index array index => containsSizedCastExpr array || containsSizedCastExpr index
+  | .slice expression _ _ => containsSizedCastExpr expression
+  | .partSelectPlus expression base width =>
+      containsSizedCastExpr expression || containsSizedCastExpr base ||
+        containsSizedCastExpr width
+  | .concat expressions => expressions.any containsSizedCastExpr
+  | .repeat_ count value => containsSizedCastExpr count || containsSizedCastExpr value
+  | .lit _ | .ident _ => false
+
+private partial def containsSizedCastStmt : SVStmt → Bool
+  | .blockAssign lhs rhs | .nonblockAssign lhs rhs =>
+      containsSizedCastExpr lhs || containsSizedCastExpr rhs
+  | .ifElse condition then_ else_ =>
+      containsSizedCastExpr condition || then_.any containsSizedCastStmt ||
+        else_.any containsSizedCastStmt
+  | .caseStmt selector arms default_ =>
+      containsSizedCastExpr selector ||
+        arms.any (fun arm => arm.1.any containsSizedCastExpr ||
+          arm.2.any containsSizedCastStmt) ||
+        default_.any (fun statements => statements.any containsSizedCastStmt)
+  | .forLoop init condition step body =>
+      containsSizedCastStmt init || containsSizedCastExpr condition ||
+        containsSizedCastStmt step || body.any containsSizedCastStmt
+  | .assertStmt condition => containsSizedCastExpr condition
+
+private partial def containsSizedCastItem : SVModuleItem → Bool
+  | .wireDecl _ _ init _ => init.any containsSizedCastExpr
+  | .paramDecl parameter => containsSizedCastExpr parameter.value
+  | .contAssign lhs rhs => containsSizedCastExpr lhs || containsSizedCastExpr rhs
+  | .alwaysBlock _ statements => statements.any containsSizedCastStmt
+  | .generateBlock condition body elseBody =>
+      containsSizedCastExpr condition || body.any containsSizedCastItem ||
+        elseBody.any containsSizedCastItem
+  | .instantiation _ _ connections overrides =>
+      connections.any (fun connection => containsSizedCastExpr connection.2) ||
+        overrides.any (fun override => containsSizedCastExpr override.2)
+  | .taskDecl _ statements => statements.any containsSizedCastStmt
+  | .validationGuard condition => containsSizedCastExpr condition
+  | .regDecl .. | .integerDecl _ | .readmemh _ _ => false
+
+private def hasSizedCast (module_ : SVModule) : Bool :=
+  module_.params.any (fun parameter => containsSizedCastExpr parameter.value) ||
+    module_.items.any containsSizedCastItem
+
+/-- SystemVerilog sized casts are context-determined: their target width can
+    flow into arithmetic, bitwise, shift, unary, and conditional operands
+    before those operands are evaluated.  `Expr.resize`, by contrast, resizes
+    an already evaluated unsigned IR value.  The two operations agree for
+    self-determined operands such as identifiers, concatenations, selects,
+    comparisons, nested casts, and an explicit `$unsigned` boundary, but not
+    in general for the nodes listed here. -/
+private def sizedCastOperandNeedsContext : SVExpr → Bool
+  | .unary .neg (.lit _) => false
+  | .unary .neg _ | .unary .bitNot _ => true
+  | .binary .add _ _ | .binary .sub _ _ | .binary .mul _ _
+  | .binary .pow _ _ | .binary .bitAnd _ _ | .binary .bitOr _ _
+  | .binary .bitXor _ _ | .binary .shl _ _ | .binary .shr _ _
+  | .binary .asr _ _ => true
+  | .ternary _ _ _ => true
+  | _ => false
+
+/-- Find a context-dependent operand at any sized-cast boundary.  Traversal
+    below a self-determined boundary is still required so nested sized casts
+    receive their own independent check. -/
+private partial def hasUnsupportedSizedCastContextExpr : SVExpr → Bool
+  | .sizedCast _ value =>
+      sizedCastOperandNeedsContext value ||
+        hasUnsupportedSizedCastContextExpr value
+  | .unary _ argument => hasUnsupportedSizedCastContextExpr argument
+  | .binary _ lhs rhs =>
+      hasUnsupportedSizedCastContextExpr lhs ||
+        hasUnsupportedSizedCastContextExpr rhs
+  | .ternary condition then_ else_ =>
+      hasUnsupportedSizedCastContextExpr condition ||
+        hasUnsupportedSizedCastContextExpr then_ ||
+        hasUnsupportedSizedCastContextExpr else_
+  | .index array index =>
+      hasUnsupportedSizedCastContextExpr array ||
+        hasUnsupportedSizedCastContextExpr index
+  | .slice expression _ _ => hasUnsupportedSizedCastContextExpr expression
+  | .partSelectPlus expression base width =>
+      hasUnsupportedSizedCastContextExpr expression ||
+        hasUnsupportedSizedCastContextExpr base ||
+        hasUnsupportedSizedCastContextExpr width
+  | .concat expressions => expressions.any hasUnsupportedSizedCastContextExpr
+  | .repeat_ count value =>
+      hasUnsupportedSizedCastContextExpr count ||
+        hasUnsupportedSizedCastContextExpr value
+  | .lit _ | .ident _ => false
+
+private partial def hasUnsupportedSizedCastContextStmt : SVStmt → Bool
+  | .blockAssign lhs rhs | .nonblockAssign lhs rhs =>
+      hasUnsupportedSizedCastContextExpr lhs ||
+        hasUnsupportedSizedCastContextExpr rhs
+  | .ifElse condition then_ else_ =>
+      hasUnsupportedSizedCastContextExpr condition ||
+        then_.any hasUnsupportedSizedCastContextStmt ||
+        else_.any hasUnsupportedSizedCastContextStmt
+  | .caseStmt selector arms default_ =>
+      hasUnsupportedSizedCastContextExpr selector ||
+        arms.any (fun arm =>
+          arm.1.any hasUnsupportedSizedCastContextExpr ||
+            arm.2.any hasUnsupportedSizedCastContextStmt) ||
+        default_.any (fun statements =>
+          statements.any hasUnsupportedSizedCastContextStmt)
+  | .forLoop init condition step body =>
+      hasUnsupportedSizedCastContextStmt init ||
+        hasUnsupportedSizedCastContextExpr condition ||
+        hasUnsupportedSizedCastContextStmt step ||
+        body.any hasUnsupportedSizedCastContextStmt
+  | .assertStmt condition => hasUnsupportedSizedCastContextExpr condition
+
+private partial def hasUnsupportedSizedCastContextItem : SVModuleItem → Bool
+  | .wireDecl _ _ init _ =>
+      init.any hasUnsupportedSizedCastContextExpr
+  | .paramDecl parameter =>
+      hasUnsupportedSizedCastContextExpr parameter.value
+  | .contAssign lhs rhs =>
+      hasUnsupportedSizedCastContextExpr lhs ||
+        hasUnsupportedSizedCastContextExpr rhs
+  | .alwaysBlock _ statements | .taskDecl _ statements =>
+      statements.any hasUnsupportedSizedCastContextStmt
+  | .generateBlock condition body elseBody =>
+      hasUnsupportedSizedCastContextExpr condition ||
+        body.any hasUnsupportedSizedCastContextItem ||
+        elseBody.any hasUnsupportedSizedCastContextItem
+  | .instantiation _ _ connections overrides =>
+      connections.any (fun connection =>
+        hasUnsupportedSizedCastContextExpr connection.2) ||
+        overrides.any (fun override =>
+          hasUnsupportedSizedCastContextExpr override.2)
+  | .validationGuard condition =>
+      hasUnsupportedSizedCastContextExpr condition
+  | .regDecl .. | .integerDecl _ | .readmemh _ _ => false
+
+private def hasUnsupportedSizedCastContext (module_ : SVModule) : Bool :=
+  module_.params.any (fun parameter =>
+      hasUnsupportedSizedCastContextExpr parameter.value) ||
+    module_.items.any hasUnsupportedSizedCastContextItem
+
+/-- `>>>` depends on the left operand's signedness.  Lowering currently has no
+    signed packed type, and a sized-cast result can reach a later shift through
+    a named wire.  A module containing both features must therefore fail closed
+    until signedness is represented in the IR. -/
+private partial def hasAsrConsumingSizedCastExpr : SVExpr → Bool
+  | .binary .asr _ _ => true
+  | .binary _ lhs rhs =>
+      hasAsrConsumingSizedCastExpr lhs || hasAsrConsumingSizedCastExpr rhs
+  | .unary _ argument => hasAsrConsumingSizedCastExpr argument
+  | .ternary condition then_ else_ =>
+      hasAsrConsumingSizedCastExpr condition ||
+        hasAsrConsumingSizedCastExpr then_ ||
+        hasAsrConsumingSizedCastExpr else_
+  | .index array index =>
+      hasAsrConsumingSizedCastExpr array || hasAsrConsumingSizedCastExpr index
+  | .slice expression _ _ => hasAsrConsumingSizedCastExpr expression
+  | .partSelectPlus expression base width =>
+      hasAsrConsumingSizedCastExpr expression ||
+        hasAsrConsumingSizedCastExpr base || hasAsrConsumingSizedCastExpr width
+  | .concat expressions => expressions.any hasAsrConsumingSizedCastExpr
+  | .repeat_ count value =>
+      hasAsrConsumingSizedCastExpr count || hasAsrConsumingSizedCastExpr value
+  | .sizedCast _ value => hasAsrConsumingSizedCastExpr value
+  | .lit _ | .ident _ => false
+
+private partial def hasAsrConsumingSizedCastStmt : SVStmt → Bool
+  | .blockAssign lhs rhs | .nonblockAssign lhs rhs =>
+      hasAsrConsumingSizedCastExpr lhs || hasAsrConsumingSizedCastExpr rhs
+  | .ifElse condition then_ else_ =>
+      hasAsrConsumingSizedCastExpr condition ||
+        then_.any hasAsrConsumingSizedCastStmt ||
+        else_.any hasAsrConsumingSizedCastStmt
+  | .caseStmt selector arms default_ =>
+      hasAsrConsumingSizedCastExpr selector ||
+        arms.any (fun arm => arm.1.any hasAsrConsumingSizedCastExpr ||
+          arm.2.any hasAsrConsumingSizedCastStmt) ||
+        default_.any (fun statements => statements.any hasAsrConsumingSizedCastStmt)
+  | .forLoop init condition step body =>
+      hasAsrConsumingSizedCastStmt init ||
+        hasAsrConsumingSizedCastExpr condition ||
+        hasAsrConsumingSizedCastStmt step || body.any hasAsrConsumingSizedCastStmt
+  | .assertStmt condition => hasAsrConsumingSizedCastExpr condition
+
+private partial def hasAsrConsumingSizedCastItem : SVModuleItem → Bool
+  | .wireDecl _ _ init _ => init.any hasAsrConsumingSizedCastExpr
+  | .paramDecl parameter => hasAsrConsumingSizedCastExpr parameter.value
+  | .contAssign lhs rhs =>
+      hasAsrConsumingSizedCastExpr lhs || hasAsrConsumingSizedCastExpr rhs
+  | .alwaysBlock _ statements | .taskDecl _ statements =>
+      statements.any hasAsrConsumingSizedCastStmt
+  | .generateBlock condition body elseBody =>
+      hasAsrConsumingSizedCastExpr condition ||
+        body.any hasAsrConsumingSizedCastItem ||
+        elseBody.any hasAsrConsumingSizedCastItem
+  | .instantiation _ _ connections overrides =>
+      connections.any (fun connection =>
+        hasAsrConsumingSizedCastExpr connection.2) ||
+        overrides.any (fun override => hasAsrConsumingSizedCastExpr override.2)
+  | .validationGuard condition => hasAsrConsumingSizedCastExpr condition
+  | .regDecl .. | .integerDecl _ | .readmemh _ _ => false
+
+private def hasAsrConsumingSizedCast (module_ : SVModule) : Bool :=
+  hasSizedCast module_ &&
+    (module_.params.any (fun parameter =>
+        hasAsrConsumingSizedCastExpr parameter.value) ||
+      module_.items.any hasAsrConsumingSizedCastItem)
 
 /-- Does a procedural loop require elaboration using a retained module
     parameter?  Such a loop cannot be unrolled at the default while still
@@ -1195,18 +1762,10 @@ private partial def hasUnsupportedParameterizedExpr (parameterNames : List Strin
     (collectReadNamesExpr count).any parameterNames.contains ||
       hasUnsupportedParameterizedExpr parameterNames value
   | .sizedCast _width value =>
-    -- Literal casts lower to an IR constant carrying `width` and therefore
-    -- retain a native parameter exactly.  For a nonliteral value, however,
-    -- `lowerExpr` currently has no resize/cast node and would drop the cast.
-    -- Reject every nonliteral cast instead of silently changing concat,
-    -- extension, or truncation semantics. This is required even for a
-    -- concrete cast width: `(3)'(x)` can truncate `x` before a concat, whereas
-    -- dropping the cast lets the enclosing assignment truncate differently.
-    let isLiteralValue := match value with
-      | .lit _ | .unary .neg (.lit _) => true
-      | _ => false
-    !isLiteralValue ||
-      hasUnsupportedParameterizedExpr parameterNames value
+    -- Sized casts lower to the width-preserving IR `resize` node.  Continue
+    -- checking the operand for independently unsupported constructs such as
+    -- retained signed casts.
+    hasUnsupportedParameterizedExpr parameterNames value
   | _ => false
 
 private def hasUnsupportedNativeLhs (parameterNames : List String) (lhs : SVExpr) : Bool :=
@@ -1261,7 +1820,7 @@ private def hasUnsupportedParameterizedConstruct (parameterNames : List String)
       statements.any (hasUnsupportedParameterizedStmt parameterNames)
   | .alwaysBlock _ statements =>
     statements.any (hasUnsupportedParameterizedStmt parameterNames)
-  | .wireDecl _ _ init => init.any (hasUnsupportedParameterizedExpr parameterNames)
+  | .wireDecl _ _ init _ => init.any (hasUnsupportedParameterizedExpr parameterNames)
   | .instantiation _ _ connections overrides =>
     connections.any (fun connection => hasUnsupportedParameterizedExpr parameterNames connection.2) ||
       overrides.any (fun override => hasUnsupportedParameterizedExpr parameterNames override.2)
@@ -1426,8 +1985,8 @@ def specializeItem (parameters : List (String × SVExpr))
       (statements.map (substParamStmt parameters))
   | .contAssign lhs rhs =>
     .contAssign (substParamExpr parameters lhs) (substParamExpr parameters rhs)
-  | .wireDecl name width init =>
-    .wireDecl name width (init.map (substParamExpr parameters))
+  | .wireDecl name width init isSigned =>
+    .wireDecl name width (init.map (substParamExpr parameters)) isSigned
   | .instantiation moduleName instanceName connections overrides =>
     .instantiation moduleName instanceName
       (connections.map fun connection => (connection.1, substParamExpr parameters connection.2))
@@ -1450,6 +2009,88 @@ partial def expandGenerateBlocks (paramVals : List (String × Nat))
     | other => result := result ++ [other]
   pure result
 
+/-- Validate replication multipliers after legacy parameter specialization.
+    Replication is a constant elaboration context, so accepting an exactly
+    evaluable sized cast here is sound even when its literal would be signed in
+    a packed data path.  Conversely, lowering must never guess a multiplier. -/
+private partial def validateRepeatCountsExpr : SVExpr → Except String Unit
+  | .repeat_ count value => do
+      match svExprToNat count with
+      | some n =>
+          if n == 0 then
+            throw s!"replication count evaluates to zero: {repr count}"
+      | none =>
+          throw s!"replication count is not an exactly evaluable non-negative constant after parameter specialization: {repr count}"
+      validateRepeatCountsExpr count
+      validateRepeatCountsExpr value
+  | .unary _ argument => validateRepeatCountsExpr argument
+  | .binary _ lhs rhs => do
+      validateRepeatCountsExpr lhs
+      validateRepeatCountsExpr rhs
+  | .ternary condition then_ else_ => do
+      validateRepeatCountsExpr condition
+      validateRepeatCountsExpr then_
+      validateRepeatCountsExpr else_
+  | .index array index => do
+      validateRepeatCountsExpr array
+      validateRepeatCountsExpr index
+  | .slice expression _ _ => validateRepeatCountsExpr expression
+  | .partSelectPlus expression base width => do
+      validateRepeatCountsExpr expression
+      validateRepeatCountsExpr base
+      validateRepeatCountsExpr width
+  | .concat expressions =>
+      for expression in expressions do validateRepeatCountsExpr expression
+  | .sizedCast _ value => validateRepeatCountsExpr value
+  | .lit _ | .ident _ => pure ()
+
+private partial def validateRepeatCountsStmt : SVStmt → Except String Unit
+  | .blockAssign lhs rhs | .nonblockAssign lhs rhs => do
+      validateRepeatCountsExpr lhs
+      validateRepeatCountsExpr rhs
+  | .ifElse condition then_ else_ => do
+      validateRepeatCountsExpr condition
+      for statement in then_ do validateRepeatCountsStmt statement
+      for statement in else_ do validateRepeatCountsStmt statement
+  | .caseStmt selector arms default_ => do
+      validateRepeatCountsExpr selector
+      for (labels, statements) in arms do
+        for label in labels do validateRepeatCountsExpr label
+        for statement in statements do validateRepeatCountsStmt statement
+      for statements in default_.toList do
+        for statement in statements do validateRepeatCountsStmt statement
+  | .forLoop init condition step body => do
+      validateRepeatCountsStmt init
+      validateRepeatCountsExpr condition
+      validateRepeatCountsStmt step
+      for statement in body do validateRepeatCountsStmt statement
+  | .assertStmt condition => validateRepeatCountsExpr condition
+
+private partial def validateRepeatCountsItem : SVModuleItem → Except String Unit
+  | .wireDecl _ _ init _ =>
+      for expression in init.toList do validateRepeatCountsExpr expression
+  | .paramDecl parameter => validateRepeatCountsExpr parameter.value
+  | .contAssign lhs rhs => do
+      validateRepeatCountsExpr lhs
+      validateRepeatCountsExpr rhs
+  | .alwaysBlock _ statements | .taskDecl _ statements =>
+      for statement in statements do validateRepeatCountsStmt statement
+  | .generateBlock condition body elseBody => do
+      validateRepeatCountsExpr condition
+      for item in body do validateRepeatCountsItem item
+      for item in elseBody do validateRepeatCountsItem item
+  | .instantiation _ _ connections overrides => do
+      for (_, expression) in connections do validateRepeatCountsExpr expression
+      for (_, expression) in overrides do validateRepeatCountsExpr expression
+  | .validationGuard condition => validateRepeatCountsExpr condition
+  | .regDecl .. | .integerDecl _ | .readmemh _ _ => pure ()
+
+private def validateRepeatCounts (module_ : SVModule) : Except String Unit := do
+  for parameter in module_.params do
+    validateRepeatCountsExpr parameter.value
+  for item in module_.items do
+    validateRepeatCountsItem item
+
 -- ============================================================================
 -- Module lowering
 -- ============================================================================
@@ -1459,6 +2100,16 @@ partial def expandGenerateBlocks (paramVals : List (String × Nat))
     their defaults (or explicit overrides) before lowering. -/
 def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     (retainParameters : Bool := false) : Except String Module := do
+  if retainParameters && hasSignedDeclaration svMod then
+    throw "native symbolic lowering does not support signed port, parameter, wire, register, or integer declarations; specialize the module through the legacy path"
+  if hasSignedDeclaration svMod && hasSizedCast svMod then
+    throw "a SystemVerilog module combines signed declarations with sized casts, but Sparkle IR resize is unsigned; signed sized-cast semantics are not supported"
+  if hasSignedSizedCast svMod then
+    throw "a SystemVerilog sized cast has signed operand/result semantics that Sparkle's unsigned IR resize cannot retain; wrap an intentionally materialized cast in $unsigned or use an explicitly unsigned operand"
+  if hasUnsupportedSizedCastContext svMod then
+    throw "a SystemVerilog sized cast applies context width to an arithmetic, bitwise, shift, unary, or conditional operand; Sparkle IR resize operates on an already evaluated value, so this cast must be rewritten with explicit operand widths before lowering"
+  if hasAsrConsumingSizedCast svMod then
+    throw "a module combines a sized cast with arithmetic right shift, but Sparkle IR does not retain enough signedness to prove their dataflow semantics; rewrite the shift with an explicitly supported signed or logical operation before lowering"
   -- Expand generate blocks using parameter defaults + overrides
   let paramDefaults := extractParamDefaults svMod
   -- Overrides take priority: replace defaults with overridden values
@@ -1480,7 +2131,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
   if retainParameters && hasParameterizedGenerate parameterNames svMod.items then
     throw "parameter-dependent generate/procedural-for elaboration cannot be retained as a native override; specialize the module explicitly"
   if retainParameters && hasUnsupportedParameterizedConstruct parameterNames svMod.items then
-    throw "parameter-dependent slice/repeat/part-select/sign-extension, signed/nonliteral sized-cast, complex assignment target, or procedural-combinational lowering is not supported for native overrides; specialize the module explicitly"
+    throw "parameter-dependent slice/repeat/part-select/sign-extension, signed cast, complex assignment target, or procedural-combinational lowering is not supported for native overrides; specialize the module explicitly"
   let mut moduleParameters : List Sparkle.IR.AST.Parameter := []
   if retainParameters then
     for parameter in parameterDecls do
@@ -1506,16 +2157,18 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     { port with width := specializeWidth paramVals port.width }
   let expandedItems := if retainParameters then expandedItems else expandedItems.map fun item =>
     match item with
-    | .wireDecl name width init => .wireDecl name (specializeWidth paramVals width) init
-    | .regDecl name width arraySize =>
+    | .wireDecl name width init isSigned =>
+      .wireDecl name (specializeWidth paramVals width) init isSigned
+    | .regDecl name width arraySize isSigned =>
       let arraySize := arraySize.map fun size => size.substitute fun parameter =>
         paramVals.find? (fun entry => entry.1 == parameter)
           |>.map fun entry => DimExpr.literal entry.2
-      .regDecl name (specializeWidth paramVals width) arraySize
+      .regDecl name (specializeWidth paramVals width) arraySize isSigned
     | .paramDecl parameter =>
       .paramDecl { parameter with width := specializeWidth paramVals parameter.width }
     | other => other
   let svMod := { svMod with items := expandedItems, params := svParams, ports := svPorts }
+  validateRepeatCounts svMod
 
   -- Build environment
   let mut env := LowerEnv.empty
@@ -1523,8 +2176,8 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     env := { env with portWidths := env.portWidths ++ [(p.name, p.width)] }
   for item in svMod.items do
     match item with
-    | .wireDecl name width _ => env := { env with wireWidths := env.wireWidths ++ [(name, width)] }
-    | .regDecl name width _ =>
+    | .wireDecl name width _ _ => env := { env with wireWidths := env.wireWidths ++ [(name, width)] }
+    | .regDecl name width _ _ =>
       env := { env with wireWidths := env.wireWidths ++ [(name, width)],
                          regNames := env.regNames ++ [name] }
     | _ => pure ()
@@ -1538,7 +2191,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
 
   -- Collect array register names (memory arrays, not scalar registers)
   let arrayRegNames := svMod.items.filterMap fun item => match item with
-    | .regDecl name _ (some _) => some name
+    | .regDecl name _ (some _) _ => some name
     | _ => none
 
   -- Helper: check if a wire name is already declared
@@ -1549,8 +2202,8 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
   let mut wires : List Port := []
   for item in svMod.items do
     match item with
-    | .wireDecl name width _ => wires := wires ++ [{ name, ty := widthToHWType width }]
-    | .regDecl name width arraySize =>
+    | .wireDecl name width _ _ => wires := wires ++ [{ name, ty := widthToHWType width }]
+    | .regDecl name width arraySize _ =>
       match arraySize with
       | some _ => pure ()  -- Array regs handled by Stmt.memory (not wires)
       | none => wires := wires ++ [{ name, ty := widthToHWType width }]
@@ -1612,17 +2265,33 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
         if !isActiveHigh then
           wires := wires ++ [{ name := resetName, ty := .bit }]
           body := body ++ [.assign resetName (.op .not [.ref resetSig])]
-        initMap := initBranch.filterMap fun s => match s with
+        for statement in initBranch do
+          match statement with
           | .nonblockAssign lhs rhs =>
             match exprToName lhs with
-            | some n => match rhs with
-              | .unary .neg (.lit (.decimal _ v)) => some (n, -(Int.ofNat v))
-              | .sizedCast _ (.unary .neg (.lit (.decimal _ v))) => some (n, -(Int.ofNat v))
-              | _ => match evalConstExpr paramVals rhs with
-                | some v => some (n, Int.ofNat v)
-                | none => none
-            | none => none
-          | _ => none
+            | none => pure ()
+            | some name =>
+              let initValue? ← match rhs with
+                | .unary .neg (.lit (.decimal _ value)) =>
+                    pure (some (-(Int.ofNat value)))
+                | .sizedCast target (.unary .neg (.lit literal)) =>
+                    pure (some (← materializeSizedNegativeLiteral target literal))
+                | .unary .unsigned (.sizedCast target (.lit literal)) =>
+                    pure (some (← materializeDestinationWidthLiteral target
+                      (env.getHWType name).width false literal))
+                | .unary .unsigned
+                    (.sizedCast target (.unary .neg (.lit literal))) =>
+                    pure (some (← materializeDestinationWidthLiteral target
+                      (env.getHWType name).width true literal))
+                | .unary .unsigned (.sizedCast target _) | .sizedCast target _ =>
+                    if retainParameters && target.toNat?.isNone then
+                      throw s!"symbolic reset cast for register '{name}' is not a supported literal form and cannot be evaluated at its default parameter value"
+                    else
+                      pure ((evalConstExpr paramVals rhs).map Int.ofNat)
+                | _ => pure ((evalConstExpr paramVals rhs).map Int.ofNat)
+              for initValue in initValue?.toList do
+                initMap := initMap ++ [(name, initValue)]
+          | _ => pure ()
       | none => pure ()
 
       -- Extract blocking assigns as combinational intermediates (from full always body)
@@ -1660,10 +2329,10 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
           body := body ++ [.assign sigName (.ref latestWire)]
           if !wireExists wires sigName then
             wires := wires ++ [{ name := sigName, ty := .bitVector 64 }]
-    | .wireDecl name _ (some initExpr) =>
+    | .wireDecl name _ (some initExpr) _ =>
       -- wire x = expr; → assign
       body := body ++ [.assign name (lowerExpr initExpr)]
-    | .regDecl name width (some arraySize) =>
+    | .regDecl name width (some arraySize) _ =>
       -- Array reg → Stmt.memory for JIT memory access
       -- Do NOT add to wires list — Stmt.memory creates the class member.
       let dataWidth ← match widthToBits width with
@@ -1736,6 +2405,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
   let exprDepthSimple := fun (e : Expr) =>
     let rec go : Expr → Nat
       | .op _ args => 1 + (args.map go).foldl max 0
+      | .resize _ value => 1 + go value
       | .slice e _ _ => 1 + go e
       | .index a i => 1 + max (go a) (go i)
       | _ => 0
@@ -1817,6 +2487,7 @@ partial def prefixExprNames (pfx : String) (nameSet : List String) : Expr → Ex
   | .ref name => if nameSet.any (· == name) then .ref s!"{pfx}_{name}" else .ref name
   | .op o args => .op o (args.map (prefixExprNames pfx nameSet))
   | .concat args => .concat (args.map (prefixExprNames pfx nameSet))
+  | .resize width value => .resize width (prefixExprNames pfx nameSet value)
   | .slice e hi lo => .slice (prefixExprNames pfx nameSet e) hi lo
   | .index arr idx => .index (prefixExprNames pfx nameSet arr) (prefixExprNames pfx nameSet idx)
   | e => e
@@ -1992,6 +2663,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
                   then .ref s!"_gen_{n}" else .ref n
       | .op o args => .op o (args.map (genExprRefs wireNames))
       | .concat args => .concat (args.map (genExprRefs wireNames))
+      | .resize width value => .resize width (genExprRefs wireNames value)
       | .slice e hi lo => .slice (genExprRefs wireNames e) hi lo
       | .index a i => .index (genExprRefs wireNames a) (genExprRefs wireNames i)
       | e => e

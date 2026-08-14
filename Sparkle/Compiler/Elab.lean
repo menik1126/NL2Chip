@@ -477,6 +477,9 @@ partial def validateExprDefaults (m : Sparkle.IR.AST.Module) (role : String) : S
   | .ref _ => pure ()
   | .op _ args | .concat args =>
       args.forM (validateExprDefaults m role)
+  | .resize width value => do
+      validatePositiveDefaultDim m s!"{role} resize width" width
+      validateExprDefaults m role value
   | .slice expr hi lo => do
       validateExprDefaults m role expr
       let hiValue ← evalDefaultDim m s!"{role} slice high index" hi
@@ -1608,16 +1611,16 @@ mutual
       CompilerM.emitAssign resWire (.concat [.ref hiWire, .ref loWire])
       return some resWire
 
-    -- BitVec.zeroExtend / BitVec.setWidth: zero-extend to wider width
+    -- BitVec.zeroExtend / BitVec.setWidth: unsigned resize in either direction
     if (name == ``BitVec.zeroExtend || name == ``BitVec.setWidth) && args.size >= 2 then
-      trace[sparkle.compiler] "→ zeroExtend"
+      trace[sparkle.compiler] "→ setWidth/unsigned resize"
       let targetWidth ← extractPositiveDim "BitVec target width" args[args.size - 2]!
       let srcWire ← translateExprToWire args[args.size - 1]! "zext_src"
       let resWire ← CompilerM.makeWire hint (.bitVector targetWidth) (named := isNamed)
-      -- SystemVerilog assignment applies the destination packed width: an
-      -- unsigned source is zero-extended or truncated without requiring a
-      -- compile-time comparison between symbolic dimensions.
-      CompilerM.emitAssign resWire (.ref srcWire)
+      -- Preserve the conversion as an explicit IR operation.  This matters
+      -- when the value is later inlined or embedded in a concat: assignment
+      -- context alone is not a stable representation of the resize boundary.
+      CompilerM.emitAssign resWire (.resize targetWidth (.ref srcWire))
       return some resWire
 
     -- isPrimitive dispatch

@@ -370,6 +370,11 @@ partial def parsePrimary : P SVExpr := do
       -- width is a retained module parameter; the native lowering path can
       -- now diagnose this unsupported case instead of losing signedness.
       pure (SVExpr.unary .signed arg)
+    else if name == "unsigned" then
+      -- Sparkle IR packed expressions are intrinsically unsigned.  Retain the
+      -- wrapper in the parser AST long enough for sized-cast lowering to avoid
+      -- accidentally treating `$unsigned(-1)` as a sign-extending literal.
+      pure (SVExpr.unary .unsigned arg)
     else
       pure arg
   | some '\'' =>
@@ -526,10 +531,12 @@ def parsePortInList : P SVPort := do
   let isReg ← match ← attempt (keyword "reg") with | some _ => pure true | none => pure false
   let _ ← attempt (keyword "logic")
   let _ ← attempt (keyword "wire")
-  let _ ← attempt (keyword "signed")
+  let isSigned ← match ← attempt (keyword "signed") with
+    | some _ => pure true
+    | none => pure false
   let width ← parseOptWidth
   let name ← identifier
-  pure { dir, isReg, width, name }
+  pure { dir, isReg, isSigned, width, name }
 
 /-- Parse port list with direction carry-over.
     In Verilog, `input clk, resetn` means both are inputs.
@@ -540,6 +547,7 @@ def parsePortList : P (List SVPort) := do
   let mut ports := [first]
   let mut lastDir := first.dir
   let mut lastIsReg := first.isReg
+  let mut lastIsSigned := first.isSigned
   let mut lastWidth := first.width
   let mut cont := true
   while cont do
@@ -552,31 +560,34 @@ def parsePortList : P (List SVPort) := do
         lastIsReg := match ← attempt (keyword "reg") with | some _ => true | none => false
         let _ ← attempt (keyword "logic")
         let _ ← attempt (keyword "wire")
-        let _ ← attempt (keyword "signed")
+        lastIsSigned := match ← attempt (keyword "signed") with
+          | some _ => true
+          | none => false
         lastWidth ← parseOptWidth
         let name ← identifier
-        let port := { dir := lastDir, isReg := lastIsReg, width := lastWidth, name : SVPort }
+        let port : SVPort := { dir := lastDir, isReg := lastIsReg, isSigned := lastIsSigned, width := lastWidth, name := name }
         ports := ports ++ [port]
       | none =>
         -- No direction keyword — carry over from previous
-        let _ ← attempt (keyword "signed")
+        if (← attempt (keyword "signed")).isSome then
+          lastIsSigned := true
         -- Check for new width override
         let width ← parseOptWidth
         let w := if width.isSome then width else lastWidth
         let name ← identifier
-        let port := { dir := lastDir, isReg := lastIsReg, width := w, name : SVPort }
+        let port : SVPort := { dir := lastDir, isReg := lastIsReg, isSigned := lastIsSigned, width := w, name := name }
         ports := ports ++ [port]
     | none => cont := false
   rparen; pure ports
 
 /-- Parse a single parameter declaration: parameter [width] name = value -/
 def parseParamDecl (isLocal : Bool) : P SVParam := do
-  let _ ← attempt (keyword "integer")  -- optional: integer type
-  let _ ← attempt (keyword "signed")
+  let isInteger := (← attempt (keyword "integer")).isSome
+  let hasSignedKeyword := (← attempt (keyword "signed")).isSome
   let width ← parseOptWidth
   let name ← identifier
   eqSign; let value ← parseExpr
-  pure { name, width, value, isLocal }
+  pure { name, width, value, isLocal, isSigned := isInteger || hasSignedKeyword }
 
 /-- Parse parameter list in #(...) -/
 def parseParamList : P (List SVParam) := do
@@ -748,23 +759,23 @@ partial def parseModuleItems : P (List SVModuleItem) := do
     pure [SVModuleItem.contAssign lhs rhs]
   | none => match ← attempt (keyword "wire") with
     | some _ =>
-      let _ ← attempt (keyword "signed")
+      let isSigned := (← attempt (keyword "signed")).isSome
       let w ← parseOptWidth
       let n ← identifier
       match ← attempt eqSign with
-      | some _ => let e ← parseExpr; semi; pure [SVModuleItem.wireDecl n w (some e)]
+      | some _ => let e ← parseExpr; semi; pure [SVModuleItem.wireDecl n w (some e) isSigned]
       | none =>
         -- Check for additional comma-separated names
-        let mut items := [SVModuleItem.wireDecl n w none]
+        let mut items := [SVModuleItem.wireDecl n w none isSigned]
         let mut cont := true
         while cont do
           match ← attempt comma with
-          | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.wireDecl n2 w none]
+          | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.wireDecl n2 w none isSigned]
           | none => cont := false
         semi; pure items
     | none => match ← attempt (keyword "logic") with
       | some _ =>
-        let _ ← attempt (keyword "signed")
+        let isSigned := (← attempt (keyword "signed")).isSome
         let w ← parseOptWidth
         let n ← identifier
         match ← attempt lbracket with
@@ -784,21 +795,21 @@ partial def parseModuleItems : P (List SVModuleItem) := do
             | _, _ => Sparkle.IR.Type.DimExpr.mkAdd
                 (Sparkle.IR.Type.DimExpr.mkSub hiDim loDim) 1
           semi
-          pure [SVModuleItem.regDecl n w (some arrSize)]
+          pure [SVModuleItem.regDecl n w (some arrSize) isSigned]
         | none =>
           match ← attempt eqSign with
-          | some _ => let e ← parseExpr; semi; pure [SVModuleItem.wireDecl n w (some e)]
+          | some _ => let e ← parseExpr; semi; pure [SVModuleItem.wireDecl n w (some e) isSigned]
           | none =>
-            let mut items := [SVModuleItem.wireDecl n w none]
+            let mut items := [SVModuleItem.wireDecl n w none isSigned]
             let mut cont := true
             while cont do
               match ← attempt comma with
-              | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.wireDecl n2 w none]
+              | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.wireDecl n2 w none isSigned]
               | none => cont := false
             semi; pure items
       | none => match ← attempt (keyword "reg") with
       | some _ =>
-        let _ ← attempt (keyword "signed")
+        let isSigned := (← attempt (keyword "signed")).isSome
         let w ← parseOptWidth; let n ← identifier
         match ← attempt lbracket with
         | some _ =>
@@ -817,13 +828,13 @@ partial def parseModuleItems : P (List SVModuleItem) := do
             | _, _ => Sparkle.IR.Type.DimExpr.mkAdd
                 (Sparkle.IR.Type.DimExpr.mkSub hiDim loDim) 1
           semi
-          pure [SVModuleItem.regDecl n w (some arrSize)]
+          pure [SVModuleItem.regDecl n w (some arrSize) isSigned]
         | none =>
-          let mut items := [SVModuleItem.regDecl n w none]
+          let mut items := [SVModuleItem.regDecl n w none isSigned]
           let mut cont := true
           while cont do
             match ← attempt comma with
-            | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.regDecl n2 w none]
+            | some _ => let n2 ← identifier; items := items ++ [SVModuleItem.regDecl n2 w none isSigned]
             | none => cont := false
           semi; pure items
       | none => match ← attempt (keyword "integer") with

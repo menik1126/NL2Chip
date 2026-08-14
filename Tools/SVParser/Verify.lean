@@ -108,6 +108,7 @@ partial def inlineAssigns (assigns : List (String × Expr)) : Expr → Expr
     | none => .ref name
   | .op operator args => .op operator (args.map (inlineAssigns assigns))
   | .concat args => .concat (args.map (inlineAssigns assigns))
+  | .resize width value => .resize width (inlineAssigns assigns value)
   | .slice e hi lo => .slice (inlineAssigns assigns e) hi lo
   | .index a i => .index (inlineAssigns assigns a) (inlineAssigns assigns i)
   | e => e  -- const passes through
@@ -126,14 +127,23 @@ partial def inferWidthChecked (regWidths inputWidths : List (String × Nat)) : E
     | none => match inputWidths.find? (·.1 == name) with
       | some (_, w) => pure w
       | none => throw s!"verification width is unknown for reference '{name}'"
+  | .resize width _ => width.requireNat "verification resize width"
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _ | .op .le_s _
   | .op .gt_u _ | .op .gt_s _ | .op .ge_u _ | .op .ge_s _ => pure 1
   | .op .mux args => match args with
-    | [_, t, _] => inferWidthChecked regWidths inputWidths t
+    | [_, t, e] => do
+      return max (← inferWidthChecked regWidths inputWidths t)
+        (← inferWidthChecked regWidths inputWidths e)
     | _ => throw "verification mux width inference requires exactly three operands"
+  | .op .shl args | .op .shr args | .op .asr args => match args with
+    | [a, _] => inferWidthChecked regWidths inputWidths a
+    | _ => throw "verification shift width inference requires exactly two operands"
   | .op _ args => match args with
-    | a :: _ => inferWidthChecked regWidths inputWidths a
-    | _ => throw "verification operator width inference requires at least one operand"
+    | [a, b] => do
+      return max (← inferWidthChecked regWidths inputWidths a)
+        (← inferWidthChecked regWidths inputWidths b)
+    | [a] => inferWidthChecked regWidths inputWidths a
+    | _ => throw "verification operator width inference requires one or two operands"
   | .slice _ hi lo => (hi - lo + 1).requireNat "verification slice width"
   | .concat args => args.foldlM (fun acc a => return acc + (← inferWidthChecked regWidths inputWidths a)) 0
   | .index _ _ => throw "verification model generation does not support array-index expressions"
@@ -166,6 +176,7 @@ partial def fixConstWidths (expr : Expr) (targetWidth : Nat)
     .op .mux [c, fixConstWidths t targetWidth widthEnv, fixConstWidths e targetWidth widthEnv]
   | .op op args => .op op (args.map (fixConstWidths · targetWidth widthEnv))
   | .concat args => .concat (args.map (fixConstWidths · targetWidth widthEnv))
+  | .resize width value => .resize width value
   | .slice e hi lo =>
     match (hi - lo + 1).toNat? with
     | some width => .slice (fixConstWidths e width widthEnv) hi lo
@@ -204,6 +215,10 @@ partial def fixConstWidthsSmart (expr : Expr) (widthEnv : List (String × Nat)) 
     let b := if wb == 32 && wa != 32 then match b with | .const v _ => .const v wa | _ => b else b
     .op op [a, b]
   | .op op args => .op op (args.map (fixConstWidthsSmart · widthEnv))
+  -- A resize establishes a self-determined boundary.  Rewriting constants in
+  -- its operand to an enclosing/reference width would change SystemVerilog
+  -- expression sizing before the cast.
+  | .resize width value => .resize width value
   | _ => expr
 
 /-- Convert IR Expr to a Lean BitVec expression string.
@@ -212,6 +227,15 @@ partial def fixConstWidthsSmart (expr : Expr) (widthEnv : List (String × Nat)) 
 partial def irExprToLeanChecked (expr : Expr) (regNames inputNames : List (String × Nat))
     (widthEnv : List (String × Nat)) (stateVar inputVar : String) : Except String String := do
   let go (e : Expr) := irExprToLeanChecked e regNames inputNames widthEnv stateVar inputVar
+  let goAtWidth (target : Nat) (e : Expr) : Except String String := do
+    let actual ← inferWidthChecked widthEnv widthEnv e
+    let source ← go e
+    if actual == target then return source
+    return s!"(BitVec.setWidth {target} {source})"
+  let goBinaryAtCommonWidth (a b : Expr) : Except String (String × String) := do
+    let common := max (← inferWidthChecked widthEnv widthEnv a)
+      (← inferWidthChecked widthEnv widthEnv b)
+    return (← goAtWidth common a, ← goAtWidth common b)
   let width ← inferWidthChecked widthEnv widthEnv expr
   match expr with
   | .const v w =>
@@ -224,21 +248,39 @@ partial def irExprToLeanChecked (expr : Expr) (regNames inputNames : List (Strin
     if regNames.any (·.1 == name) then pure s!"{stateVar}.{leanName name}"
     else if inputNames.any (·.1 == name) then pure s!"{inputVar}.{leanName name}"
     else throw s!"unresolved reference '{name}' reached verification source generation"
+  | .resize targetWidth value =>
+    let concreteTarget ← targetWidth.requireNat "verification resize width"
+    return s!"(BitVec.setWidth {concreteTarget} {← go value})"
   | .op .mux [cond, thenVal, elseVal] =>
     let condW ← inferWidthChecked widthEnv widthEnv cond
-    return s!"(if {← go cond} != (0 : BitVec {condW}) then {← go thenVal} else {← go elseVal})"
-  | .op .add [a, b] => return s!"({← go a} + {← go b})"
-  | .op .sub [a, b] => return s!"({← go a} - {← go b})"
-  | .op .mul [a, b] => return s!"({← go a} * {← go b})"
-  | .op .and [a, b] => return s!"({← go a} &&& {← go b})"
-  | .op .or [a, b] => return s!"({← go a} ||| {← go b})"
-  | .op .xor [a, b] => return s!"({← go a} ^^^ {← go b})"
+    return s!"(if {← go cond} != (0 : BitVec {condW}) then {← goAtWidth width thenVal} else {← goAtWidth width elseVal})"
+  | .op .add [a, b] =>
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"({a} + {b})"
+  | .op .sub [a, b] =>
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"({a} - {b})"
+  | .op .mul [a, b] =>
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"({a} * {b})"
+  | .op .and [a, b] =>
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"({a} &&& {b})"
+  | .op .or [a, b] =>
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"({a} ||| {b})"
+  | .op .xor [a, b] =>
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"({a} ^^^ {b})"
   | .op .not [a] =>
     if width <= 1 then return s!"(if {← go a} == (0 : BitVec {width}) then (1 : BitVec {width}) else (0 : BitVec {width}))"
     else return s!"(~~~ {← go a})"
   | .op .eq [a, b] =>
-    return s!"(if {← go a} == {← go b} then (1 : BitVec 1) else (0 : BitVec 1))"
-  | .op .lt_u [a, b] => return s!"(if {← go a} < {← go b} then (1 : BitVec 1) else (0 : BitVec 1))"
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"(if {a} == {b} then (1 : BitVec 1) else (0 : BitVec 1))"
+  | .op .lt_u [a, b] =>
+    let (a, b) ← goBinaryAtCommonWidth a b
+    return s!"(if {a} < {b} then (1 : BitVec 1) else (0 : BitVec 1))"
   | .op .shl [a, b] => return s!"({← go a} <<< {← go b})"
   | .op .shr [a, b] => return s!"({← go a} >>> {← go b})"
   | .op .asr [a, b] =>

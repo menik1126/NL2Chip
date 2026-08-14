@@ -120,12 +120,22 @@ partial def emitExpr (e : Expr) : String :=
         s!"{concreteWidth}'d{value}"
     | none =>
       -- IEEE 1800 sized casting accepts a constant parameter expression as
-      -- its size.  The cast gives literals the same elaborated width as the
-      -- corresponding Lean BitVec without forcing a concrete default here.
-      s!"{emitSafeDimension width}'({value})"
+      -- its size.  A sized cast inherits the literal's signedness, whereas IR
+      -- constants are unsigned packed values.  Materialize the width first,
+      -- then make that result unsigned so later widening/comparison cannot
+      -- silently sign-extend an unsized decimal literal.
+      s!"$unsigned({emitSafeDimension width}'({value}))"
 
   | .ref name =>
     sanitizeName name
+
+  | .resize width value =>
+    -- IR packed values are unsigned.  `$unsigned` makes widening explicitly
+    -- zero-extending while the sized cast truncates to the least-significant
+    -- `width` bits when narrowing.  Keep the safe dimension wrapper so an
+    -- invalid zero override reaches Sparkle's generated validation guard
+    -- instead of crashing the downstream parser on a zero-sized cast.
+    s!"({emitSafeDimension width})'($unsigned({emitExpr value}))"
 
   | .concat args =>
     s!"\{{String.intercalate ", " (args.map emitExpr)}}"

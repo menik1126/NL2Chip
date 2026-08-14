@@ -202,7 +202,12 @@ ranges depend on `W`. A downstream tool can instantiate that same module with,
 for example, `#(.W(3))` and `#(.W(17))`; the command value is the SystemVerilog
 default, not a Lean-side specialization. Derived dimensions such as `W + 1`,
 register widths, slices, and memory address/data widths remain symbolic as
-well. Concrete constants can be cast to a retained width, and the common
+well. Width-changing operations such as `BitVec.zeroExtend` and
+`BitVec.setWidth` are preserved as explicit unsigned resize nodes in the IR;
+the emitted SystemVerilog therefore retains parameter-sized casts such as
+`(W)'($unsigned(x))` instead of erasing the conversion or freezing it at the
+default width. Narrowing keeps the least-significant bits, while widening
+zero-extends. Concrete constants can also be cast to a retained width, and the common
 all-ones forms `BitVec.ofNat W (2 ^ W - 1)` and `BitVec.allOnes W` are
 supported. This is not general value-level symbolic evaluation: an expression
 such as `BitVec.ofNat W (W + 1)` is deliberately rejected instead of being

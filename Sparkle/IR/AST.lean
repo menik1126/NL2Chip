@@ -98,6 +98,10 @@ inductive Expr where
   | ref (name : String) : Expr
   | op (operator : Operator) (args : List Expr) : Expr
   | concat (args : List Expr) : Expr
+  /-- Resize an unsigned packed value to exactly `width` bits.  Narrowing keeps
+      the least-significant bits; widening zero-extends.  This is the IR form
+      of a SystemVerilog sized cast such as `(W)'(x)`. -/
+  | resize (width : DimExpr) (value : Expr) : Expr
   | slice (expr : Expr) (hi lo : DimExpr) : Expr
   | index (array : Expr) (idx : Expr) : Expr
   deriving Repr, BEq, Inhabited
@@ -123,6 +127,7 @@ def eq (a b : Expr) : Expr := .op .eq [a, b]
 def lt_u (a b : Expr) : Expr := .op .lt_u [a, b]
 def lt_s (a b : Expr) : Expr := .op .lt_s [a, b]
 def mux (cond then_ else_ : Expr) : Expr := .op .mux [cond, then_, else_]
+def setWidth (width : DimExpr) (value : Expr) : Expr := .resize width value
 
 /-- Replace module parameters in every expression dimension.  Slice bounds are
     substituted as constant expressions but are not treated as positive
@@ -132,6 +137,8 @@ partial def substituteDimensions (lookup : String → Option DimExpr) : Expr →
   | .ref name => .ref name
   | .op operator args => .op operator (args.map (substituteDimensions lookup))
   | .concat args => .concat (args.map (substituteDimensions lookup))
+  | .resize width value =>
+      .resize (width.substitute lookup) (value.substituteDimensions lookup)
   | .slice expr hi lo =>
       .slice (expr.substituteDimensions lookup) (hi.substitute lookup) (lo.substitute lookup)
   | .index array idx =>
@@ -143,6 +150,7 @@ partial def dimensionExpressions : Expr → List DimExpr
   | .const _ width => [width]
   | .ref _ => []
   | .op _ args | .concat args => args.flatMap dimensionExpressions
+  | .resize width value => width :: value.dimensionExpressions
   | .slice expr hi lo => expr.dimensionExpressions ++ [hi, lo]
   | .index array idx => array.dimensionExpressions ++ idx.dimensionExpressions
 
@@ -152,6 +160,8 @@ partial def positiveDimensions (role : String) : Expr → List (String × DimExp
   | .const _ width => [(s!"{role} constant width", width)]
   | .ref _ => []
   | .op _ args | .concat args => args.flatMap (positiveDimensions role)
+  | .resize width value =>
+      (s!"{role} resize width", width) :: value.positiveDimensions role
   | .slice expr _ _ => expr.positiveDimensions role
   | .index array idx =>
       array.positiveDimensions role ++ idx.positiveDimensions role
@@ -164,6 +174,7 @@ partial def toString : Expr → String
       let argStr := String.intercalate ", " (args.map toString)
       s!"{operator}({argStr})"
   | concat args => s!"\{{String.intercalate ", " (args.map toString)}}"
+  | resize width value => s!"resize<{width}>({toString value})"
   | slice e hi lo => s!"{toString e}[{hi}:{lo}]"
   | index arr idx => s!"{toString arr}[{toString idx}]"
 

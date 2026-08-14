@@ -96,6 +96,7 @@ private partial def validateSliceOrder (role : String) : Expr → Except String 
       | _, _ => pure ()
       validateSliceOrder role inner
   | .op _ args | .concat args => args.forM (validateSliceOrder role)
+  | .resize _ value => validateSliceOrder role value
   | .index array index =>
       validateSliceOrder role array *> validateSliceOrder role index
   | .const _ _ | .ref _ => pure ()

@@ -45,6 +45,7 @@ def buildWidthMap (m : Module) : WidthMap :=
 partial def inferWidth (wm : WidthMap) : Expr → DimExpr
   | .const _ w => w
   | .ref name => wm.getD name 0
+  | .resize width _ => width
   | .slice _ hi lo => hi - lo + 1
   | .concat args => args.foldl (fun acc a => acc + inferWidth wm a) 0
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
@@ -52,11 +53,15 @@ partial def inferWidth (wm : WidthMap) : Expr → DimExpr
   | .op .ge_s _ => 1
   | .op .mux args =>
     match args with
-    | [_, t, _] => inferWidth wm t
+    | [_, t, e] => DimExpr.mkMax (inferWidth wm t) (inferWidth wm e)
+    | _ => 0
+  | .op .shl args | .op .shr args | .op .asr args =>
+    match args with
+    | [a, _] => inferWidth wm a
     | _ => 0
   | .op _ args =>
     match args with
-    | [a, _] => inferWidth wm a
+    | [a, b] => DimExpr.mkMax (inferWidth wm a) (inferWidth wm b)
     | [a] => inferWidth wm a
     | _ => 0
   | .index _ _ => 0
@@ -140,21 +145,21 @@ partial def resolveSlice (dm : DefMap) (wm : WidthMap)
 
 /-- Fold constant expressions -/
 def foldConstants : Expr → Expr
-  -- mux(true, t, e) = t
-  | .op .mux [.const 1 1, t, _] => t
-  -- mux(false, t, e) = e
-  | .op .mux [.const 0 1, _, e] => e
-  -- eq(a, b) where both constants
-  | .op .eq [.const a _, .const b _] => .const (if a == b then 1 else 0) 1
-  -- add(0, e) = e, add(e, 0) = e
-  | .op .add [.const 0 _, e] => e
-  | .op .add [e, .const 0 _] => e
-  -- or(0, e) = e, or(e, 0) = e
-  | .op .or [.const 0 _, e] => e
-  | .op .or [e, .const 0 _] => e
-  -- and(0, e) = 0, and(e, 0) = 0
-  | .op .and [.const 0 w, _] => .const 0 w
-  | .op .and [_, .const 0 w] => .const 0 w
+  -- Normalize through the source width before changing widths.  Simply
+  -- relabelling `0x1ff#8` as a 16-bit constant would incorrectly produce
+  -- 0x01ff instead of zero-extending the source value 0xff.
+  | .resize width (.const value sourceWidth) =>
+    match width.toNat?, sourceWidth.toNat? with
+    | some targetWidth, some concreteSourceWidth =>
+      let sourceModulus : Int := (2 : Int) ^ concreteSourceWidth
+      let sourceValue := ((value % sourceModulus) + sourceModulus) % sourceModulus
+      let targetModulus : Int := (2 : Int) ^ targetWidth
+      .const (sourceValue % targetModulus) width
+    | _, _ => .resize width (.const value sourceWidth)
+  -- Do not erase mux/arithmetic/bitwise operands merely because one side is a
+  -- constant.  In SystemVerilog those operands participate in result sizing;
+  -- replacing `x8 + 0#32` with `x8`, for example, changes a 32-bit field into
+  -- an 8-bit field when the expression is later placed in a concatenation.
   -- slice of constant
   | .slice (.const v w) hi lo =>
     match w.toNat?, hi.toNat?, lo.toNat? with
@@ -172,6 +177,8 @@ def foldConstants : Expr → Expr
 
 /-- Optimize a single expression by resolving slice chains and folding constants -/
 partial def optimizeExpr (dm : DefMap) (wm : WidthMap) : Expr → Expr
+  | .resize width value =>
+      foldConstants (.resize width (optimizeExpr dm wm value))
   | .slice (.ref name) hi lo => foldConstants (resolveSlice dm wm name hi lo 500)
   | .slice e hi lo => foldConstants (.slice (optimizeExpr dm wm e) hi lo)
   | .op op args => foldConstants (.op op (args.map (optimizeExpr dm wm ·)))
@@ -185,6 +192,7 @@ partial def countExprUses (e : Expr) (counts : HashMap String Nat)
   match e with
   | .ref name => counts.insert name ((counts.getD name 0) + 1)
   | .const _ _ => counts
+  | .resize _ value => countExprUses value counts
   | .slice inner _ _ => countExprUses inner counts
   | .concat args => args.foldl (fun acc a => countExprUses a acc) counts
   | .op _ args => args.foldl (fun acc a => countExprUses a acc) counts
@@ -226,6 +234,7 @@ partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
       | none => .ref name
     else .ref name
   | .const v w => .const v w
+  | .resize width value => .resize width (substituteExpr dm inlinable fuel value)
   | .slice e hi lo => .slice (substituteExpr dm inlinable fuel e) hi lo
   | .concat args => .concat (args.map (substituteExpr dm inlinable fuel ·))
   | .op op args => .op op (args.map (substituteExpr dm inlinable fuel ·))
@@ -236,7 +245,18 @@ partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
     and remove the now-dead assign statements. -/
 def inlineSingleUseWires (m : Module) (body : List Stmt)
     (observableWires : Option (List String) := none) : List Stmt × List Port :=
-  let dm := buildDefMap body
+  let rawDm := buildDefMap body
+  let wm := buildWidthMap m
+  -- An assignment is a packed-width boundary even when the RHS has the same
+  -- nominal IR width: C++ integer promotion can otherwise carry overflow into
+  -- a surrounding concat after inlining.  Preserve that boundary explicitly.
+  let dm := body.foldl (fun definitions statement =>
+    match statement with
+    | .assign lhs rhs =>
+      match wm.get? lhs with
+      | some width => definitions.insert lhs (.resize width rhs)
+      | none => definitions
+    | _ => definitions) ({} : DefMap)
   let useCounts := countAllUses body
 
   -- Build sets of names that must NOT be inlined
@@ -256,10 +276,16 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
   let inlinable := body.foldl (fun s stmt =>
     match stmt with
     | .assign lhs _ =>
+      let preservesAssignmentWidth :=
+        match wm.get? lhs, rawDm.get? lhs with
+        | some lhsWidth, some rhs =>
+          lhsWidth.toNat?.any (· ≤ 64) && inferWidth wm rhs == lhsWidth
+        | _, _ => false
       if (useCounts.getD lhs 0) == 1
         && !outputSet.contains lhs
         && !registerOutputs.contains lhs
         && !memoryReadData.contains lhs
+        && preservesAssignmentWidth
         && (match observableWires with
             | some ws => !ws.contains lhs
             | none => !lhs.startsWith "_gen_")  -- _gen_ wires are JIT-observable

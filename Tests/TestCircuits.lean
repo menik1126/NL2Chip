@@ -58,6 +58,18 @@ def testNativeDerivedWidth {dom : DomainConfig} {width : Nat}
     (sig : Signal dom (BitVec (width + 1))) : Signal dom (BitVec (width + 1)) :=
   sig
 
+def testNativeZeroExtendLambda {dom : DomainConfig} {width : Nat}
+    (sig : Signal dom (BitVec width)) : Signal dom (BitVec (width + 1)) :=
+  Signal.map (fun value => value.zeroExtend (width + 1)) sig
+
+def testNativeZeroExtendPartial {dom : DomainConfig} {width : Nat}
+    (sig : Signal dom (BitVec width)) : Signal dom (BitVec (width + 1)) :=
+  Signal.map (BitVec.zeroExtend (width + 1)) sig
+
+def testNativeSetWidthNarrow {dom : DomainConfig} {width : Nat}
+    (sig : Signal dom (BitVec (width + 1))) : Signal dom (BitVec width) :=
+  Signal.map (BitVec.setWidth width) sig
+
 def testNativeConstant {width : Nat} : Signal Domain (BitVec width) :=
   Signal.pure (1 : BitVec width)
 

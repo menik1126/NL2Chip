@@ -130,6 +130,15 @@ invalid zero-width overrides. Expressions such as
 `BitVec (width + 1)` and symbolic `HWVector` sizes are retained as dimension
 expressions as well.
 
+`BitVec.zeroExtend` and `BitVec.setWidth` produce an explicit unsigned resize
+node rather than relying on an inferred destination width. Consequently,
+parameterized narrowing and widening survive IR optimization and are emitted
+as SystemVerilog sized casts such as `(width)'($unsigned(x))`: narrowing keeps
+the least-significant bits and widening fills the new high bits with zero.
+Unsupported signed or context-dependent SystemVerilog cast semantics are
+rejected with a diagnostic instead of silently being treated as this unsigned
+resize operation.
+
 This support is for hardware dimensions, not arbitrary value-level evaluation
 of Lean `Nat` programs. A concrete value may have a symbolic result width, for
 example `BitVec.ofNat width 1`. The common all-ones forms
