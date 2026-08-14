@@ -238,12 +238,38 @@ the same specialization. Since the present CppSim execution backend supports
 scalar packed operations only through 64 bits, wider arithmetic
 specializations fail closed on the C++/JIT paths while concrete SystemVerilog
 remains available. Passive, word-aligned concat/copy into wide output
-containers is supported. The current
-SV-to-Lean verification-model generator
+containers is supported. The current SV-to-Lean verification-model generator
 also requires a concrete module. Source-level Lean theorems may still be
-written directly over a generic definition. For CVDP, functional simulation
-for parameter overrides is supported, but per-configuration synthesis/PPA is
-not yet run, so PPA is reported as skipped for parameterized designs.
+written directly over a generic definition.
+
+Parameter-sweep evidence and a generic Lean theorem are deliberately reported
+as different claims. A passing finite sweep establishes behavior only for the
+exact configurations listed in the report, such as `W = 3`, `W = 8`, and
+`W = 17`; it is not evidence for any untested value. A claim covering every
+legal width requires an explicit source-level theorem whose proposition
+quantifies over `W` and states the design-specific legality assumptions. A Lean
+file merely compiling without `sorry` does not establish that such a theorem
+exists. Reports therefore use separate **Finite sweep** and **Universal Lean
+source theorem** evidence labels and never promote one into the other. The
+latter concerns Lean source semantics; without a separate compiler-correctness
+result, it does not by itself certify the emitted RTL.
+
+For CVDP, functional simulation can exercise parameter overrides. When the
+harness exposes an exact finite configuration matrix, the evaluator runs
+Yosys/OpenROAD once per concrete configuration. Use `--ppa-workers N` to set a
+single global concurrency limit across all problem workers and
+`--ppa-cache-dir PATH` to select the persistent content-addressed cache (the
+default is `.lake/build/ppa_sweep_cache`). The cache key includes the exact RTL,
+selected top, sorted parameter map, and flow/tool fingerprint; failures are not
+cached. Each point uses an isolated workspace, and results remain attached to
+their exact configurations. Scalar area/cell/power summaries are conservative
+maxima and WNS is the minimum across the finite sweep. If the complete matrix
+cannot be recovered statically, PPA is reported as skipped rather than
+inventing a Cartesian product or attaching module-default metrics to the whole
+sweep. For cache reuse across separate processes, set
+`ORFS_DOCKER_IMAGE_DIGEST` to the immutable digest of the actual flow image;
+when only a mutable tag is known, reuse is deliberately limited to the current
+process so a tool-image update cannot return stale PPA.
 
 Specialization selects a concrete native generate branch but preserves its SV
 scope, and native procedural loops remain structured SV items. CppSim and the
@@ -271,6 +297,29 @@ theorem alu_add_assoc (a b c : BitVec 16) :
   simp [alu_add]
   apply BitVec.add_assoc
 ```
+
+Width-generic proofs quantify over `Nat`; they do not enumerate widths:
+
+```lean
+def Passthrough.ValidConfig (W : Nat) : Prop := 0 < W
+
+theorem passthrough_correct
+    (W : Nat) (legal : Passthrough.ValidConfig W) (x : BitVec W) :
+    x = x := by
+  rfl
+
+#sparkleUniversalTheorem passthrough_correct parameters [W]
+```
+
+The certificate command checks that the named declaration is a kernel-checked
+theorem, that `W` is a genuinely used universally bound `Nat`, and that the
+proof has no direct or transitive `sorry` or project-defined axiom. Evaluator
+evidence is not taken from the candidate's log marker: the prebuilt
+`sparkle-certify` helper independently imports the checked module, calls the
+trusted certificate API with a fresh nonce, and accepts only the structured
+response. The evidence records the proposition, premises, and actual axiom
+dependencies. It deliberately makes no compiler-correctness claim about
+emitted RTL.
 
 **Real Example:** Our Sparkle-16 CPU includes **9 formally proven theorems** about ALU correctness!
 

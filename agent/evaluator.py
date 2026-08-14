@@ -16,6 +16,8 @@ Returns a score dict for each problem.
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import math
 import os
 import re
@@ -24,8 +26,23 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+try:
+    from universal_theorem import (
+        UNIVERSAL_THEOREM_MARKER,
+        extract_universal_theorem_evidence,
+        independently_revalidate_universal_theorems,
+    )
+except ModuleNotFoundError:  # package-style ``import agent.evaluator``
+    from .universal_theorem import (
+        UNIVERSAL_THEOREM_MARKER,
+        extract_universal_theorem_evidence,
+        independently_revalidate_universal_theorems,
+    )
 
 
 DATASET_DIR = Path("verilog-eval/dataset_spec-to-rtl")
@@ -41,6 +58,37 @@ STA_TIMEOUT = 120
 GLS_TIMEOUT = 120
 MIN_DIE_SIDE_UM = 50  # minimum die side for sky130hd PDN straps
 CVDP_PARAMETERIZATION_UNSUPPORTED = "CVDP_FIXED_CORE_PARAMETERIZATION_UNSUPPORTED"
+# A mutable Docker tag is not a persistent cache identity.  Keep duplicate
+# work single-flight within this process, but force a new cache namespace on
+# the next invocation unless the caller supplies an immutable image digest.
+_UNPINNED_ORFS_PROCESS_NONCE = uuid.uuid4().hex
+
+
+def _cvdp_incomplete_pytest_summary(output: str) -> str | None:
+    """Return a stable summary when pytest did not execute every test."""
+    incomplete = sorted(set(re.findall(
+        r"\b([1-9][0-9]*)\s+(skipped|xfailed|xpassed)\b",
+        output,
+        re.IGNORECASE,
+    )))
+    if not incomplete:
+        return None
+    return ", ".join(f"{count} {kind.lower()}" for count, kind in incomplete)
+
+
+def _extract_universal_theorem_evidence(
+    compiler_output: str,
+    source: str,
+    source_artifact: str,
+) -> list[dict]:
+    """Parse a candidate marker as an untrusted revalidation request.
+
+    Evaluator results never attach this output directly; the dedicated
+    ``sparkle-certify`` process must independently revalidate it first.
+    """
+    return extract_universal_theorem_evidence(
+        compiler_output, source, source_artifact
+    )
 
 
 class CVDPAdapterContractError(RuntimeError):
@@ -1968,6 +2016,1359 @@ def _cvdp_parameter_overrides(
     )
 
 
+ParameterConfiguration = tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class CVDPParameterSweepPlan:
+    """Exact concrete configurations observed at CVDP ``build`` calls.
+
+    A plan is executable only when ``unresolved`` is false.  In particular,
+    independent per-parameter value sets are never multiplied here: doing so
+    can invent configurations that the benchmark never requests.
+    """
+
+    configurations: tuple[ParameterConfiguration, ...]
+    unresolved: bool
+    unresolved_reasons: tuple[str, ...] = ()
+
+
+_CVDP_EXACT_UNKNOWN = object()
+_CVDP_RUNNER = object()
+_CVDP_BUILD_CALLABLE = object()
+_CVDP_MAX_SWEEP_CONFIGS = 256
+_CVDP_MAX_INTERPRETER_STEPS = 4096
+
+
+def _canonical_parameter_configuration(
+    mapping: dict[str, int],
+) -> ParameterConfiguration:
+    return tuple(sorted((str(name), int(value)) for name, value in mapping.items()))
+
+
+def _render_orfs_top_parameters(parameters: dict[str, int] | None) -> str:
+    """Render validated Yosys top parameters for an ORFS make config.
+
+    SystemVerilog permits ``$`` after the first identifier character, while
+    GNU make consumes dollar syntax before exporting this value.  Keep the
+    flow contract deliberately narrower and fail closed instead of depending
+    on multiple layers of make/Tcl escaping for a cached result identity.
+    """
+    if not parameters:
+        return ""
+    validated: list[tuple[str, int]] = []
+    for name, value in parameters.items():
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_$]*", name
+        ):
+            raise ValueError(f"Invalid parameter name for ORFS: {name!r}")
+        if "$" in name:
+            raise ValueError(
+                f"Parameter name {name!r} contains '$', which is not supported "
+                "safely by the ORFS make configuration"
+            )
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not (0 <= value <= 0xFFFF_FFFF)
+        ):
+            raise ValueError(
+                f"Parameter {name}={value!r} is outside the 32-bit unsigned Nat contract"
+            )
+        validated.append((name, value))
+    rendered_parameters = [
+        item
+        for name, value in sorted(validated)
+        for item in (name, str(value))
+    ]
+    return "export VERILOG_TOP_PARAMS = " + " ".join(rendered_parameters) + "\n"
+
+
+class _CVDPExactSweepExtractor:
+    """Conservative interpreter for literal CVDP build matrices.
+
+    It intentionally understands a small, deterministic Python subset:
+    literal containers, integer arithmetic, ``range``, exact ``for`` loops,
+    pytest ``parametrize`` decorators, dictionary ``update`` and direct
+    ``runner.build(parameters=...)`` calls.  Any build whose complete mapping
+    cannot be recovered makes the whole plan unresolved instead of returning
+    a misleading partial sweep.
+    """
+
+    def __init__(self, parameter_names: set[str]) -> None:
+        self.parameter_names = set(parameter_names)
+        self.configurations: set[ParameterConfiguration] = set()
+        self.unresolved_reasons: list[str] = []
+        self.build_calls = 0
+        # The broad coverage analyzer below counts syntactic build sites.  A
+        # site in a branch that this interpreter can prove dead is accounted
+        # for here without turning it into an executable sweep point.
+        self.ignored_build_calls = 0
+        self.execution_steps = 0
+        self.budget_exhausted = False
+        self.local_function_names: set[str] = set()
+        self.runner_factory_names: set[str] = set()
+
+    def _unresolved(self, reason: str) -> None:
+        if reason not in self.unresolved_reasons:
+            self.unresolved_reasons.append(reason)
+
+    def _take_step(self) -> bool:
+        if self.budget_exhausted:
+            return False
+        self.execution_steps += 1
+        if self.execution_steps > _CVDP_MAX_INTERPRETER_STEPS:
+            self._unresolved(
+                f"parameter sweep interpretation exceeds {_CVDP_MAX_INTERPRETER_STEPS} steps"
+            )
+            self.budget_exhausted = True
+            return False
+        return True
+
+    def _eval(self, node: ast.AST | None, env: dict[str, Any]) -> Any:
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, str, bool)) or node.value is None:
+                return node.value
+            return _CVDP_EXACT_UNKNOWN
+        if isinstance(node, ast.Name):
+            return env.get(node.id, _CVDP_EXACT_UNKNOWN)
+        if isinstance(node, ast.Attribute):
+            if (
+                node.attr == "build"
+                and self._eval(node.value, env) is _CVDP_RUNNER
+            ):
+                return _CVDP_BUILD_CALLABLE
+            return _CVDP_EXACT_UNKNOWN
+        if isinstance(node, ast.Set):
+            # Set iteration order is an implementation detail, not source
+            # order; it cannot define an exact deterministic sweep matrix.
+            return _CVDP_EXACT_UNKNOWN
+        if isinstance(node, (ast.List, ast.Tuple)):
+            values = [self._eval(item, env) for item in node.elts]
+            if any(value is _CVDP_EXACT_UNKNOWN for value in values):
+                return _CVDP_EXACT_UNKNOWN
+            return values if isinstance(node, ast.List) else tuple(values)
+        if isinstance(node, ast.Dict):
+            result: dict[Any, Any] = {}
+            for key_node, value_node in zip(node.keys, node.values):
+                if key_node is None:
+                    expanded = self._eval(value_node, env)
+                    if not isinstance(expanded, dict):
+                        return _CVDP_EXACT_UNKNOWN
+                    result.update(expanded)
+                    continue
+                key = self._eval(key_node, env)
+                value = self._eval(value_node, env)
+                if key is _CVDP_EXACT_UNKNOWN or value is _CVDP_EXACT_UNKNOWN:
+                    return _CVDP_EXACT_UNKNOWN
+                result[key] = value
+            return result
+        if isinstance(node, ast.UnaryOp):
+            value = self._eval(node.operand, env)
+            if not isinstance(value, int):
+                return _CVDP_EXACT_UNKNOWN
+            if isinstance(node.op, ast.UAdd):
+                return value
+            if isinstance(node.op, ast.USub):
+                return -value
+            if isinstance(node.op, ast.Invert):
+                return ~value
+            if isinstance(node.op, ast.Not):
+                return not value
+            return _CVDP_EXACT_UNKNOWN
+        if isinstance(node, ast.BinOp):
+            left = self._eval(node.left, env)
+            right = self._eval(node.right, env)
+            if not isinstance(left, int) or not isinstance(right, int):
+                return _CVDP_EXACT_UNKNOWN
+            try:
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                if isinstance(node.op, ast.FloorDiv) and right != 0:
+                    return left // right
+                if isinstance(node.op, ast.Mod) and right != 0:
+                    return left % right
+                if isinstance(node.op, ast.Pow) and 0 <= right <= 63:
+                    return left ** right
+                if isinstance(node.op, ast.LShift) and 0 <= right <= 63:
+                    return left << right
+                if isinstance(node.op, ast.RShift) and 0 <= right <= 63:
+                    return left >> right
+                if isinstance(node.op, ast.BitOr):
+                    return left | right
+                if isinstance(node.op, ast.BitAnd):
+                    return left & right
+                if isinstance(node.op, ast.BitXor):
+                    return left ^ right
+            except (ArithmeticError, OverflowError):
+                return _CVDP_EXACT_UNKNOWN
+            return _CVDP_EXACT_UNKNOWN
+        if isinstance(node, ast.Compare):
+            left = self._eval(node.left, env)
+            if left is _CVDP_EXACT_UNKNOWN:
+                return _CVDP_EXACT_UNKNOWN
+            for operator, comparator_node in zip(node.ops, node.comparators):
+                right = self._eval(comparator_node, env)
+                if right is _CVDP_EXACT_UNKNOWN:
+                    return _CVDP_EXACT_UNKNOWN
+                try:
+                    matched = (
+                        left == right if isinstance(operator, ast.Eq) else
+                        left != right if isinstance(operator, ast.NotEq) else
+                        left < right if isinstance(operator, ast.Lt) else
+                        left <= right if isinstance(operator, ast.LtE) else
+                        left > right if isinstance(operator, ast.Gt) else
+                        left >= right if isinstance(operator, ast.GtE) else
+                        left in right if isinstance(operator, ast.In) else
+                        left not in right if isinstance(operator, ast.NotIn) else
+                        _CVDP_EXACT_UNKNOWN
+                    )
+                except (TypeError, ValueError):
+                    return _CVDP_EXACT_UNKNOWN
+                if matched is _CVDP_EXACT_UNKNOWN:
+                    return matched
+                if not matched:
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.BoolOp):
+            if not node.values:
+                return _CVDP_EXACT_UNKNOWN
+            value = self._eval(node.values[0], env)
+            if value is _CVDP_EXACT_UNKNOWN:
+                return value
+            for child in node.values[1:]:
+                if isinstance(node.op, ast.And) and not bool(value):
+                    return value
+                if isinstance(node.op, ast.Or) and bool(value):
+                    return value
+                value = self._eval(child, env)
+                if value is _CVDP_EXACT_UNKNOWN:
+                    return value
+            return value
+        if isinstance(node, ast.IfExp):
+            condition = self._eval(node.test, env)
+            if condition is _CVDP_EXACT_UNKNOWN:
+                return condition
+            return self._eval(node.body if bool(condition) else node.orelse, env)
+        if isinstance(node, ast.NamedExpr):
+            return self._eval(node.value, env)
+        if isinstance(node, ast.Subscript):
+            value = self._eval(node.value, env)
+            index = self._eval(node.slice, env)
+            try:
+                return value[index]
+            except (KeyError, IndexError, TypeError):
+                return _CVDP_EXACT_UNKNOWN
+        if isinstance(node, ast.Call):
+            factory_name = (
+                node.func.id if isinstance(node.func, ast.Name) else None
+            )
+            factory_path = (
+                ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+            )
+            if (
+                factory_name in self.runner_factory_names
+                or factory_path in {
+                    "cocotb.runner.get_runner",
+                    "cocotb_tools.runner.get_runner",
+                }
+            ):
+                return _CVDP_RUNNER
+            if isinstance(node.func, ast.Name) and node.func.id == "range":
+                args = [self._eval(arg, env) for arg in node.args]
+                if not all(isinstance(arg, int) for arg in args):
+                    return _CVDP_EXACT_UNKNOWN
+                try:
+                    range_value = range(*args)
+                except (TypeError, ValueError, OverflowError):
+                    return _CVDP_EXACT_UNKNOWN
+                if len(range_value) > _CVDP_MAX_SWEEP_CONFIGS:
+                    return _CVDP_EXACT_UNKNOWN
+                return list(range_value)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and self._eval(node.args[0], env) is _CVDP_RUNNER
+                and self._eval(node.args[1], env) == "build"
+            ):
+                return _CVDP_BUILD_CALLABLE
+            if isinstance(node.func, ast.Name) and node.func.id in {"list", "tuple"} and node.args:
+                value = self._eval(node.args[0], env)
+                if isinstance(value, (list, tuple, range)):
+                    return list(value) if node.func.id == "list" else tuple(value)
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                if len(node.args) > 1:
+                    return _CVDP_EXACT_UNKNOWN
+                result: dict[Any, Any] = {}
+                if node.args:
+                    value = self._eval(node.args[0], env)
+                    try:
+                        result.update(value)
+                    except (TypeError, ValueError):
+                        return _CVDP_EXACT_UNKNOWN
+                for keyword in node.keywords:
+                    if keyword.arg is None:
+                        expanded = self._eval(keyword.value, env)
+                        if not isinstance(expanded, dict):
+                            return _CVDP_EXACT_UNKNOWN
+                        result.update(expanded)
+                    else:
+                        value = self._eval(keyword.value, env)
+                        if value is _CVDP_EXACT_UNKNOWN:
+                            return _CVDP_EXACT_UNKNOWN
+                        result[keyword.arg] = value
+                return result
+            if isinstance(node.func, ast.Attribute):
+                receiver = self._eval(node.func.value, env)
+                if (
+                    isinstance(receiver, dict)
+                    and node.func.attr == "copy"
+                    and not node.args
+                    and not node.keywords
+                ):
+                    return dict(receiver)
+                if isinstance(receiver, dict) and node.func.attr == "items" and not node.args:
+                    return list(receiver.items())
+                if isinstance(receiver, dict) and node.func.attr == "keys" and not node.args:
+                    return list(receiver.keys())
+                if isinstance(receiver, dict) and node.func.attr == "values" and not node.args:
+                    return list(receiver.values())
+                if (
+                    isinstance(receiver, dict)
+                    and node.func.attr == "get"
+                    and 1 <= len(node.args) <= 2
+                    and not node.keywords
+                ):
+                    key = self._eval(node.args[0], env)
+                    default = self._eval(node.args[1], env) if len(node.args) > 1 else None
+                    if key is not _CVDP_EXACT_UNKNOWN and default is not _CVDP_EXACT_UNKNOWN:
+                        return receiver.get(key, default)
+                if (
+                    isinstance(receiver, list)
+                    and node.func.attr == "copy"
+                    and not node.args
+                    and not node.keywords
+                ):
+                    return list(receiver)
+            return _CVDP_EXACT_UNKNOWN
+        return _CVDP_EXACT_UNKNOWN
+
+    def _assign(self, target: ast.AST, value: Any, env: dict[str, Any]) -> bool:
+        if isinstance(target, ast.Name):
+            env[target.id] = value
+            return True
+        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (list, tuple)):
+            if len(target.elts) == len(value):
+                return all(
+                    self._assign(child, child_value, env)
+                    for child, child_value in zip(target.elts, value)
+                )
+            return False
+        if isinstance(target, ast.Subscript):
+            container = self._eval(target.value, env)
+            index = self._eval(target.slice, env)
+            if index is _CVDP_EXACT_UNKNOWN:
+                return False
+            if isinstance(container, (dict, list)):
+                try:
+                    # Mutate in place so aliases and nested containers retain
+                    # Python reference semantics.
+                    container[index] = value
+                    return True
+                except (IndexError, KeyError, TypeError):
+                    return False
+            return False
+        # Starred unpacking, attributes and other structured targets are not
+        # part of the exact interpreter's supported assignment subset.
+        return False
+
+    @staticmethod
+    def _clone_env(env: dict[str, Any]) -> dict[str, Any]:
+        """Clone mutable values while preserving aliases within the scope."""
+        cloned_mutables: dict[int, Any] = {}
+        result: dict[str, Any] = {}
+        for name, value in env.items():
+            if isinstance(value, dict):
+                result[name] = cloned_mutables.setdefault(id(value), dict(value))
+            elif isinstance(value, list):
+                result[name] = cloned_mutables.setdefault(id(value), list(value))
+            elif isinstance(value, set):
+                result[name] = cloned_mutables.setdefault(id(value), set(value))
+            else:
+                result[name] = value
+        return result
+
+    def _is_build_call(self, call: ast.Call, env: dict[str, Any]) -> bool:
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "build":
+            return self._eval(call.func.value, env) is _CVDP_RUNNER
+        if isinstance(call.func, ast.Name) and env.get(call.func.id) is _CVDP_BUILD_CALLABLE:
+            return True
+        return False
+
+    def _record_build(self, call: ast.Call, env: dict[str, Any]) -> None:
+        self.build_calls += 1
+        parameters: Any = None
+        found_parameters = False
+        seen_keywords: set[str] = set()
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                expanded = self._eval(keyword.value, env)
+                if not isinstance(expanded, dict):
+                    self._unresolved(
+                        "a build() **kwargs mapping could not be resolved exactly"
+                    )
+                    return
+                if not all(isinstance(key, str) for key in expanded):
+                    self._unresolved(
+                        "a build() **kwargs mapping contains a non-string key"
+                    )
+                    return
+                duplicate_keywords = seen_keywords.intersection(expanded)
+                if duplicate_keywords:
+                    self._unresolved(
+                        "duplicate build() keyword(s) across **kwargs: "
+                        + ", ".join(sorted(duplicate_keywords))
+                    )
+                    return
+                seen_keywords.update(expanded)
+                if "parameters" in expanded:
+                    found_parameters = True
+                    parameters = expanded["parameters"]
+                continue
+
+            if keyword.arg in seen_keywords:
+                self._unresolved(
+                    f"duplicate build() keyword {keyword.arg!r}"
+                )
+                return
+            seen_keywords.add(keyword.arg)
+            if keyword.arg == "parameters":
+                found_parameters = True
+                parameters = self._eval(keyword.value, env)
+        if found_parameters and not isinstance(parameters, dict):
+            self._unresolved("a build() parameter dictionary could not be resolved exactly")
+            return
+        mapping = parameters if found_parameters else {}
+        concrete: dict[str, int] = {}
+        for key, value in mapping.items():
+            if not isinstance(key, str) or not isinstance(value, int) or isinstance(value, bool):
+                self._unresolved("a build() parameter key/value is not a literal integer")
+                return
+            if value < 0:
+                self._unresolved(f"parameter {key} has a negative sweep value")
+                return
+            if value > 0xFFFF_FFFF:
+                self._unresolved(
+                    f"parameter {key}={value} exceeds the 32-bit unsigned Nat contract"
+                )
+                return
+            if self.parameter_names and key not in self.parameter_names:
+                self._unresolved(f"build() overrides unknown parameter {key}")
+                return
+            concrete[key] = value
+        self.configurations.add(_canonical_parameter_configuration(concrete))
+        if len(self.configurations) > _CVDP_MAX_SWEEP_CONFIGS:
+            self._unresolved(
+                f"parameter sweep exceeds {_CVDP_MAX_SWEEP_CONFIGS} concrete configurations"
+            )
+            self.budget_exhausted = True
+
+    def _account_ignored_builds(self, node: ast.AST, env: dict[str, Any]) -> None:
+        """Account for build sites in control flow proven not to execute."""
+        self.ignored_build_calls += sum(
+            1
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and self._is_build_call(child, env)
+        )
+
+    @staticmethod
+    def _is_mapping_update(call: ast.Call) -> bool:
+        return (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "update"
+        )
+
+    def _contains_relevant_side_effect(self, node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and (
+                (isinstance(child.func, ast.Attribute)
+                 and child.func.attr in {"build", "update"})
+                or (isinstance(child.func, ast.Name)
+                    and "build" in child.func.id.lower())
+                or (
+                    (ast.unparse(child.func) if hasattr(ast, "unparse") else "")
+                    in {"pytest.skip", "pytest.xfail", "pytest.importorskip"}
+                )
+            )
+            for child in ast.walk(node)
+        )
+
+    @staticmethod
+    def _contains_state_mutation_syntax(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete, ast.NamedExpr))
+            or (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr in {
+                    "update", "setdefault", "pop", "popitem", "clear", "__setitem__",
+                }
+            )
+            for child in ast.walk(node)
+        )
+
+    def _may_mutate_tracked_state(
+        self, node: ast.AST, env: dict[str, Any]
+    ) -> bool:
+        if self._contains_state_mutation_syntax(node):
+            return True
+        tracked_mutable_ids = {
+            id(value)
+            for value in env.values()
+            if isinstance(value, (dict, list, set))
+        }
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            if isinstance(child.func, ast.Name) and child.func.id in self.local_function_names:
+                return True
+            values = [self._eval(argument, env) for argument in child.args]
+            values.extend(self._eval(keyword.value, env) for keyword in child.keywords)
+            if isinstance(child.func, ast.Attribute):
+                values.append(self._eval(child.func.value, env))
+            if any(
+                isinstance(value, (dict, list, set))
+                and id(value) in tracked_mutable_ids
+                for value in values
+            ):
+                return True
+        return False
+
+    def _preflight_exact_subset(self, tree: ast.Module) -> bool:
+        """Reject Python execution features outside the exact whitelist.
+
+        Static source interpretation cannot soundly reproduce pytest fixture
+        scheduling, definition-time custom decorators, or arbitrary control
+        flow with shared global state.  Those harnesses still run functional
+        simulation, but PPA enumeration is deliberately skipped.
+        """
+        unsupported_control = (
+            ast.ClassDef,
+            ast.Global,
+            ast.Nonlocal,
+            ast.Match,
+            ast.Try,
+            ast.With,
+            ast.AsyncWith,
+            ast.While,
+            ast.Yield,
+            ast.YieldFrom,
+            ast.NamedExpr,
+            ast.Lambda,
+            ast.ListComp,
+            ast.SetComp,
+            ast.DictComp,
+            ast.GeneratorExp,
+        )
+
+        # Calls in this small interpreter deliberately implement only these
+        # Python builtins.  If the harness rebinds one of their names, applying
+        # builtin semantics would fabricate a configuration which real Python
+        # may never build (for example a user-defined ``dict`` constructor).
+        interpreted_builtins = {
+            "dict", "getattr", "len", "list", "range", "sorted", "tuple",
+        }
+        called_builtins = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in interpreted_builtins
+        }
+        shadowed_builtins: set[str] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and node.id in interpreted_builtins
+            ):
+                shadowed_builtins.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name in interpreted_builtins:
+                    shadowed_builtins.add(node.name)
+                for argument in (
+                    list(node.args.posonlyargs)
+                    + list(node.args.args)
+                    + list(node.args.kwonlyargs)
+                ) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else ():
+                    if argument.arg in interpreted_builtins:
+                        shadowed_builtins.add(argument.arg)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    bound_name = alias.asname or alias.name.split(".", 1)[0]
+                    if bound_name in interpreted_builtins:
+                        shadowed_builtins.add(bound_name)
+        ambiguous_builtins = called_builtins & shadowed_builtins
+        if ambiguous_builtins and self._contains_build_syntax(tree.body):
+            self._unresolved(
+                "interpreter builtin name(s) are shadowed: "
+                + ", ".join(sorted(ambiguous_builtins))
+            )
+            return False
+
+        for node in ast.walk(tree):
+            if isinstance(node, unsupported_control):
+                self._unresolved(
+                    f"{type(node).__name__} is outside the exact parameter-sweep interpreter"
+                )
+                return False
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorator_names = [
+                ast.unparse(decorator.func if isinstance(decorator, ast.Call) else decorator)
+                if hasattr(ast, "unparse") else ""
+                for decorator in node.decorator_list
+            ]
+            if (
+                isinstance(node, ast.AsyncFunctionDef)
+                and self._contains_build_syntax(node.body)
+                and not any(
+                    name.endswith("pytest.mark.asyncio")
+                    or name.endswith("cocotb.test")
+                    for name in decorator_names
+                )
+            ):
+                self._unresolved(
+                    f"async test {node.name} containing build() has no supported execution marker"
+                )
+                return False
+            for decorator in node.decorator_list:
+                decorator_func = decorator.func if isinstance(decorator, ast.Call) else decorator
+                name = ast.unparse(decorator_func) if hasattr(ast, "unparse") else ""
+                allowed = (
+                    name.endswith("pytest.mark.parametrize")
+                    or name.endswith("pytest.mark.skip")
+                    or name.endswith("pytest.mark.skipif")
+                    or name.endswith("pytest.mark.xfail")
+                    or name.endswith("pytest.mark.asyncio")
+                    or name.endswith("cocotb.test")
+                )
+                if name.endswith("pytest.fixture") or name.endswith("pytest.mark.usefixtures"):
+                    self._unresolved(
+                        "pytest fixture scheduling is outside the exact parameter-sweep interpreter"
+                    )
+                    return False
+                if not allowed:
+                    self._unresolved(
+                        f"decorator {name or '<dynamic>'} is outside the exact parameter-sweep interpreter"
+                    )
+                    return False
+                if name.endswith("cocotb.test") and isinstance(decorator, ast.Call):
+                    for keyword in decorator.keywords:
+                        if keyword.arg in {"skip", "expect_fail", "expect_error"}:
+                            value = self._eval(keyword.value, {})
+                            if value is _CVDP_EXACT_UNKNOWN or bool(value):
+                                self._unresolved(
+                                    "cocotb skip/expected-failure tests cannot establish complete finite evidence"
+                                )
+                                return False
+        return True
+
+    def _apply_direct_mapping_update(
+        self, call: ast.Call, env: dict[str, Any]
+    ) -> None:
+        """Apply one update call after its arguments have been evaluated."""
+        assert isinstance(call.func, ast.Attribute)
+        old = self._eval(call.func.value, env)
+        merged: Any = old if isinstance(old, dict) else _CVDP_EXACT_UNKNOWN
+        if merged is _CVDP_EXACT_UNKNOWN or len(call.args) > 1:
+            self._unresolved("a dictionary update could not be resolved exactly")
+            return
+        if call.args:
+            updates = self._eval(call.args[0], env)
+            if not isinstance(updates, dict):
+                self._unresolved("a dictionary update could not be resolved exactly")
+                return
+            merged.update(updates)
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                expanded = self._eval(keyword.value, env)
+                if not isinstance(expanded, dict):
+                    self._unresolved("a dictionary update could not be resolved exactly")
+                    return
+                merged.update(expanded)
+            else:
+                value = self._eval(keyword.value, env)
+                if value is _CVDP_EXACT_UNKNOWN:
+                    self._unresolved("a dictionary update could not be resolved exactly")
+                    return
+                merged[keyword.arg] = value
+
+    def _observe_expr(self, node: ast.AST, env: dict[str, Any]) -> None:
+        """Observe expression side effects in Python evaluation order.
+
+        This deliberately does not use ``ast.walk``: doing so executes calls
+        hidden behind a false ``and`` operand and mutates sweep dictionaries
+        in branches which the harness never takes.
+        """
+        if isinstance(node, ast.NamedExpr):
+            self._observe_expr(node.value, env)
+            if not self._assign(node.target, self._eval(node.value, env), env):
+                self._unresolved(
+                    "a named-expression target affecting build() is not exactly supported"
+                )
+            return
+        if isinstance(node, ast.BoolOp):
+            for index, child in enumerate(node.values):
+                self._observe_expr(child, env)
+                value = self._eval(child, env)
+                if value is _CVDP_EXACT_UNKNOWN:
+                    remaining = node.values[index + 1:]
+                    if any(
+                        self._contains_relevant_side_effect(item)
+                        or self._may_mutate_tracked_state(item, env)
+                        for item in remaining
+                    ):
+                        for item in remaining:
+                            self._account_ignored_builds(item, env)
+                        self._unresolved(
+                            "an unknown short-circuit condition controls build() or its parameters"
+                        )
+                    return
+                stops = (
+                    isinstance(node.op, ast.And) and not bool(value)
+                ) or (
+                    isinstance(node.op, ast.Or) and bool(value)
+                )
+                if stops:
+                    for item in node.values[index + 1:]:
+                        self._account_ignored_builds(item, env)
+                    return
+            return
+        if isinstance(node, ast.IfExp):
+            self._observe_expr(node.test, env)
+            condition = self._eval(node.test, env)
+            if condition is _CVDP_EXACT_UNKNOWN:
+                if (
+                    self._contains_relevant_side_effect(node.body)
+                    or self._contains_relevant_side_effect(node.orelse)
+                    or self._may_mutate_tracked_state(node.body, env)
+                    or self._may_mutate_tracked_state(node.orelse, env)
+                ):
+                    self._account_ignored_builds(node.body, env)
+                    self._account_ignored_builds(node.orelse, env)
+                    self._unresolved(
+                        "an unknown conditional expression controls build() or its parameters"
+                    )
+                return
+            selected = node.body if bool(condition) else node.orelse
+            skipped = node.orelse if bool(condition) else node.body
+            self._account_ignored_builds(skipped, env)
+            self._observe_expr(selected, env)
+            return
+        if isinstance(node, ast.Call):
+            # Python evaluates the receiver and arguments before the call.
+            if isinstance(node.func, ast.Attribute):
+                self._observe_expr(node.func.value, env)
+            for argument in node.args:
+                self._observe_expr(argument, env)
+            for keyword in node.keywords:
+                self._observe_expr(keyword.value, env)
+            call_name = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+            if call_name in {"pytest.skip", "pytest.xfail", "pytest.importorskip"}:
+                self._unresolved(
+                    f"{call_name} makes the executed parameter sweep incomplete"
+                )
+                return
+            if self._is_build_call(node, env):
+                self._record_build(node, env)
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "build":
+                self._unresolved(
+                    "a .build() call has an unknown receiver and cannot be identified as the CVDP runner"
+                )
+            elif self._is_mapping_update(node):
+                self._apply_direct_mapping_update(node, env)
+            elif isinstance(node.func, ast.Name) and node.func.id in {
+                "dict", "list", "tuple", "len", "sorted", "range", "getattr",
+            }:
+                pass
+            elif isinstance(node.func, ast.Name) and node.func.id in self.local_function_names:
+                self._unresolved(
+                    f"call to local helper {node.func.id} may change build() parameters"
+                )
+            elif isinstance(node.func, ast.Attribute):
+                receiver = self._eval(node.func.value, env)
+                if isinstance(receiver, dict) and node.func.attr not in {
+                    "copy", "get", "items", "keys", "values",
+                }:
+                    self._unresolved(
+                        f"unsupported dictionary method {node.func.attr} may change a build() configuration"
+                    )
+                elif isinstance(receiver, (list, set)) and node.func.attr != "copy":
+                    self._unresolved(
+                        f"unsupported mutable method {node.func.attr} may change a build() configuration"
+                    )
+                elif not isinstance(receiver, (dict, list, set)):
+                    argument_values = [self._eval(argument, env) for argument in node.args]
+                    argument_values.extend(
+                        self._eval(keyword.value, env) for keyword in node.keywords
+                    )
+                    tracked_mutable_ids = {
+                        id(value)
+                        for value in env.values()
+                        if isinstance(value, (dict, list, set))
+                    }
+                    if any(
+                        isinstance(value, (dict, list, set))
+                        and id(value) in tracked_mutable_ids
+                        for value in argument_values
+                    ):
+                        self._unresolved(
+                            "an unknown method call may mutate a build() parameter dictionary"
+                        )
+            else:
+                # An arbitrary callback receiving one of our tracked mapping
+                # objects may mutate it.  Refuse to guess its post-state.
+                argument_values = [self._eval(argument, env) for argument in node.args]
+                argument_values.extend(
+                    self._eval(keyword.value, env) for keyword in node.keywords
+                )
+                tracked_mutable_ids = {
+                    id(value)
+                    for value in env.values()
+                    if isinstance(value, (dict, list, set))
+                }
+                if any(
+                    isinstance(value, (dict, list, set))
+                    and id(value) in tracked_mutable_ids
+                    for value in argument_values
+                ):
+                    self._unresolved(
+                        "an unknown call may mutate a build() parameter dictionary"
+                    )
+            return
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            for child in node.elts:
+                self._observe_expr(child, env)
+            return
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if key is not None:
+                    self._observe_expr(key, env)
+                self._observe_expr(value, env)
+            return
+        # ast fields are ordered in evaluation order for the simple arithmetic,
+        # comparison, subscript and f-string forms accepted by this interpreter.
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.expr):
+                self._observe_expr(child, env)
+
+    def _contains_build_syntax(self, statements: list[ast.stmt]) -> bool:
+        return any(
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Attribute) and node.func.attr == "build")
+                or (
+                    isinstance(node.func, ast.Name)
+                    and "build" in node.func.id.lower()
+                )
+            )
+            for statement in statements
+            for node in ast.walk(statement)
+        )
+
+    def _execute(self, statements: list[ast.stmt], env: dict[str, Any]) -> None:
+        block_contains_build = self._contains_build_syntax(statements)
+        for statement_index, statement in enumerate(statements):
+            if not self._take_step():
+                return
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Definition statements bind their name immediately in the
+                # surrounding scope.  Do not leave the conventional ``runner``
+                # sentinel (or a module parameter value) visible through a
+                # real Python shadowing definition.
+                env[statement.name] = _CVDP_EXACT_UNKNOWN
+                continue
+            if isinstance(statement, ast.ClassDef):
+                continue
+            if isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    env[alias.asname or alias.name.split(".", 1)[0]] = _CVDP_EXACT_UNKNOWN
+                continue
+            if isinstance(statement, ast.ImportFrom):
+                for alias in statement.names:
+                    if alias.name == "*":
+                        if block_contains_build:
+                            self._unresolved(
+                                "wildcard imports are outside the exact parameter-sweep interpreter"
+                            )
+                        continue
+                    env[alias.asname or alias.name] = _CVDP_EXACT_UNKNOWN
+                continue
+            if isinstance(statement, ast.Assign):
+                self._observe_expr(statement.value, env)
+                value = self._eval(statement.value, env)
+                for target in statement.targets:
+                    if not self._assign(target, value, env) and block_contains_build:
+                        self._unresolved(
+                            "an assignment target affecting build() is not exactly supported"
+                        )
+                continue
+            if isinstance(statement, ast.AnnAssign):
+                if statement.value is not None:
+                    self._observe_expr(statement.value, env)
+                if not self._assign(
+                    statement.target, self._eval(statement.value, env), env
+                ) and block_contains_build:
+                    self._unresolved(
+                        "an annotated assignment target affecting build() is not exactly supported"
+                    )
+                continue
+            if isinstance(statement, ast.AugAssign):
+                if block_contains_build:
+                    self._unresolved(
+                        "augmented assignment may change a build() configuration"
+                    )
+                continue
+            if isinstance(statement, ast.Delete):
+                if block_contains_build:
+                    self._unresolved(
+                        "deletion may change a build() configuration"
+                    )
+                continue
+            if isinstance(statement, ast.Expr):
+                expression = statement.value
+                self._observe_expr(expression, env)
+                continue
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                if any(
+                    isinstance(node, (ast.Break, ast.Continue, ast.Return))
+                    for child_statement in statement.body
+                    for node in ast.walk(child_statement)
+                ):
+                    if block_contains_build:
+                        for child_statement in statement.body:
+                            self._account_ignored_builds(child_statement, env)
+                        self._unresolved(
+                            "a build() sweep loop uses break, continue, or return"
+                        )
+                    continue
+                iterable = self._eval(statement.iter, env)
+                if not isinstance(iterable, (list, tuple, range)):
+                    if block_contains_build:
+                        self._unresolved(
+                            "a loop which may affect build() has a non-literal or unordered iteration space"
+                        )
+                    continue
+                if len(iterable) > _CVDP_MAX_SWEEP_CONFIGS:
+                    self._unresolved("a build() loop exceeds the sweep configuration limit")
+                    continue
+                if not iterable:
+                    for child_statement in statement.body:
+                        self._account_ignored_builds(child_statement, env)
+                for value in iterable:
+                    if self.budget_exhausted:
+                        return
+                    if not self._assign(statement.target, value, env):
+                        self._unresolved(
+                            "a loop target affecting build() is not exactly supported"
+                        )
+                        return
+                    self._execute(statement.body, env)
+                self._execute(statement.orelse, env)
+                continue
+            if isinstance(statement, ast.If):
+                self._observe_expr(statement.test, env)
+                condition = self._eval(statement.test, env)
+                if condition is not _CVDP_EXACT_UNKNOWN:
+                    selected = statement.body if bool(condition) else statement.orelse
+                    skipped = statement.orelse if bool(condition) else statement.body
+                    for child_statement in skipped:
+                        self._account_ignored_builds(child_statement, env)
+                    self._execute(selected, env)
+                elif (
+                    self._contains_build_syntax(statement.body + statement.orelse)
+                    or any(
+                        self._contains_relevant_side_effect(child_statement)
+                        or self._may_mutate_tracked_state(child_statement, env)
+                        for child_statement in statement.body + statement.orelse
+                    )
+                ):
+                    for child_statement in statement.body + statement.orelse:
+                        self._account_ignored_builds(child_statement, env)
+                    self._unresolved(
+                        "a data-dependent branch controls build() or its parameters"
+                    )
+                continue
+            if isinstance(statement, (ast.With, ast.AsyncWith, ast.Try, ast.Match, ast.While)):
+                if (
+                    self._contains_build_syntax([statement])
+                    or (
+                        block_contains_build
+                        and self._contains_state_mutation_syntax(statement)
+                    )
+                ):
+                    self._unresolved(
+                        "unsupported control flow may change build() execution or parameters"
+                    )
+                continue
+            for _, value in ast.iter_fields(statement):
+                nodes = value if isinstance(value, list) else [value]
+                for node in nodes:
+                    if isinstance(node, ast.expr):
+                        self._observe_expr(node, env)
+
+    def _parametrize_rows(
+        self, decorator: ast.AST, env: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        if not isinstance(decorator, ast.Call) or len(decorator.args) < 2:
+            return None
+        name = ast.unparse(decorator.func) if hasattr(ast, "unparse") else ""
+        if not name.endswith("parametrize"):
+            return None
+        for keyword in decorator.keywords:
+            if keyword.arg != "indirect":
+                continue
+            indirect = self._eval(keyword.value, env)
+            if indirect is _CVDP_EXACT_UNKNOWN or bool(indirect):
+                self._unresolved(
+                    "pytest indirect parameterization cannot be resolved without executing its fixture"
+                )
+                return []
+        raw_names = self._eval(decorator.args[0], env)
+        raw_values = self._eval(decorator.args[1], env)
+        if not isinstance(raw_names, str) or not isinstance(raw_values, (list, tuple)):
+            return []
+        names = [item.strip() for item in raw_names.split(",") if item.strip()]
+        rows: list[dict[str, Any]] = []
+        if len(names) == 1:
+            rows = [{names[0]: value} for value in raw_values]
+        else:
+            for raw_row in raw_values:
+                if not isinstance(raw_row, (list, tuple)) or len(raw_row) != len(names):
+                    return []
+                rows.append(dict(zip(names, raw_row)))
+        return rows
+
+    def _function_mutates_module_mapping(
+        self,
+        statement: ast.FunctionDef | ast.AsyncFunctionDef,
+        module_env: dict[str, Any],
+    ) -> bool:
+        """Detect cross-test mutation which our per-test scope cannot model."""
+        module_mappings = {
+            name
+            for name, value in module_env.items()
+            if isinstance(value, (dict, list, set))
+        }
+        if not module_mappings:
+            return False
+        for node in ast.walk(statement):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
+                targets: list[ast.AST] = []
+                if isinstance(node, ast.Assign):
+                    targets = list(node.targets)
+                elif isinstance(node, ast.Delete):
+                    targets = list(node.targets)
+                else:
+                    targets = [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and not isinstance(
+                        node, (ast.AugAssign, ast.Delete)
+                    ):
+                        continue
+                    root = target
+                    while isinstance(root, (ast.Subscript, ast.Attribute)):
+                        root = root.value
+                    if isinstance(root, ast.Name) and root.id in module_mappings:
+                        return True
+            if isinstance(node, ast.Call):
+                if self._is_build_call(node, module_env):
+                    continue
+                candidates = list(node.args) + [keyword.value for keyword in node.keywords]
+                if isinstance(node.func, ast.Attribute):
+                    candidates.append(node.func.value)
+                if any(
+                    isinstance(candidate, ast.Name) and candidate.id in module_mappings
+                    for candidate in candidates
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _function_local_bindings(
+        statement: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        """Return names which Python treats as local throughout ``statement``.
+
+        The exact interpreter executes statements in source order, but Python
+        decides function scope before execution.  Seeding a later-assigned name
+        from the module environment would therefore miss an UnboundLocalError
+        and could record the module value as an executed sweep point.
+        """
+
+        class BindingVisitor(ast.NodeVisitor):
+            def __init__(self, root: ast.AST) -> None:
+                self.root = root
+                self.names: set[str] = set()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                if node is not self.root:
+                    self.names.add(node.name)
+                    return
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                if node is not self.root:
+                    self.names.add(node.name)
+                    return
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_Lambda(self, _node: ast.Lambda) -> None:
+                return
+
+            def visit_Name(self, node: ast.Name) -> None:
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    self.names.add(node.id)
+
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    self.names.add(alias.asname or alias.name.split(".", 1)[0])
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                for alias in node.names:
+                    if alias.name != "*":
+                        self.names.add(alias.asname or alias.name)
+
+        visitor = BindingVisitor(statement)
+        visitor.visit(statement)
+        return visitor.names
+
+    def analyze(self, tree: ast.Module) -> None:
+        self.local_function_names = {
+            statement.name
+            for statement in tree.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.runner_factory_names = {
+            alias.asname or alias.name
+            for statement in tree.body
+            if isinstance(statement, ast.ImportFrom)
+            and statement.module in {"cocotb.runner", "cocotb_tools.runner"}
+            for alias in statement.names
+            if alias.name == "get_runner"
+        }
+        if not self._preflight_exact_subset(tree):
+            return
+        # ``runner`` is the conventional CVDP runner binding used by the
+        # benchmark harness snippets. Other receivers must be derived from it
+        # or from cocotb's imported ``get_runner`` factory.
+        module_env: dict[str, Any] = {"runner": _CVDP_RUNNER}
+        self._execute(tree.body, module_env)
+        last_function_by_name = {
+            statement.name: statement
+            for statement in tree.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for statement in tree.body:
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if last_function_by_name.get(statement.name) is not statement:
+                for child_statement in statement.body:
+                    self._account_ignored_builds(child_statement, module_env)
+                continue
+            skipped = False
+            for decorator in statement.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    decorator_name = (
+                        ast.unparse(decorator) if hasattr(ast, "unparse") else ""
+                    )
+                    if decorator_name.endswith("pytest.mark.skip"):
+                        skipped = True
+                    elif decorator_name.endswith("pytest.mark.xfail"):
+                        self._unresolved(
+                            f"pytest xfail marker on {statement.name} makes finite verification incomplete"
+                        )
+                        skipped = True
+                    continue
+                decorator_name = (
+                    ast.unparse(decorator.func) if hasattr(ast, "unparse") else ""
+                )
+                if decorator_name.endswith("pytest.mark.skip"):
+                    skipped = True
+                elif decorator_name.endswith("pytest.mark.skipif"):
+                    condition = self._eval(
+                        decorator.args[0] if decorator.args else None,
+                        module_env,
+                    )
+                    if condition is _CVDP_EXACT_UNKNOWN:
+                        self._unresolved(
+                            f"pytest skipif condition for {statement.name} is not statically known"
+                        )
+                        skipped = True
+                    elif bool(condition):
+                        skipped = True
+                elif decorator_name.endswith("pytest.mark.xfail"):
+                    self._unresolved(
+                        f"pytest xfail marker on {statement.name} makes finite verification incomplete"
+                    )
+                    skipped = True
+            if skipped:
+                for child_statement in statement.body:
+                    self._account_ignored_builds(child_statement, module_env)
+                continue
+            if self._function_mutates_module_mapping(statement, module_env):
+                for child_statement in statement.body:
+                    self._account_ignored_builds(child_statement, module_env)
+                self._unresolved(
+                    f"test {statement.name} mutates shared module parameter state"
+                )
+                continue
+            variants: list[dict[str, Any]] = [{}]
+            saw_parametrize = False
+            invalid_parametrize = False
+            parametrized_names: set[str] = set()
+            for decorator in statement.decorator_list:
+                rows = self._parametrize_rows(decorator, module_env)
+                if rows is None:
+                    continue
+                saw_parametrize = True
+                if not rows:
+                    invalid_parametrize = True
+                    break
+                raw_names = self._eval(decorator.args[0], module_env)
+                names = (
+                    [item.strip() for item in raw_names.split(",") if item.strip()]
+                    if isinstance(raw_names, str)
+                    else []
+                )
+                duplicate_names = (
+                    {name for name in names if names.count(name) > 1}
+                    | (set(names) & parametrized_names)
+                )
+                if duplicate_names:
+                    self._unresolved(
+                        "pytest parameter(s) are parametrized more than once: "
+                        + ", ".join(sorted(duplicate_names))
+                    )
+                    invalid_parametrize = True
+                    break
+                parametrized_names.update(names)
+                variants = [
+                    {**variant, **row}
+                    for variant in variants
+                    for row in rows
+                ]
+                if len(variants) > _CVDP_MAX_SWEEP_CONFIGS:
+                    invalid_parametrize = True
+                    break
+            contains_build = self._contains_build_syntax(statement.body)
+            if invalid_parametrize:
+                if contains_build:
+                    self._unresolved("pytest parameterization containing build() is not literal")
+                continue
+            is_test = saw_parametrize or statement.name.startswith("test") or any(
+                "cocotb" in (ast.unparse(decorator) if hasattr(ast, "unparse") else "")
+                for decorator in statement.decorator_list
+            )
+            if contains_build and not is_test:
+                self._unresolved(
+                    f"function {statement.name} contains build() but its invocation matrix is unknown"
+                )
+                continue
+            if not contains_build:
+                continue
+            if any(
+                isinstance(node, (ast.Return, ast.Break, ast.Continue))
+                for child_statement in statement.body
+                for node in ast.walk(child_statement)
+            ):
+                for child_statement in statement.body:
+                    self._account_ignored_builds(child_statement, module_env)
+                self._unresolved(
+                    f"function {statement.name} containing build() uses unsupported terminating control flow"
+                )
+                continue
+            for variant in variants:
+                function_env = self._clone_env(module_env)
+                for local_name in self._function_local_bindings(statement):
+                    function_env[local_name] = _CVDP_EXACT_UNKNOWN
+                for argument in (
+                    list(statement.args.posonlyargs)
+                    + list(statement.args.args)
+                    + list(statement.args.kwonlyargs)
+                ):
+                    # Function arguments shadow module bindings, including the
+                    # conventional ``runner`` name. Literal parametrize rows
+                    # below re-establish only values proven by the decorator.
+                    function_env[argument.arg] = _CVDP_EXACT_UNKNOWN
+                function_env.update(variant)
+                self._execute(statement.body, function_env)
+
+
+def _cvdp_exact_parameter_sweep_plan(
+    harness_files: dict,
+    parameter_names: set[str],
+) -> CVDPParameterSweepPlan:
+    """Return an exact finite config list, or an unresolved fail-closed plan."""
+    extractor = _CVDPExactSweepExtractor(parameter_names)
+    saw_python = False
+    for path, content in harness_files.items():
+        if not str(path).endswith(".py"):
+            continue
+        saw_python = True
+        try:
+            tree = ast.parse(textwrap.dedent(str(content)))
+        except SyntaxError:
+            if re.search(r"(?:\.\s*|\b)build\s*\(", str(content)):
+                extractor._unresolved("a harness containing build() could not be parsed")
+            continue
+        extractor.analyze(tree)
+
+    # Reuse the broader alias/flow analyzer as a coverage oracle.  The exact
+    # interpreter may deliberately not understand a clever build alias; such
+    # a call must make the plan unresolved, never masquerade as a defaults-only
+    # singleton.
+    broad_analysis = _cvdp_parameter_override_analysis(harness_files)
+    if broad_analysis.build_call_count > (
+        extractor.build_calls + extractor.ignored_build_calls
+    ):
+        extractor._unresolved(
+            "one or more build() calls were detected but their exact parameter mapping was not recovered"
+        )
+
+    configurations = tuple(sorted(extractor.configurations))
+    if not configurations and parameter_names and not extractor.unresolved_reasons:
+        if broad_analysis.build_call_count:
+            extractor._unresolved(
+                "all detected build() sites are skipped or unreachable"
+            )
+        else:
+            extractor._unresolved(
+                "no executable build() call was recovered for the parameterized top"
+            )
+    if not saw_python and parameter_names:
+        extractor._unresolved(
+            "no Python harness was available to recover an exact parameter configuration"
+        )
+    return CVDPParameterSweepPlan(
+        configurations=configurations,
+        unresolved=bool(extractor.unresolved_reasons),
+        unresolved_reasons=tuple(extractor.unresolved_reasons),
+    )
+
+
 @dataclass(frozen=True)
 class _SVModuleParameter:
     """One overrideable parameter from a SystemVerilog module header."""
@@ -2674,24 +4075,348 @@ def generate_cvdp_wrapper(
 class Evaluator:
     """Evaluate a Sparkle-generated .lean file: compile → extract SV → lint → sim → (synth+PPA) → (P&R+DRC+LVS)."""
 
-    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False, enable_gls: bool = False, lean_repl=None, dataset: str = "verilogeval", dataset_obj=None):
+    def __init__(
+        self,
+        project_root: Path = Path("."),
+        enable_synth: bool = False,
+        enable_pnr: bool = False,
+        enable_drc: bool = False,
+        enable_lvs: bool = False,
+        enable_corners: bool = False,
+        enable_gls: bool = False,
+        lean_repl=None,
+        dataset: str = "verilogeval",
+        dataset_obj=None,
+        parameterized_ppa_runner=None,
+        ppa_cache_dir: Path | None = None,
+        ppa_workers: int = 2,
+        universal_certifier_path: Path | None = None,
+        universal_certifier_sha256: str | None = None,
+    ):
         self.project_root = project_root.resolve()
         self.dataset_name = dataset.lower()
         self.dataset_obj = dataset_obj  # Optional Dataset instance from dataset.py
         self.dataset_dir = self.project_root / "verilog-eval" / "dataset_spec-to-rtl"
-        self.enable_pnr = enable_pnr or enable_drc or enable_lvs  # drc/lvs imply pnr
+        self.enable_pnr = (
+            enable_pnr or enable_drc or enable_lvs or enable_corners
+        )  # drc/lvs/corners imply pnr
         self.enable_synth = enable_synth or self.enable_pnr  # pnr implies synth
         self.enable_gls = enable_gls and self.enable_synth  # gls requires synth
         self.enable_drc = enable_drc
         self.enable_lvs = enable_lvs
         self.enable_corners = enable_corners and self.enable_pnr  # corners require pnr
         self.lean_repl = lean_repl  # Optional LeanREPL instance for fast compilation
+        self.parameterized_ppa_runner = parameterized_ppa_runner
+        self.ppa_cache_dir = (
+            Path(ppa_cache_dir).resolve()
+            if ppa_cache_dir is not None
+            else self.project_root / ".lake" / "build" / "ppa_sweep_cache"
+        )
+        self.ppa_workers = max(1, int(ppa_workers))
+        self.universal_certifier_path = (
+            Path(universal_certifier_path).resolve()
+            if universal_certifier_path is not None
+            else self.project_root / ".lake" / "build" / "bin" / "sparkle-certify"
+        )
+        self.universal_certifier_sha256 = universal_certifier_sha256
+        if (
+            self.universal_certifier_sha256 is None
+            and self.universal_certifier_path.is_file()
+        ):
+            try:
+                self.universal_certifier_sha256 = hashlib.sha256(
+                    self.universal_certifier_path.read_bytes()
+                ).hexdigest()
+            except OSError:
+                self.universal_certifier_sha256 = None
 
         if self.enable_synth:
             # Add siliconcrew/src to path for synthesis tools
             sc_src = self.project_root / "siliconcrew" / "src"
             if str(sc_src) not in sys.path:
                 sys.path.insert(0, str(sc_src))
+
+    def _materialize_certificate_module(
+        self, prob_id: str, lean_file: Path, expected_source_sha256: str
+    ) -> bool:
+        """Build the exact REPL candidate as an importable checked module.
+
+        The standalone certifier never elaborates candidate text.  The REPL
+        fast path therefore materializes the already accepted source first,
+        and rejects evidence if compilation mutates that source.
+        """
+        try:
+            completed = subprocess.run(
+                ["lake", "build", f"Generated.{prob_id}"],
+                capture_output=True,
+                text=True,
+                timeout=BASH_TIMEOUT,
+                cwd=str(self.project_root),
+            )
+            current_source_sha256 = hashlib.sha256(lean_file.read_bytes()).hexdigest()
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        build_output = completed.stdout + "\n" + completed.stderr
+        return bool(
+            completed.returncode == 0
+            and not re.search(r"error:", build_output)
+            and current_source_sha256 == expected_source_sha256
+        )
+
+    def _parameterized_ppa_flow_fingerprint(self) -> str:
+        """Fingerprint every visible input to the configured ORFS flow."""
+        docker_adapter = self.project_root / "siliconcrew" / "src" / "tools" / "run_docker.py"
+        adapter_hash = None
+        if docker_adapter.exists():
+            adapter_hash = hashlib.sha256(docker_adapter.read_bytes()).hexdigest()
+        image_digest = os.environ.get("ORFS_DOCKER_IMAGE_DIGEST", "unknown")
+        payload = {
+            "schema": 1,
+            "evaluator_sha256": hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
+            "platform": "sky130hd",
+            "clock_period_ns": 10,
+            "core_utilization": 5,
+            "core_aspect_ratio": 1,
+            "core_margin_um": 2,
+            "place_density": 0.15,
+            "pdk_version": SKY130_VOLARE_VERSION,
+            "docker_image": os.environ.get("ORFS_DOCKER_IMAGE", "default"),
+            "docker_image_digest": image_digest,
+            "unversioned_toolchain_nonce": (
+                _UNPINNED_ORFS_PROCESS_NONCE
+                if not image_digest or image_digest == "unknown"
+                else None
+            ),
+            "runner_sha256": adapter_hash,
+            "stages": {
+                "synth": bool(self.enable_synth),
+                "pnr": bool(self.enable_pnr),
+                "drc": bool(self.enable_drc),
+                "lvs": bool(self.enable_lvs),
+                "corners": bool(self.enable_corners),
+            },
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def prepare_parameterized_ppa_runner(self):
+        """Create (or return) the shared finite-sweep runner."""
+        if self.parameterized_ppa_runner is not None:
+            return self.parameterized_ppa_runner
+        try:
+            from parameterized_ppa import ParameterizedPPARunner
+        except ModuleNotFoundError:  # package-style ``agent.evaluator`` import
+            from .parameterized_ppa import ParameterizedPPARunner
+
+        self.parameterized_ppa_runner = ParameterizedPPARunner(
+            cache_dir=self.ppa_cache_dir,
+            synthesize=self._run_parameterized_flow,
+            max_workers=self.ppa_workers,
+        )
+        return self.parameterized_ppa_runner
+
+    def _run_parameterized_flow(self, request, workspace: Path) -> dict:
+        """Run one concrete Yosys/OpenROAD point in its isolated workspace."""
+        parameters = dict(request.config)
+        result = self._run_synthesis(
+            request.top_module,
+            request.sv_code,
+            request.top_module,
+            workspace.parent,
+            parameters=parameters,
+            synth_dir=workspace,
+        )
+        if (
+            result.get("synth_pass")
+            and result.get("area_um2") is None
+            and result.get("cell_count") is None
+            and not result.get("ppa_error")
+        ):
+            result["ppa_error"] = "synthesis completed without an area or cell-count report"
+        if self.enable_pnr and result.get("synth_pass"):
+            result.update(self._run_pnr(
+                request.top_module,
+                request.sv_code,
+                request.top_module,
+                workspace.parent,
+                parameters=parameters,
+                synth_dir=workspace,
+            ))
+        explicit_flow_error = any(
+            result.get(name)
+            for name in ("synth_error", "ppa_error", "pnr_error")
+        )
+        result["success"] = bool(
+            result.get("synth_pass")
+            and (
+                not self.enable_pnr
+                or (result.get("pnr_pass") and result.get("gds_generated"))
+            )
+            and (not self.enable_drc or result.get("drc_pass") is True)
+            and (not self.enable_lvs or result.get("lvs_pass") is True)
+            and (not self.enable_corners or result.get("corners_pass") is True)
+            and not explicit_flow_error
+        )
+        return result
+
+    def run_parameterized_ppa(
+        self,
+        *,
+        sv_code: str,
+        top_module: str,
+        configurations: tuple[ParameterConfiguration, ...],
+    ) -> dict:
+        """Run and aggregate a finite concrete parameter sweep.
+
+        This result is explicitly finite evidence.  It never creates or
+        upgrades ``universal_lean_theorem`` evidence, even when every point
+        passes.
+        """
+        try:
+            from parameterized_ppa import PPARequest
+        except ModuleNotFoundError:  # package-style ``agent.evaluator`` import
+            from .parameterized_ppa import PPARequest
+
+        runner = self.prepare_parameterized_ppa_runner()
+        fingerprint = self._parameterized_ppa_flow_fingerprint()
+        requests = [
+            PPARequest(
+                config=config,
+                sv_code=sv_code,
+                top_module=top_module,
+                flow_fingerprint=fingerprint,
+            )
+            for config in configurations
+        ]
+        point_results = runner.run(requests)
+        rendered_points: list[dict] = []
+        for point in point_results:
+            rendered_points.append({
+                "config": dict(point.config),
+                "success": bool(point.success),
+                "metrics": dict(point.metrics),
+                "error": point.error,
+                "cache_hit": bool(point.cache_hit),
+                "cache_key": getattr(point, "cache_key", None),
+                "cache_error": getattr(point, "cache_error", None),
+                "evidence": {
+                    "kind": point.evidence.kind.value,
+                    "status": "passed" if point.success else "failed",
+                    "scope": "enumerated_configuration_only",
+                    "configurations": [dict(config) for config in point.evidence.configurations],
+                    "theorem": point.evidence.theorem,
+                },
+            })
+
+        all_success = bool(rendered_points) and all(point["success"] for point in rendered_points)
+        synth_pass = bool(rendered_points) and all(
+            point["metrics"].get("synth_pass", False)
+            for point in rendered_points
+        )
+        pnr_pass = bool(rendered_points) and all(
+            point["metrics"].get("pnr_pass", False)
+            for point in rendered_points
+        ) if self.enable_pnr else False
+
+        def metric_values(name: str) -> list[float | int]:
+            return [
+                point["metrics"][name]
+                for point in rendered_points
+                if point["metrics"].get(name) is not None
+            ]
+
+        area_values = metric_values("area_um2")
+        cell_values = metric_values("cell_count")
+        wns_values = metric_values("wns_ns")
+        power_values = metric_values("power_uw")
+        drc_values = metric_values("drc_violations")
+        pvt_wns_values = metric_values("pvt_worst_wns_ns")
+        pvt_whs_values = metric_values("pvt_worst_whs_ns")
+        pvt_power_values = metric_values("pvt_worst_power_uw")
+        requested = [dict(config) for config in configurations]
+        executed = [point["config"] for point in rendered_points]
+        evidence = {
+            "kind": "finite_parameter_sweep",
+            "status": "passed" if all_success else "failed",
+            "scope": "enumerated_configurations_only",
+            "requested_configurations": requested,
+            "executed_configurations": executed,
+            "runs": [
+                {
+                    "parameters": point["config"],
+                    "status": "passed" if point["success"] else "failed",
+                    "cache_hit": point["cache_hit"],
+                }
+                for point in rendered_points
+            ],
+        }
+        errors = [
+            f"{point['config']}: {point['error']}"
+            for point in rendered_points
+            if not point["success"] and point["error"]
+        ]
+        cache_errors = [
+            f"{point['config']}: {point['cache_error']}"
+            for point in rendered_points
+            if point.get("cache_error")
+        ]
+        lvs_errors = [
+            f"{point['config']}: {point['metrics'].get('lvs_error')}"
+            for point in rendered_points
+            if point["metrics"].get("lvs_error")
+        ]
+        pvt_corners = [
+            {**corner, "config": point["config"]}
+            for point in rendered_points
+            for corner in (point["metrics"].get("pvt_corners") or [])
+            if isinstance(corner, dict)
+        ]
+        return {
+            "parameterized_ppa_unsupported": False,
+            "parameter_sweep_results": rendered_points,
+            "parameterized_ppa_results": rendered_points,
+            "verification_evidence": [evidence],
+            "synth_status": (
+                "finite_parameter_sweep_passed"
+                if synth_pass else "finite_parameter_sweep_failed"
+            ),
+            "ppa_status": "finite_parameter_sweep",
+            "synth_pass": synth_pass,
+            "pnr_pass": pnr_pass,
+            "gds_generated": (
+                bool(rendered_points)
+                and all(point["metrics"].get("gds_generated") is True for point in rendered_points)
+            ) if self.enable_pnr else False,
+            "drc_pass": (
+                bool(rendered_points)
+                and all(point["metrics"].get("drc_pass") is True for point in rendered_points)
+            ) if self.enable_drc else None,
+            "drc_violations": sum(drc_values) if drc_values else None,
+            "lvs_pass": (
+                bool(rendered_points)
+                and all(point["metrics"].get("lvs_pass") is True for point in rendered_points)
+            ) if self.enable_lvs else None,
+            "lvs_error": "; ".join(lvs_errors) if lvs_errors else None,
+            "pvt_corners": pvt_corners,
+            "corners_pass": (
+                bool(rendered_points)
+                and all(point["metrics"].get("corners_pass") is True for point in rendered_points)
+            ) if self.enable_corners else None,
+            "pvt_worst_wns_ns": min(pvt_wns_values) if pvt_wns_values else None,
+            "pvt_worst_whs_ns": min(pvt_whs_values) if pvt_whs_values else None,
+            "pvt_worst_power_uw": max(pvt_power_values) if pvt_power_values else None,
+            # Conservative scalar summaries retained for existing ranking.
+            "area_um2": max(area_values) if area_values else None,
+            "cell_count": max(cell_values) if cell_values else None,
+            "wns_ns": min(wns_values) if wns_values else None,
+            "power_uw": max(power_values) if power_values else None,
+            "ppa_error": "; ".join(errors) if errors else None,
+            "ppa_cache_error": "; ".join(cache_errors) if cache_errors else None,
+            "parameter_sweep_cache_hits": sum(
+                1 for point in rendered_points if point["cache_hit"]
+            ),
+        }
 
     def evaluate(self, prob_id: str, run_dir: Path) -> dict:
         """Run full evaluation for a single problem.
@@ -2725,7 +4450,11 @@ class Evaluator:
             "gls_synth_mismatches": -1,
             "gls_pnr_status": "not_run",     # post-PnR gate-level sim
             "gls_pnr_mismatches": -1,
-            "has_sorry": True,       # True = unverified (default), False = formally verified
+            # Compatibility source-quality field only.  Absence of ``sorry``
+            # is not evidence that a universal theorem was declared.
+            "has_sorry": True,
+            "lean_source_status": "not_compiled",
+            "verification_evidence": [],
             "unsupported_parameterization": False,
             "terminal_capability_error": False,
             "repairable_parameterization_error": False,
@@ -2741,6 +4470,8 @@ class Evaluator:
             return result
 
         sv_code = None
+        lean_source = lean_file.read_text()
+        certificate_output = ""
 
         if self.lean_repl is not None:
             # ── Fast path: use persistent REPL (~0.1s) ──
@@ -2750,6 +4481,14 @@ class Evaluator:
                 return result
             result["compile_pass"] = True
             result["has_sorry"] = not repl_result.complete
+            result["lean_source_status"] = (
+                "complete" if repl_result.complete else "contains_sorry"
+            )
+            certificate_output = "\n".join(
+                "info: " + str(info.get("data", ""))
+                for info in getattr(repl_result, "infos", [])
+                if isinstance(info, dict)
+            )
             repl_verilog = repl_result.verilog or ""
             # Use the same multi-module extraction as the lake-build path.  A
             # hierarchical Sparkle design prints one generated block per
@@ -2782,7 +4521,39 @@ class Evaluator:
 
             result["compile_pass"] = True
             result["has_sorry"] = bool(re.search(r"declaration uses `sorry`", build_output))
+            result["lean_source_status"] = (
+                "contains_sorry" if result["has_sorry"] else "complete"
+            )
+            certificate_output = build_output
             sv_code = self._extract_sv(build_output)
+
+        certificate_requests = _extract_universal_theorem_evidence(
+            certificate_output,
+            lean_source,
+            str(lean_file.relative_to(self.project_root)),
+        )
+        certificate_module_ready = not certificate_requests
+        if certificate_requests:
+            certificate_module_ready = self.lean_repl is None or (
+                self._materialize_certificate_module(
+                    prob_id,
+                    lean_file,
+                    hashlib.sha256(lean_file.read_bytes()).hexdigest(),
+                )
+            )
+        if certificate_requests and certificate_module_ready:
+            result["verification_evidence"] = (
+                independently_revalidate_universal_theorems(
+                    certificate_output,
+                    lean_source,
+                    str(lean_file.relative_to(self.project_root)),
+                    project_root=self.project_root,
+                    module_name=f"Generated.{prob_id}",
+                    certifier_path=self.universal_certifier_path,
+                    expected_certifier_sha256=self.universal_certifier_sha256,
+                    timeout=BASH_TIMEOUT,
+                )
+            )
 
         # 2. Extract SystemVerilog
         if not sv_code:
@@ -2832,34 +4603,76 @@ class Evaluator:
 
         if self.dataset_name == "cvdp" and self.dataset_obj is not None:
             info = self.dataset_obj.load_problem(prob_id)
+            harness_files = info.metadata.get("harness_files", {})
             parameter_analysis = _cvdp_parameter_override_analysis(
-                info.metadata.get("harness_files", {})
+                harness_files
             )
-            reference_has_parameters = bool(
-                _module_parameters(info.ref_code or "", info.design_name)
+            reference_parameters = _module_parameters(
+                info.ref_code or "", info.design_name
             )
-            core_has_parameters = bool(
-                _module_parameters(sv_code, sparkle_mod_name)
+            core_parameters = _module_parameters(sv_code, sparkle_mod_name)
+            parameter_names = (
+                {parameter.name for parameter in reference_parameters}
+                | {parameter.name for parameter in core_parameters}
+                | set(parameter_analysis.parameter_names)
             )
+            reference_has_parameters = bool(reference_parameters)
+            core_has_parameters = bool(core_parameters)
             if (
                 parameter_analysis.may_have_overrides
                 or reference_has_parameters
                 or core_has_parameters
             ):
-                result.update({
-                    "parameterized_ppa_unsupported": True,
-                    "synth_status": "not_run_parameterized_sweep",
-                    "ppa_status": "unsupported_parameter_sweep",
-                    "ppa_error": (
-                        "PPA was not run: the CVDP reference, harness, or "
-                        "generated core uses native SystemVerilog parameters, "
-                        "while the current backend "
-                        "would synthesize only one module-default configuration. "
-                        "Per-configuration synthesis and reporting are required "
-                        "before these metrics are meaningful."
-                    ),
-                })
-                return result
+                plan = _cvdp_exact_parameter_sweep_plan(
+                    harness_files, parameter_names
+                )
+                result["parameter_sweep_plan"] = {
+                    "configurations": [
+                        dict(config) for config in plan.configurations
+                    ],
+                    "exact": not plan.unresolved,
+                    "unresolved_reasons": list(plan.unresolved_reasons),
+                }
+                if plan.unresolved:
+                    result.update({
+                        "parameterized_ppa_unsupported": True,
+                        "synth_status": "not_run_parameterized_sweep",
+                        "ppa_status": "unsupported_parameter_sweep",
+                        "ppa_error": (
+                            "PPA was not run because the complete CVDP parameter "
+                            "configuration matrix could not be recovered exactly: "
+                            + "; ".join(plan.unresolved_reasons)
+                            + ". A module-default configuration alone is not representative."
+                        ),
+                    })
+                    return result
+                if self.enable_synth and result["sim_status"] == "sim_pass":
+                    sweep_result = self.run_parameterized_ppa(
+                        sv_code=sv_code,
+                        top_module=sparkle_mod_name or info.design_name,
+                        configurations=plan.configurations,
+                    )
+                    sweep_evidence = sweep_result.pop("verification_evidence", [])
+                    result.update(sweep_result)
+                    result["verification_evidence"] = (
+                        list(result.get("verification_evidence", []))
+                        + list(sweep_evidence)
+                    )
+                    # Gate-level simulation is intentionally not summarized
+                    # as one scalar across heterogeneous parameter configs.
+                    result["gls_synth_status"] = "not_run_parameter_sweep"
+                    result["gls_pnr_status"] = "not_run_parameter_sweep"
+                    return result
+                if self.enable_synth:
+                    result.update({
+                        "synth_status": "not_run_simulation_failed",
+                        "ppa_status": "not_run_simulation_failed",
+                        "ppa_error": (
+                            "Finite parameter PPA was not run because the "
+                            "functional parameter sweep did not pass."
+                        ),
+                    })
+                    return result
 
         # 5. Synthesis + PPA (optional)
         if self.enable_synth and result["sv_extracted"]:
@@ -3388,6 +5201,13 @@ class Evaluator:
         (sim_dir / "cvdp_output.txt").write_text(output)
         tail = "\n".join(output.splitlines()[-40:])
         if proc.returncode == 0:
+            incomplete = _cvdp_incomplete_pytest_summary(output)
+            if incomplete:
+                return (
+                    "sim_error",
+                    -1,
+                    f"CVDP harness is incomplete ({incomplete}); finite verification is not claimed",
+                )
             return "sim_pass", 0, "CVDP harness passed"
         if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
             return "sim_fail", -1, f"CVDP harness failed:\n{tail[:1200]}"
@@ -3445,6 +5265,13 @@ class Evaluator:
         (sim_dir / "cvdp_local_output.txt").write_text(output)
         tail = "\n".join(output.splitlines()[-40:])
         if proc.returncode == 0:
+            incomplete = _cvdp_incomplete_pytest_summary(output)
+            if incomplete:
+                return (
+                    "sim_error",
+                    -1,
+                    f"CVDP local harness is incomplete ({incomplete}); finite verification is not claimed",
+                )
             return "sim_pass", 0, "CVDP local harness passed"
         if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
             return "sim_fail", -1, f"CVDP local harness failed:\n{tail[:1200]}"
@@ -3976,8 +5803,35 @@ class Evaluator:
         lines.append("endmodule")
         return "\n".join(lines)
 
+    @staticmethod
+    def _selected_top_clock_port(sv_code: str, top_module: str) -> str | None:
+        """Return the selected top's supported clock port, if it has one."""
+        parsed_top, top_ports = parse_module_ports(
+            sv_code, module_name=top_module
+        )
+        if parsed_top != top_module:
+            return None
+        return next(
+            (
+                name
+                for direction, _typ, name in top_ports
+                if direction == "input"
+                and re.search(
+                    r"(^|_)(clk|clock|aclk|pclk)($|_)", name.lower()
+                )
+            ),
+            None,
+        )
+
     def _run_synthesis(
-        self, prob_id: str, sv_code: str, top_module: str, run_dir: Path
+        self,
+        prob_id: str,
+        sv_code: str,
+        top_module: str,
+        run_dir: Path,
+        *,
+        parameters: dict[str, int] | None = None,
+        synth_dir: Path | None = None,
     ) -> dict:
         """Run Yosys synthesis via ORFS Docker and extract PPA metrics."""
         result: dict = {
@@ -3995,29 +5849,37 @@ class Evaluator:
             return result
 
         # Set up workspace directory
-        synth_dir = run_dir / "synth" / prob_id
+        synth_dir = synth_dir or (run_dir / "synth" / prob_id)
         synth_dir.mkdir(parents=True, exist_ok=True)
 
         # Write SV to workspace
         sv_file = synth_dir / f"{prob_id}.sv"
         sv_file.write_text(sv_code)
 
-        # Check if module has a clk port — if not, write an empty SDC
-        # (ORFS defaults to `create_clock [get_ports clk]` which errors on combinational designs)
-        has_clk = bool(re.search(r'\binput\b.*\bclk\b', sv_code))
+        # Inspect only the selected top.  A clock on a helper module must not
+        # cause an invalid SDC constraint on a combinational design root.
+        clock_port = self._selected_top_clock_port(sv_code, top_module)
         sdc_file = synth_dir / "constraints.sdc"
-        if not has_clk:
+        if clock_port is None:
             sdc_file.write_text("# Combinational design — no clock constraint\n")
         else:
-            sdc_file.write_text("create_clock -period 10 [get_ports clk]\n")
+            sdc_file.write_text(
+                f"create_clock -period 10 [get_ports {clock_port}]\n"
+            )
 
         # Generate config.mk
         container_sv = f"/workspace/{prob_id}.sv"
+        try:
+            parameter_line = _render_orfs_top_parameters(parameters)
+        except ValueError as exc:
+            result["synth_error"] = str(exc)
+            return result
         config_content = (
             f"export DESIGN_NAME = {top_module}\n"
             f"export PLATFORM = sky130hd\n"
             f"export VERILOG_FILES = {container_sv}\n"
             f"export SDC_FILE = /workspace/constraints.sdc\n"
+            f"{parameter_line}"
             f"export CORE_UTILIZATION = 5\n"
             f"export CORE_ASPECT_RATIO = 1\n"
             f"export CORE_MARGIN = 2\n"
@@ -4092,7 +5954,14 @@ class Evaluator:
         return result
 
     def _run_pnr(
-        self, prob_id: str, sv_code: str, top_module: str, run_dir: Path
+        self,
+        prob_id: str,
+        sv_code: str,
+        top_module: str,
+        run_dir: Path,
+        *,
+        parameters: dict[str, int] | None = None,
+        synth_dir: Path | None = None,
     ) -> dict:
         """Run full P&R (floorplan→place→CTS→route→finish) + DRC + LVS."""
         from tools.run_docker import run_docker_command
@@ -4106,7 +5975,7 @@ class Evaluator:
             "lvs_error": None,
         }
 
-        synth_dir = run_dir / "synth" / prob_id
+        synth_dir = synth_dir or (run_dir / "synth" / prob_id)
         if not synth_dir.exists():
             result["pnr_error"] = "Synth directory not found"
             return result
@@ -4134,13 +6003,19 @@ class Evaluator:
         core_side = die_side - 2 * margin
 
         # ── Update config.mk with DIE_AREA ──
-        has_clk = bool(re.search(r'\binput\b.*\bclk\b', sv_code))
+        clock_port = self._selected_top_clock_port(sv_code, top_module)
         container_sv = f"/workspace/{prob_id}.sv"
+        try:
+            parameter_line = _render_orfs_top_parameters(parameters)
+        except ValueError as exc:
+            result["pnr_error"] = str(exc)
+            return result
         config_content = (
             f"export DESIGN_NAME = {top_module}\n"
             f"export PLATFORM = sky130hd\n"
             f"export VERILOG_FILES = {container_sv}\n"
             f"export SDC_FILE = /workspace/constraints.sdc\n"
+            f"{parameter_line}"
             f"export DIE_AREA = 0 0 {die_side} {die_side}\n"
             f"export CORE_AREA = {margin} {margin} {core_side} {core_side}\n"
             f"export PLACE_DENSITY = 0.15\n"
@@ -4150,10 +6025,12 @@ class Evaluator:
         # Ensure SDC exists (should already from synth phase)
         sdc_file = synth_dir / "constraints.sdc"
         if not sdc_file.exists():
-            if not has_clk:
+            if clock_port is None:
                 sdc_file.write_text("# Combinational design\n")
             else:
-                sdc_file.write_text("create_clock -period 10 [get_ports clk]\n")
+                sdc_file.write_text(
+                    f"create_clock -period 10 [get_ports {clock_port}]\n"
+                )
 
         volumes = [
             f"{synth_dir / 'orfs_results'}:/OpenROAD-flow-scripts/flow/results",
@@ -4243,7 +6120,7 @@ class Evaluator:
         """Run STA at each PVT corner on the post-route netlist."""
         from tools.run_docker import run_docker_command
 
-        has_clk = bool(re.search(r'\binput\b.*\bclk\b', sv_code))
+        has_clk = self._selected_top_clock_port(sv_code, top_module) is not None
         corners_data: list[dict] = []
         platform_dir = "/OpenROAD-flow-scripts/flow/platforms/sky130hd"
         results_base = f"/OpenROAD-flow-scripts/flow/results/sky130hd/{top_module}/base"
@@ -4287,6 +6164,14 @@ class Evaluator:
                 })
                 continue
 
+            if not sta_result.get("success"):
+                corners_data.append({
+                    "corner": cname,
+                    "label": corner["label"],
+                    "error": str(sta_result.get("stderr") or "STA failed"),
+                })
+                continue
+
             stdout = sta_result.get("stdout", "")
             (synth_dir / f"sta_{cname}_out.txt").write_text(stdout)
 
@@ -4322,6 +6207,10 @@ class Evaluator:
         # Compute worst-case across corners
         worst: dict = {
             "pvt_corners": corners_data,
+            "corners_pass": (
+                len(corners_data) == len(PVT_CORNERS)
+                and all(not corner.get("error") for corner in corners_data)
+            ),
             "pvt_worst_wns_ns": None,
             "pvt_worst_whs_ns": None,
             "pvt_worst_power_uw": None,

@@ -184,6 +184,30 @@ not prevent manually stated source-level Lean theorems from quantifying over a
 generic circuit definition; it only limits automatic verification-model
 extraction from parameterized IR/SystemVerilog.
 
+Keep three claims separate when reading evaluator output:
+
+- **Lean source complete** means compilation found no reported `sorry`. It does
+  not imply that the file contains a correctness theorem.
+- **Finite parameter sweep** means only the exact configurations listed in the
+  evidence were exercised. Even if every listed configuration passes, no
+  conclusion follows for an unlisted width.
+- **Universal Lean source theorem** requires explicit theorem evidence whose
+  proposition quantifies over the parameter and states its design-specific
+  legal domain. This is a theorem about Lean source semantics; it is not, by
+  itself, a proof of the compiler or emitted SystemVerilog.
+
+Universal evidence is independently rechecked by the prebuilt
+`sparkle-certify` process against the imported kernel environment. Candidate
+log text is used only to discover a requested theorem and is never trusted as
+the certificate itself. The checker rejects `sorry` and project-defined axioms;
+its fresh nonce, theorem, parameter list, proposition, and axiom list must all
+match before the report shows a proved source theorem.
+
+The HTML report never upgrades `has_sorry = false`, a successful sweep, or a
+cache hit into a universal theorem. Cached and newly computed results for the
+same configuration have the same finite evidence scope; cache provenance only
+explains where that configuration's result came from.
+
 The parameter must actually determine the relevant ports, state, memories, or
 logic. Merely adding `parameter WIDTH = 8` to a wrapper or to an otherwise
 fixed 8-bit core does not implement a sweep; changing the wrapper parameter
@@ -193,9 +217,17 @@ missing parameters and declaration-only/fixed-port parameterization.
 Concrete wrappers remain useful when a separate fixed module is desired, but
 they are not a substitute for a benchmark that rebuilds one DUT over multiple
 parameter values. Functional simulation can exercise a native parameter
-sweep. The current PPA backend does not yet synthesize every configuration
-separately, so parameterized designs report PPA as skipped rather than
-attaching module-default metrics to the entire sweep.
+sweep. When the harness yields a complete literal configuration matrix, the
+PPA runner executes each point in an isolated workspace, with global
+parallelism controlled by `--ppa-workers`; successful points are reused from a
+content-addressed cache selected by `--ppa-cache-dir`. Cache identity includes
+RTL, top, configuration, and the effective flow/tool fingerprint. Failed or
+timed-out points remain retryable. If enumeration is incomplete, PPA remains
+skipped rather than inventing missing combinations or attaching module-default
+metrics to the entire sweep. Persistent reuse across program invocations
+requires an immutable `ORFS_DOCKER_IMAGE_DIGEST`; with an unpinned image tag,
+the evaluator intentionally adds a process nonce to the fingerprint and only
+deduplicates work inside that invocation.
 
 ---
 

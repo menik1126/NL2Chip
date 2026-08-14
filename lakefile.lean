@@ -67,6 +67,10 @@ lean_lib «Tests» where
 lean_exe «sparkle» where
   root := `Main
 
+/-- Kernel-environment-only universal theorem certificate checker. -/
+lean_exe «sparkle-certify» where
+  root := `Tools.SparkleCertify
+
 lean_exe «verilog-tests» where
   root := `Tests.VerilogTests
   supportInterpreter := true

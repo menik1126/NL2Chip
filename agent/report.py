@@ -14,6 +14,11 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
+try:
+    from universal_theorem import is_valid_universal_theorem_evidence
+except ModuleNotFoundError:  # package-style ``import agent.report``
+    from .universal_theorem import is_valid_universal_theorem_evidence
+
 
 def load_run(run_dir: Path) -> tuple[dict, list[dict]]:
     """Load summary.json and results.jsonl from a run directory."""
@@ -41,6 +46,256 @@ def _fmt_tokens(n: int) -> str:
     if n >= 1_000:
         return f"{n/1_000:.1f}K"
     return str(n)
+
+
+_FINITE_EVIDENCE_KINDS = {
+    "finite_parameter_sweep",
+    "finite_sweep",
+}
+_UNIVERSAL_EVIDENCE_KINDS = {
+    "universal_lean_theorem",
+    "lean_universal_theorem",
+}
+
+
+def _normalize_evidence_kind(value: object) -> str:
+    """Normalize serialized enum spellings without assigning them semantics."""
+    if value is None:
+        return ""
+    text = str(value).strip().lower().replace("-", "_")
+    # ``str(EnumMember)`` can survive in hand-built/legacy result dictionaries.
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def _evidence_items(record: dict) -> list[dict]:
+    """Return only explicitly serialized verification-evidence objects.
+
+    In particular, this function never derives theorem evidence from
+    ``has_sorry`` or the legacy ``ppa_verified`` boolean.  Those fields say at
+    most that a Lean source file was complete; they do not say that it contains
+    a theorem, much less a theorem quantified over every legal parameter value.
+    """
+    items: list[dict] = []
+
+    def append(raw: object, implied_kind: str | None = None) -> None:
+        if isinstance(raw, list):
+            for entry in raw:
+                append(entry, implied_kind)
+            return
+        if not isinstance(raw, dict):
+            return
+        if "kind" in raw:
+            items.append(raw)
+            return
+        if implied_kind is not None:
+            items.append({"kind": implied_kind, **raw})
+            return
+        # Also accept a named-object representation while keeping the two
+        # evidence variants disjoint.
+        for key in _FINITE_EVIDENCE_KINDS | _UNIVERSAL_EVIDENCE_KINDS:
+            if key in raw:
+                append(raw[key], key)
+
+    for field in (
+        "verification_evidence",
+        "ppa_evidence",
+        "parameter_sweep_evidence",
+        "universal_lean_theorem_evidence",
+        "evidence",
+    ):
+        append(record.get(field))
+
+    # Parameterized PPA results may carry one finite-sweep evidence object per
+    # canonical configuration.  Consume those objects without treating their
+    # cache provenance as a stronger kind of evidence.
+    for field in ("parameterized_ppa_results", "parameter_sweep_results"):
+        raw_results = record.get(field)
+        if isinstance(raw_results, list):
+            for result in raw_results:
+                if isinstance(result, dict):
+                    raw_evidence = result.get("evidence")
+                    if isinstance(raw_evidence, dict):
+                        enriched = dict(raw_evidence)
+                        if "status" not in enriched and isinstance(result.get("success"), bool):
+                            enriched["status"] = "passed" if result["success"] else "failed"
+                        if (
+                            not enriched.get("configurations")
+                            and result.get("config") is not None
+                        ):
+                            enriched["configurations"] = [result["config"]]
+                        if isinstance(result.get("cache_hit"), bool):
+                            enriched["cache_hit"] = result["cache_hit"]
+                        append(enriched)
+                    else:
+                        append(raw_evidence)
+    return items
+
+
+def _configuration_key(configuration: object) -> str:
+    """Render one exact finite-sweep configuration deterministically."""
+    if isinstance(configuration, dict):
+        pairs = sorted((str(name), value) for name, value in configuration.items())
+    elif isinstance(configuration, (list, tuple)):
+        pairs = []
+        for entry in configuration:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                return str(configuration)
+            pairs.append((str(entry[0]), entry[1]))
+        pairs.sort()
+    else:
+        return str(configuration)
+    if not pairs:
+        return "module defaults"
+    return ", ".join(f"{name}={value}" for name, value in pairs)
+
+
+def _finite_configurations(evidence: dict) -> list[str]:
+    raw = evidence.get("executed_configurations")
+    if raw is None:
+        raw = evidence.get("configurations")
+    if raw is None and evidence.get("config") is not None:
+        raw = [evidence["config"]]
+    if not isinstance(raw, (list, tuple)):
+        return []
+
+    # A canonical single configuration is often serialized from
+    # ``tuple[tuple[str, int], ...]`` as ``[[name, value], ...]``.  Do not count
+    # each parameter pair as a separate sweep point.
+    if raw and all(
+        isinstance(entry, (list, tuple))
+        and len(entry) == 2
+        and isinstance(entry[0], str)
+        for entry in raw
+    ):
+        raw = [raw]
+
+    rendered = {_configuration_key(configuration) for configuration in raw}
+    rendered.discard("")
+    return sorted(rendered)
+
+
+def _render_verification_evidence(record: dict, *, legacy_ppa: bool = False) -> str:
+    """Render finite testing and universal Lean theorems as separate claims."""
+    finite: list[dict] = []
+    universal: list[dict] = []
+    for evidence in _evidence_items(record):
+        kind = _normalize_evidence_kind(evidence.get("kind"))
+        if kind in _FINITE_EVIDENCE_KINDS:
+            finite.append(evidence)
+        elif kind in _UNIVERSAL_EVIDENCE_KINDS:
+            universal.append(evidence)
+
+    badges: list[str] = []
+    if finite:
+        configurations = sorted({
+            configuration
+            for evidence in finite
+            for configuration in _finite_configurations(evidence)
+        })
+        statuses = {
+            str(evidence.get("status", "")).strip().lower()
+            for evidence in finite
+            if evidence.get("status") is not None
+        }
+        if statuses and statuses <= {"passed", "pass", "success", "succeeded"}:
+            css_class = "ok"
+            status_text = " passed"
+        elif statuses & {"failed", "fail", "error"}:
+            css_class = "fail"
+            status_text = " failed"
+        elif statuses:
+            css_class = "warn"
+            status_text = " incomplete"
+        else:
+            css_class = "warn"
+            status_text = ""
+        count_text = (
+            f" &middot; {len(configurations)} config"
+            f"{'s' if len(configurations) != 1 else ''}"
+            if configurations
+            else " &middot; enumerated configs"
+        )
+        title = "Finite parameter sweep only"
+        if configurations:
+            title += ": " + "; ".join(configurations)
+        cache_records = [
+            evidence["cache_hit"]
+            for evidence in finite
+            if isinstance(evidence.get("cache_hit"), bool)
+        ]
+        if cache_records:
+            title += f". Cache hits: {sum(cache_records)}/{len(cache_records)}"
+        title += ". This is not a theorem over all legal parameter values."
+        badges.append(
+            f'<span class="badge {css_class}" title="{escape(title, quote=True)}">'
+            f"Finite sweep{status_text}{count_text}</span>"
+        )
+
+    for evidence in universal:
+        theorem = str(evidence.get("theorem") or evidence.get("theorem_name") or "unnamed theorem")
+        parameters = evidence.get("parameters") or evidence.get("quantified_parameters") or []
+        if isinstance(parameters, str):
+            parameters = [parameters]
+        parameter_text = ", ".join(str(parameter) for parameter in parameters)
+        domain = str(
+            evidence.get("domain_predicate")
+            or evidence.get("domain")
+            or "the theorem's stated domain"
+        )
+        proposition = str(evidence.get("proposition") or evidence.get("statement") or "")
+        valid = is_valid_universal_theorem_evidence(evidence)
+        if valid:
+            css_class = "ok"
+            label = "Universal Lean source theorem"
+        else:
+            css_class = "warn"
+            label = "Universal Lean theorem evidence incomplete"
+        scope = f"forall {parameter_text}" if parameter_text else "universal scope"
+        title_parts = [
+            f"Lean source theorem {theorem}",
+            scope,
+            f"domain: {domain}",
+        ]
+        if proposition:
+            title_parts.append(f"statement: {proposition}")
+        axioms = evidence.get("axioms")
+        if isinstance(axioms, list) and any(
+            not isinstance(axiom, str)
+            or axiom not in {
+                "propext", "Classical.choice", "Quot.sound"
+            }
+            for axiom in axioms
+        ):
+            title_parts.append(
+                "untrusted axioms: " + ", ".join(str(axiom) for axiom in axioms)
+            )
+        title_parts.append(
+            "This source-level theorem is distinct from finite sweep evidence and does not by itself certify the emitted RTL compiler path."
+        )
+        badges.append(
+            f'<span class="badge {css_class}" title="{escape("; ".join(title_parts), quote=True)}">'
+            f"{label} &middot; {escape(theorem)}</span>"
+        )
+
+    if badges:
+        return '<div class="evidence-list">' + "".join(badges) + "</div>"
+
+    # Compatibility for historical rows.  A clean source or ppa_verified=true
+    # was previously rendered as “Verified”; preserve the information while
+    # explicitly declining to infer a theorem from it.
+    source_complete = record.get("has_sorry") is False
+    legacy_complete = legacy_ppa and record.get("ppa_verified") is True
+    if source_complete or legacy_complete:
+        return (
+            '<span class="badge na" title="Legacy result: Lean source completed without a reported sorry. '
+            'No explicit universally quantified theorem evidence was recorded.">'
+            "Lean source complete (legacy; no theorem claim)</span>"
+        )
+    if record.get("has_sorry") is True:
+        return '<span class="badge warn">Lean source contains sorry; no theorem claim</span>'
+    return '<span class="badge na">No explicit verification evidence</span>'
 
 
 def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
@@ -97,6 +352,7 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
         power = r.get("power_uw")
         turns = r.get("agent_turns", 0)
         detail = escape(str(r.get("detail", ""))[:80])
+        evidence_cell = _render_verification_evidence(r)
 
         # Status badges
         def badge(ok, label_ok="Pass", label_fail="Fail"):
@@ -163,7 +419,8 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
             <td class="pid">{escape(pid)}</td>
             <td>{badge(c_pass)}</td>
             <td>{badge(lint)}</td>
-            <td>{sim_badge}</td>{synth_cell}{gls_cell}{pnr_cell}
+            <td>{sim_badge}</td>
+            <td>{evidence_cell}</td>{synth_cell}{gls_cell}{pnr_cell}
             <td class="num">{turns}</td>
             <td class="detail" title="{detail}">{detail}</td>
         </tr>""")
@@ -191,7 +448,7 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
             <th>LVS</th>"""
 
     # Compute turns column index for sort
-    turns_sort_col = 4
+    turns_sort_col = 5
     if synth_enabled:
         turns_sort_col += 5
     if gls_enabled:
@@ -299,12 +556,14 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
         </div>"""
 
     if ppa_opt_results:
-        # Build verification status lookup from ppa_iteration events
-        ppa_verified_lookup: dict[tuple[str, int], bool] = {}
+        # Build an evidence lookup from PPA iteration events.  Explicit typed
+        # evidence wins; historical ``ppa_verified`` is retained only as a
+        # legacy source-completeness note and never as a universal claim.
+        ppa_evidence_lookup: dict[tuple[str, int], dict] = {}
         for r in results:
             if "ppa_iteration" in r:
                 key = (r.get("prob_id", ""), r["ppa_iteration"])
-                ppa_verified_lookup[key] = r.get("ppa_verified", False)
+                ppa_evidence_lookup[key] = r
 
         opt_rows = []
         for r in ppa_opt_results:
@@ -316,12 +575,15 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
                 w = f"{h['wns_ns']:.3f}" if h.get("wns_ns") is not None else "-"
                 p = f"{h['power_uw']:.4f}" if h.get("power_uw") is not None else "-"
                 label = "baseline" if idx == 0 else f"iter {idx}"
-                # Verification badge
-                if idx == 0:
-                    v_badge = '<span class="badge na">N/A</span>'
-                else:
-                    is_verified = ppa_verified_lookup.get((r.get("prob_id", ""), idx), False)
-                    v_badge = '<span class="badge ok">Verified</span>' if is_verified else '<span class="badge warn">Unverified</span>'
+                # Evidence is scoped to this exact iteration.  A final-row
+                # theorem must not be retroactively attached to the baseline.
+                evidence_record = h if _evidence_items(h) else ppa_evidence_lookup.get(
+                    (r.get("prob_id", ""), idx), {}
+                )
+                evidence_badge = _render_verification_evidence(
+                    evidence_record,
+                    legacy_ppa=True,
+                )
                 # Show improvement delta for non-baseline
                 delta = ""
                 if idx > 0 and history[0].get("area_um2") and h.get("area_um2"):
@@ -331,7 +593,7 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
                 opt_rows.append(f"""<tr>
                     <td class="pid">{pid}</td>
                     <td>{label}</td>
-                    <td>{v_badge}</td>
+                    <td>{evidence_badge}</td>
                     <td class="num">{a}{delta}</td>
                     <td class="num">{c}</td>
                     <td class="num">{w}</td>
@@ -342,7 +604,7 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
             <h2>PPA Optimization History</h2>
             <table>
             <thead><tr>
-                <th>Problem</th><th>Iteration</th><th>Proof</th><th>Area (um2)</th><th>Cells</th><th>WNS (ns)</th><th>Power (uW)</th>
+                <th>Problem</th><th>Iteration</th><th>Evidence</th><th>Area (um2)</th><th>Cells</th><th>WNS (ns)</th><th>Power (uW)</th>
             </tr></thead>
             <tbody>{"".join(opt_rows)}</tbody>
             </table>
@@ -402,8 +664,28 @@ def generate_html(summary: dict, results: list[dict], run_dir: Path) -> str:
         pvt_rows = []
         for r in pvt_results:
             pid = escape(r.get("prob_id", "?"))
-            for c in r["pvt_corners"]:
+            flat_corners: list[dict] = []
+            for raw_corner in r["pvt_corners"]:
+                if not isinstance(raw_corner, dict):
+                    continue
+                nested = raw_corner.get("corners")
+                if isinstance(nested, list):
+                    for child in nested:
+                        if isinstance(child, dict):
+                            flat_corners.append({
+                                **child,
+                                "config": raw_corner.get("config", child.get("config")),
+                            })
+                else:
+                    flat_corners.append(raw_corner)
+            for c in flat_corners:
                 label = escape(c.get("label", c.get("corner", "?")))
+                config = c.get("config")
+                if isinstance(config, dict):
+                    rendered_config = ", ".join(
+                        f"{name}={value}" for name, value in sorted(config.items())
+                    ) or "module defaults"
+                    label = f"{label} [{escape(rendered_config)}]"
                 if c.get("error"):
                     pvt_rows.append(f"""<tr>
                         <td class="pid">{pid}</td>
@@ -493,6 +775,8 @@ tr:hover {{ background: var(--surface2); }}
 .badge.fail {{ background: rgba(248,81,73,0.15); color: var(--red); }}
 .badge.warn {{ background: rgba(210,153,34,0.15); color: var(--yellow); }}
 .badge.na {{ background: var(--surface2); color: var(--muted); }}
+.evidence-list {{ display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }}
+.evidence-note {{ color: var(--muted); font-size: 0.8rem; }}
 .ppa-chart {{ display: flex; flex-direction: column; gap: 3px; }}
 .ppa-bar {{ height: 14px; background: var(--purple); border-radius: 3px; min-width: 2px; opacity: 0.8; transition: opacity 0.2s; }}
 .ppa-bar:hover {{ opacity: 1; }}
@@ -543,6 +827,9 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 24px; text-align:
 
 <div class="section">
     <h2>Results</h2>
+    <p class="evidence-note">
+        Evidence scopes are intentionally separate: a finite parameter sweep covers only the configurations listed in its tooltip; it is not a proof for every legal parameter value. A universal Lean source theorem is reported only when explicit theorem evidence is present, and does not by itself certify the emitted RTL compiler path. Historical <code>has_sorry=false</code>/<code>ppa_verified=true</code> rows are shown only as legacy source-completeness information.
+    </p>
     <div class="filter"><input type="text" id="filter" placeholder="Filter by problem ID..." oninput="filterTable()"></div>
     <div style="overflow-x:auto;">
     <table id="results">
@@ -550,7 +837,8 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 24px; text-align:
         <th onclick="sortTable(0)">Problem</th>
         <th onclick="sortTable(1)">Compile</th>
         <th onclick="sortTable(2)">Lint</th>
-        <th onclick="sortTable(3)">Sim</th>{synth_header}{gls_header}{pnr_header}
+        <th onclick="sortTable(3)">Sim</th>
+        <th>Verification Evidence</th>{synth_header}{gls_header}{pnr_header}
         <th onclick="sortTable({turns_sort_col})">Turns</th>
         <th>Detail</th>
     </tr></thead>

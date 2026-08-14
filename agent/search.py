@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import threading
@@ -41,11 +43,16 @@ from dataset import Dataset, ProblemInfo
 from evaluator import (
     CVDP_PARAMETERIZATION_UNSUPPORTED,
     Evaluator,
+    _cvdp_exact_parameter_sweep_plan,
     _cvdp_parameter_overrides,
     _module_parameters,
     _rename_module_declaration,
     parse_module_ports,
 )
+try:
+    from universal_theorem import is_valid_universal_theorem_evidence
+except ModuleNotFoundError:  # package-style ``import agent.search``
+    from .universal_theorem import is_valid_universal_theorem_evidence
 from lean_repl import LeanREPLPool
 from report import generate_report
 
@@ -132,6 +139,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gls", action="store_true", help="Run gate-level simulation after synthesis/PnR (implies --synth)")
     p.add_argument("--quiet", "-q", action="store_true", help="Minimal output (progress bar only)")
     p.add_argument("--workers", "-w", type=int, default=1, help="Concurrent workers (default: 1, recommended: 4)")
+    p.add_argument(
+        "--ppa-workers",
+        type=int,
+        default=2,
+        help="Global concurrent parameter-sweep Yosys/OpenROAD jobs (default: 2)",
+    )
+    p.add_argument(
+        "--ppa-cache-dir",
+        type=str,
+        default=None,
+        help="Persistent parameter-sweep cache (default: .lake/build/ppa_sweep_cache)",
+    )
     p.add_argument("--results-dir", type=str, default=None, help="Directory for run outputs (default: ./results)")
     p.add_argument("--resume-mode", choices=["passed", "completed"], default="passed",
                     help="With --resume, skip sim-passing problems or any completed non-agent-error problem")
@@ -2001,6 +2020,36 @@ def ppa_improved(old: dict, new: dict) -> bool:
     return any_improved
 
 
+def _has_kernel_checked_universal_theorem(result: dict) -> bool:
+    """Return true only for explicit universal Lean-source evidence.
+
+    ``has_sorry == False`` is deliberately insufficient: a source file can be
+    complete while declaring no correctness theorem at all.
+    """
+    evidence_items = result.get("verification_evidence", [])
+    if isinstance(evidence_items, dict):
+        evidence_items = [evidence_items]
+    for evidence in evidence_items or []:
+        if isinstance(evidence, dict) and is_valid_universal_theorem_evidence(evidence):
+            return True
+    return False
+
+
+def _has_kernel_checked_design_contract(result: dict) -> bool:
+    """Return whether evidence is trusted *and bound to this design contract*.
+
+    A generic theorem over ``W`` can be perfectly valid Lean-source evidence
+    while saying nothing about the generated circuit.  The current certificate
+    schema intentionally makes no compiler-correctness claim and carries no
+    trusted binding to a design artifact, so it must not influence architecture
+    or PPA candidate selection.  A future design-contract certificate can make
+    this predicate nontrivial once it includes a kernel-checked subject binding
+    and a compiler-correctness story.
+    """
+    _ = result
+    return False
+
+
 def build_ppa_feedback(prob_id: str, result: dict, iteration: int, history: list[dict]) -> str:
     """Build a PPA feedback message for the agent."""
     ppa = extract_ppa(result)
@@ -2038,7 +2087,7 @@ def build_ppa_feedback(prob_id: str, result: dict, iteration: int, history: list
     elif ppa["area_um2"] is not None and ppa["cell_count"] is not None:
         lines.append("- Focus on reducing area and cell count through logic simplification.")
     lines.append("")
-    lines.append("### Instructions (Verified Optimization)")
+    lines.append("### Instructions (Proof-aware Optimization)")
     lines.append(f"You MUST prove functional equivalence when optimizing. Use `lean_proof_step` for interactive proofs:")
     lines.append(f"1. Read your current `Generated/{prob_id}.lean`")
     lines.append(f"2. Use `lean_proof_step` to define both `{prob_id.lower()}_spec` (original) and `{prob_id.lower()}` (optimized)")
@@ -2175,17 +2224,47 @@ def _cvdp_direct_sv_requires_parameter_sweep(
     )
 
 
-def _mark_parameterized_ppa_unsupported(result: dict) -> dict:
+def _cvdp_direct_sv_parameter_plan(
+    info: ProblemInfo,
+    evaluator: Evaluator,
+    sv_code: str | None = None,
+):
+    """Return an exact finite plan for a parameterized CVDP top, if needed."""
+    if not _cvdp_direct_sv_requires_parameter_sweep(info, evaluator, sv_code):
+        return None
+    harness_files = (info.metadata or {}).get("harness_files", {})
+    _has_overrides, observed_names, _unresolved = _cvdp_parameter_overrides(
+        harness_files
+    )
+    parameter_names = set(observed_names)
+    parameter_names.update(
+        parameter.name
+        for parameter in _module_parameters(
+            info.ref_code or "", info.design_name
+        )
+    )
+    if sv_code:
+        parameter_names.update(
+            parameter.name
+            for parameter in _module_parameters(sv_code, info.design_name)
+        )
+    return _cvdp_exact_parameter_sweep_plan(harness_files, parameter_names)
+
+
+def _mark_parameterized_ppa_unsupported(
+    result: dict,
+    reasons: tuple[str, ...] | list[str] = (),
+) -> dict:
     """Mark PPA as intentionally skipped without changing simulation status."""
     result.update({
         "parameterized_ppa_unsupported": True,
         "synth_status": "not_run_parameterized_sweep",
         "ppa_status": "unsupported_parameter_sweep",
         "ppa_error": (
-            "PPA was not run: the CVDP reference, harness, or generated top "
-            "uses native SystemVerilog parameters, while the current backend "
-            "would synthesize only the module defaults. Per-configuration synthesis and reporting are "
-            "required before these metrics are meaningful."
+            "PPA was not run because the complete CVDP parameter configuration "
+            "matrix could not be recovered exactly"
+            + (": " + "; ".join(reasons) if reasons else ".")
+            + " Synthesizing only module defaults would be incomplete."
         ),
         "synth_pass": False,
         "synth_error": None,
@@ -2233,11 +2312,12 @@ def evaluate_verilog_candidate(
         "terminal_capability_error": False,
         "repairable_parameterization_error": False,
         "parameterized_ppa_unsupported": False,
+        "verification_evidence": [],
         "unsupported_reason": None,
         "detail": "",
     }
 
-    parameterized_ppa_unsupported = _cvdp_direct_sv_requires_parameter_sweep(
+    parameter_plan = _cvdp_direct_sv_parameter_plan(
         info, evaluator, sv_code
     )
 
@@ -2299,15 +2379,41 @@ def evaluate_verilog_candidate(
         sim_status == "sim_error" and "compile failed" in detail.lower()
     )
 
-    if parameterized_ppa_unsupported:
-        _mark_parameterized_ppa_unsupported(result)
+    parameterized_sweep_ran = False
+    if parameter_plan is not None and parameter_plan.unresolved:
+        _mark_parameterized_ppa_unsupported(
+            result, parameter_plan.unresolved_reasons
+        )
+    elif parameter_plan is not None and evaluator.enable_synth:
+        if not hasattr(evaluator, "run_parameterized_ppa"):
+            _mark_parameterized_ppa_unsupported(
+                result,
+                ("the evaluator does not provide the parameterized PPA runner",),
+            )
+        elif result["sim_status"] == "sim_pass":
+            sweep_result = evaluator.run_parameterized_ppa(
+                sv_code=sv_code,
+                top_module=sparkle_mod_name or info.design_name,
+                configurations=parameter_plan.configurations,
+            )
+            sweep_evidence = sweep_result.pop("verification_evidence", [])
+            result.update(sweep_result)
+            result["verification_evidence"] = (
+                list(result.get("verification_evidence", []))
+                + list(sweep_evidence)
+            )
+            parameterized_sweep_ran = True
     elif evaluator.enable_synth and result["sim_status"] == "sim_pass":
         synth_result = evaluator._run_synthesis(
             prob_id, sv_code, sparkle_mod_name or info.design_name, eval_dir
         )
         result.update(synth_result)
 
-    if evaluator.enable_pnr and result.get("synth_pass"):
+    if (
+        evaluator.enable_pnr
+        and result.get("synth_pass")
+        and not parameterized_sweep_ran
+    ):
         pnr_result = evaluator._run_pnr(
             prob_id, sv_code, sparkle_mod_name or info.design_name, eval_dir
         )
@@ -2326,7 +2432,10 @@ def run_verilog_ppa_loop(
     stats: dict,
 ) -> tuple[dict, list[dict]]:
     """Run PPA optimization directly on exported SystemVerilog instead of Lean."""
-    if _cvdp_direct_sv_requires_parameter_sweep(info, evaluator):
+    if (
+        _cvdp_direct_sv_requires_parameter_sweep(info, evaluator)
+        and not result.get("parameter_sweep_results")
+    ):
         return _mark_parameterized_ppa_unsupported(result), []
 
     env = load_env(PROJECT_ROOT / "key.env")
@@ -2453,6 +2562,7 @@ class ArchCandidate:
     sim_pass: bool
     verified: bool
     description: str
+    verification_evidence: list[dict] = field(default_factory=list)
 
 
 def pareto_dominant(a: dict, b: dict) -> bool:
@@ -2481,7 +2591,7 @@ def select_best_candidate(
     candidates: list[ArchCandidate],
     constraints: dict,
 ) -> ArchCandidate:
-    """Select best candidate: must pass sim, prefer verified, then smallest area."""
+    """Select best candidate: pass sim, then prefer a bound design proof and PPA."""
     valid = [c for c in candidates if c.sim_pass]
     if not valid:
         return candidates[0]  # fallback to initial
@@ -2554,7 +2664,7 @@ def build_arch_feedback(
         lines.append("- Explore a different point in the parallelism/pipeline/resource-sharing space")
 
     lines.append("")
-    lines.append("### Instructions (Verified Architecture)")
+    lines.append("### Instructions (Proof-aware Architecture)")
     lines.append(f"Use `lean_proof_step` for interactive proof development:")
     lines.append(f"1. Read your current `Generated/{prob_id}.lean`")
     lines.append(f"2. Use `lean_proof_step` to define `{func_name}_spec` (keep original) and `{func_name}` (new architecture)")
@@ -2705,6 +2815,11 @@ def _process_one_problem(
         lean_repl=repl,
         dataset=evaluator.dataset_name,
         dataset_obj=evaluator.dataset_obj,
+        parameterized_ppa_runner=evaluator.parameterized_ppa_runner,
+        ppa_cache_dir=evaluator.ppa_cache_dir,
+        ppa_workers=evaluator.ppa_workers,
+        universal_certifier_path=evaluator.universal_certifier_path,
+        universal_certifier_sha256=evaluator.universal_certifier_sha256,
     )
 
     try:
@@ -2853,6 +2968,8 @@ def _process_one_problem_inner(
             lean_repl=repl,
             dataset=evaluator.dataset_name,
             dataset_obj=evaluator.dataset_obj,
+            universal_certifier_path=evaluator.universal_certifier_path,
+            universal_certifier_sha256=evaluator.universal_certifier_sha256,
         )
 
     eval_t0 = time.monotonic()
@@ -3271,8 +3388,8 @@ def _process_one_problem_inner(
                     "result_summary": summarize_eval_result(new_result),
                 })
 
-                # Check verification status (no sorry = formally verified)
-                verified = not new_result.get("has_sorry", True)
+                # A no-sorry source is not automatically a universal theorem.
+                verified = _has_kernel_checked_design_contract(new_result)
 
                 # Check: functional correctness preserved?
                 if new_result["sim_status"] != "sim_pass":
@@ -3283,6 +3400,9 @@ def _process_one_problem_inner(
                         "ppa_iteration": ppa_iter + 1,
                         "ppa_target": "lean",
                         "ppa_verified": verified,
+                        "verification_evidence": new_result.get(
+                            "verification_evidence", []
+                        ),
                         "ppa_status": "rollback_sim_fail",
                         "ppa_elapsed_seconds": round(opt_elapsed, 3),
                         **extract_ppa(new_result),
@@ -3292,14 +3412,15 @@ def _process_one_problem_inner(
                 # Check: PPA improved vs global best?
                 new_ppa = extract_ppa(new_result)
                 improved = ppa_improved(best_ppa, new_ppa)
-                status = "verified_improved" if verified and improved else \
-                         "unverified_improved" if improved else \
-                         "verified_converged" if verified else "converged"
+                status = "improved" if improved else "converged"
                 log_event(run_dir, {
                     "prob_id": prob_id,
                     "ppa_iteration": ppa_iter + 1,
                     "ppa_target": "lean",
                     "ppa_verified": verified,
+                    "verification_evidence": new_result.get(
+                        "verification_evidence", []
+                    ),
                     "ppa_status": status,
                     "ppa_elapsed_seconds": round(opt_elapsed, 3),
                     **new_ppa,
@@ -3343,8 +3464,9 @@ def _process_one_problem_inner(
             code=lean_file.read_text(),
             ppa=extract_ppa(result),
             sim_pass=True,
-            verified=not result.get("has_sorry", True),
+            verified=_has_kernel_checked_design_contract(result),
             description="initial",
+            verification_evidence=list(result.get("verification_evidence", [])),
         ))
 
         for arch_iter in range(args.arch_candidates):
@@ -3417,8 +3539,11 @@ def _process_one_problem_inner(
                 code=lean_file.read_text(),
                 ppa=extract_ppa(new_result),
                 sim_pass=new_result["sim_status"] == "sim_pass",
-                verified=not new_result.get("has_sorry", True),
+                verified=_has_kernel_checked_design_contract(new_result),
                 description=f"candidate_{arch_iter + 1}",
+                verification_evidence=list(
+                    new_result.get("verification_evidence", [])
+                ),
             )
             arch_candidates.append(new_candidate)
             repair_attempts.append({
@@ -3433,6 +3558,7 @@ def _process_one_problem_inner(
                 "arch_iteration": arch_iter + 1,
                 "arch_sim_pass": new_candidate.sim_pass,
                 "arch_verified": new_candidate.verified,
+                "verification_evidence": new_candidate.verification_evidence,
                 **new_candidate.ppa,
             })
 
@@ -3556,6 +3682,7 @@ def _process_one_problem_inner(
                 "description": c.description,
                 "sim_pass": c.sim_pass,
                 "verified": c.verified,
+                "verification_evidence": c.verification_evidence,
                 **c.ppa,
             }
             for c in arch_candidates
@@ -3607,8 +3734,61 @@ def _process_one_problem_inner(
     overall_progress.advance(overall_task)
 
 
+def _apply_implied_stage_flags(args: argparse.Namespace) -> argparse.Namespace:
+    """Normalize CLI stage dependencies before display, execution, and summary."""
+    if args.corners:
+        args.pnr = True
+    if (
+        args.synth_feedback
+        or args.ppa_opt
+        or args.arch_explore
+        or args.gls
+        or args.pnr
+        or args.drc
+        or args.lvs
+    ):
+        args.synth = True
+    return args
+
+
+def _prepare_universal_certifier(project_root: Path) -> tuple[Path, str | None]:
+    """Build and fingerprint the trusted certifier before candidate code runs."""
+    executable = project_root / ".lake" / "build" / "bin" / "sparkle-certify"
+    try:
+        completed = subprocess.run(
+            ["lake", "build", "sparkle-certify"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        console.print(
+            f"[yellow]Universal theorem evidence disabled:[/yellow] "
+            f"could not build trusted sparkle-certify ({error})."
+        )
+        return project_root / ".lake" / "build" / "disabled-sparkle-certify", None
+    if completed.returncode != 0 or not executable.is_file():
+        detail = (completed.stderr or completed.stdout).strip().splitlines()
+        suffix = f" ({detail[-1]})" if detail else ""
+        console.print(
+            "[yellow]Universal theorem evidence disabled:[/yellow] "
+            f"trusted sparkle-certify did not build{suffix}."
+        )
+        return project_root / ".lake" / "build" / "disabled-sparkle-certify", None
+    try:
+        digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    except OSError as error:
+        console.print(
+            "[yellow]Universal theorem evidence disabled:[/yellow] "
+            f"could not fingerprint sparkle-certify ({error})."
+        )
+        return project_root / ".lake" / "build" / "disabled-sparkle-certify", None
+    return executable, digest
+
+
 def main():
-    args = parse_args()
+    args = _apply_implied_stage_flags(parse_args())
     t0 = time.monotonic()
 
     if args.sim_feedback and (args.sim_feedback_iters is not None or args.sim_feedback_turns is not None):
@@ -3616,10 +3796,6 @@ def main():
             "[yellow]Note:[/yellow] --sim-feedback-iters/--sim-feedback-turns are deprecated "
             "and ignored; --sim-feedback shares the main --max-turns budget."
         )
-
-    # Downstream physical-design and feedback modes require synthesis.
-    if args.synth_feedback or args.ppa_opt or args.arch_explore or args.gls or args.pnr or args.drc or args.lvs or args.corners:
-        args.synth = True
 
     # Discover problems
     ds = Dataset(args.dataset, project_root=PROJECT_ROOT)
@@ -3679,8 +3855,35 @@ def main():
     # Load skill prompt
     skill = load_skill()
 
+    # This executable is compiled before any generated candidate is checked.
+    # Evaluators pin its digest and fail closed if candidate code changes it.
+    universal_certifier_path, universal_certifier_sha256 = (
+        _prepare_universal_certifier(PROJECT_ROOT)
+    )
+
     # Create evaluator (REPL will be set per-worker below)
-    evaluator = Evaluator(project_root=PROJECT_ROOT, enable_synth=args.synth, enable_pnr=args.pnr, enable_drc=args.drc, enable_lvs=args.lvs, enable_corners=args.corners, enable_gls=args.gls, dataset=args.dataset, dataset_obj=ds)
+    evaluator = Evaluator(
+        project_root=PROJECT_ROOT,
+        enable_synth=args.synth,
+        enable_pnr=args.pnr,
+        enable_drc=args.drc,
+        enable_lvs=args.lvs,
+        enable_corners=args.corners,
+        enable_gls=args.gls,
+        dataset=args.dataset,
+        dataset_obj=ds,
+        ppa_cache_dir=(
+            Path(args.ppa_cache_dir).resolve()
+            if args.ppa_cache_dir else None
+        ),
+        ppa_workers=args.ppa_workers,
+        universal_certifier_path=universal_certifier_path,
+        universal_certifier_sha256=universal_certifier_sha256,
+    )
+    if args.synth:
+        # One shared executor provides a true global concurrency limit across
+        # all problem workers and enables cross-evaluator single-flight.
+        evaluator.prepare_parameterized_ppa_runner()
 
     # Track stats
     stats = {
@@ -3771,6 +3974,9 @@ def main():
                     future.result()
                 except Exception as exc:
                     console.print(f"[red]Worker exception: {exc}[/red]")
+
+    if evaluator.parameterized_ppa_runner is not None:
+        evaluator.parameterized_ppa_runner.close()
 
     # ── Cleanup REPL pool ──────────────────────────────────────────
     if repl_pool is not None:

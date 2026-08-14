@@ -1302,15 +1302,15 @@ def test_unsupported_parameterization_is_repairable_and_skips_synthesis(tmp_path
 
 
 @pytest.mark.parametrize(
-    "harness",
+    ("harness", "expected_config"),
     [
-        'runner.build(parameters={"WIDTH": WIDTH})',
-        "runner.build()",
+        ('runner.build(parameters={"WIDTH": WIDTH})', None),
+        ("runner.build()", {}),
     ],
-    ids=["explicit-sweep", "native-reference-parameter"],
+    ids=["unresolved-symbolic-sweep", "exact-default-configuration"],
 )
-def test_native_parameter_sweep_keeps_sim_result_but_skips_default_ppa(
-    tmp_path, monkeypatch, harness
+def test_native_parameter_sweep_runs_only_when_configuration_is_exact(
+    tmp_path, monkeypatch, harness, expected_config
 ):
     generated = tmp_path / "Generated"
     generated.mkdir()
@@ -1363,7 +1363,7 @@ def test_native_parameter_sweep_keeps_sim_result_but_skips_default_ppa(
         lambda *_args: ("sim_pass", 0, "all native parameter configurations passed"),
     )
 
-    def fake_synthesis(*_args):
+    def fake_synthesis(*_args, **_kwargs):
         nonlocal synthesis_called
         synthesis_called = True
         return {"synth_pass": True, "area_um2": 1.0}
@@ -1374,14 +1374,24 @@ def test_native_parameter_sweep_keeps_sim_result_but_skips_default_ppa(
 
     assert result["sim_status"] == "sim_pass"
     assert result["sim_mismatches"] == 0
-    assert result["parameterized_ppa_unsupported"] is True
-    assert result["synth_status"] == "not_run_parameterized_sweep"
-    assert result["ppa_status"] == "unsupported_parameter_sweep"
-    assert result["synth_pass"] is False
-    assert result["area_um2"] is None
     assert result["terminal_capability_error"] is False
-    assert "module-default configuration" in result["ppa_error"]
-    assert not synthesis_called
+    if expected_config is None:
+        assert result["parameterized_ppa_unsupported"] is True
+        assert result["synth_status"] == "not_run_parameterized_sweep"
+        assert result["ppa_status"] == "unsupported_parameter_sweep"
+        assert result["synth_pass"] is False
+        assert result["area_um2"] is None
+        assert "module-default configuration" in result["ppa_error"]
+        assert not synthesis_called
+    else:
+        assert result["parameterized_ppa_unsupported"] is False
+        assert result["synth_status"] == "finite_parameter_sweep_passed"
+        assert result["ppa_status"] == "finite_parameter_sweep"
+        assert result["synth_pass"] is True
+        assert result["area_um2"] == 1.0
+        assert result["parameter_sweep_results"][0]["config"] == expected_config
+        assert synthesis_called
+        evaluator.parameterized_ppa_runner.close()
 
 
 def test_cvdp_wrapper_bridges_observed_internal_memory_without_making_it_a_port():

@@ -2153,6 +2153,175 @@ private def parseParameterDefaults
     result := result ++ [(name.getId.toString, value.getNat)]
   return result
 
+/-!
+## Kernel-checked universal theorem certificates
+
+The certificate emitted by `#sparkleUniversalTheorem` is deliberately about a
+Lean theorem only.  In particular, it does not claim that the Sparkle compiler
+or generated SystemVerilog preserves the theorem.  Downstream tooling can use
+the single-line JSON marker without confusing a finite parameter sweep with a
+theorem quantified over natural-number parameters.
+-/
+
+private def universalTheoremPPOptions (options : Options) : Options :=
+  options
+    |>.set `pp.explicit true
+    |>.set `pp.fullNames true
+    |>.set `pp.universes true
+    |>.set `pp.piBinderNames true
+    |>.set `pp.deepTerms true
+    |>.set `pp.proofs true
+    -- The standalone certifier deliberately does not load candidate-owned
+    -- environment extensions.  Preserve a complete raw proposition if a
+    -- custom pretty-printer is therefore unavailable.
+    |>.set `pp.rawOnError true
+    |>.set `pp.maxSteps 1000000
+
+private def renderUniversalTheoremExpr (expr : Lean.Expr) : MetaM String :=
+  withOptions universalTheoremPPOptions do
+    return toString (← ppExpr expr)
+
+private def universalTheoremBinderInfoName : BinderInfo → String
+  | .default => "explicit"
+  | .implicit => "implicit"
+  | .strictImplicit => "strict_implicit"
+  | .instImplicit => "instance_implicit"
+
+/--
+The only noncomputational principles accepted by a universal theorem
+certificate.  These are Lean's standard logical axioms; project- or
+candidate-defined axioms are deliberately excluded.
+-/
+private def universalTheoremAllowedAxioms : Array Name :=
+  #[``propext, ``Classical.choice, ``Quot.sound]
+
+/--
+Validate a universal-width theorem directly against Lean's kernel-checked
+environment and return its structured certificate.  This is the trusted API
+for evaluator-owned checkers: callers should consume the returned `Json`
+directly instead of trusting marker-shaped text emitted by candidate code.
+
+An evaluator may supply a fresh nonce to bind a serialized copy of the result
+to one controlled checker invocation.  A nonce is not a substitute for calling
+this API from trusted code.
+-/
+def certifyUniversalTheorem
+    (declName : Name) (parameterNames : Array Name)
+    (nonce : Option String := none) : MetaM Json := do
+  if parameterNames.isEmpty then
+    throwError "A universal theorem certificate must name at least one Nat parameter."
+  if let some nonce := nonce then
+    if nonce.isEmpty then
+      throwError "A universal theorem certificate nonce must not be empty."
+  for parameterName in parameterNames do
+    if parameterNames.count parameterName != 1 then
+      throwError m!"Duplicate universal theorem parameter '{parameterName}'."
+
+  -- Read from the kernel-checked environment rather than only the elaborator
+  -- environment.  This is what justifies the `kernel_checked` field below.
+  let env ← getEnv
+  let theoremInfo ← match env.checked.get.find? declName with
+    | some (.thmInfo info) => pure info
+    | some _ =>
+        throwError m!"'{declName}' is not a Lean theorem or lemma."
+    | none =>
+        throwError m!"'{declName}' is not present in Lean's kernel-checked environment."
+
+  if theoremInfo.value.hasSorry then
+    throwError m!"Theorem '{declName}' contains 'sorry' and cannot receive a universal theorem certificate."
+  let axioms ← Lean.collectAxioms declName
+  if axioms.any (fun axiomName => axiomName == ``sorryAx) then
+    throwError m!"Theorem '{declName}' transitively depends on 'sorry' and cannot receive a universal theorem certificate."
+  let disallowedAxioms := axioms.filter fun axiomName =>
+    !universalTheoremAllowedAxioms.contains axiomName
+  unless disallowedAxioms.isEmpty do
+    let renderedDisallowed := String.intercalate ", " <|
+      (disallowedAxioms.qsort Name.lt).toList.map Name.toString
+    let renderedAllowed := String.intercalate ", " <|
+      universalTheoremAllowedAxioms.toList.map Name.toString
+    throwError m!"Theorem '{declName}' depends on non-allowlisted axiom(s): {renderedDisallowed}. Universal theorem certificates only allow Lean's standard logical axioms: {renderedAllowed}."
+
+  let proposition ← renderUniversalTheoremExpr theoremInfo.type
+  let (binders, domain, conclusion) ←
+      forallTelescopeReducing theoremInfo.type fun fvars conclusion => do
+    let localDecls ← fvars.mapM getFVarLocalDecl
+    for parameterName in parameterNames do
+      let parameterMatches := localDecls.filter (fun localDecl => localDecl.userName == parameterName)
+      if parameterMatches.size == 0 then
+        throwError m!"Theorem '{declName}' does not universally bind a parameter named '{parameterName}'."
+      if parameterMatches.size != 1 then
+        throwError m!"Theorem '{declName}' has multiple binders named '{parameterName}', so the requested parameter is ambiguous."
+      let parameterType ← whnf parameterMatches[0]!.type
+      unless parameterType.isConstOf ``Nat do
+        let renderedType ← renderUniversalTheoremExpr parameterMatches[0]!.type
+        throwError m!"Universal theorem parameter '{parameterName}' has type '{renderedType}', not Nat."
+      let parameterFVarId := parameterMatches[0]!.fvarId
+      let occursInDomain := localDecls.any fun localDecl =>
+        localDecl.fvarId != parameterFVarId && localDecl.type.containsFVar parameterFVarId
+      unless occursInDomain || conclusion.containsFVar parameterFVarId do
+        throwError m!"Universal theorem parameter '{parameterName}' does not occur in the theorem domain or conclusion; refusing to certify a fixed-width statement with an unused dummy parameter."
+
+    let mut binderJson : Array Json := #[]
+    let mut domainJson : Array Json := #[]
+    for localDecl in localDecls do
+      let renderedType ← renderUniversalTheoremExpr localDecl.type
+      let isParameter := parameterNames.contains localDecl.userName
+      let isPremise ← isProp localDecl.type
+      let role := if isParameter then "parameter" else if isPremise then "premise" else "quantified"
+      let entry := Json.mkObj [
+        ("binder_info", .str (universalTheoremBinderInfoName localDecl.binderInfo)),
+        ("name", .str localDecl.userName.toString),
+        ("role", .str role),
+        ("type", .str renderedType)
+      ]
+      binderJson := binderJson.push entry
+      unless isParameter do
+        domainJson := domainJson.push entry
+    let renderedConclusion ← renderUniversalTheoremExpr conclusion
+    return (binderJson, domainJson, renderedConclusion)
+
+  let sortedAxioms := axioms.qsort Name.lt
+  let certificate := Json.mkObj [
+    ("axioms", .arr (sortedAxioms.map fun axiomName => .str axiomName.toString)),
+    ("binders", .arr binders),
+    ("compiler_correctness_claimed", .bool false),
+    ("conclusion", .str conclusion),
+    ("domain", .arr domain),
+    ("evidence_kind", .str "universal_lean_theorem"),
+    ("kernel_checked", .bool true),
+    ("verification_nonce", nonce.map Json.str |>.getD .null),
+    ("parameters", .arr (parameterNames.map fun parameterName => .str parameterName.toString)),
+    ("proposition", .str proposition),
+    ("schema_version", (1 : Json)),
+    ("status", .str "proved"),
+    ("theorem", .str declName.toString)
+  ]
+  return certificate
+
+private def emitUniversalTheoremCertificate
+    (theoremId : TSyntax `ident) (parameterNames : Array Name)
+    (nonce : Option String := none) : CommandElabM Unit := do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload theoremId
+  let certificate ← Lean.Elab.Command.liftTermElabM do
+    certifyUniversalTheorem declName parameterNames nonce
+  logInfo m!"SPARKLE_UNIVERSAL_THEOREM_JSON:{certificate.compress}"
+
+/--
+Emit a machine-readable certificate for a kernel-checked Lean theorem that
+universally binds the named `Nat` parameters.  Any later binders and premises
+are preserved in `domain`, and the entire theorem type is preserved in
+`proposition`.  This command certifies no relationship to generated hardware.
+-/
+elab "#sparkleUniversalTheorem" theoremId:ident "parameters" "[" parameters:ident,* "]" : command => do
+  let parameterNames := parameters.getElems.map TSyntax.getId
+  emitUniversalTheoremCertificate theoremId parameterNames
+
+/-- Evaluator-owned variant carrying a fresh challenge nonce in the marker. -/
+elab "#sparkleUniversalTheorem" theoremId:ident verificationNonce:str "parameters" "[" parameterIds:ident,* "]" : command => do
+  let parameterNames := parameterIds.getElems.map TSyntax.getId
+  emitUniversalTheoremCertificate theoremId parameterNames (some verificationNonce.getString)
+
 elab "#synthesize" id:ident : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
     Lean.resolveGlobalConstNoOverload id
