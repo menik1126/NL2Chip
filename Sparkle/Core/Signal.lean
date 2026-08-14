@@ -123,6 +123,14 @@ def clock {dom : DomainConfig} : Signal dom Bool :=
 def map (f : α → β) (s : Signal dom α) : Signal dom β :=
   ⟨fun t => f (s.val t)⟩
 
+/-- Apply a Boolean function independently to every bit of a packed signal.
+    Synthesis retains `W` as a SystemVerilog generate-loop bound. -/
+def mapBits {W : Nat} (f : Bool → Bool)
+    (s : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  s.map fun value =>
+    BitVec.ofNat W <| (List.range W).foldl (fun result index =>
+      if f (value.getLsbD index) then result + 2 ^ index else result) 0
+
 /-- Apply a signal of functions to a signal of values -/
 def ap (sf : Signal dom (α → β)) (s : Signal dom α) : Signal dom β :=
   ⟨fun t => sf.val t (s.val t)⟩

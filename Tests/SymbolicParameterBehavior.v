@@ -40,6 +40,13 @@ module symbolic_parameter_behavior_tb;
     logic [64:0] hier65_rhs;
     wire [64:0] hier65_out;
 
+    logic [2:0] generate3_in;
+    wire [2:0] generate3_out;
+    logic [16:0] generate17_in;
+    wire [16:0] generate17_out;
+    logic [64:0] generate65_in;
+    wire [64:0] generate65_out;
+
     symbolicConcat #(.HI(3), .LO(5)) concat_dut (
         ._gen_hi(concat_hi),
         ._gen_lo(concat_lo),
@@ -96,6 +103,18 @@ module symbolic_parameter_behavior_tb;
         ._gen_lhs(hier65_lhs), ._gen_rhs(hier65_rhs), .out(hier65_out)
     );
 
+    symbolicGenerateNot #(.W(3)) generate3_dut (
+        ._gen_x(generate3_in), .out(generate3_out)
+    );
+
+    symbolicGenerateNot #(.W(17)) generate17_dut (
+        ._gen_x(generate17_in), .out(generate17_out)
+    );
+
+    symbolicGenerateNot #(.W(65)) generate65_dut (
+        ._gen_x(generate65_in), .out(generate65_out)
+    );
+
     initial begin
         concat_hi = 3'b101;
         concat_lo = 5'b10011;
@@ -120,6 +139,9 @@ module symbolic_parameter_behavior_tb;
         hier17_rhs = 17'h0_0ff0;
         hier65_lhs = {1'b1, 64'h0123_4567_89ab_cdef};
         hier65_rhs = {1'b0, 64'hffff_0000_ffff_0000};
+        generate3_in = 3'b101;
+        generate17_in = 17'h1_2468;
+        generate65_in = {1'b1, 64'h0123_4567_89ab_cdef};
         #1;
 
         if (concat_out !== {concat_hi, concat_lo})
@@ -132,6 +154,10 @@ module symbolic_parameter_behavior_tb;
             hier17_out !== (hier17_lhs ^ hier17_rhs) ||
             hier65_out !== (hier65_lhs ^ hier65_rhs))
             $fatal(1, "symbolic hierarchy parameter forwarding failed");
+        if (generate3_out !== ~generate3_in ||
+            generate17_out !== ~generate17_in ||
+            generate65_out !== ~generate65_in)
+            $fatal(1, "symbolic generate behavior failed");
 
         rst = 1'b1;
         #1;

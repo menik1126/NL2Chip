@@ -115,6 +115,12 @@ def emitAssign (lhs : String) (rhs : Sparkle.IR.AST.Expr) : CompilerM Unit := do
   let ((), cs') := CircuitM.emitAssign lhs rhs cs
   set cs'
 
+def emitGenerateFor (label index : String) (start stop : DimExpr)
+    (body : List Stmt) : CompilerM Unit := do
+  let cs ← get
+  let ((), cs') := CircuitM.emitGenerateFor label index start stop body cs
+  set cs'
+
 def addInput (name : String) (ty : HWType) : CompilerM Unit := do
   let cs ← get
   let ((), cs') := CircuitM.addInput name ty cs
@@ -1631,6 +1637,61 @@ mutual
 
     return none
 
+  partial def translateGeneratedBitExpr (expression : Lean.Expr)
+      (binder : FVarId) (inputBit : Sparkle.IR.AST.Expr) : CompilerM Sparkle.IR.AST.Expr := do
+    if let .fvar fvarId := expression then
+      if fvarId == binder then return inputBit
+    let fn := expression.getAppFn
+    let args := expression.getAppArgs
+    match fn with
+    | .const name _ =>
+      if name == ``Bool.true then return .const 1 1
+      if name == ``Bool.false then return .const 0 1
+      if (name == ``Bool.not || name == ``not) && !args.isEmpty then
+        return .op .not [← translateGeneratedBitExpr args.back! binder inputBit]
+      if name == ``ite && args.size >= 3 then
+        let condition ← translateGeneratedBitExpr args[args.size - 3]! binder inputBit
+        let thenValue ← translateGeneratedBitExpr args[args.size - 2]! binder inputBit
+        let elseValue ← translateGeneratedBitExpr args[args.size - 1]! binder inputBit
+        return .op .mux [condition, thenValue, elseValue]
+      if let some operator := getOperator name then
+        if args.size >= 2 && (operator == .and || operator == .or || operator == .xor) then
+          let lhs ← translateGeneratedBitExpr args[args.size - 2]! binder inputBit
+          let rhs ← translateGeneratedBitExpr args[args.size - 1]! binder inputBit
+          return .op operator [lhs, rhs]
+    | _ => pure ()
+    let rendered ← CompilerM.liftMetaM (ppExpr expression)
+    CompilerM.liftMetaM $ throwError
+      (s!"Unsupported Signal.mapBits body '{rendered}'.\n" ++
+       "Supported Boolean operations: constants, NOT, AND, OR, XOR, and ite.")
+
+  /-- Lower per-bit combinational mapping to a native SystemVerilog generate loop. -/
+  partial def handleGenerate (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.mapBits && args.size >= 2 then
+      let function := args[args.size - 2]!
+      let input := args[args.size - 1]!
+      let inputWire ← translateExprToWire input "generate_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let inputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref inputWire) indexDimension indexDimension
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) indexDimension indexDimension
+      let generatedValue ← match function with
+        | .lam binderName binderType body _ =>
+          CompilerM.withLocalDecl binderName binderType fun fvar =>
+            translateGeneratedBitExpr (body.instantiate1 fvar) fvar.fvarId! inputBit
+        | _ => CompilerM.liftMetaM $ throwError
+          "Signal.mapBits currently requires an explicit one-argument lambda"
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0)
+        hwType.bitWidthDim [.assignExpr outputBit generatedValue]
+      return some resultWire
+    return none
+
   /-- Handle definition unfolding (inline) or sub-module synthesis (fallback) -/
   partial def handleDefinitionUnfold (e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
     let isValidDef ← CompilerM.liftMetaM do
@@ -1724,6 +1785,7 @@ mutual
       if let some w ← handleTupleProjections e name args hint isNamed then return w
       if let some w ← handleApplicative e name args hint isNamed then return w
       if let some w ← handleBitVecOps e name args hint isNamed then return w
+      if let some w ← handleGenerate e name args hint isNamed then return w
       if let some w ← handleRegister e name args hint isNamed then return w
       if let some w ← handleMux e name args hint isNamed then return w
       if let some w ← handleMemory e name args hint isNamed then return w

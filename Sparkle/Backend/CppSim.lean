@@ -304,6 +304,12 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       , resetBody := []
       , evalTickLocals := [] }
 
+  | .assignExpr .. =>
+    panic! "CppSim requires specialization before generated lvalue assignments"
+
+  | .generateFor label .. =>
+    panic! s!"CppSim requires specialization of generate loop '{label}'"
+
   | .register output _clock _reset input initValue =>
     let width := lookupWidth typeMap output
     let cppType := emitCppType (.bitVector width)

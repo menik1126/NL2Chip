@@ -141,11 +141,26 @@ def emitTypedConstant (value : Int) : HWType → String
 /-- Emit a single statement.
     The optional `wires` parameter provides wire declarations for register
     reset value width lookup. -/
-def emitStmt (stmt : Stmt) (indent : String := "    ")
+partial def emitStmt (stmt : Stmt) (indent : String := "    ")
     (wires : List Port := []) : String :=
   match stmt with
   | .assign lhs rhs =>
     s!"{indent}assign {sanitizeName lhs} = {emitExpr rhs};"
+
+  | .assignExpr lhs rhs =>
+    s!"{indent}assign {emitExpr lhs} = {emitExpr rhs};"
+
+  | .generateFor label index start stop body =>
+    let indexName := sanitizeName index
+    let bodyIndent := indent ++ "        "
+    let bodyCode := String.intercalate "\n" (body.map (emitStmt · bodyIndent wires))
+    s!"{indent}genvar {indexName};\n" ++
+      s!"{indent}generate\n" ++
+      s!"{indent}    for ({indexName} = {emitDimExpr start}; " ++
+      s!"{indexName} < {emitDimExpr stop}; {indexName} = {indexName} + 1) begin : {sanitizeName label}\n" ++
+      bodyCode ++ "\n" ++
+      s!"{indent}    end\n" ++
+      s!"{indent}endgenerate"
 
   | .register output clock reset input initValue =>
     -- Generate always_ff block for register

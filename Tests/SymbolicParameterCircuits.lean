@@ -43,3 +43,7 @@ def symbolicXorChild {dom : DomainConfig} {W : Nat}
 def symbolicXorHierarchy {dom : DomainConfig} {W : Nat}
     (lhs rhs : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
   symbolicXorChild lhs rhs
+
+def symbolicGenerateNot {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  Signal.mapBits (fun bit => Bool.not bit) x

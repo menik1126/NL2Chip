@@ -94,6 +94,7 @@ structure VerilogOutputs where
   symbolicRegisterVerilog : String
   symbolicMemoryVerilog : String
   symbolicHierarchyVerilog : String
+  symbolicGenerateVerilog : String
   rejectsUnretainedWidth : Bool
   rejectsMissingBinder : Bool
   rejectsDuplicateParameter : Bool
@@ -122,6 +123,8 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedToString `symbolicMemory [("ADDR_W", 3), ("DATA_W", 8)]
   let symbolicHierarchyVerilog ←
     synthesizeParameterizedDesignToString `symbolicXorHierarchy [("W", 8)]
+  let symbolicGenerateVerilog ←
+    synthesizeParameterizedToString `symbolicGenerateNot [("W", 8)]
   let rejectsUnretainedWidth ←
     parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
   let rejectsMissingBinder ←
@@ -137,7 +140,7 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
     symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
     symbolicSliceLowVerilog, symbolicZeroExtendVerilog, symbolicRegisterVerilog,
-    symbolicMemoryVerilog, symbolicHierarchyVerilog,
+    symbolicMemoryVerilog, symbolicHierarchyVerilog, symbolicGenerateVerilog,
     rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
     rejectsZeroWidthDefault
   }
@@ -221,6 +224,14 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           (outputs.symbolicHierarchyVerilog.containsSubstr "parameter integer W = 8") $
         test "parent explicitly forwards W"
           (outputs.symbolicHierarchyVerilog.containsSubstr ".W(W)")
+      ) ++
+      group "symbolic generate" (
+        test "emits a generate block"
+          (outputs.symbolicGenerateVerilog.containsSubstr "generate") $
+        test "uses W as the exclusive loop bound"
+          (outputs.symbolicGenerateVerilog.containsSubstr " < W;") $
+        test "emits per-bit Boolean logic"
+          (outputs.symbolicGenerateVerilog.containsSubstr " = ~")
       ) ++
       group "fail-closed diagnostics" (
         test "rejects an unretained generic width" outputs.rejectsUnretainedWidth $

@@ -150,6 +150,13 @@ end Expr
 -/
 inductive Stmt where
   | assign (lhs : String) (rhs : Expr) : Stmt
+  | assignExpr (lhs rhs : Expr) : Stmt
+  | generateFor
+      (label : String)
+      (index : String)
+      (start stop : DimExpr)
+      (body : List Stmt)
+      : Stmt
   | register
       (output : String)      -- Output wire name
       (clock : String)       -- Clock signal name
@@ -180,8 +187,12 @@ inductive Stmt where
 namespace Stmt
 
 /-- Convert statement to string (for debugging) -/
-def toString : Stmt → String
+partial def toString : Stmt → String
   | assign lhs rhs => s!"{lhs} := {rhs}"
+  | assignExpr lhs rhs => s!"{lhs} := {rhs}"
+  | generateFor label index start stop body =>
+      let bodyStr := String.intercalate "; " (body.map toString)
+      s!"generate {label}: for {index} in [{start}, {stop}): {bodyStr}"
   | register output clock reset input initValue =>
       s!"reg {output} @(posedge {clock}, {reset}) <= {input} (init: {initValue})"
   | memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>

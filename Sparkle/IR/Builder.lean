@@ -115,6 +115,11 @@ def emitAssign (lhs : String) (rhs : Expr) : CircuitM Unit := do
   let m ← getModule
   setModule (m.addStmt (.assign lhs rhs))
 
+def emitGenerateFor (label index : String) (start stop : DimExpr)
+    (body : List Stmt) : CircuitM Unit := do
+  let m ← getModule
+  setModule (m.addStmt (.generateFor label index start stop body))
+
 /--
   Emit a register statement (D flip-flop).
   Returns the name of the output wire.

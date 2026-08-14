@@ -15,6 +15,9 @@ open Sparkle.IR.AST
 def findDriver (body : List Stmt) (wireName : String) : Option Stmt :=
   body.find? fun
     | .assign lhs _ => lhs == wireName
+    | .assignExpr (.ref lhs) _ => lhs == wireName
+    | .assignExpr _ _ => false
+    | .generateFor .. => false
     | .register output .. => output == wireName
     | .memory (readData := rd) .. => rd == wireName
     | .inst _ instName _ _ => instName == wireName
