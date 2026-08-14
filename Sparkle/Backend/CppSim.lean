@@ -81,6 +81,7 @@ partial def exprIsMasked (w : Nat) : Expr → Bool
   | .op .le_s _ | .op .gt_u _ | .op .gt_s _ | .op .ge_u _
   | .op .ge_s _ => w == 1  -- comparisons produce 0 or 1
   | .slice _ hi lo => (hi - lo + 1) == w  -- slice is already exact width
+  | .sliceDim _ _ _ => false
   | .op .mux [_, t, e] => exprIsMasked w t && exprIsMasked w e
   | .op .and [a, b] => exprIsMasked w a || exprIsMasked w b  -- AND is masked if either operand is
   | .op .or [a, b] => exprIsMasked w a && exprIsMasked w b  -- OR of masked stays in width
@@ -126,6 +127,8 @@ partial def inferExprWidth (typeMap : List (String × HWType)) : Expr → Nat
   | .const _ w => w
   | .ref name => lookupWidth typeMap name
   | .slice _ hi lo => hi - lo + 1
+  | .sliceDim _ hi lo =>
+    panic! s!"CppSim requires concrete slice bounds, found [{hi}:{lo}]"
   | .concat args =>
     args.foldl (fun acc arg => acc + inferExprWidth typeMap arg) 0
   | .index arr _ =>
@@ -198,6 +201,9 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
       s!"({emitExpr typeMap e} & ((1ULL << {sliceWidth}) - 1))"
     else
       s!"(({emitExpr typeMap e} >> {lo}) & ((1ULL << {sliceWidth}) - 1))"
+
+  | .sliceDim _ hi lo =>
+    panic! s!"CppSim requires concrete slice bounds, found [{hi}:{lo}]"
 
   | .index arr idx =>
     s!"{emitExpr typeMap arr}[{emitExpr typeMap idx}]"
@@ -362,6 +368,7 @@ partial def collectExprRefs : Expr → List String
   | .ref name => [name]
   | .const _ _ => []
   | .slice inner _ _ => collectExprRefs inner
+  | .sliceDim inner _ _ => collectExprRefs inner
   | .concat args => args.foldl (fun acc a => acc ++ collectExprRefs a) []
   | .op _ args => args.foldl (fun acc a => acc ++ collectExprRefs a) []
   | .index arr idx => collectExprRefs arr ++ collectExprRefs idx

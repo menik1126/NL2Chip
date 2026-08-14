@@ -3,3 +3,6 @@ import Tests.SymbolicParameterCircuits
 
 #synthesizeParameterizedVerilog symbolicIdentity [W := 8]
 #synthesizeParameterizedVerilog symbolicXor [W := 8]
+#synthesizeParameterizedVerilog symbolicConcat [HI := 5, LO := 3]
+#synthesizeParameterizedVerilog symbolicSliceLow [W := 8]
+#synthesizeParameterizedVerilog symbolicZeroExtend [W := 8]

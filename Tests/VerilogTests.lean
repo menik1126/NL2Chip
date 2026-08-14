@@ -83,6 +83,9 @@ structure VerilogOutputs where
   hierarchicalVerilog : String
   symbolicIdentityVerilog : String
   symbolicXorVerilog : String
+  symbolicConcatVerilog : String
+  symbolicSliceLowVerilog : String
+  symbolicZeroExtendVerilog : String
   rejectsUnretainedWidth : Bool
   rejectsMissingBinder : Bool
   rejectsDuplicateParameter : Bool
@@ -99,6 +102,12 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedToString `symbolicIdentity [("W", 8)]
   let symbolicXorVerilog ←
     synthesizeParameterizedToString `symbolicXor [("W", 8)]
+  let symbolicConcatVerilog ←
+    synthesizeParameterizedToString `symbolicConcat [("HI", 5), ("LO", 3)]
+  let symbolicSliceLowVerilog ←
+    synthesizeParameterizedToString `symbolicSliceLow [("W", 8)]
+  let symbolicZeroExtendVerilog ←
+    synthesizeParameterizedToString `symbolicZeroExtend [("W", 8)]
   let rejectsUnretainedWidth ←
     parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
   let rejectsMissingBinder ←
@@ -112,7 +121,8 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
       "must have a positive default"
   return {
     addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
-    symbolicIdentityVerilog, symbolicXorVerilog,
+    symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
+    symbolicSliceLowVerilog, symbolicZeroExtendVerilog,
     rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
     rejectsZeroWidthDefault
   }
@@ -160,6 +170,19 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           (outputs.symbolicXorVerilog.containsSubstr "input logic [W-1:0]") $
         test "emits XOR logic"
           (outputs.symbolicXorVerilog.containsSubstr " ^ ")
+      ) ++
+      group "derived dimensions" (
+        test "concat retains both parameters"
+          (outputs.symbolicConcatVerilog.containsSubstr "parameter integer HI = 5" &&
+           outputs.symbolicConcatVerilog.containsSubstr "parameter integer LO = 3") $
+        test "concat output width is HI + LO"
+          (outputs.symbolicConcatVerilog.containsSubstr "logic [(HI + LO)-1:0]") $
+        test "slice length remains W"
+          (outputs.symbolicSliceLowVerilog.containsSubstr "[W-1:0]") $
+        test "slice high index remains W - 1"
+          (outputs.symbolicSliceLowVerilog.containsSubstr "[(W - 1):0]") $
+        test "extension output width remains W + 1"
+          (outputs.symbolicZeroExtendVerilog.containsSubstr "logic [(W + 1)-1:0]")
       ) ++
       group "fail-closed diagnostics" (
         test "rejects an unretained generic width" outputs.rejectsUnretainedWidth $

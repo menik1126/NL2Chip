@@ -41,6 +41,25 @@ def toNat? : DimExpr → Option Nat
   | .literal value => some value
   | _ => none
 
+def mkAdd : DimExpr → DimExpr → DimExpr
+  | .literal 0, rhs => rhs
+  | lhs, .literal 0 => lhs
+  | .literal lhs, .literal rhs => .literal (lhs + rhs)
+  | lhs, rhs => .add lhs rhs
+
+def mkSub : DimExpr → DimExpr → DimExpr
+  | lhs, .literal 0 => lhs
+  | .literal lhs, .literal rhs => .literal (lhs - rhs)
+  | lhs, rhs => .sub lhs rhs
+
+def mkMul : DimExpr → DimExpr → DimExpr
+  | .literal 0, _ => .literal 0
+  | _, .literal 0 => .literal 0
+  | .literal 1, rhs => rhs
+  | lhs, .literal 1 => lhs
+  | .literal lhs, .literal rhs => .literal (lhs * rhs)
+  | lhs, rhs => .mul lhs rhs
+
 partial def toString : DimExpr → String
   | .literal value => s!"{value}"
   | .parameter name => name
@@ -92,8 +111,8 @@ def bitWidthDim : HWType → DimExpr
   | bit => .literal 1
   | bitVector width => .literal width
   | bitVectorDim width => width
-  | array size elemType => .mul (.literal size) elemType.bitWidthDim
-  | arrayDim size elemType => .mul size elemType.bitWidthDim
+  | array size elemType => DimExpr.mkMul (.literal size) elemType.bitWidthDim
+  | arrayDim size elemType => DimExpr.mkMul size elemType.bitWidthDim
 
 /-- Check if a hardware type is a single bit -/
 def isBit : HWType → Bool

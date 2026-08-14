@@ -130,6 +130,15 @@ def getWireWidth (wireName : String) : CompilerM Nat := do
   | some p => return match p.ty with | .bitVector w => w | .bit => 1 | _ => 8
   | none => return 8
 
+/-- Look up a wire width without forcing retained dimensions to concrete Nats. -/
+def getWireWidthDim (wireName : String) : CompilerM DimExpr := do
+  let cs ← get
+  let allPorts := cs.module.wires ++ cs.module.inputs ++ cs.module.outputs
+  match allPorts.find? (fun p => p.name == wireName) with
+  | some port => return port.ty.bitWidthDim
+  | none =>
+    CompilerM.liftMetaM $ throwError s!"Cannot determine hardware width for wire '{wireName}'"
+
 def emitRegister (hint : String) (clk : String) (rst : String) (input : Sparkle.IR.AST.Expr) (initVal : Nat) (ty : HWType) (named : Bool := false) : CompilerM String := do
   let cs ← get
   let (name, cs') := CircuitM.emitRegister hint clk rst input initVal ty named cs
@@ -248,14 +257,16 @@ partial def extractDimExpr (expr : Lean.Expr) : CompilerM DimExpr := do
         let lhs ← extractDimExpr args[args.size - 2]!
         let rhs ← extractDimExpr args[args.size - 1]!
         return constructor lhs rhs
-      if name == ``Nat.add then binary .add
-      else if name == ``Nat.sub then binary .sub
-      else if name == ``Nat.mul then binary .mul
+      if name == ``Nat.add then binary DimExpr.mkAdd
+      else if name == ``Nat.sub then binary DimExpr.mkSub
+      else if name == ``Nat.mul then binary DimExpr.mkMul
       else if name == ``Nat.div then binary .div
       else if name == ``Nat.mod then binary .mod
       else if name == ``Nat.pow then binary .pow
       else if name == ``Nat.min then binary .min
       else if name == ``Nat.max then binary .max
+      else if name == ``Nat.succ && !args.isEmpty then
+        return DimExpr.mkAdd (← extractDimExpr args.back!) (.literal 1)
       else if name == ``OfNat.ofNat && args.size >= 2 then
         extractDimExpr args[1]!
       else
@@ -280,7 +291,7 @@ partial def inferHWType (type : Lean.Expr) : CompilerM (Option HWType) := do
     -- Product type: concatenate the two types
     match ← inferHWType ty1, ← inferHWType ty2 with
     | some lhs, some rhs =>
-      return some (hwTypeFromDim (.add lhs.bitWidthDim rhs.bitWidthDim))
+      return some (hwTypeFromDim (DimExpr.mkAdd lhs.bitWidthDim rhs.bitWidthDim))
     | _, _ => return none
   | .app (.app (.const ``Sparkle.Core.Vector.HWVector _) elemType) size =>
     let size ← extractDimExpr size
@@ -330,6 +341,18 @@ def isSignalBinderType (type : Lean.Expr) : CompilerM Bool := do
 partial def topLevelBinderNames : Lean.Expr → List String
   | .lam name _ body _ => name.toString :: topLevelBinderNames body
   | _ => []
+
+/-- Build a concrete or symbolic IR slice without freezing either bound. -/
+def makeSliceExpr (source : Sparkle.IR.AST.Expr) (hi lo : DimExpr) :
+    Sparkle.IR.AST.Expr :=
+  match hi.toNat?, lo.toNat? with
+  | some hiValue, some loValue => .slice source hiValue loValue
+  | _, _ => .sliceDim source hi lo
+
+def makeSliceFromStartLength (source : Sparkle.IR.AST.Expr)
+    (start length : DimExpr) : Sparkle.IR.AST.Expr :=
+  let hi := DimExpr.mkSub (DimExpr.mkAdd start length) (.literal 1)
+  makeSliceExpr source hi start
 
 /-- Helper to extract a Nat literal or OfNat.ofNat wrap. -/
 partial def extractNat (e : Lean.Expr) : CompilerM Nat := do
@@ -654,11 +677,12 @@ mutual
                if opName == ``BitVec.extractLsb' then
                  let bodyArgs := body.getAppArgs
                  if bodyArgs.size >= 4 then
-                   let start ← extractNat bodyArgs[bodyArgs.size - 3]!
-                   let len ← extractNat bodyArgs[bodyArgs.size - 2]!
+                   let start ← extractDimExpr bodyArgs[bodyArgs.size - 3]!
+                   let len ← extractDimExpr bodyArgs[bodyArgs.size - 2]!
                    let wireS ← translateExprToWire s "s" (isTopLevel := false)
-                   let resWire ← CompilerM.makeWire hint (.bitVector len) (named := isNamed)
-                   CompilerM.emitAssign resWire (.slice (.ref wireS) (start + len - 1) start)
+                   let resWire ← CompilerM.makeWire hint (hwTypeFromDim len) (named := isNamed)
+                   CompilerM.emitAssign resWire
+                     (makeSliceFromStartLength (.ref wireS) start len)
                    return resWire
                -- Unary primitives (neg, not) — binary ops fall through to generic fallback
                if let some op := getOperator opName then
@@ -856,11 +880,12 @@ mutual
                  if opName == ``BitVec.extractLsb' then
                    let bodyArgs := bodyApp.getAppArgs
                    if bodyArgs.size >= 4 then
-                     let start ← extractNat bodyArgs[bodyArgs.size - 3]!
-                     let len ← extractNat bodyArgs[bodyArgs.size - 2]!
+                     let start ← extractDimExpr bodyArgs[bodyArgs.size - 3]!
+                     let len ← extractDimExpr bodyArgs[bodyArgs.size - 2]!
                      let wireA ← translateExprToWire a "a" (isTopLevel := false)
-                     let resWire ← CompilerM.makeWire hint (.bitVector len) (named := isNamed)
-                     CompilerM.emitAssign resWire (.slice (.ref wireA) (start + len - 1) start)
+                     let resWire ← CompilerM.makeWire hint (hwTypeFromDim len) (named := isNamed)
+                     CompilerM.emitAssign resWire
+                       (makeSliceFromStartLength (.ref wireA) start len)
                      return resWire
 
                  -- Simple unary map: NOT, NEG (may have extra typeclass/type args)
@@ -1236,11 +1261,12 @@ mutual
     -- BitVec.extractLsb': bit slice extraction
     if name == ``BitVec.extractLsb' && args.size >= 4 then
       trace[sparkle.compiler] "→ extractLsb'"
-      let start ← extractNat args[args.size - 3]!
-      let len ← extractNat args[args.size - 2]!
+      let start ← extractDimExpr args[args.size - 3]!
+      let len ← extractDimExpr args[args.size - 2]!
       let bvWire ← translateExprToWire args[args.size - 1]! "slice_src"
-      let resWire ← CompilerM.makeWire hint (.bitVector len) (named := isNamed)
-      CompilerM.emitAssign resWire (.slice (.ref bvWire) (start + len - 1) start)
+      let resWire ← CompilerM.makeWire hint (hwTypeFromDim len) (named := isNamed)
+      CompilerM.emitAssign resWire
+        (makeSliceFromStartLength (.ref bvWire) start len)
       return some resWire
 
     -- BitVec.getLsb: single bit extraction → slice of width 1
@@ -1284,18 +1310,25 @@ mutual
     -- BitVec.zeroExtend / BitVec.setWidth: zero-extend to wider width
     if (name == ``BitVec.zeroExtend || name == ``BitVec.setWidth) && args.size >= 2 then
       trace[sparkle.compiler] "→ zeroExtend"
-      let targetWidth ← extractNat args[args.size - 2]!
+      let targetWidth ← extractDimExpr args[args.size - 2]!
       let srcWire ← translateExprToWire args[args.size - 1]! "zext_src"
-      let srcWidth ← CompilerM.getWireWidth srcWire
-      let resWire ← CompilerM.makeWire hint (.bitVector targetWidth) (named := isNamed)
-      if targetWidth > srcWidth then
-        let padWidth := targetWidth - srcWidth
-        let padWire ← CompilerM.makeWire "zext_pad" (.bitVector padWidth)
-        CompilerM.emitAssign padWire (.const 0 padWidth)
-        CompilerM.emitAssign resWire (.concat [.ref padWire, .ref srcWire])
-      else
-        -- Same width or narrower: just slice (truncate)
-        CompilerM.emitAssign resWire (.slice (.ref srcWire) (targetWidth - 1) 0)
+      let srcWidth ← CompilerM.getWireWidthDim srcWire
+      let resWire ← CompilerM.makeWire hint (hwTypeFromDim targetWidth) (named := isNamed)
+      match targetWidth.toNat?, srcWidth.toNat? with
+      | some targetWidth, some srcWidth =>
+        if targetWidth > srcWidth then
+          let padWidth := targetWidth - srcWidth
+          let padWire ← CompilerM.makeWire "zext_pad" (.bitVector padWidth)
+          CompilerM.emitAssign padWire (.const 0 padWidth)
+          CompilerM.emitAssign resWire (.concat [.ref padWire, .ref srcWire])
+        else
+          -- Same width or narrower: retain the established concrete lowering.
+          CompilerM.emitAssign resWire (.slice (.ref srcWire) (targetWidth - 1) 0)
+      | _, _ =>
+        -- Verilog logic vectors are unsigned. Assignment therefore implements
+        -- BitVec's zero-extension and least-significant-bit truncation for any
+        -- legal parameter value without freezing the default width.
+        CompilerM.emitAssign resWire (.ref srcWire)
       return some resWire
 
     -- isPrimitive dispatch

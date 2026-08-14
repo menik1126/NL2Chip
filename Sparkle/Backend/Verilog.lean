@@ -95,6 +95,9 @@ partial def emitExpr (e : Expr) : String :=
   | .slice e hi lo =>
     s!"{emitExpr e}[{hi}:{lo}]"
 
+  | .sliceDim e hi lo =>
+    s!"{emitExpr e}[{emitDimExpr hi}:{emitDimExpr lo}]"
+
   | .index arr idx =>
     s!"{emitExpr arr}[{emitExpr idx}]"
 

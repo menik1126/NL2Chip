@@ -97,6 +97,7 @@ inductive Expr where
   | op (operator : Operator) (args : List Expr) : Expr
   | concat (args : List Expr) : Expr
   | slice (expr : Expr) (hi lo : Nat) : Expr
+  | sliceDim (expr : Expr) (hi lo : DimExpr) : Expr
   | index (array : Expr) (idx : Expr) : Expr
   deriving Repr, BEq, Inhabited
 
@@ -131,6 +132,7 @@ partial def toString : Expr → String
       s!"{operator}({argStr})"
   | concat args => s!"\{{String.intercalate ", " (args.map toString)}}"
   | slice e hi lo => s!"{toString e}[{hi}:{lo}]"
+  | sliceDim e hi lo => s!"{toString e}[{hi}:{lo}]"
   | index arr idx => s!"{toString arr}[{toString idx}]"
 
 instance : ToString Expr where

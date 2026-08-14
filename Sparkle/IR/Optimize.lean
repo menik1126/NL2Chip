@@ -46,6 +46,7 @@ partial def inferWidth (wm : WidthMap) : Expr → Nat
   | .const _ w => w
   | .ref name => wm.getD name 0
   | .slice _ hi lo => hi - lo + 1
+  | .sliceDim _ _ _ => 0
   | .concat args => args.foldl (fun acc a => acc + inferWidth wm a) 0
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
   | .op .le_s _ | .op .gt_u _ | .op .gt_s _ | .op .ge_u _
@@ -157,6 +158,7 @@ def foldConstants : Expr → Expr
 partial def optimizeExpr (dm : DefMap) (wm : WidthMap) : Expr → Expr
   | .slice (.ref name) hi lo => foldConstants (resolveSlice dm wm name hi lo 500)
   | .slice e hi lo => foldConstants (.slice (optimizeExpr dm wm e) hi lo)
+  | .sliceDim e hi lo => .sliceDim (optimizeExpr dm wm e) hi lo
   | .op op args => foldConstants (.op op (args.map (optimizeExpr dm wm ·)))
   | .concat args => .concat (args.map (optimizeExpr dm wm ·))
   | .index arr idx => .index (optimizeExpr dm wm arr) (optimizeExpr dm wm idx)
@@ -169,6 +171,7 @@ partial def countExprUses (e : Expr) (counts : HashMap String Nat)
   | .ref name => counts.insert name ((counts.getD name 0) + 1)
   | .const _ _ => counts
   | .slice inner _ _ => countExprUses inner counts
+  | .sliceDim inner _ _ => countExprUses inner counts
   | .concat args => args.foldl (fun acc a => countExprUses a acc) counts
   | .op _ args => args.foldl (fun acc a => countExprUses a acc) counts
   | .index arr idx => countExprUses idx (countExprUses arr counts)
@@ -209,6 +212,7 @@ partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
     else .ref name
   | .const v w => .const v w
   | .slice e hi lo => .slice (substituteExpr dm inlinable fuel e) hi lo
+  | .sliceDim e hi lo => .sliceDim (substituteExpr dm inlinable fuel e) hi lo
   | .concat args => .concat (args.map (substituteExpr dm inlinable fuel ·))
   | .op op args => .op op (args.map (substituteExpr dm inlinable fuel ·))
   | .index arr idx =>
