@@ -479,14 +479,15 @@ class CandidateTracker:
         if improved_candidate:
             self.stagnation_count = 0
             stagnation_reason = None
-        else:
+        elif code_hash is not None and code_hash == self.previous_code_hash:
             self.stagnation_count += 1
-            if code_hash is not None and code_hash == self.previous_code_hash:
-                stagnation_reason = "candidate source did not change"
-            elif signature == self.previous_signature:
-                stagnation_reason = "evaluation failure signature repeated"
-            else:
-                stagnation_reason = "evaluator score did not improve"
+            stagnation_reason = "candidate source did not change"
+        elif signature == self.previous_signature:
+            self.stagnation_count += 1
+            stagnation_reason = "evaluation failure signature repeated"
+        else:
+            self.stagnation_count = 0
+            stagnation_reason = "evaluation failure signature changed"
 
         if accepted:
             self.active_best_result = dict(result)

@@ -824,3 +824,28 @@ def test_chat_response_to_responses_sse():
     payload = events_to_sse(events).decode()
     assert "event: response.output_item.done" in payload
     assert "\"type\": \"response.completed\"" in payload
+
+
+def test_candidate_tracker_rewrites_only_after_repeated_diagnostic_signature(tmp_path: Path):
+    tracker = CandidateTracker(
+        snapshot_root=tmp_path / "candidates",
+        prob_id="prob_b",
+        progress_key=_progress,
+        max_candidates=3,
+        patience=2,
+    )
+    tracker.start_candidate({"rank": 0, "detail": "first error"}, "candidate A", reason="initial")
+
+    repeated = tracker.observe({"rank": 0, "detail": "first error"}, "candidate A1", reason="repair")
+    assert repeated.stagnation_count == 1
+    assert repeated.stagnation_reason == "evaluation failure signature repeated"
+
+    changed = tracker.observe({"rank": 0, "detail": "second error"}, "candidate A2", reason="repair")
+    assert changed.stagnation_count == 0
+    assert changed.stagnation_reason == "evaluation failure signature changed"
+    assert not tracker.is_stagnant
+
+    tracker.observe({"rank": 0, "detail": "second error"}, "candidate A3", reason="repair")
+    final = tracker.observe({"rank": 0, "detail": "second error"}, "candidate A4", reason="repair")
+    assert final.stagnation_count == 2
+    assert tracker.is_stagnant
