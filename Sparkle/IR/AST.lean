@@ -95,6 +95,10 @@ end Operator
 -/
 inductive Expr where
   | const (value : Int) (width : DimExpr) : Expr
+  /-- A nonnegative packed constant whose value, as well as its result width,
+      may depend on module parameters.  Its semantics under an environment
+      `rho` is `BitVec.ofNat (width.eval rho) (value.eval rho)`. -/
+  | paramConst (value : DimExpr) (width : DimExpr) : Expr
   | ref (name : String) : Expr
   | op (operator : Operator) (args : List Expr) : Expr
   | concat (args : List Expr) : Expr
@@ -107,6 +111,15 @@ inductive Expr where
   deriving Repr, BEq, Inhabited
 
 namespace Expr
+
+/-- Reduce a natural-number constant modulo `2^width` without constructing an
+    enormous power when the value already fits.  This keeps specialization of
+    a small constant at a very large (but otherwise valid) symbolic width from
+    allocating `2^width` merely to discover that no truncation is needed. -/
+def normalizeNatToWidth (value width : Nat) : Nat :=
+  if width == 0 || value == 0 then 0
+  else if Nat.log2 value < width then value
+  else value % (2 ^ width)
 
 /-- Create a constant expression from a BitVec -/
 def ofBitVec {n : Nat} (bv : BitVec n) : Expr :=
@@ -134,6 +147,16 @@ def setWidth (width : DimExpr) (value : Expr) : Expr := .resize width value
     hardware dimensions: zero is a valid bit offset. -/
 partial def substituteDimensions (lookup : String → Option DimExpr) : Expr → Expr
   | .const value width => .const value (width.substitute lookup)
+  | .paramConst value width =>
+      let value' := value.substitute lookup
+      let width' := width.substitute lookup
+      match value'.toNat? with
+      | some concreteValue =>
+          let normalized := match width'.toNat? with
+            | some concreteWidth => normalizeNatToWidth concreteValue concreteWidth
+            | none => concreteValue
+          .const (Int.ofNat normalized) width'
+      | none => .paramConst value' width'
   | .ref name => .ref name
   | .op operator args => .op operator (args.map (substituteDimensions lookup))
   | .concat args => .concat (args.map (substituteDimensions lookup))
@@ -148,6 +171,7 @@ partial def substituteDimensions (lookup : String → Option DimExpr) : Expr →
     slice bounds.  This is used to reject references to undeclared parameters. -/
 partial def dimensionExpressions : Expr → List DimExpr
   | .const _ width => [width]
+  | .paramConst value width => [value, width]
   | .ref _ => []
   | .op _ args | .concat args => args.flatMap dimensionExpressions
   | .resize width value => width :: value.dimensionExpressions
@@ -158,17 +182,21 @@ partial def dimensionExpressions : Expr → List DimExpr
     positive.  Slice indexes are intentionally excluded. -/
 partial def positiveDimensions (role : String) : Expr → List (String × DimExpr)
   | .const _ width => [(s!"{role} constant width", width)]
+  | .paramConst _ width => [(s!"{role} parameter constant width", width)]
   | .ref _ => []
   | .op _ args | .concat args => args.flatMap (positiveDimensions role)
   | .resize width value =>
       (s!"{role} resize width", width) :: value.positiveDimensions role
-  | .slice expr _ _ => expr.positiveDimensions role
+  | .slice expr hi lo =>
+      let width := DimExpr.mkAdd (DimExpr.mkSub hi lo) 1
+      (s!"{role} slice result width", width) :: expr.positiveDimensions role
   | .index array idx =>
       array.positiveDimensions role ++ idx.positiveDimensions role
 
 /-- Convert expression to string (for debugging) -/
 partial def toString : Expr → String
   | const v w => s!"{v}#{w}"
+  | paramConst v w => s!"paramConst<{w}>({v})"
   | ref name => name
   | op operator args =>
       let argStr := String.intercalate ", " (args.map toString)
@@ -202,8 +230,9 @@ inductive Stmt where
       : Stmt
   | memory
       (name : String)         -- Memory instance name
-      (addrWidth : DimExpr)   -- Address width (size = 2^addrWidth)
+      (addrWidth : DimExpr)   -- Address width
       (dataWidth : DimExpr)   -- Data width
+      (depth : DimExpr)       -- Number of addressable words
       (clock : String)        -- Clock signal
       (writeAddr : Expr)      -- Write address port
       (writeData : Expr)      -- Write data port
@@ -227,9 +256,10 @@ def substituteDimensions (lookup : String → Option DimExpr) : Stmt → Stmt
   | .assign lhs rhs => .assign lhs (rhs.substituteDimensions lookup)
   | .register output clock reset input initValue =>
       .register output clock reset (input.substituteDimensions lookup) initValue
-  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable
+  | .memory name addrWidth dataWidth depth clock writeAddr writeData writeEnable
       readAddr readData comboRead =>
-    .memory name (addrWidth.substitute lookup) (dataWidth.substitute lookup) clock
+    .memory name (addrWidth.substitute lookup) (dataWidth.substitute lookup)
+      (depth.substitute lookup) clock
       (writeAddr.substituteDimensions lookup) (writeData.substituteDimensions lookup)
       (writeEnable.substituteDimensions lookup) (readAddr.substituteDimensions lookup)
       readData comboRead
@@ -244,8 +274,8 @@ def substituteDimensions (lookup : String → Option DimExpr) : Stmt → Stmt
 def dimensionExpressions : Stmt → List DimExpr
   | .assign _ rhs => rhs.dimensionExpressions
   | .register _ _ _ input _ => input.dimensionExpressions
-  | .memory _ addrWidth dataWidth _ writeAddr writeData writeEnable readAddr _ _ =>
-      [addrWidth, dataWidth] ++
+  | .memory _ addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ =>
+      [addrWidth, dataWidth, depth] ++
         [writeAddr, writeData, writeEnable, readAddr].flatMap Expr.dimensionExpressions
   | .inst _ _ connections parameterOverrides =>
       connections.flatMap (fun (_, expr) => expr.dimensionExpressions) ++
@@ -256,9 +286,10 @@ def positiveDimensions (role : String) : Stmt → List (String × DimExpr)
   | .assign lhs rhs => rhs.positiveDimensions s!"{role} assignment '{lhs}'"
   | .register output _ _ input _ =>
       input.positiveDimensions s!"{role} register '{output}'"
-  | .memory name addrWidth dataWidth _ writeAddr writeData writeEnable readAddr _ _ =>
+  | .memory name addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ =>
       [(s!"{role} memory '{name}' address width", addrWidth),
-       (s!"{role} memory '{name}' data width", dataWidth)] ++
+       (s!"{role} memory '{name}' data width", dataWidth),
+       (s!"{role} memory '{name}' depth", depth)] ++
         [writeAddr, writeData, writeEnable, readAddr].flatMap
           (Expr.positiveDimensions s!"{role} memory '{name}'")
   | .inst _ instName connections _ =>
@@ -270,9 +301,9 @@ def toString : Stmt → String
   | assign lhs rhs => s!"{lhs} := {rhs}"
   | register output clock reset input initValue =>
       s!"reg {output} @(posedge {clock}, {reset}) <= {input} (init: {initValue})"
-  | memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
+  | memory name addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readData comboRead =>
       let readKind := if comboRead then "combo_read" else "read"
-      s!"memory {name}[2^{addrWidth}][{dataWidth}] @(posedge {clock}) " ++
+      s!"memory {name}[{depth}][{dataWidth}] (addrWidth={addrWidth}) @(posedge {clock}) " ++
       s!"write({writeAddr}, {writeData}, {writeEnable}) {readKind}({readAddr}) => {readData}"
   | inst modName instName conns parameterOverrides =>
       let paramStr := if parameterOverrides.isEmpty then "" else
@@ -285,6 +316,173 @@ instance : ToString Stmt where
   toString := Stmt.toString
 
 end Stmt
+
+/-- A parameter-only condition that must remain until SystemVerilog
+    elaboration.  Keeping generate conditions separate from data-path `Expr`
+    prevents an ordinary signal reference from accidentally becoming an
+    elaboration-time decision. -/
+inductive NativeCondition where
+  | nonzero (value : DimExpr)
+  | eq (lhs rhs : DimExpr)
+  | ne (lhs rhs : DimExpr)
+  | lt (lhs rhs : DimExpr)
+  | le (lhs rhs : DimExpr)
+  | gt (lhs rhs : DimExpr)
+  | ge (lhs rhs : DimExpr)
+  | and (lhs rhs : NativeCondition)
+  | or (lhs rhs : NativeCondition)
+  | not (condition : NativeCondition)
+  deriving Repr, BEq
+
+namespace NativeCondition
+
+partial def substitute (condition : NativeCondition)
+    (lookup : String → Option DimExpr) : NativeCondition :=
+  match condition with
+  | .nonzero value => .nonzero (value.substitute lookup)
+  | .eq lhs rhs => .eq (lhs.substitute lookup) (rhs.substitute lookup)
+  | .ne lhs rhs => .ne (lhs.substitute lookup) (rhs.substitute lookup)
+  | .lt lhs rhs => .lt (lhs.substitute lookup) (rhs.substitute lookup)
+  | .le lhs rhs => .le (lhs.substitute lookup) (rhs.substitute lookup)
+  | .gt lhs rhs => .gt (lhs.substitute lookup) (rhs.substitute lookup)
+  | .ge lhs rhs => .ge (lhs.substitute lookup) (rhs.substitute lookup)
+  | .and lhs rhs => .and (lhs.substitute lookup) (rhs.substitute lookup)
+  | .or lhs rhs => .or (lhs.substitute lookup) (rhs.substitute lookup)
+  | .not inner => .not (inner.substitute lookup)
+
+partial def dimensionExpressions : NativeCondition → List DimExpr
+  | .nonzero value => [value]
+  | .eq lhs rhs | .ne lhs rhs | .lt lhs rhs | .le lhs rhs
+  | .gt lhs rhs | .ge lhs rhs => [lhs, rhs]
+  | .and lhs rhs | .or lhs rhs =>
+      lhs.dimensionExpressions ++ rhs.dimensionExpressions
+  | .not inner => inner.dimensionExpressions
+
+partial def eval? (condition : NativeCondition)
+    (lookup : String → Option Nat) : Option Bool :=
+  match condition with
+  | .nonzero value => return (← value.eval? lookup) != 0
+  | .eq lhs rhs => return (← lhs.eval? lookup) == (← rhs.eval? lookup)
+  | .ne lhs rhs => return (← lhs.eval? lookup) != (← rhs.eval? lookup)
+  | .lt lhs rhs => return (← lhs.eval? lookup) < (← rhs.eval? lookup)
+  | .le lhs rhs => return (← lhs.eval? lookup) ≤ (← rhs.eval? lookup)
+  | .gt lhs rhs => return (← lhs.eval? lookup) > (← rhs.eval? lookup)
+  | .ge lhs rhs => return (← lhs.eval? lookup) ≥ (← rhs.eval? lookup)
+  | .and lhs rhs => return (← lhs.eval? lookup) && (← rhs.eval? lookup)
+  | .or lhs rhs => return (← lhs.eval? lookup) || (← rhs.eval? lookup)
+  | .not inner => return !(← inner.eval? lookup)
+
+end NativeCondition
+
+/-- Native procedural blocks are retained only for the explicitly supported
+    SystemVerilog subset.  Concrete backends reject modules containing these
+    nodes rather than approximating their execution. -/
+inductive ProcessKind where
+  | comb
+  deriving Repr, BEq
+
+inductive ProcStmt where
+  | blocking (lhs rhs : Expr)
+  | ifElse (condition : Expr) (then_ else_ : List ProcStmt)
+  /-- Canonical increasing loop: `var = init; var <[=] bound;
+      var = var + step`.  `step` is checked to be strictly positive while
+      lowering. -/
+  | forLoop (var : String) (init : Nat) (bound : DimExpr) (step : Nat)
+      (inclusive : Bool) (body : List ProcStmt)
+  deriving Repr, BEq
+
+namespace ProcStmt
+
+partial def substituteDimensions (lookup : String → Option DimExpr) : ProcStmt → ProcStmt
+  | .blocking lhs rhs =>
+      .blocking (lhs.substituteDimensions lookup) (rhs.substituteDimensions lookup)
+  | .ifElse condition then_ else_ =>
+      .ifElse (condition.substituteDimensions lookup)
+        (then_.map (substituteDimensions lookup))
+        (else_.map (substituteDimensions lookup))
+  | .forLoop var init bound step inclusive body =>
+      .forLoop var init (bound.substitute lookup) step inclusive
+        (body.map (substituteDimensions lookup))
+
+partial def dimensionExpressions : ProcStmt → List DimExpr
+  | .blocking lhs rhs => lhs.dimensionExpressions ++ rhs.dimensionExpressions
+  | .ifElse condition then_ else_ =>
+      condition.dimensionExpressions ++ then_.flatMap dimensionExpressions ++
+        else_.flatMap dimensionExpressions
+  | .forLoop _ _ bound _ _ body => bound :: body.flatMap dimensionExpressions
+
+partial def positiveDimensions (role : String) : ProcStmt → List (String × DimExpr)
+  | .blocking lhs rhs =>
+      lhs.positiveDimensions s!"{role} procedural assignment target" ++
+        rhs.positiveDimensions s!"{role} procedural assignment value"
+  | .ifElse condition then_ else_ =>
+      condition.positiveDimensions s!"{role} procedural condition" ++
+        then_.flatMap (positiveDimensions role) ++
+        else_.flatMap (positiveDimensions role)
+  | .forLoop _ _ _ _ _ body => body.flatMap (positiveDimensions role)
+
+end ProcStmt
+
+/-- SystemVerilog-native elaboration and procedural constructs.  They are kept
+    outside normalized `Stmt` so existing simulation/proof backends cannot
+    silently interpret them with the wrong semantics. -/
+inductive NativeItem where
+  | wireDecl (name : String) (ty : HWType)
+  | integerDecl (name : String)
+  | contAssign (lhs rhs : Expr)
+  | process (kind : ProcessKind) (body : List ProcStmt)
+  | generateIf (condition : NativeCondition)
+      (thenItems elseItems : List NativeItem)
+  | inst (moduleName instName : String)
+      (connections : List (String × Expr))
+      (parameterOverrides : List (String × DimExpr) := [])
+  deriving Repr, BEq
+
+namespace NativeItem
+
+partial def substituteDimensions (lookup : String → Option DimExpr) : NativeItem → NativeItem
+  | .wireDecl name ty => .wireDecl name (ty.substituteDimensions lookup)
+  | .integerDecl name => .integerDecl name
+  | .contAssign lhs rhs =>
+      .contAssign (lhs.substituteDimensions lookup) (rhs.substituteDimensions lookup)
+  | .process kind body => .process kind (body.map (ProcStmt.substituteDimensions lookup))
+  | .generateIf condition thenItems elseItems =>
+      .generateIf (condition.substitute lookup)
+        (thenItems.map (substituteDimensions lookup))
+        (elseItems.map (substituteDimensions lookup))
+  | .inst moduleName instName connections overrides =>
+      .inst moduleName instName
+        (connections.map fun (name, value) =>
+          (name, value.substituteDimensions lookup))
+        (overrides.map fun (name, value) => (name, value.substitute lookup))
+
+partial def dimensionExpressions : NativeItem → List DimExpr
+  | .wireDecl name ty => (ty.dimensions s!"native wire '{name}'").map (·.2)
+  | .integerDecl _ => []
+  | .contAssign lhs rhs => lhs.dimensionExpressions ++ rhs.dimensionExpressions
+  | .process _ body => body.flatMap ProcStmt.dimensionExpressions
+  | .generateIf condition thenItems elseItems =>
+      condition.dimensionExpressions ++ thenItems.flatMap dimensionExpressions ++
+        elseItems.flatMap dimensionExpressions
+  | .inst _ _ connections overrides =>
+      connections.flatMap (fun (_, value) => value.dimensionExpressions) ++
+        overrides.map (·.2)
+
+partial def positiveDimensions (role : String) : NativeItem → List (String × DimExpr)
+  | .wireDecl name ty => ty.dimensions s!"{role} native wire '{name}'"
+  | .integerDecl _ => []
+  | .contAssign lhs rhs =>
+      lhs.positiveDimensions s!"{role} native continuous assignment target" ++
+        rhs.positiveDimensions s!"{role} native continuous assignment value"
+  | .process _ body => body.flatMap (ProcStmt.positiveDimensions role)
+  | .generateIf _ thenItems elseItems =>
+      thenItems.flatMap (positiveDimensions role) ++
+        elseItems.flatMap (positiveDimensions role)
+  | .inst _ instName connections _ =>
+      connections.flatMap fun (_, value) =>
+        value.positiveDimensions s!"{role} native instance '{instName}'"
+
+end NativeItem
 
 /--
   Module: A hardware module with inputs, outputs, internal wires, and logic
@@ -301,6 +499,7 @@ structure Module where
   outputs     : List Port
   wires       : List Port    -- Internal wires (ignored for primitives)
   body        : List Stmt    -- Logic (ignored for primitives)
+  nativeItems : List NativeItem := [] -- SV elaboration/procedural subset
   assertions  : List (String × Expr) := []  -- Formal assertions (name, condition)
   isPrimitive : Bool := false  -- True for vendor-provided blackbox modules
   deriving Repr, BEq
@@ -361,6 +560,7 @@ def substituteDimensions (m : Module) (lookup : String → Option DimExpr) : Mod
     wires := m.wires.map fun p =>
       { p with ty := p.ty.substituteDimensions lookup }
     body := m.body.map (Stmt.substituteDimensions lookup)
+    nativeItems := m.nativeItems.map (NativeItem.substituteDimensions lookup)
     assertions := m.assertions.map fun (name, expr) =>
       (name, expr.substituteDimensions lookup) }
 
@@ -369,6 +569,7 @@ def dimensionExpressions (m : Module) : List DimExpr :=
   let portExprs := (m.inputs ++ m.outputs ++ m.wires).flatMap fun port =>
     (port.ty.dimensions s!"port '{port.name}'").map (·.2)
   portExprs ++ m.body.flatMap Stmt.dimensionExpressions ++
+    m.nativeItems.flatMap NativeItem.dimensionExpressions ++
     m.assertions.flatMap (fun (_, expr) => expr.dimensionExpressions)
 
 /-- Every hardware width/length that must be positive. -/
@@ -376,6 +577,7 @@ def positiveDimensions (m : Module) : List (String × DimExpr) :=
   let portDimensions := (m.inputs ++ m.outputs ++ m.wires).flatMap fun port =>
     port.ty.dimensions s!"module '{m.name}' port/wire '{port.name}'"
   portDimensions ++ m.body.flatMap (Stmt.positiveDimensions s!"module '{m.name}'") ++
+    m.nativeItems.flatMap (NativeItem.positiveDimensions s!"module '{m.name}'") ++
     m.assertions.flatMap fun (name, expr) =>
       expr.positiveDimensions s!"module '{m.name}' assertion '{name}'"
 
@@ -394,6 +596,18 @@ def validateDimensions (m : Module) : Except String Unit := do
   let lookupDefault := fun name =>
     m.parameters.find? (fun parameter => parameter.name == name)
       |>.map (·.defaultValue)
+  -- Validate the conservative working width before exact evaluation.  Without
+  -- this preflight, a default such as `K = 0xffffffff` in `1 << K` would make
+  -- Lean construct a multi-billion-bit Nat merely to discover that the
+  -- hardware dimension is invalid.
+  for expr in m.dimensionExpressions do
+    let bound := expr.natValueBitWidthBound
+    match bound.evalUpperBoundCapped? lookupDefault DimExpr.maxNatWorkWidth with
+    | some value =>
+        if value > DimExpr.maxNatWorkWidth then
+          throw s!"module '{m.name}' dimension expression '{expr}' requires more than {DimExpr.maxNatWorkWidth} bits of natural-number working width"
+    | none =>
+        throw s!"module '{m.name}' dimension expression '{expr}' has an unresolved natural-number working-width bound"
   for (role, expr) in m.positiveDimensions do
     match expr.eval? lookupDefault with
     | some 0 => throw s!"{role} evaluates to zero under the module's default parameters"
@@ -405,9 +619,14 @@ def validateDimensions (m : Module) : Except String Unit := do
     parameters and ports share declaration scopes closely enough that a
     sanitized collision is ambiguous and must not be emitted. -/
 def validateSanitizedNames (m : Module) (sanitize : String → String) : Except String Unit := do
+  let nativeDeclarations := m.nativeItems.filterMap fun item => match item with
+    | .wireDecl name _ => some ("native wire", name)
+    | .integerDecl name => some ("native integer", name)
+    | _ => none
   let declarations :=
     (m.parameters.map fun parameter => ("parameter", parameter.name)) ++
-    ((m.inputs ++ m.outputs ++ m.wires).map fun port => ("port/wire", port.name))
+    ((m.inputs ++ m.outputs ++ m.wires).map fun port => ("port/wire", port.name)) ++
+    nativeDeclarations
   let distinctDeclarations := declarations.foldl (fun result declaration =>
     if result.any (fun existing => existing == declaration) then result
     else result ++ [declaration]) []

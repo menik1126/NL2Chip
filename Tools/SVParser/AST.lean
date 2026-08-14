@@ -20,6 +20,10 @@ inductive SVLiteral where
   | decimal (width : Option Nat) (value : Nat)
   | hex     (width : Option Nat) (value : Nat)
   | binary  (width : Option Nat) (value : Nat)
+  /-- A four-state literal containing at least one x/z digit.  Sparkle's
+      two-state core cannot materialize it as zero; lowering must either use it
+      in an explicitly supported don't-care position or fail closed. -/
+  | unknown (width : Option Nat)
   deriving Repr, BEq
 
 /-- Unary operators -/
@@ -31,12 +35,13 @@ inductive SVUnaryOp where
   | reductOr  -- |x (reduction OR)
   | signed    -- $signed(x)
   | unsigned  -- $unsigned(x); IR packed values are intrinsically unsigned
+  | clog2     -- $clog2(x), retained for parameter expressions
   deriving Repr, BEq
 
 /-- Binary operators -/
 inductive SVBinOp where
   -- Arithmetic
-  | add | sub | mul | pow
+  | add | sub | mul | div | mod | pow
   -- Bitwise
   | bitAnd | bitOr | bitXor
   -- Shift

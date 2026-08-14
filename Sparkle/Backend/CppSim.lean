@@ -27,6 +27,7 @@ def buildTypeMap (m : Module) : List (String × HWType) :=
 /-- True when an expression still contains a dimension requiring SV elaboration. -/
 partial def exprHasSymbolicDimension : Expr → Bool
   | .const _ width => !width.isConcrete
+  | .paramConst value width => !value.isConcrete || !width.isConcrete
   | .ref _ => false
   | .op _ args | .concat args => args.any exprHasSymbolicDimension
   | .resize width value => !width.isConcrete || exprHasSymbolicDimension value
@@ -39,8 +40,8 @@ partial def exprHasSymbolicDimension : Expr → Bool
 def stmtHasSymbolicDimension : Stmt → Bool
   | .assign _ rhs => exprHasSymbolicDimension rhs
   | .register _ _ _ input _ => exprHasSymbolicDimension input
-  | .memory _ addrWidth dataWidth _ writeAddr writeData writeEnable readAddr _ _ =>
-      !addrWidth.isConcrete || !dataWidth.isConcrete ||
+  | .memory _ addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ =>
+      !addrWidth.isConcrete || !dataWidth.isConcrete || !depth.isConcrete ||
         [writeAddr, writeData, writeEnable, readAddr].any exprHasSymbolicDimension
   | .inst _ _ connections parameterOverrides =>
       !parameterOverrides.isEmpty ||
@@ -49,7 +50,7 @@ def stmtHasSymbolicDimension : Stmt → Bool
 /-- CppSim is deliberately a concrete backend; native SV parameters must first
     be specialized to one concrete environment. -/
 def moduleRequiresSpecialization (m : Module) : Bool :=
-  !m.parameters.isEmpty ||
+  !m.nativeItems.isEmpty || !m.parameters.isEmpty ||
     (m.inputs ++ m.outputs ++ m.wires).any (fun port => port.ty.bitWidth?.isNone) ||
     m.body.any stmtHasSymbolicDimension ||
     m.assertions.any (fun (_, expr) => exprHasSymbolicDimension expr)
@@ -63,7 +64,10 @@ def moduleDimensionError? (m : Module) : Option String :=
   | .error message => some message
 
 def specializationError (m : Module) : String :=
-  s!"Sparkle CppSim cannot emit parameterized module '{m.name}'; specialize all module parameters and symbolic dimensions before C++ generation"
+  if !m.nativeItems.isEmpty then
+    s!"Sparkle CppSim cannot execute SystemVerilog-native generate/procedural items in module '{m.name}'; emit SystemVerilog or lower the native items to normalized IR first"
+  else
+    s!"Sparkle CppSim cannot emit parameterized module '{m.name}'; specialize all module parameters and symbolic dimensions before C++ generation"
 
 def emitSpecializationError (m : Module) : String :=
   s!"#error \"{specializationError m}\"\n"
@@ -85,6 +89,91 @@ def sanitizeName (name : String) : String :=
     |>.replace "'" "_prime"
     |>.replace "#" ""
 
+/-- Width inference used by the deliberately small wide-container subset.
+    A packed value wider than 64 bits is not a C++ scalar, but a concat whose
+    immediate leaves are 32/64-bit scalars can still be copied into the
+    backend's little-endian `std::array<uint32_t, _>` representation without
+    evaluating a wide arithmetic expression. -/
+partial def passiveExprWidth (typeMap : List (String × HWType)) : Expr → Nat
+  | .const _ width | .paramConst _ width | .resize width _ =>
+      width.toNat?.getD 0
+  | .ref name => lookupWidth typeMap name
+  | .slice _ hi lo => (hi - lo + 1).toNat?.getD 0
+  | .concat args => args.foldl (fun total arg => total + passiveExprWidth typeMap arg) 0
+  | .index array _ =>
+      match array with
+      | .ref name =>
+          match typeMap.find? (fun (candidate, _) => candidate == name) with
+          | some (_, .array _ elementType) => elementType.bitWidth?.getD 0
+          | _ => 0
+      | _ => 0
+  | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
+  | .op .le_s _ | .op .gt_u _ | .op .gt_s _ | .op .ge_u _
+  | .op .ge_s _ => 1
+  | .op .mux args =>
+      match args with
+      | [_, thenValue, elseValue] =>
+          max (passiveExprWidth typeMap thenValue) (passiveExprWidth typeMap elseValue)
+      | _ => 0
+  | .op .shl args | .op .shr args | .op .asr args =>
+      match args with
+      | [value, _] => passiveExprWidth typeMap value
+      | _ => 0
+  | .op _ args =>
+      match args with
+      | [lhs, rhs] => max (passiveExprWidth typeMap lhs) (passiveExprWidth typeMap rhs)
+      | [value] => passiveExprWidth typeMap value
+      | _ => 0
+
+/-- A scalar concat leaf may index a true IR array, but it may not use that
+    aggregate itself as a C++ integer.  Keep this predicate beside the passive
+    width inference so the validator never accepts source that `emitExpr` would
+    turn into an invalid `std::array`-to-integer cast. -/
+partial def passiveScalarExprRefsSupported
+    (typeMap : List (String × HWType)) : Expr → Bool
+  | .const _ _ | .paramConst _ _ => true
+  | .ref name =>
+      typeMap.find? (fun (candidate, _) => candidate == name) |>.any fun (_, ty) =>
+        match ty with
+        | .bit => true
+        | .bitVector width => width.toNat?.any (· ≤ 64)
+        | .array _ _ => false
+  | .op _ args | .concat args => args.all (passiveScalarExprRefsSupported typeMap)
+  | .resize _ value | .slice value _ _ => passiveScalarExprRefsSupported typeMap value
+  | .index (.ref name) index =>
+      typeMap.find? (fun (candidate, _) => candidate == name) |>.any fun (_, ty) =>
+        match ty with
+        | .array _ .bit => passiveScalarExprRefsSupported typeMap index
+        | .array _ (.bitVector width) =>
+            width.toNat?.any (· ≤ 64) && passiveScalarExprRefsSupported typeMap index
+        | _ => false
+  | .index _ _ => false
+
+def isPackedBitVectorOfWidth (typeMap : List (String × HWType))
+    (name : String) (width : Nat) : Bool :=
+  typeMap.find? (fun (candidate, _) => candidate == name) |>.any fun (_, ty) =>
+    match ty with
+    | .bitVector packedWidth => packedWidth.toNat? == some width
+    | _ => false
+
+/-- The only packed values above 64 bits that CppSim currently executes are
+    passive word containers.  They may be copied from another same-width packed
+    container, or assembled from word-aligned 32/64-bit scalar concat leaves.
+    In particular, this does not admit wide arithmetic, slices, resizes, inputs,
+    or registers. -/
+def isSupportedPassiveWideAssignment (typeMap : List (String × HWType))
+    (target : String) (targetWidth : Nat) (rhs : Expr) : Bool :=
+  targetWidth > 64 && isPackedBitVectorOfWidth typeMap target targetWidth &&
+    match rhs with
+    | .ref source =>
+        isPackedBitVectorOfWidth typeMap source targetWidth
+    | .concat args =>
+        passiveExprWidth typeMap rhs == targetWidth && !args.isEmpty &&
+          args.all fun arg =>
+            let width := passiveExprWidth typeMap arg
+            (width == 32 || width == 64) && passiveScalarExprRefsSupported typeMap arg
+    | _ => false
+
 /-- Strict validation used when native parameters have just been specialized.
     The legacy CppSim emitter represents packed values above 64 bits as word
     arrays but does not yet implement general assignments or arithmetic over
@@ -99,43 +188,71 @@ def validateSpecializedDesign (d : Design) : Except String Unit := do
       throw s!"Sparkle CppSim module names '{module_.name}' and '{conflict.name}' both emit as C++ class '{sanitizeName module_.name}'"
     if module_.isPrimitive then
       throw s!"Sparkle CppSim cannot execute primitive/blackbox module '{module_.name}'"
-    for port in module_.inputs ++ module_.outputs ++ module_.wires do
-      let rec validateType : HWType → Except String Unit
+    unless module_.nativeItems.isEmpty do
+      throw s!"Sparkle CppSim cannot execute SystemVerilog-native generate/procedural items in module '{module_.name}'"
+    let rec validateType (portName : String) (allowWidePacked : Bool) : HWType → Except String Unit
         | .bit => pure ()
         | .bitVector width =>
             match width.toNat? with
             | some concreteWidth =>
-                if concreteWidth > 64 then
-                  throw s!"Sparkle CppSim cannot execute {concreteWidth}-bit value '{module_.name}.{port.name}'; native packed values above 64 bits are not implemented"
+                if concreteWidth > 64 && !allowWidePacked then
+                  throw s!"Sparkle CppSim cannot execute {concreteWidth}-bit value '{module_.name}.{portName}'; native packed values above 64 bits are not implemented"
                 else
                   pure ()
             | none =>
-                throw s!"Sparkle CppSim value '{module_.name}.{port.name}' still has a symbolic width"
-        | .array _ elementType => validateType elementType
-      validateType port.ty
+                throw s!"Sparkle CppSim value '{module_.name}.{portName}' still has a symbolic width"
+        | .array _ elementType => validateType portName false elementType
+    -- Wide input values cannot cross the uint64_t JIT ABI.  Wide outputs and
+    -- internal wires may exist only as passive word containers; statement
+    -- validation below checks every producer.
+    for port in module_.inputs do
+      validateType port.name false port.ty
+    for port in module_.outputs ++ module_.wires do
+      validateType port.name true port.ty
     let typeMap := buildTypeMap module_
     for statement in module_.body do
       match statement with
-      | .assign lhs _ =>
+      | .assign lhs rhs =>
           let width := lookupWidth typeMap lhs
-          if width > 64 then
-            throw s!"Sparkle CppSim cannot execute {width}-bit assignment '{module_.name}.{lhs}'; native wide-value operations above 64 bits are not implemented"
+          if width > 64 && !isSupportedPassiveWideAssignment typeMap lhs width rhs then
+            throw s!"Sparkle CppSim cannot execute {width}-bit assignment '{module_.name}.{lhs}'; only same-width packed copies and 32/64-bit-leaf passive concats are supported above 64 bits"
       | .register output _ _ _ _ =>
           let width := lookupWidth typeMap output
           if width > 64 then
             throw s!"Sparkle CppSim cannot execute {width}-bit register '{module_.name}.{output}'; native wide-value operations above 64 bits are not implemented"
-      | .memory name addrWidth dataWidth .. =>
-          match addrWidth.toNat?, dataWidth.toNat? with
-          | some concreteAddrWidth, some concreteDataWidth =>
+      | .memory name addrWidth dataWidth depth .. =>
+          match addrWidth.toNat?, dataWidth.toNat?, depth.toNat? with
+          | some concreteAddrWidth, some concreteDataWidth, some concreteDepth =>
+              if concreteDepth == 0 then
+                throw s!"Sparkle CppSim cannot execute zero-depth memory '{module_.name}.{name}'"
+              if concreteDepth > DimExpr.maxNatWorkWidth then
+                throw s!"Sparkle CppSim cannot allocate memory '{module_.name}.{name}' with depth {concreteDepth}; the safe concrete-memory limit is {DimExpr.maxNatWorkWidth} entries"
               if concreteAddrWidth >= 64 || concreteDataWidth > 64 then
                 throw s!"Sparkle CppSim cannot execute memory '{module_.name}.{name}' with AW={concreteAddrWidth}, DW={concreteDataWidth}; native values above 64 bits are not implemented"
-          | _, _ =>
+          | _, _, _ =>
               throw s!"Sparkle CppSim memory '{module_.name}.{name}' still has symbolic dimensions"
       | .inst childName instanceName _ overrides =>
           unless overrides.isEmpty do
             throw s!"Sparkle CppSim instance '{module_.name}.{instanceName}' still has parameter overrides"
           unless d.modules.any (fun child => child.name == childName) do
             throw s!"Sparkle CppSim instance '{module_.name}.{instanceName}' refers to missing module '{childName}'"
+
+/-- The public JIT memory ABI still transports one word through `uint32_t`.
+    The class backend itself supports scalar memory elements through 64 bits,
+    but exposing those memories through JIT would silently truncate the upper
+    half.  Keep the checked JIT API fail-closed until its ABI is widened. -/
+def validateJITMemoryABI (d : Design) : Except String Unit := do
+  for module_ in d.modules do
+    for statement in module_.body do
+      match statement with
+      | .memory name _ dataWidth _ .. =>
+          match dataWidth.toNat? with
+          | some concreteDataWidth =>
+              if concreteDataWidth > 32 then
+                throw s!"Sparkle CppSim JIT memory '{module_.name}.{name}' has DW={concreteDataWidth}, but the current jit_set_mem/jit_get_mem ABI supports at most 32 bits"
+          | none =>
+              throw s!"Sparkle CppSim JIT memory '{module_.name}.{name}' still has a symbolic data width"
+      | _ => pure ()
 
 /-- Convert HWType to C++ type string -/
 def emitCppType : HWType → String
@@ -177,6 +294,7 @@ def applyMask (expr : String) (w : Nat) : String :=
     Invariant: every assignment applies a mask, so .ref reads yield masked values. -/
 partial def exprIsMasked (w : Nat) : Expr → Bool
   | .const _ _ => true  -- constants are always exact
+  | .paramConst _ width => width.toNat? == some w
   | .ref _ => true  -- all wires are masked at their assignment site
   | .resize width _ => width.toNat? == some w
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
@@ -226,6 +344,7 @@ def signedCastType (w : Nat) : String :=
 /-- Best-effort width inference for an expression -/
 partial def inferExprWidth (typeMap : List (String × HWType)) : Expr → Nat
   | .const _ w => w.toNat?.getD 0
+  | .paramConst _ w => w.toNat?.getD 0
   | .ref name => lookupWidth typeMap name
   | .resize width _ => width.toNat?.getD 0
   | .slice _ hi lo => (hi - lo + 1).toNat?.getD 0
@@ -257,13 +376,23 @@ partial def inferExprWidth (typeMap : List (String × HWType)) : Expr → Nat
     | [arg1] => inferExprWidth typeMap arg1
     | _ => 0
 
-/-- Validate the portion of the concrete C++ expression language introduced by
-    IR resize nodes.  The backend can execute packed casts up to 64 bits; wider
-    packed values use an array representation for which inline casts are not
-    implemented.  Existing designs without resize nodes retain their legacy
-    behavior. -/
+/-- Validate the concrete C++ expression language recursively.  The backend can
+    execute packed expression nodes and casts up to 64 bits; wider packed values
+    use an array representation for which inline operations are not implemented.
+    Array references themselves are exempt because indexing a wide aggregate can
+    still produce a supported scalar element. -/
 partial def validateResizeExpr (typeMap : List (String × HWType))
-    (moduleName role : String) : Expr → Except String Unit
+    (moduleName role : String) (expression : Expr) : Except String Unit := do
+  let packedWidth? := match expression with
+    | .ref name =>
+        match typeMap.find? (fun (candidate, _) => candidate == name) with
+        | some (_, .array _ _) => none
+        | _ => some (inferExprWidth typeMap expression)
+    | _ => some (inferExprWidth typeMap expression)
+  if let some concreteWidth := packedWidth? then
+    if concreteWidth > 64 then
+      throw s!"Sparkle CppSim cannot execute {concreteWidth}-bit expression in {role} of module '{moduleName}'; packed expression nodes above 64 bits are not implemented"
+  match expression with
   | .resize width value => do
       let targetWidth ← match width.toNat? with
         | some concrete => pure concrete
@@ -282,16 +411,31 @@ partial def validateResizeExpr (typeMap : List (String × HWType))
   | .index array index =>
       validateResizeExpr typeMap moduleName role array *>
         validateResizeExpr typeMap moduleName role index
-  | .const _ _ | .ref _ => pure ()
+  | .const _ _ | .paramConst _ _ | .ref _ => pure ()
 
 def validateModuleResizeExprs (m : Module) : Except String Unit := do
   let typeMap := buildTypeMap m
   for statement in m.body do
     match statement with
-    | .assign lhs rhs => validateResizeExpr typeMap m.name s!"assignment '{lhs}'" rhs
+    | .assign lhs rhs =>
+        let width := lookupWidth typeMap lhs
+        if width > 64 then
+          unless isSupportedPassiveWideAssignment typeMap lhs width rhs do
+            throw s!"Sparkle CppSim cannot execute {width}-bit assignment '{m.name}.{lhs}'; only same-width packed copies and 32/64-bit-leaf passive concats are supported above 64 bits"
+          -- Do not feed the wide concat/copy root to the scalar validator.
+          -- Its concat leaves still are ordinary scalar expressions and must
+          -- independently satisfy every existing <=64-bit safety check.
+          match rhs with
+          | .concat args =>
+              args.forM (validateResizeExpr typeMap m.name s!"assignment '{lhs}' concat leaf")
+          | .ref _ => pure ()
+          | _ =>
+              throw s!"Sparkle CppSim internal error: unsupported passive wide assignment '{m.name}.{lhs}'"
+        else
+          validateResizeExpr typeMap m.name s!"assignment '{lhs}'" rhs
     | .register output _ _ input _ =>
         validateResizeExpr typeMap m.name s!"register '{output}'" input
-    | .memory name _ _ _ writeAddr writeData writeEnable readAddr _ _ =>
+    | .memory name _ _ _ _ writeAddr writeData writeEnable readAddr _ _ =>
         for (portRole, expression) in
             [("write address", writeAddr), ("write data", writeData),
              ("write enable", writeEnable), ("read address", readAddr)] do
@@ -316,12 +460,20 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
     | none => "SparkleCppSim_symbolic_constant_requires_specialization"
     | some concreteWidth =>
       let cppType := emitCppType (.bitVector width)
-      if value < 0 then
-        let modulus : Int := (2 : Int) ^ concreteWidth
-        let unsigned := ((value % modulus) + modulus) % modulus
-        s!"({cppType})0x{Nat.toDigits 16 unsigned.toNat |> String.ofList}ULL"
-      else
-        s!"({cppType}){value}ULL"
+      -- Normalize every constant at its IR width before forming a C++
+      -- literal.  Positive parameter constants may be much larger than
+      -- `ULL` before the final BitVec truncation (for example `(1<<80)-1`
+      -- at width 8); emitting that mathematical Nat directly is rejected by
+      -- C++ compilers or relies on implementation extensions.
+      let modulus : Int := (2 : Int) ^ concreteWidth
+      let unsigned := ((value % modulus) + modulus) % modulus
+      s!"({cppType})0x{Nat.toDigits 16 unsigned.toNat |> String.ofList}ULL"
+
+  | .paramConst value width =>
+    match value.toNat?, width.toNat? with
+    | some concreteValue, some _ =>
+        emitExpr typeMap (.const (Int.ofNat concreteValue) width)
+    | _, _ => "SparkleCppSim_parameter_constant_requires_specialization"
 
   | .ref name =>
     sanitizeName name
@@ -370,18 +522,22 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
     match hi.toNat?, lo.toNat? with
     | some concreteHi, some concreteLo =>
       let sliceWidth := concreteHi - concreteLo + 1
+      let source := s!"((uint64_t)({emitExpr typeMap e}))"
       -- Always mask slice results for widths < 64.  The inner expression may be
       -- wider than sliceWidth (e.g., .slice(.op .shr [32-bit, 12]) 7 0 produces
       -- 20 bits, not 8).  We cannot rely on emitMask/needsMask which skip native
       -- widths (8,16,32) assuming C++ variable-type truncation — that doesn't
       -- hold for inline expressions within concats.
-      if sliceWidth >= 64 then
-        if concreteLo == 0 then emitExpr typeMap e
-        else s!"({emitExpr typeMap e} >> {concreteLo})"
+      -- A source is at most 64 packed bits in checked CppSim.  Selecting above
+      -- bit 63 is therefore zero; never emit a C++ shift count >= 64 (UB).
+      if concreteLo >= 64 then "0ULL"
+      else if sliceWidth >= 64 then
+        if concreteLo == 0 then source
+        else s!"({source} >> {concreteLo})"
       else if concreteLo == 0 then
-        s!"({emitExpr typeMap e} & ((1ULL << {sliceWidth}) - 1))"
+        s!"({source} & ((1ULL << {sliceWidth}) - 1))"
       else
-        s!"(({emitExpr typeMap e} >> {concreteLo}) & ((1ULL << {sliceWidth}) - 1))"
+        s!"(({source} >> {concreteLo}) & ((1ULL << {sliceWidth}) - 1))"
     | _, _ => "SparkleCppSim_symbolic_slice_requires_specialization"
 
   | .index arr idx =>
@@ -415,22 +571,81 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
     match args with
     | [arg1, arg2] =>
       match operator with
+      | .shl | .shr =>
+        let width := inferExprWidth typeMap arg1
+        if width == 0 then
+          "SparkleCppSim_shift_operand_width_is_unknown"
+        else
+          -- Evaluate logical shifts in an unsigned 64-bit carrier.  Narrow IR
+          -- values are masked at their assignment/resize boundary, while this
+          -- wider carrier preserves intentional byte-lane placement such as
+          -- `(byte << 24)` before it is ORed into a 32-bit word.  Guarding at
+          -- the carrier width avoids C++'s undefined oversized shifts without
+          -- incorrectly treating the narrow source width as the expression's
+          -- surrounding evaluation context.
+          let lhs := s!"((uint64_t)({emitExpr typeMap arg1}))"
+          let rhs := s!"((uint64_t)({emitExpr typeMap arg2}))"
+          let shifted := if operator == .shl then
+              s!"(({lhs}) << ({rhs}))"
+            else s!"(({lhs}) >> ({rhs}))"
+          -- C++ shifts by the promoted operand width or more are undefined;
+          -- the backend's packed carrier is 64 bits, and later width masks
+          -- recover the declared BitVec/SystemVerilog result.
+          s!"(({rhs} >= 64ULL) ? 0ULL : {shifted})"
+      | .asr =>
+        let width := inferExprWidth typeMap arg1
+        if width == 0 then
+          "SparkleCppSim_shift_operand_width_is_unknown"
+        else
+          let lhs := s!"((uint64_t)({emitExpr typeMap arg1}))"
+          let rhs := s!"((uint64_t)({emitExpr typeMap arg2}))"
+          let fullMask := if width >= 64 then "~0ULL"
+            else if width == 1 then "1ULL"
+            else s!"((1ULL << {width}) - 1ULL)"
+          let signMask := if width == 64 then "0x8000000000000000ULL"
+            else s!"(1ULL << {width - 1})"
+          let signSet := s!"(({lhs} & {signMask}) != 0ULL)"
+          -- Avoid signed right-shift and oversized-shift corner cases.  For a
+          -- nonzero in-range amount, logical shift the payload and explicitly
+          -- OR the high sign-fill mask.  Every shift below is then < 64.
+          let inRange :=
+            s!"(({rhs} == 0ULL) ? ({lhs} & {fullMask}) : " ++
+            s!"((({lhs} >> {rhs}) | ({signSet} ? ({fullMask} << ({width} - {rhs})) : 0ULL)) & {fullMask}))"
+          s!"(({rhs} >= {width}) ? ({signSet} ? {fullMask} : 0ULL) : {inRange})"
       | .lt_s | .le_s | .gt_s | .ge_s =>
         let w := inferExprWidth typeMap arg1
         let stype := signedCastType w
         s!"(({stype}){emitExpr typeMap arg1} {emitCppOperator operator} ({stype}){emitExpr typeMap arg2} ? 1 : 0)"
-      | .asr =>
-        -- Always use at least 32-bit types for ASR to avoid overflow in
-        -- sign-extension patterns like (val << N) >> N where N can be large
-        let w := max (inferExprWidth typeMap arg1) 32
-        let stype := signedCastType w
-        let utype := emitCppType (.bitVector w)
-        s!"(({utype})(({stype}){emitExpr typeMap arg1} >> {emitExpr typeMap arg2}))"
       | .eq | .lt_u | .le_u | .gt_u | .ge_u =>
         s!"({emitExpr typeMap arg1} {emitCppOperator operator} {emitExpr typeMap arg2} ? 1 : 0)"
       | _ =>
         s!"({emitExpr typeMap arg1} {emitCppOperator operator} {emitExpr typeMap arg2})"
     | _ => s!"/* ERROR: operator with wrong arity */"
+
+/-- Emit a word-aligned passive concat into the wide packed representation.
+    Concat arguments are ordered MSB-to-LSB in the IR, while the C++ array and
+    JIT output ABI expose word zero first, so emission walks the arguments in
+    reverse order.  Validation guarantees that every argument is exactly one
+    or two 32-bit words and is otherwise a supported scalar expression. -/
+def emitPassiveWideConcatAssign (typeMap : List (String × HWType))
+    (lhs : String) (args : List Expr) : List String :=
+  let (_, assignments) := args.reverse.foldl (fun (wordIndex, lines) arg =>
+    let width := passiveExprWidth typeMap arg
+    let scalarType := emitCppType (.bitVector (.literal width))
+    let value := s!"((uint64_t)(({scalarType})({emitExpr typeMap arg})))"
+    if width == 32 then
+      (wordIndex + 1,
+        lines ++ [s!"        {sanitizeName lhs}[{wordIndex}] = (uint32_t)({value} & 0xffffffffULL);"])
+    else if width == 64 then
+      (wordIndex + 2,
+        lines ++
+          [s!"        {sanitizeName lhs}[{wordIndex}] = (uint32_t)({value} & 0xffffffffULL);",
+           s!"        {sanitizeName lhs}[{wordIndex + 1}] = (uint32_t)(({value} >> 32) & 0xffffffffULL);"])
+    else
+      (wordIndex,
+        lines ++ [s!"#error \"Sparkle CppSim passive wide concat requires 32/64-bit leaves\""])
+  ) (0, [])
+  assignments
 
 /-- Parts of a C++ class generated from a single statement -/
 structure StmtParts where
@@ -468,9 +683,16 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
   | .assign lhs rhs =>
     let width := lookupWidth typeMap lhs
     if width > 64 then
-      -- Skip wide assigns (dead after IR optimization, e.g. tuple packing)
+      let evalBody :=
+        if isSupportedPassiveWideAssignment typeMap lhs width rhs then
+          match rhs with
+          | .ref source => [s!"        {sanitizeName lhs} = {sanitizeName source};"]
+          | .concat args => emitPassiveWideConcatAssign typeMap lhs args
+          | _ => [s!"#error \"Sparkle CppSim internal passive-wide assignment mismatch\""]
+        else
+          [s!"#error \"Sparkle CppSim cannot execute {width}-bit assignment '{sanitizeName lhs}'\""]
       { declarations := []
-      , evalBody := [s!"        // skipped: {sanitizeName lhs} ({width}-bit wide assign)"]
+      , evalBody
       , tickBody := []
       , resetBody := []
       , evalTickLocals := [] }
@@ -497,10 +719,10 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
     , resetBody := [s!"        {outName} = {initExpr};"]
     , evalTickLocals := [s!"        {cppType} {nextName};"] }
 
-  | .memory name addrWidth dataWidth _clock writeAddr writeData writeEnable readAddr readData comboRead =>
-    match addrWidth.toNat?, dataWidth.toNat? with
-    | some concreteAddrWidth, some _concreteDataWidth =>
-      let memSize := 2 ^ concreteAddrWidth
+  | .memory name addrWidth dataWidth depth _clock writeAddr writeData writeEnable readAddr readData comboRead =>
+    match addrWidth.toNat?, dataWidth.toNat?, depth.toNat? with
+    | some _concreteAddrWidth, some _concreteDataWidth, some concreteDepth =>
+      let memSize := concreteDepth
       let elemType := emitCppType (.bitVector dataWidth)
       let memName := sanitizeName name
       let rdName := sanitizeName readData
@@ -509,23 +731,27 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       let rdType := emitCppType (.bitVector dataWidth)
       let rdInTypeMap := typeMap.any fun (n, _) => sanitizeName n == rdName
       let rdDecl := if rdInTypeMap then [] else [s!"    {rdType} {rdName};"]
+      let readIndex := emitExpr typeMap readAddr
+      let writeIndex := emitExpr typeMap writeAddr
+      let writeCondition := emitExpr typeMap writeEnable
+      let writeValue := emitExpr typeMap writeData
       if comboRead then
         { declarations := [memDecl] ++ rdDecl
-        , evalBody := [s!"        {rdName} = {memName}[{emitExpr typeMap readAddr}];"]
-        , tickBody := [s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};"]
-        , resetBody := [s!"        {memName}.fill(0);"]
+        , evalBody := [s!"        {rdName} = ((uint64_t)({readIndex}) < {memSize}) ? {memName}[{readIndex}] : ({rdType})0;"]
+        , tickBody := [s!"        if (({writeCondition}) && (uint64_t)({writeIndex}) < {memSize}) {memName}[{writeIndex}] = {writeValue};"]
+        , resetBody := [s!"        {memName}.fill(0);", s!"        {rdName} = ({rdType})0;"]
         , evalTickLocals := [] }
       else
         let addrLatch := s!"{memName}_raddr"
         let addrType := emitCppType (.bitVector addrWidth)
         { declarations := [memDecl, s!"    {addrType} {addrLatch};"] ++ rdDecl
-        , evalBody := [s!"        {addrLatch} = {emitExpr typeMap readAddr};"]
+        , evalBody := [s!"        {addrLatch} = {readIndex};"]
         , tickBody :=
-            [ s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};"
-            , s!"        {rdName} = {memName}[{addrLatch}];" ]
-        , resetBody := [s!"        {memName}.fill(0);"]
+            [ s!"        {rdName} = ((uint64_t)({addrLatch}) < {memSize}) ? {memName}[{addrLatch}] : ({rdType})0;"
+            , s!"        if (({writeCondition}) && (uint64_t)({writeIndex}) < {memSize}) {memName}[{writeIndex}] = {writeValue};" ]
+        , resetBody := [s!"        {memName}.fill(0);", s!"        {addrLatch} = ({addrType})0;", s!"        {rdName} = ({rdType})0;"]
         , evalTickLocals := [] }
-    | _, _ =>
+    | _, _, _ =>
       { declarations := ["#error \"Sparkle CppSim symbolic memory dimensions require specialization\""]
       , evalBody := []
       , tickBody := []
@@ -562,6 +788,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
 partial def collectExprRefs : Expr → List String
   | .ref name => [name]
   | .const _ _ => []
+  | .paramConst _ _ => []
   | .resize _ value => collectExprRefs value
   | .slice inner _ _ => collectExprRefs inner
   | .concat args => args.foldl (fun acc a => acc ++ collectExprRefs a) []
@@ -573,7 +800,7 @@ partial def collectExprRefs : Expr → List String
 def collectTickRefWires (body : List Stmt) : List String :=
   body.foldl (fun acc stmt =>
     match stmt with
-    | .memory _ _ _ _ wa wd we ra rd cr =>
+    | .memory _ _ _ _ _ wa wd we ra rd cr =>
       let refs := collectExprRefs wa ++ collectExprRefs wd ++ collectExprRefs we
       -- Non-combo-read: tick() assigns rd and references readAddr exprs
       let refs := if !cr then refs ++ collectExprRefs ra ++ [rd] else refs
@@ -627,7 +854,7 @@ def emitModule (m : Module) (design : Option Design := none)
           sn.startsWith "_gen_" || tickRefs.contains sn
     -- Collect memory names to avoid declaring them as local scalars
     let memoryNames := m.body.filterMap fun s => match s with
-      | .memory name _ _ _ _ _ _ _ _ _ => some (sanitizeName name) | _ => none
+      | .memory name _ _ _ _ _ _ _ _ _ _ => some (sanitizeName name) | _ => none
     let localWires := match observableWires with
       | some ws => internalWires.filter fun (w : Port) =>
           let sn := sanitizeName w.name
@@ -710,15 +937,16 @@ def toCppSim (m : Module) : String :=
 /-- Checked C++ entry point for callers that want an error before writing or
     compiling generated source.  `toCppSim` remains source-compatible and emits
     a C++ `#error` directive for the same condition. -/
-def toCppSimChecked (m : Module) : Except String String :=
+def toCppSimChecked (m : Module) : Except String String := do
   if let some message := moduleDimensionError? m then
-    .error (dimensionError m message)
+    throw (dimensionError m message)
   else if moduleRequiresSpecialization m then
-    .error (specializationError m)
+    throw (specializationError m)
   else if let some message := moduleResizeError? m then
-    .error message
+    throw message
   else
-    .ok (toCppSim m)
+    validateSpecializedDesign { topModule := m.name, modules := [m] }
+    pure (toCppSim m)
 
 /-- Convert a full design to C++ simulation code -/
 def toCppSimDesign (d : Design)
@@ -735,27 +963,29 @@ def toCppSimDesign (d : Design)
   header ++ String.intercalate "\n" (subCode ++ topCode)
 
 def toCppSimDesignChecked (d : Design)
-    (observableWires : Option (List String) := none) : Except String String :=
+    (observableWires : Option (List String) := none) : Except String String := do
   match d.modules.findSome? (fun module =>
       moduleDimensionError? module |>.map fun message => (module, message)) with
-  | some (module, message) => .error (dimensionError module message)
+  | some (module, message) => throw (dimensionError module message)
   | none =>
     match d.modules.find? moduleRequiresSpecialization with
-    | some module => .error (specializationError module)
+    | some module => throw (specializationError module)
     | none =>
       match d.modules.findSome? moduleResizeError? with
-      | some message => .error message
-      | none => .ok (toCppSimDesign d observableWires)
+      | some message => throw message
+      | none =>
+        validateSpecializedDesign d
+        pure (toCppSimDesign d observableWires)
 
-/-- Collect memory entries from a module's body (name, addrWidth, dataWidth) -/
-private def collectMemories (body : List Stmt) : List (String × Nat × Nat) :=
+/-- Collect memory entries from a module's body (name, addrWidth, dataWidth, exact depth). -/
+private def collectMemories (body : List Stmt) : List (String × Nat × Nat × Nat) :=
   body.filterMap fun stmt =>
     match stmt with
-    | .memory name addrWidth dataWidth .. =>
-      match addrWidth.toNat?, dataWidth.toNat? with
-      | some concreteAddrWidth, some concreteDataWidth =>
-        some (name, concreteAddrWidth, concreteDataWidth)
-      | _, _ => none
+    | .memory name addrWidth dataWidth depth .. =>
+      match addrWidth.toNat?, dataWidth.toNat?, depth.toNat? with
+      | some concreteAddrWidth, some concreteDataWidth, some concreteDepth =>
+        some (name, concreteAddrWidth, concreteDataWidth, concreteDepth)
+      | _, _, _ => none
     | _ => none
 
 /-- Collect (sanitizedName, width) for all registers ≤64 bits -/
@@ -861,12 +1091,12 @@ private def emitMemoryAccessSwitches (body : List Stmt) :
     String × String × Nat :=
   let mems := collectMemories body
   let indexed := (List.range mems.length).zip mems
-  let setCases := indexed.map fun (i, name, _addrWidth, _dataWidth) =>
+  let setCases := indexed.map fun (i, name, _addrWidth, _dataWidth, depth) =>
     let sName := sanitizeName name
-    s!"            case {i}: s->{sName}[addr] = data; break;"
-  let getCases := indexed.map fun (i, name, _addrWidth, _dataWidth) =>
+    s!"            case {i}: if (addr < {depth}) s->{sName}[addr] = data; break;"
+  let getCases := indexed.map fun (i, name, _addrWidth, _dataWidth, depth) =>
     let sName := sanitizeName name
-    s!"            case {i}: return (uint32_t)s->{sName}[addr];"
+    s!"            case {i}: return addr < {depth} ? (uint32_t)s->{sName}[addr] : 0;"
   ( String.intercalate "\n" setCases
   , String.intercalate "\n" getCases
   , mems.length )
@@ -875,10 +1105,9 @@ private def emitMemoryAccessSwitches (body : List Stmt) :
 private def emitMemsetWordSwitch (body : List Stmt) : String :=
   let mems := collectMemories body
   let indexed := (List.range mems.length).zip mems
-  let cases := indexed.map fun (i, name, addrWidth, _dataWidth) =>
+  let cases := indexed.map fun (i, name, _addrWidth, _dataWidth, depth) =>
     let sName := sanitizeName name
-    let memSize := 2 ^ addrWidth
-    s!"            case {i}: for (uint32_t k = 0; k < count && (addr + k) < {memSize}; k++) s->{sName}[addr + k] = val; break;"
+    s!"            case {i}: for (uint32_t k = 0; k < count && (uint64_t)addr + k < {depth}; k++) s->{sName}[addr + k] = val; break;"
   String.intercalate "\n" cases
 
 /-- Generate self-contained JIT wrapper .cpp from a Design -/
@@ -1004,16 +1233,19 @@ def toCppSimJIT (d : Design)
 /-- Checked JIT entry point.  Parameterized designs cannot be reflected through
     the fixed-width uint64_t JIT ABI until they have been specialized. -/
 def toCppSimJITChecked (d : Design)
-    (observableWires : Option (List String) := none) : Except String String :=
+    (observableWires : Option (List String) := none) : Except String String := do
   match d.modules.findSome? (fun module =>
       moduleDimensionError? module |>.map fun message => (module, message)) with
-  | some (module, message) => .error (dimensionError module message)
+  | some (module, message) => throw (dimensionError module message)
   | none =>
     match d.modules.find? moduleRequiresSpecialization with
-    | some module => .error (specializationError module)
+    | some module => throw (specializationError module)
     | none =>
       match d.modules.findSome? moduleResizeError? with
-      | some message => .error message
-      | none => .ok (toCppSimJIT d observableWires)
+      | some message => throw message
+      | none =>
+        validateSpecializedDesign d
+        validateJITMemoryABI d
+        pure (toCppSimJIT d observableWires)
 
 end Sparkle.Backend.CppSim

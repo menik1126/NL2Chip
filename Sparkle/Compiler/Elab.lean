@@ -365,6 +365,18 @@ partial def lowerDimExpr (role : String) (expr : Lean.Expr) : CompilerM DimExpr 
       return ← lowerBinary DimExpr.mkMod
     if fn.isConstOf ``HPow.hPow || fn.isConstOf ``Nat.pow then
       return ← lowerBinary DimExpr.mkPow
+    if fn.isConstOf ``HShiftLeft.hShiftLeft || fn.isConstOf ``ShiftLeft.shiftLeft then
+      return ← lowerBinary DimExpr.mkShl
+    if fn.isConstOf ``HShiftRight.hShiftRight || fn.isConstOf ``ShiftRight.shiftRight then
+      return ← lowerBinary DimExpr.mkShr
+    if fn.isConstOf ``HAnd.hAnd then
+      return ← lowerBinary DimExpr.mkBitAnd
+    if fn.isConstOf ``HOr.hOr then
+      return ← lowerBinary DimExpr.mkBitOr
+    if fn.isConstOf ``HXor.hXor then
+      return ← lowerBinary DimExpr.mkBitXor
+    if fn.isConstOf ``Sparkle.IR.Type.DimExpr.clog2Nat && args.size >= 1 then
+      return DimExpr.mkClog2 (← lowerDimExpr role args.back!)
     if fn.isConstOf ``Min.min || fn.isConstOf ``Nat.min then
       return ← lowerBinary DimExpr.mkMin
     if fn.isConstOf ``Max.max || fn.isConstOf ``Nat.max then
@@ -378,7 +390,8 @@ partial def lowerDimExpr (role : String) (expr : Lean.Expr) : CompilerM DimExpr 
     let rendered ← CompilerM.liftMetaM (ppExpr expr)
     CompilerM.liftMetaM $ throwError m!"Cannot lower {role} {rendered} to a SystemVerilog constant expression.\n\n\
       Supported symbolic dimension operations are addition, natural subtraction, \
-      multiplication, division, remainder, power, min, and max."
+      multiplication, division, remainder, power, shifts, bitwise and/or/xor, \
+      ceiling-log2, min, and max."
 
 /-- Lower a hardware dimension and reject a statically known zero. -/
 def lowerPositiveDimExpr (role : String) (expr : Lean.Expr) : CompilerM DimExpr := do
@@ -454,6 +467,13 @@ def extractPositiveDim (role : String) (e : Lean.Expr) : CompilerM DimExpr :=
 def evalDefaultDim (m : Sparkle.IR.AST.Module) (role : String) (dim : DimExpr) : MetaM Nat := do
   let lookup (name : String) : Option Nat :=
     (m.parameters.find? (fun parameter => parameter.name == name)).map (·.defaultValue)
+  match dim.natValueBitWidthBound.evalUpperBoundCapped?
+      lookup DimExpr.maxNatWorkWidth with
+  | some value =>
+      if value > DimExpr.maxNatWorkWidth then
+        throwError m!"Cannot evaluate {role} '{dim}' in module '{m.name}': the natural-number working width exceeds {DimExpr.maxNatWorkWidth} bits."
+  | none =>
+      throwError m!"Cannot evaluate {role} '{dim}' in module '{m.name}': its natural-number working-width bound is unresolved."
   match dim.eval? lookup with
   | some value => return value
   | none => throwError m!"Cannot evaluate {role} '{dim}' in module '{m.name}' under its parameter defaults."
@@ -474,6 +494,9 @@ partial def validateHWTypeDefaults (m : Sparkle.IR.AST.Module) (role : String) :
 
 partial def validateExprDefaults (m : Sparkle.IR.AST.Module) (role : String) : Sparkle.IR.AST.Expr → MetaM Unit
   | .const _ width => validatePositiveDefaultDim m s!"{role} constant width" width
+  | .paramConst value width => do
+      let _ ← evalDefaultDim m s!"{role} parameter constant value" value
+      validatePositiveDefaultDim m s!"{role} parameter constant width" width
   | .ref _ => pure ()
   | .op _ args | .concat args =>
       args.forM (validateExprDefaults m role)
@@ -493,9 +516,10 @@ partial def validateExprDefaults (m : Sparkle.IR.AST.Module) (role : String) : S
 def validateStmtDefaults (m : Sparkle.IR.AST.Module) : Stmt → MetaM Unit
   | .assign lhs rhs => validateExprDefaults m s!"assignment to '{lhs}'" rhs
   | .register output _ _ input _ => validateExprDefaults m s!"register '{output}' input" input
-  | .memory name addrWidth dataWidth _ writeAddr writeData writeEnable readAddr _ _ => do
+  | .memory name addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ => do
       validatePositiveDefaultDim m s!"memory '{name}' address width" addrWidth
       validatePositiveDefaultDim m s!"memory '{name}' data width" dataWidth
+      validatePositiveDefaultDim m s!"memory '{name}' depth" depth
       [writeAddr, writeData, writeEnable, readAddr].forM
         (validateExprDefaults m s!"memory '{name}' expression")
   | .inst _ instName connections _ =>
@@ -547,6 +571,13 @@ private def isLegalSystemVerilogIdentifier (name : String) : Bool :=
 /-- Validate facts that SystemVerilog itself cannot express in a parameter
     declaration: emitted-name uniqueness and a legal default elaboration. -/
 def validateParameterizedModule (m : Sparkle.IR.AST.Module) : MetaM Unit := do
+  -- Run the shared capped work-width preflight before any of the detailed
+  -- default checks below call `DimExpr.eval?`.  This prevents a hostile but
+  -- syntactically valid default such as `K = 0xffffffff` in `1 << K` from
+  -- allocating an enormous Nat during compiler-side validation.
+  match m.validateDimensions with
+  | .ok () => pure ()
+  | .error message => throwError m!"{message}"
   for parameter in m.parameters do
     let emittedName := Sparkle.Backend.Verilog.sanitizeName parameter.name
     unless isLegalSystemVerilogIdentifier emittedName do
@@ -689,13 +720,36 @@ partial def extractSymbolicAllOnes? (expr : Lean.Expr) (fuel : Nat := 4)
   | some unfolded => extractSymbolicAllOnes? unfolded (fuel - 1)
   | none => return none
 
+/-- Recognize a `BitVec.ofNat` whose natural-number value belongs to the
+    retained parameter-expression subset.  Bounded unfolding admits small
+    transparent mask helpers while still refusing arbitrary value programs. -/
+partial def extractParameterizedBitVecConstant? (expr : Lean.Expr) (fuel : Nat := 4)
+    : CompilerM (Option (Sparkle.IR.AST.Expr × DimExpr)) := do
+  let expr ← CompilerM.liftMetaM (instantiateMVars expr)
+  let fn := expr.getAppFn
+  let args := expr.getAppArgs
+  if fn.isConstOf ``BitVec.ofNat && args.size >= 2 then
+    let width ← extractPositiveDim "BitVec parameter constant width"
+      args[args.size - 2]!
+    let value ← lowerDimExpr "BitVec parameter constant value" args.back!
+    return some <| match value.toNat? with
+      | some concreteValue => (.const (Int.ofNat concreteValue) width, width)
+      | none => (.paramConst value width, width)
+  if fuel == 0 then return none
+  let unfolded? ← CompilerM.liftMetaM (Lean.Meta.unfoldDefinition? expr)
+  match unfolded? with
+  | some unfolded => extractParameterizedBitVecConstant? unfolded (fuel - 1)
+  | none => return none
+
 /-- Extract a constant BitVec as hardware IR.  Concrete literals retain the
-existing `.const` representation; the common width-dependent all-ones mask is
-represented as `~0` at the same symbolic width. -/
+existing `.const` representation; parameter-only Nat values use `.paramConst`,
+while the common all-ones idiom keeps its compact width-polymorphic `~0` form. -/
 def extractBitVecConstant (expr : Lean.Expr)
     : CompilerM (Sparkle.IR.AST.Expr × DimExpr) := do
   if let some width ← extractSymbolicAllOnes? expr then
     return (.op .not [.const 0 width], width)
+  if let some constant ← extractParameterizedBitVecConstant? expr then
+    return constant
   let (value, width) ← extractBitVecLiteral expr
   return (.const (Int.ofNat value) width, width)
 
@@ -940,6 +994,11 @@ mutual
            if let some width ← extractSymbolicAllOnes? constValue then
              let resWire ← CompilerM.makeWire hint (.bitVector width) (named := isNamed)
              CompilerM.emitAssign resWire (.op .not [.const 0 width])
+             return resWire
+           if let some (constant, width) ←
+               extractParameterizedBitVecConstant? constValue then
+             let resWire ← CompilerM.makeWire hint (.bitVector width) (named := isNamed)
+             CompilerM.emitAssign resWire constant
              return resWire
            -- Shape mismatches can fall through to general expression lowering,
            -- but errors in a recognized literal (such as a symbolic width) must
@@ -1590,14 +1649,14 @@ mutual
       let bvExpr := args[args.size - 2]!
       let natExpr := args[args.size - 1]!
       let wire1 ← translateExprToWire bvExpr "shift_a"
-      let wire2 ← translateShiftAmount bvExpr natExpr "shift_b"
+      let amountExpr ← translateShiftAmount natExpr "shift_b"
       let op := if name == ``BitVec.shiftLeft then Operator.shl
                 else if name == ``BitVec.ushiftRight then Operator.shr
                 else Operator.asr
       let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
       let hwType ← inferHWTypeFromSignal exprType
       let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-      CompilerM.emitAssign resWire (.op op [.ref wire1, .ref wire2])
+      CompilerM.emitAssign resWire (.op op [.ref wire1, amountExpr])
       return some resWire
 
     -- BitVec.append / HAppend.hAppend: concatenation
@@ -1971,23 +2030,25 @@ mutual
   /-- Translate a Nat shift amount argument to a hardware wire.
       Unwraps BitVec.toNat / Fin.val if the Nat came from a BitVec signal,
       otherwise treats it as a constant shift amount. -/
-  partial def translateShiftAmount (bvExpr natExpr : Lean.Expr) (hint : String) : CompilerM String := do
+  partial def translateShiftAmount (natExpr : Lean.Expr) (hint : String) : CompilerM Sparkle.IR.AST.Expr := do
     let natExpr' ← CompilerM.liftMetaM (whnf natExpr)
     let natFn := natExpr'.getAppFn
     let natArgs := natExpr'.getAppArgs
     if let .const natName _ := natFn then
       if natName == ``BitVec.toNat && natArgs.size >= 2 then
-        return ← translateExprToWire natArgs[natArgs.size - 1]! hint
+        return .ref (← translateExprToWire natArgs[natArgs.size - 1]! hint)
       if natName == ``Fin.val && natArgs.size >= 2 then
-        return ← translateExprToWire natArgs[natArgs.size - 1]! hint
-    -- Fallback: treat as a constant shift amount
-    let n ← extractNat natExpr'
-    let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType bvExpr)
-    let bvHwType ← inferHWTypeFromSignal exprType
-    let width := bvHwType.width
-    let constWire ← CompilerM.makeWire "shift_const" (.bitVector width)
-    CompilerM.emitAssign constWire (.const (Int.ofNat n) width)
-    return constWire
+        return .ref (← translateExprToWire natArgs[natArgs.size - 1]! hint)
+    -- Fallback: retain a constant/parameter Nat shift amount as a packed
+    -- parameter constant instead of narrowing it to the data operand width.
+    -- A Nat shift of K=4 on a 2-bit value must remain 4 (and therefore shift
+    -- the result to zero), not become `2'b00` and accidentally shift by zero.
+    let amount ← lowerDimExpr "BitVec shift amount" natExpr'
+    return match amount.toNat? with
+      | some concrete =>
+          let width := Nat.max 1 (Nat.log2 concrete + 1)
+          Sparkle.IR.AST.Expr.const (Int.ofNat concrete) width
+      | none => .paramConst amount amount.natValueBitWidthBound
 
   partial def getPrimitiveNameFromLambda (e : Lean.Expr) : CompilerM Name := do
     match e with

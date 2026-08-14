@@ -60,12 +60,18 @@ def extractModelChecked (m : Module) : Except String SemanticModel := do
   m.validateDimensions
   unless m.parameters.isEmpty do
     throw s!"module '{m.name}' is parameterized; specialize it before generating a concrete Lean verification model"
+  unless m.nativeItems.isEmpty do
+    throw s!"module '{m.name}' contains SystemVerilog-native generate/procedural items; lower them to normalized IR before generating a Lean verification model"
   for dimension in m.dimensionExpressions do
     unless dimension.isConcrete do
       throw s!"module '{m.name}' contains symbolic dimension '{dimension}'; specialize it before generating a concrete Lean verification model"
   let mut regs := []
   for stmt in m.body do
     match stmt with
+    | .memory name .. =>
+      throw s!"module '{m.name}' contains memory '{name}'; memory semantics are not supported by Lean verification-model generation"
+    | .inst moduleName instName .. =>
+      throw s!"module '{m.name}' contains instance '{instName}' of '{moduleName}'; hierarchical instance semantics are not supported by Lean verification-model generation"
     | .register name _clk _rst input initVal =>
       let port ← match m.wires.find? (fun w => w.name == name) with
         | some p => pure p
@@ -108,6 +114,7 @@ partial def inlineAssigns (assigns : List (String × Expr)) : Expr → Expr
     | none => .ref name
   | .op operator args => .op operator (args.map (inlineAssigns assigns))
   | .concat args => .concat (args.map (inlineAssigns assigns))
+  | .paramConst value width => .paramConst value width
   | .resize width value => .resize width (inlineAssigns assigns value)
   | .slice e hi lo => .slice (inlineAssigns assigns e) hi lo
   | .index a i => .index (inlineAssigns assigns a) (inlineAssigns assigns i)
@@ -121,6 +128,7 @@ partial def inlineAssigns (assigns : List (String × Expr)) : Expr → Expr
     operator arities are errors rather than guessed 32-bit values. -/
 partial def inferWidthChecked (regWidths inputWidths : List (String × Nat)) : Expr → Except String Nat
   | .const _ w => w.requireNat "verification expression constant width"
+  | .paramConst _ w => w.requireNat "verification parameter constant width"
   | .ref name =>
     match regWidths.find? (·.1 == name) with
     | some (_, w) => pure w
@@ -172,6 +180,7 @@ partial def fixConstWidths (expr : Expr) (targetWidth : Nat)
     (widthEnv : List (String × Nat)) : Expr :=
   match expr with
   | .const v w => if w.toNat? == some 32 && targetWidth != 32 then .const v targetWidth else expr
+  | .paramConst _ _ => expr
   | .op .mux [c, t, e] =>
     .op .mux [c, fixConstWidths t targetWidth widthEnv, fixConstWidths e targetWidth widthEnv]
   | .op op args => .op op (args.map (fixConstWidths · targetWidth widthEnv))
@@ -244,6 +253,10 @@ partial def irExprToLeanChecked (expr : Expr) (regNames inputNames : List (Strin
       if v < 0 then pure s!"(BitVec.ofInt {concreteWidth} ({v}))"
       else pure s!"({v}#{concreteWidth})"
     | none => throw s!"symbolic constant width '{w}' reached concrete verification source generation"
+  | .paramConst value w =>
+    let concreteValue ← value.requireNat "verification parameter constant value"
+    let concreteWidth ← w.requireNat "verification parameter constant width"
+    pure s!"({concreteValue}#{concreteWidth})"
   | .ref name =>
     if regNames.any (·.1 == name) then pure s!"{stateVar}.{leanName name}"
     else if inputNames.any (·.1 == name) then pure s!"{inputVar}.{leanName name}"
@@ -336,12 +349,20 @@ def generateLeanChecked (model : SemanticModel)
     String.intercalate "\n" inputFields ++
     "\n  deriving DecidableEq, Repr, BEq, Inhabited\n"
 
-  -- nextState function — use register width to fix constant widths
+  -- A register assignment supplies only the final destination boundary.  Do
+  -- not rewrite explicit constant widths inside the expression: doing so
+  -- changes operations such as `256#32 >>> 8#32` before the 8-bit result is
+  -- assigned.  Preserve the IR expression exactly and resize only its final
+  -- value to the register width.
   let mut regAssigns : List String := []
   for r in model.registers do
-    let fixedExpr := fixConstWidths r.nextExpr r.width allWidths
+    let expressionWidth ← inferWidthChecked allWidths [] r.nextExpr
+    let expressionSource ←
+      irExprToLeanChecked r.nextExpr regWidths inputWidths allWidths "s" "i"
+    let assignedSource := if expressionWidth == r.width then expressionSource
+      else s!"(BitVec.setWidth {r.width} {expressionSource})"
     regAssigns := regAssigns ++
-      [s!"    {leanName r.name} := {← irExprToLeanChecked fixedExpr regWidths inputWidths allWidths "s" "i"}"]
+      [s!"    {leanName r.name} := {assignedSource}"]
   let nextStateFn := "def nextState (s : State) (i : Input) : State :=\n  {\n" ++
     String.intercalate "\n" regAssigns ++
     "\n  }\n"

@@ -91,30 +91,343 @@ where
 -- Expression parsing (all mutually recursive)
 -- ============================================================================
 
-/-- Translate the constant-expression subset accepted in packed ranges into
-    the native symbolic dimension language.  Rejecting unsupported syntax is
-    intentional: silently guessing a concrete width changes module semantics. -/
-partial def exprToDimExpr? : SVExpr → Option Sparkle.IR.Type.DimExpr
-  | .lit (.decimal _ value) | .lit (.hex _ value) | .lit (.binary _ value) =>
-      some (.literal value)
+private def literalToNaturalDim? : SVLiteral → Option Sparkle.IR.Type.DimExpr
+  | .decimal width value | .hex width value | .binary width value =>
+      match width with
+      | some 0 => none
+      | some bits => some (.literal (value % (2 ^ bits)))
+      | none => some (.literal value)
+  | .unknown _ => none
+
+private inductive NatWrapperMode where
+  | exactWorkWidth
+  | metaUInt64
+
+private def natWrapperWidthMatches (mode : NatWrapperMode)
+    (width recovered : Sparkle.IR.Type.DimExpr) : Bool :=
+  match mode with
+  | .exactWorkWidth => width == recovered.natValueBitWidthBound
+  | .metaUInt64 =>
+      width == .literal 64 &&
+        match recovered.natValueBitWidthBound.toNat? with
+        | some bits => bits <= 64
+        | none => false
+
+/- Recover the two canonical wrapper layers emitted for a mathematical Nat.
+   Value wrappers must exactly match the conservative work width.  Meta-width
+   wrappers are fixed at 64 bits and accepted only when the recovered value is
+   statically proven to fit; arbitrary narrowing casts are never erased. -/
+mutual
+private partial def recoverNatWrapped? (mode : NatWrapperMode) :
+    SVExpr → Option Sparkle.IR.Type.DimExpr
+  | .unary .unsigned (.sizedCast width value) => do
+      let recovered ← recoverNatRawWith? mode value
+      if natWrapperWidthMatches mode width recovered then some recovered else none
+  | _ => none
+
+private partial def recoverNatRawWith? (mode : NatWrapperMode) :
+    SVExpr → Option Sparkle.IR.Type.DimExpr
+  | .lit literal => literalToNaturalDim? literal
   | .ident name => some (.param name)
+  | .binary .add lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkAdd
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  | .binary .mul lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkMul
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  | .binary .pow lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkPow
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  | .binary .shl lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkShl
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  | .binary .shr lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkShr
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  | .binary .bitAnd lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkBitAnd
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  | .binary .bitOr lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkBitOr
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  | .binary .bitXor lhs rhs =>
+      return Sparkle.IR.Type.DimExpr.mkBitXor
+        (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+  -- Canonical totalization of Sparkle's Nat `clog2`: both zero and one map
+  -- to zero, independent of downstream-tool behavior for `$clog2(0)`.
+  | .ternary (.binary .le value (.lit (.decimal none 1)))
+      (.lit (.decimal none 0)) (.unary .clog2 thenValue) => do
+      if value == thenValue then
+        return Sparkle.IR.Type.DimExpr.mkClog2 (← recoverNatWrapped? mode value)
+      else none
+  -- Canonical total Nat subtraction emitted by the backend.
+  | .ternary (.binary .ge lhs rhs) (.binary .sub thenLhs thenRhs)
+      (.lit (.decimal none 0)) => do
+      if lhs == thenLhs && rhs == thenRhs then
+        return Sparkle.IR.Type.DimExpr.mkSub
+          (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+      else none
+  -- `Nat.div a 0 = 0`.
+  | .ternary (.binary .eq rhs (.lit (.decimal none 0)))
+      (.lit (.decimal none 0)) (.binary .div lhs thenRhs) => do
+      if rhs == thenRhs then
+        return Sparkle.IR.Type.DimExpr.mkDiv
+          (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+      else none
+  -- `Nat.mod a 0 = a`.
+  | .ternary (.binary .eq rhs (.lit (.decimal none 0))) lhsElse
+      (.binary .mod lhs thenRhs) => do
+      if rhs == thenRhs && lhsElse == lhs then
+        return Sparkle.IR.Type.DimExpr.mkMod
+          (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+      else none
+  | .ternary (.binary .lt lhs rhs) then_ else_ => do
+      if lhs == then_ && rhs == else_ then
+        return Sparkle.IR.Type.DimExpr.mkMin
+          (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+      else none
+  | .ternary (.binary .gt lhs rhs) then_ else_ => do
+      if lhs == then_ && rhs == else_ then
+        return Sparkle.IR.Type.DimExpr.mkMax
+          (← recoverNatWrapped? mode lhs) (← recoverNatWrapped? mode rhs)
+      else none
+  | _ => none
+end
+
+def recoverNatWorkExpr? (expression : SVExpr) : Option Sparkle.IR.Type.DimExpr :=
+  recoverNatWrapped? .exactWorkWidth expression
+
+private def recoverMetaNat64Expr? (expression : SVExpr) :
+    Option Sparkle.IR.Type.DimExpr :=
+  recoverNatWrapped? .metaUInt64 expression
+
+private partial def provablyPositiveNatExpr : SVExpr → Bool
+  | .lit literal =>
+      match literalToNaturalDim? literal >>= (fun value => value.toNat?) with
+      | some value => value > 0
+      | none => false
+  | .unary .unsigned value | .sizedCast _ value => provablyPositiveNatExpr value
+  | .binary .add lhs rhs | .binary .bitOr lhs rhs =>
+      provablyPositiveNatExpr lhs || provablyPositiveNatExpr rhs
+  | .binary .mul lhs rhs =>
+      provablyPositiveNatExpr lhs && provablyPositiveNatExpr rhs
+  | .binary .shl lhs _ => provablyPositiveNatExpr lhs
+  | .binary .pow base exponent =>
+      provablyPositiveNatExpr base ||
+        match exponent with
+        | .lit literal =>
+            match literalToNaturalDim? literal with
+            | some value => value.toNat? == some 0
+            | none => false
+        | _ => false
+  | .ternary _ then_ else_ =>
+      provablyPositiveNatExpr then_ && provablyPositiveNatExpr else_
+  | _ => false
+
+private def provablyNonUnderflowingSub (lhs rhs : SVExpr) : Bool :=
+  if lhs == rhs then true
+  else
+    match rhs with
+    | .lit rhsLiteral =>
+      match literalToNaturalDim? rhsLiteral with
+      | some value =>
+        match value.toNat? with
+        | some 0 => true
+        | some 1 => provablyPositiveNatExpr lhs
+        | some rhsValue =>
+            match lhs with
+            | .lit lhsLiteral =>
+                match literalToNaturalDim? lhsLiteral >>= (fun value => value.toNat?) with
+                | some lhsValue => lhsValue >= rhsValue
+                | none => false
+            | _ => false
+        | none => false
+      | none => false
+    | _ => false
+
+private partial def exprToDimExprCore? (allowDeclarationClamp : Bool)
+    (expression : SVExpr) : Option Sparkle.IR.Type.DimExpr :=
+  if let some recovered := recoverNatWorkExpr? expression then
+    some recovered
+  else if let some recovered := recoverMetaNat64Expr? expression then
+    some recovered
+  else match expression with
+  | .lit literal =>
+      -- An explicitly sized SystemVerilog literal is truncated to that size
+      -- before it participates in a constant expression.  Retaining the raw
+      -- parser value would silently change, for example, `4'd31 + K` into
+      -- `31 + K` instead of `(31 % 16) + K`.
+      literalToNaturalDim? literal
+  | .ident name => some (.param name)
+  -- Canonical Sparkle declaration clamp.  The lower and upper checks keep an
+  -- invalid unsigned parameter override from asking an SV frontend to build a
+  -- zero- or multi-billion-bit range before the adjacent validation guard can
+  -- report it.  This shape is recognized only in declaration/cast-width
+  -- contexts; ordinary value ternaries retain their value semantics.
+  | .ternary
+      (.binary .logAnd
+        (.binary .gt positive (.lit (.decimal none 0)))
+        (.binary .le bounded (.lit (.decimal none 1048576))))
+      then_ (.lit (.decimal none 1)) => do
+      if allowDeclarationClamp && positive == bounded && positive == then_ then
+        recoverNatWorkExpr? positive
+      else none
   -- Sparkle's backend clamps a hardware dimension before placing it in a
   -- declaration range: `(d > 0 ? d : 1)`.  The guard emitted alongside the
   -- declaration rejects the invalid branch, so recover the native dimension
   -- here instead of baking the compatibility clamp into the IR.
-  | .ternary (.binary .gt condition (.lit (.decimal _ 0))) then_ (.lit (.decimal _ 1)) => do
-      if condition == then_ then exprToDimExpr? condition else none
-  | .binary .add lhs rhs => return (Sparkle.IR.Type.DimExpr.mkAdd (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
-  | .binary .sub lhs rhs => return (Sparkle.IR.Type.DimExpr.mkSub (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
-  | .binary .mul lhs rhs => return (Sparkle.IR.Type.DimExpr.mkMul (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
-  | .binary .pow lhs rhs => return (Sparkle.IR.Type.DimExpr.mkPow (← exprToDimExpr? lhs) (← exprToDimExpr? rhs))
+  | .ternary (.binary .gt condition (.lit (.decimal none 0))) then_ (.lit (.decimal none 1)) => do
+      if allowDeclarationClamp && condition == then_ then
+        recoverNatWorkExpr? condition
+      else none
+  -- Sparkle caps the temporary width used to evaluate retained Nat values.
+  -- Invalid overrides are paired with a canonical fatal generate guard; in a
+  -- cast-width context recover the mathematical bound, never the fallback 1.
+  | .ternary (.binary .le condition (.lit (.decimal none 1048576))) then_
+      (.lit (.decimal none 1)) => do
+      if allowDeclarationClamp && condition == then_ then
+        recoverMetaNat64Expr? condition
+      else none
+  | .binary .add lhs rhs => return (Sparkle.IR.Type.DimExpr.mkAdd (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .sub lhs rhs => do
+      unless allowDeclarationClamp || provablyNonUnderflowingSub lhs rhs do
+        none
+      return (Sparkle.IR.Type.DimExpr.mkSub (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .mul lhs rhs => return (Sparkle.IR.Type.DimExpr.mkMul (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .div lhs rhs => do
+      unless allowDeclarationClamp || provablyPositiveNatExpr rhs do none
+      return (Sparkle.IR.Type.DimExpr.mkDiv (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .mod lhs rhs => do
+      unless allowDeclarationClamp || provablyPositiveNatExpr rhs do none
+      return (Sparkle.IR.Type.DimExpr.mkMod (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .pow lhs rhs => return (Sparkle.IR.Type.DimExpr.mkPow (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .shl lhs rhs => return (Sparkle.IR.Type.DimExpr.mkShl (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .shr lhs rhs => return (Sparkle.IR.Type.DimExpr.mkShr (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .bitAnd lhs rhs => return (Sparkle.IR.Type.DimExpr.mkBitAnd (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .bitOr lhs rhs => return (Sparkle.IR.Type.DimExpr.mkBitOr (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .binary .bitXor lhs rhs => return (Sparkle.IR.Type.DimExpr.mkBitXor (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs))
+  | .unary .clog2 value => return Sparkle.IR.Type.DimExpr.mkClog2 (← exprToDimExprCore? allowDeclarationClamp value)
   -- SystemVerilog rendering of Nat subtraction: `(lhs >= rhs) ? lhs-rhs : 0`.
   | .ternary (.binary .ge lhs rhs) (.binary .sub thenLhs thenRhs)
-      (.lit (.decimal _ 0)) => do
+      (.lit (.decimal none 0)) => do
       if lhs == thenLhs && rhs == thenRhs then
-        return Sparkle.IR.Type.DimExpr.mkSub (← exprToDimExpr? lhs) (← exprToDimExpr? rhs)
+        return Sparkle.IR.Type.DimExpr.mkSub (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs)
+      else none
+  -- Canonical renderings produced by `emitDimExpr` for total Nat operations.
+  | .ternary (.binary .eq rhs (.lit (.decimal none 0)))
+      (.lit (.decimal none 0)) (.binary .div lhs thenRhs) => do
+      if rhs == thenRhs then
+        return Sparkle.IR.Type.DimExpr.mkDiv (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs)
+      else none
+  | .ternary (.binary .eq rhs (.lit (.decimal none 0))) lhsElse
+      (.binary .mod lhs thenRhs) => do
+      if rhs == thenRhs && lhsElse == lhs then
+        return Sparkle.IR.Type.DimExpr.mkMod (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs)
+      else none
+  | .ternary (.binary .lt lhs rhs) then_ else_ => do
+      if lhs == then_ && rhs == else_ then
+        return Sparkle.IR.Type.DimExpr.mkMin (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs)
+      else none
+  | .ternary (.binary .gt lhs rhs) then_ else_ => do
+      if lhs == then_ && rhs == else_ then
+        return Sparkle.IR.Type.DimExpr.mkMax (← exprToDimExprCore? allowDeclarationClamp lhs) (← exprToDimExprCore? allowDeclarationClamp rhs)
       else none
   | _ => none
+
+/-- Translate a packed-range/cast-width constant expression.  This entry point
+    alone recognizes Sparkle's positive declaration clamp `(d > 0 ? d : 1)`. -/
+private partial def containsIdentifierExpr : SVExpr → Bool
+  | .ident _ => true
+  | .unary _ value => containsIdentifierExpr value
+  | .binary _ lhs rhs => containsIdentifierExpr lhs || containsIdentifierExpr rhs
+  | .ternary condition then_ else_ =>
+      containsIdentifierExpr condition || containsIdentifierExpr then_ ||
+        containsIdentifierExpr else_
+  | .index array index => containsIdentifierExpr array || containsIdentifierExpr index
+  | .slice value _ _ => containsIdentifierExpr value
+  | .partSelectPlus value base width =>
+      containsIdentifierExpr value || containsIdentifierExpr base ||
+        containsIdentifierExpr width
+  | .concat values => values.any containsIdentifierExpr
+  | .repeat_ count value => containsIdentifierExpr count || containsIdentifierExpr value
+  | .sizedCast _ value => containsIdentifierExpr value
+  | .lit _ => false
+
+/-- Raw packed SV arithmetic is not automatically mathematical Nat arithmetic.
+    In particular right shift/division/modulo observe any earlier fixed-width
+    truncation, while a parameterized raw shift/power can overflow its 32-bit
+    operands before a declaration sees the result.  Backend-emitted exact work
+    wrappers are recognized first and remain fully supported. -/
+private partial def hasUnsafeRawDimensionSizing (expression : SVExpr) : Bool :=
+  if (recoverNatWorkExpr? expression).isSome ||
+      (recoverMetaNat64Expr? expression).isSome then false
+  else match expression with
+  | .binary .shr _ _ | .binary .div _ _ | .binary .mod _ _ => true
+  | .binary .shl lhs rhs | .binary .pow lhs rhs =>
+      containsIdentifierExpr lhs || containsIdentifierExpr rhs ||
+        hasUnsafeRawDimensionSizing lhs || hasUnsafeRawDimensionSizing rhs
+  | .unary _ value => hasUnsafeRawDimensionSizing value
+  | .binary _ lhs rhs =>
+      hasUnsafeRawDimensionSizing lhs || hasUnsafeRawDimensionSizing rhs
+  | .ternary condition then_ else_ =>
+      hasUnsafeRawDimensionSizing condition || hasUnsafeRawDimensionSizing then_ ||
+        hasUnsafeRawDimensionSizing else_
+  | .index array index =>
+      hasUnsafeRawDimensionSizing array || hasUnsafeRawDimensionSizing index
+  | .slice value _ _ => hasUnsafeRawDimensionSizing value
+  | .partSelectPlus value base width =>
+      hasUnsafeRawDimensionSizing value || hasUnsafeRawDimensionSizing base ||
+        hasUnsafeRawDimensionSizing width
+  | .concat values => values.any hasUnsafeRawDimensionSizing
+  | .repeat_ count value =>
+      hasUnsafeRawDimensionSizing count || hasUnsafeRawDimensionSizing value
+  | .sizedCast _ value => hasUnsafeRawDimensionSizing value
+  | .lit _ | .ident _ => false
+
+partial def exprToDimExpr? (expression : SVExpr) : Option Sparkle.IR.Type.DimExpr :=
+  if hasUnsafeRawDimensionSizing expression then none
+  else exprToDimExprCore? true expression
+
+/-- Translate a mathematical Nat value expression.  Declaration clamps are
+    deliberately not erased here: in a data path `(K > 0 ? K : 1)` really has
+    value one when K is zero. -/
+private partial def containsUnboundedRawNatOp (expression : SVExpr) : Bool :=
+  if (recoverNatWorkExpr? expression).isSome ||
+      (recoverMetaNat64Expr? expression).isSome then false
+  else match expression with
+  | .binary .add _ _ | .binary .sub _ _ | .binary .mul _ _
+  | .binary .div _ _ | .binary .mod _ _ | .binary .pow _ _
+  | .binary .shl _ _ | .binary .shr _ _
+  | .binary .bitAnd _ _ | .binary .bitOr _ _ | .binary .bitXor _ _ => true
+  | .unary _ value => containsUnboundedRawNatOp value
+  | .binary _ lhs rhs =>
+      containsUnboundedRawNatOp lhs || containsUnboundedRawNatOp rhs
+  | .ternary condition then_ else_ =>
+      containsUnboundedRawNatOp condition ||
+        containsUnboundedRawNatOp then_ || containsUnboundedRawNatOp else_
+  | .index array index =>
+      containsUnboundedRawNatOp array || containsUnboundedRawNatOp index
+  | .slice value _ _ => containsUnboundedRawNatOp value
+  | .partSelectPlus value base width =>
+      containsUnboundedRawNatOp value || containsUnboundedRawNatOp base ||
+        containsUnboundedRawNatOp width
+  | .concat values => values.any containsUnboundedRawNatOp
+  | .repeat_ count value =>
+      containsUnboundedRawNatOp count || containsUnboundedRawNatOp value
+  | .sizedCast _ _ => false
+  | .lit _ | .ident _ => false
+
+partial def exprToNatExpr? (expression : SVExpr) : Option Sparkle.IR.Type.DimExpr :=
+  if let some recovered := recoverNatWorkExpr? expression then some recovered
+  else if let some recovered := recoverMetaNat64Expr? expression then some recovered
+  else if containsUnboundedRawNatOp expression then none
+  else exprToDimExprCore? false expression
+
+/-- Parameter-only arithmetic inside an explicit sized cast is evaluated in
+    that cast's packed context.  It may therefore use shifts/powers that are
+    unsafe in a raw self-determined RHS or generate condition. -/
+partial def exprToSizedNatExpr? (expression : SVExpr) : Option Sparkle.IR.Type.DimExpr :=
+  exprToDimExprCore? false expression
 
 mutual
 
@@ -239,16 +552,37 @@ partial def parseAdd : P SVExpr := do
   pure e
 
 partial def parseMul : P SVExpr := do
-  let mut e ← parseUnary
+  let mut e ← parsePower
   let mut cont := true
   while cont do
-    match ← attempt (op2 "**") with
-    | some _ => let rhs ← parseUnary; e := SVExpr.binary .pow e rhs
+    -- A single `*` is multiplication; do not consume the first character of
+    -- the higher-precedence `**` token.
+    match ← attempt (do
+      let _ ← token (matchStr "*")
+      if (← peekChar) == some '*' then fail "exponentiation"
+      pure ()) with
+    | some _ => let rhs ← parsePower; e := SVExpr.binary .mul e rhs
     | none =>
-      match ← attempt (token (matchStr "*")) with
-      | some _ => let rhs ← parseUnary; e := SVExpr.binary .mul e rhs
-      | none => cont := false
+      match ← attempt (token (matchStr "/")) with
+      | some _ => let rhs ← parsePower; e := SVExpr.binary .div e rhs
+      | none =>
+        match ← attempt (token (matchStr "%")) with
+        | some _ => let rhs ← parsePower; e := SVExpr.binary .mod e rhs
+        | none => cont := false
   pure e
+
+/-- Exponentiation binds more tightly than multiplication/division/modulo.
+    SystemVerilog tools evaluate chained powers left-to-right, so retain that
+    associativity as well.  Keeping it in `parseMul` made `2 * 3 ** K` parse as
+    `(2 * 3) ** K`, which silently changed parameter constants. -/
+partial def parsePower : P SVExpr := do
+  let mut expression ← parseUnary
+  let mut continuing := true
+  while continuing do
+    match ← attempt (op2 "**") with
+    | some _ => expression := .binary .pow expression (← parseUnary)
+    | none => continuing := false
+  return expression
 
 partial def parseUnary : P SVExpr := do
   let c ← peekChar
@@ -375,8 +709,13 @@ partial def parsePrimary : P SVExpr := do
       -- wrapper in the parser AST long enough for sized-cast lowering to avoid
       -- accidentally treating `$unsigned(-1)` as a sign-extending literal.
       pure (SVExpr.unary .unsigned arg)
+    else if name == "clog2" then
+      pure (SVExpr.unary .clog2 arg)
     else
-      pure arg
+      -- Unknown system functions are not transparent wrappers.  For example,
+      -- `$bits(K)` evaluates to a type width, not to K.  Reject syntax outside
+      -- the modeled subset instead of silently erasing the function call.
+      fail s!"unsupported system function '${name}' in expression"
   | some '\'' =>
     -- Unsized literal: 'b0, 'bx, 'h0, etc.
     let _ ← token (matchStr "'")
@@ -385,11 +724,13 @@ partial def parsePrimary : P SVExpr := do
     | 'b' | 'B' =>
       skipUnderscoresAndSpaces
       let bd ← binDigitsStr
-      pure (SVExpr.lit (.binary none (binToNat bd)))
+      if hasUnknownDigit bd then pure (SVExpr.lit (.unknown none))
+      else pure (SVExpr.lit (.binary none (binToNat bd)))
     | 'h' | 'H' =>
       skipUnderscoresAndSpaces
       let hd ← hexDigitsWithUnderscore
-      pure (SVExpr.lit (.hex none (hexToNat hd)))
+      if hasUnknownDigit hd then pure (SVExpr.lit (.unknown none))
+      else pure (SVExpr.lit (.hex none (hexToNat hd)))
     | 'd' | 'D' =>
       skipUnderscoresAndSpaces
       let dd ← digits
@@ -522,6 +863,14 @@ def parseOptWidth : P (Option (Sparkle.IR.Type.DimExpr × Sparkle.IR.Type.DimExp
     let loDim ← match exprToDimExpr? lo with
       | some dim => pure dim
       | none => fail "unsupported symbolic low bound in packed range"
+    let descending : Bool := match hiDim.toNat?, loDim.toNat? with
+      | some hiValue, some loValue => decide (hiValue >= loValue)
+      | _, _ => match hiDim, loDim with
+        | .sub _ (.literal 1), .literal 0 => true
+        | .param _, .literal 0 => true
+        | _, _ => hiDim == loDim
+    unless descending do
+      fail "ascending or direction-ambiguous packed ranges are not supported; use a descending [high:low] range"
     pure (some (hiDim, loDim))
   | none => pure none
 
@@ -736,7 +1085,8 @@ partial def parseValidationGenerate : P (List SVModuleItem) := do
   colon
   let label ← identifier
   unless label.startsWith "sparkle_invalid_nat_parameter_" ||
-      label.startsWith "sparkle_invalid_dimension_" do
+      label.startsWith "sparkle_invalid_dimension_" ||
+      label.startsWith "sparkle_invalid_nat_work_width_" do
     fail "not a canonical Sparkle validation-generate label"
   keyword "initial"
   let _ ← token (matchStr "$fatal")
@@ -751,6 +1101,18 @@ partial def parseValidationGenerate : P (List SVModuleItem) := do
   keyword "end"
   keyword "endgenerate"
   pure [.validationGuard cond]
+
+/-- Core memory IR retains an exact depth and zero-based numeric indexes, but
+    not arbitrary unpacked-array bases.  Both `[0:N-1]` and `[N-1:0]` denote
+    the same supported index set; nonzero-base ranges fail closed. -/
+private partial def zeroBasedUnpackedDepth? (left right : Sparkle.IR.Type.DimExpr) :
+    Option Sparkle.IR.Type.DimExpr :=
+  match left, right with
+  | .literal 0, .sub base (.literal 1)
+  | .sub base (.literal 1), .literal 0 => some base
+  | .literal 0, .literal high | .literal high, .literal 0 =>
+      some (.literal (high + 1))
+  | _, _ => none
 
 partial def parseModuleItems : P (List SVModuleItem) := do
   match ← attempt (keyword "assign") with
@@ -790,10 +1152,9 @@ partial def parseModuleItems : P (List SVModuleItem) := do
           let hiDim ← match exprToDimExpr? hi with
             | some dim => pure dim
             | none => fail "unsupported symbolic high bound in unpacked array range"
-          let arrSize := match hiDim, loDim with
-            | .sub base (.literal 1), .literal 0 => base
-            | _, _ => Sparkle.IR.Type.DimExpr.mkAdd
-                (Sparkle.IR.Type.DimExpr.mkSub hiDim loDim) 1
+          let arrSize ← match zeroBasedUnpackedDepth? loDim hiDim with
+            | some depth => pure depth
+            | none => fail "unpacked arrays require a zero-based [0:high] or [high:0] range"
           semi
           pure [SVModuleItem.regDecl n w (some arrSize) isSigned]
         | none =>
@@ -823,10 +1184,9 @@ partial def parseModuleItems : P (List SVModuleItem) := do
           let hiDim ← match exprToDimExpr? hi with
             | some dim => pure dim
             | none => fail "unsupported symbolic high bound in unpacked array range"
-          let arrSize := match hiDim, loDim with
-            | .sub base (.literal 1), .literal 0 => base
-            | _, _ => Sparkle.IR.Type.DimExpr.mkAdd
-                (Sparkle.IR.Type.DimExpr.mkSub hiDim loDim) 1
+          let arrSize ← match zeroBasedUnpackedDepth? loDim hiDim with
+            | some depth => pure depth
+            | none => fail "unpacked arrays require a zero-based [0:high] or [high:0] range"
           semi
           pure [SVModuleItem.regDecl n w (some arrSize) isSigned]
         | none =>
@@ -997,10 +1357,22 @@ partial def parseModule : P SVModule := do
 
 def parse (input : String) : Except String SVDesign :=
   let preprocessed := preprocess input
-  Lexer.run (do ws; let modules ← many1 parseModule; pure { modules := modules.toList }) preprocessed
+  Lexer.run (do
+    ws
+    let modules ← many1 parseModule
+    ws
+    match ← peekChar with
+    | none => pure { modules := modules.toList }
+    | some ch => fail s!"unexpected trailing input starting with '{ch}'") preprocessed
 
 def parseModuleFromString (input : String) : Except String SVModule :=
   let preprocessed := preprocess input
-  Lexer.run (do ws; parseModule) preprocessed
+  Lexer.run (do
+    ws
+    let module_ ← parseModule
+    ws
+    match ← peekChar with
+    | none => pure module_
+    | some ch => fail s!"unexpected trailing input starting with '{ch}'") preprocessed
 
 end Tools.SVParser.Parser

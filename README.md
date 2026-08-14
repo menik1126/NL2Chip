@@ -209,10 +209,23 @@ the emitted SystemVerilog therefore retains parameter-sized casts such as
 default width. Narrowing keeps the least-significant bits, while widening
 zero-extends. Concrete constants can also be cast to a retained width, and the common
 all-ones forms `BitVec.ofNat W (2 ^ W - 1)` and `BitVec.allOnes W` are
-supported. This is not general value-level symbolic evaluation: an expression
-such as `BitVec.ofNat W (W + 1)` is deliberately rejected instead of being
-frozen at the default value. Parameter overrides must keep every resulting
-hardware width and array length positive.
+supported. More generally, `BitVec.ofNat W value` retains parameter-only Nat
+expressions (including arithmetic, masks, shifts, division/modulo, powers and
+`clog2`) as `paramConst` IR instead of evaluating them at the default. The SV
+backend gives every intermediate an explicit unsigned working width and emits
+guards before an invalid or excessively large configuration can reach a tool.
+Native Nat parameters use a 32-bit unsigned contract; hardware dimensions and
+constant-expression working widths are limited to 1,048,576 bits.
+
+The native SV parser also preserves parameter-dependent `generate if` blocks,
+canonical parameter-bounded procedural `for` loops, and exact symbolic memory
+depths. Memory depth is independent of address width in the IR, so a depth of
+10 is no longer silently rounded to 16. The currently supported parsed-memory
+profile is an unambiguous zero-based 1R1W memory; ambiguous ports, unsupported
+loop forms, signed/context-sized arithmetic, and other unmodeled SV constructs
+produce diagnostics instead of being expanded using defaults or guessed as
+8/32-bit values. Parameter overrides must keep every resulting hardware width
+and array length positive and within the guarded limit.
 
 Native parameters are supported by `#synthesize`, `#synthesizeVerilog`, the
 corresponding hierarchical `*Design` commands, and `#writeVerilogDesign`.
@@ -222,13 +235,21 @@ different values. `#writeCppSimDesign` and `#writeDesign` apply that pass using
 the supplied `parameters [...]` values (or the declared defaults) before
 emitting concrete C++/JIT artifacts; `#writeDesign` emits its SystemVerilog from
 the same specialization. Since the present CppSim execution backend supports
-packed values only through 64 bits, wider specializations fail closed on the
-C++/JIT paths while concrete SystemVerilog remains available. The current
+scalar packed operations only through 64 bits, wider arithmetic
+specializations fail closed on the C++/JIT paths while concrete SystemVerilog
+remains available. Passive, word-aligned concat/copy into wide output
+containers is supported. The current
 SV-to-Lean verification-model generator
 also requires a concrete module. Source-level Lean theorems may still be
 written directly over a generic definition. For CVDP, functional simulation
 for parameter overrides is supported, but per-configuration synthesis/PPA is
 not yet run, so PPA is reported as skipped for parameterized designs.
+
+Specialization selects a concrete native generate branch but preserves its SV
+scope, and native procedural loops remain structured SV items. CppSim and the
+automatic verification-model generator therefore reject designs that still
+contain those native items; emit/simulate their SystemVerilog, or normalize the
+selected process into ordinary core IR first.
 
 ### 🔒 Formal Verification Ready
 

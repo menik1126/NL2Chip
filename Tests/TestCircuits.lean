@@ -70,6 +70,10 @@ def testNativeSetWidthNarrow {dom : DomainConfig} {width : Nat}
     (sig : Signal dom (BitVec (width + 1))) : Signal dom (BitVec width) :=
   Signal.map (BitVec.setWidth width) sig
 
+def testNativeShiftAmount {dom : DomainConfig} {width amount : Nat}
+    (sig : Signal dom (BitVec width)) : Signal dom (BitVec width) :=
+  Signal.map (fun value => BitVec.shiftLeft value amount) sig
+
 def testNativeConstant {width : Nat} : Signal Domain (BitVec width) :=
   Signal.pure (1 : BitVec width)
 

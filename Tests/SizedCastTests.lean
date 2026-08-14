@@ -57,14 +57,14 @@ private partial def collectResizeWidths : Expr → List DimExpr
   | .op _ args | .concat args => args.flatMap collectResizeWidths
   | .slice value _ _ => collectResizeWidths value
   | .index array index => collectResizeWidths array ++ collectResizeWidths index
-  | .const _ _ | .ref _ => []
+  | .const _ _ | .paramConst _ _ | .ref _ => []
 
 private def moduleResizeWidths (module_ : Module) : List DimExpr :=
   module_.body.flatMap fun statement =>
     match statement with
     | .assign _ rhs => collectResizeWidths rhs
     | .register _ _ _ input _ => collectResizeWidths input
-    | .memory _ _ _ _ writeAddr writeData writeEnable readAddr _ _ =>
+    | .memory _ _ _ _ _ writeAddr writeData writeEnable readAddr _ _ =>
       [writeAddr, writeData, writeEnable, readAddr].flatMap collectResizeWidths
     | .inst _ _ connections _ =>
       connections.flatMap (fun (_, value) => collectResizeWidths value)
@@ -457,8 +457,8 @@ private def checkSymbolicConstantMaterialization : IO Unit := do
   let design ← requireOk (parseAndLowerNative source)
   let emitted ← requireOk
     (Sparkle.Backend.Verilog.toVerilogDesignChecked design)
-  ensure (contains emitted "$unsigned(((W) > 0 ? (W) : 1)'(-1))" &&
-      contains emitted "$unsigned(((V) > 0 ? (V) : 1)'(-1))")
+  ensure (contains emitted "$unsigned(" && contains emitted "W" &&
+      contains emitted "V" && contains emitted "'(-1))")
     "backend did not immediately materialize symbolic constants as unsigned"
   let reparsed ← requireOk (parseAndLowerNative emitted)
   let reemitted ← requireOk

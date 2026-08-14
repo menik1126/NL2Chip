@@ -146,7 +146,7 @@ def testGenericLiteral {width : Nat} : Signal Domain (BitVec width) :=
 #synthesizeVerilog testGenericLiteral parameters [width := 8]
 
 /--
-error: Unresolved BitVec literal width width is not a declared module parameter.
+error: Unresolved BitVec parameter constant width width is not a declared module parameter.
 
 Give the top-level Nat binder a SystemVerilog default in the synthesis command, for example: #synthesizeVerilog circuit parameters [W := 8]. Parameter defaults may be zero, but every derived hardware width and array length must be positive.
 -/
@@ -188,9 +188,7 @@ def testDerivedZeroDefault (width : Nat := 1)
   sig
 
 /--
-error: The default parameter configuration of module 'Tests.CompilerTests.testDerivedZeroDefault' gives zero input '_gen_sig' width ('(width - 1)').
-
-Packed hardware widths and array lengths must be positive. Choose defaults whose derived hardware dimensions are all greater than zero.
+error: module 'Tests.CompilerTests.testDerivedZeroDefault' port/wire '_gen_sig' evaluates to zero under the module's default parameters
 -/
 #guard_msgs in
 #synthesizeVerilog testDerivedZeroDefault
@@ -276,7 +274,7 @@ def testZeroWidthConstant : Signal Domain (BitVec 0) :=
   Signal.pure (BitVec.ofNat 0 0)
 
 /--
-error: Cannot synthesize hardware with zero BitVec literal width.
+error: Cannot synthesize hardware with zero BitVec parameter constant width.
 
 Packed hardware widths and array lengths must be positive.
 -/

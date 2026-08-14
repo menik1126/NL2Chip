@@ -157,7 +157,8 @@ def emitMemory (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr) (cloc
   -- Add the read data output wire
   let m := m.addWire { name := readDataName, ty := .bitVector dataWidth }
   -- Add the memory statement
-  let m := m.addStmt (.memory memName addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readDataName)
+  let depth := DimExpr.mkPow 2 addrWidth
+  let m := m.addStmt (.memory memName addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readDataName)
   setModule m
   return readDataName
 
@@ -171,7 +172,8 @@ def emitMemoryComboRead (hint : String) (addrWidth : DimExpr) (dataWidth : DimEx
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
   let m ← getModule
   let m := m.addWire { name := readDataName, ty := .bitVector dataWidth }
-  let m := m.addStmt (.memory memName addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readDataName (comboRead := true))
+  let depth := DimExpr.mkPow 2 addrWidth
+  let m := m.addStmt (.memory memName addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readDataName (comboRead := true))
   setModule m
   return readDataName
 

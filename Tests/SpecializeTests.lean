@@ -134,7 +134,7 @@ private def paramMemory : Module :=
     outputs := [{ name := "rd_data", ty := .bitVector dataWidth }]
     wires := [{ name := "rd", ty := .bitVector dataWidth }]
     body :=
-      [.memory "storage" addrWidth dataWidth "clk"
+      [.memory "storage" addrWidth dataWidth (DimExpr.mkPow 2 addrWidth) "clk"
         (.ref "wr_addr") (.ref "wr_data") (.ref "wr_en")
         (.ref "rd_addr") "rd" true,
        .assign "rd_data" (.ref "rd")] }
@@ -395,6 +395,9 @@ private def checkWidth (width : Nat) : IO Unit := do
     ensure (isError
       (Sparkle.Backend.CppSim.validateSpecializedDesign specialized))
       s!"W={width}: CppSim accepted a wide value it cannot execute"
+    ensure (isError
+      (Sparkle.Backend.CppSim.toCppSimDesignChecked specialized))
+      s!"W={width}: checked CppSim emitted a design containing skipped wide assignments"
 
 private def checkDerived : IO Unit := do
   let specialized ← requireOk
@@ -531,6 +534,27 @@ private def checkDefaultsAndErrors : IO Unit := do
     "duplicate top parameter was accepted"
   ensure (isError (specializeDesign addDesign [("W", 0)]))
     "zero hardware width was accepted"
+  ensure (isError (specializeDesign addDesign [("W", 0x100000000)]))
+    "top-level override above the 32-bit native parameter contract was accepted"
+  let oversizedDefault : Module :=
+    { (Module.empty "oversized_parameter_default") with
+      parameters := [{ name := "W", defaultValue := 0x100000000 }] }
+  ensure (isError (specializeDesign
+      { topModule := oversizedDefault.name, modules := [oversizedDefault] } []))
+    "parameter default above the 32-bit native parameter contract was accepted"
+  ensure (isError (specializeDesign hierarchyDesign [("N", 0xffffffff)]))
+    "derived child override above the 32-bit native parameter contract was accepted"
+  let excessiveWorkModule : Module :=
+    { (Module.empty "excessive_nat_work") with
+      parameters := [{ name := "K", defaultValue := 3 }]
+      outputs := [{ name := "y", ty := .bitVector 1 }]
+      body := [.assign "y" (.paramConst (DimExpr.mkShl 1 (.param "K")) 1)] }
+  let excessiveWorkDesign : Design :=
+    { topModule := excessiveWorkModule.name, modules := [excessiveWorkModule] }
+  ensure (isError (specializeDesign excessiveWorkDesign [("K", 1048577)]))
+    "specialization evaluated a parameter constant beyond the Verilog work-width cap"
+  ensure (isError (specializeDesign excessiveWorkDesign [("K", 0xffffffff)]))
+    "specialization attempted an effectively unbounded natural-number shift"
   ensure (isError (specializeDesign missingTopDesign []))
     "missing top module was accepted"
   ensure (isError (specializeDesign missingModuleDesign []))

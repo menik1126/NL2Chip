@@ -2068,7 +2068,7 @@ def _cvdp_parameter_usage_text(sv_code: str, module_name: str) -> str:
     semantic_text = _module_semantic_text(sv_code, module_name)
     generated_guard = re.compile(
         r"\bgenerate\b(?:(?!\bendgenerate\b).)*?\bbegin\s*:\s*"
-        r"sparkle_invalid_(?:nat_parameter|dimension)_\d+\b"
+        r"sparkle_invalid_(?:nat_parameter|dimension|nat_work_width)_\d+\b"
         r"(?:(?!\bendgenerate\b).)*?\bend\s+endgenerate\b",
         flags=re.DOTALL,
     )

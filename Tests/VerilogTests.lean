@@ -90,6 +90,25 @@ def zeroOffsetIR : Sparkle.IR.AST.Module :=
     outputs := [{ name := "y", ty := .bitVector 8 }]
     body := [.assign "y" (.slice (.ref "x") (.param "Start" + 7) (.param "Start"))] }
 
+def oversizedDefaultWorkIR : Sparkle.IR.AST.Module :=
+  { (Sparkle.IR.AST.Module.empty "oversized_default_work_ir") with
+    «parameters» := [{ name := "K", defaultValue := 0xffffffff }]
+    inputs := [{ name := "x", ty := .bitVector (Sparkle.IR.Type.DimExpr.mkShl 1 (.param "K")) }]
+    outputs := [{ name := "y", ty := .bit }]
+    body := [.assign "y" (.const 0 1)] }
+
+def sliceDimensionGuardIR : Sparkle.IR.AST.Module :=
+  { (Sparkle.IR.AST.Module.empty "slice_dimension_guard_ir") with
+    «parameters» := [{ name := "W", defaultValue := 8 }]
+    inputs := [{ name := "x", ty := .bitVector 8 }]
+    outputs := [{ name := "y", ty := .bit }]
+    body :=
+      [.assign "y"
+        (.op .eq [
+          .slice (.ref "x")
+            (Sparkle.IR.Type.DimExpr.mkSub (.param "W") 1) 0,
+          .ref "x"])] }
+
 def collidingNameIR : Sparkle.IR.AST.Module :=
   { (Sparkle.IR.AST.Module.empty "colliding_name_ir") with
     «parameters» := [{ name := "data-width", defaultValue := 8 }]
@@ -187,10 +206,10 @@ def generatedInternalWireRoundTripOutput : String :=
 
 def generatedSequentialRoundTrip : Except String String := do
   let source := "module native_seq #(parameter W = 8) (\n" ++
-    "  input logic [(((W) > 0 ? (W) : 1) - 1):0] x, input logic clk, input logic rst,\n" ++
-    "  output logic [(((W) > 0 ? (W) : 1) - 1):0] y);\n" ++
-    "logic [(((W) > 0 ? (W) : 1) - 1):0] q;\n" ++
-    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= $unsigned(((W) > 0 ? (W) : 1)'(0)); else q <= x; end\n" ++
+    "  input logic [W-1:0] x, input logic clk, input logic rst,\n" ++
+    "  output logic [W-1:0] y);\n" ++
+    "logic [W-1:0] q;\n" ++
+    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= $unsigned((W)'(0)); else q <= x; end\n" ++
     "assign y = q; endmodule\n"
   let parsed ← Tools.SVParser.Lower.parseAndLowerNative source
   let module_ ← match parsed.modules with
@@ -205,10 +224,10 @@ def generatedSequentialRoundTripOutput : String :=
 
 def generatedAllOnesSequentialRoundTrip : Except String String := do
   let source := "module native_seq_ones #(parameter W = 8) (\n" ++
-    "  input logic [(((W) > 0 ? (W) : 1) - 1):0] x, input logic clk, input logic rst,\n" ++
-    "  output logic [(((W) > 0 ? (W) : 1) - 1):0] y);\n" ++
-    "logic [(((W) > 0 ? (W) : 1) - 1):0] q;\n" ++
-    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= $unsigned(((W) > 0 ? (W) : 1)'(-1)); else q <= x; end\n" ++
+    "  input logic [W-1:0] x, input logic clk, input logic rst,\n" ++
+    "  output logic [W-1:0] y);\n" ++
+    "logic [W-1:0] q;\n" ++
+    "always_ff @(posedge clk or posedge rst) begin if (rst) q <= $unsigned((W)'(-1)); else q <= x; end\n" ++
     "assign y = q; endmodule\n"
   let parsed ← Tools.SVParser.Lower.parseAndLowerNative source
   let module_ ← match parsed.modules with
@@ -223,11 +242,11 @@ def generatedAllOnesSequentialRoundTripOutput : String :=
 
 def generatedPositiveSequentialRoundTrip : Except String String := do
   let source := "module native_seq_positive #(parameter W = 8) (\n" ++
-    "  input logic [(((W) > 0 ? (W) : 1) - 1):0] x, input logic clk, input logic rst,\n" ++
-    "  output logic [(((W) > 0 ? (W) : 1) - 1):0] y);\n" ++
-    "logic [(((W) > 0 ? (W) : 1) - 1):0] q;\n" ++
+    "  input logic [W-1:0] x, input logic clk, input logic rst,\n" ++
+    "  output logic [W-1:0] y);\n" ++
+    "logic [W-1:0] q;\n" ++
     "always_ff @(posedge clk or posedge rst) begin " ++
-    "if (rst) q <= $unsigned(((W) > 0 ? (W) : 1)'(511)); else q <= x; end\n" ++
+    "if (rst) q <= $unsigned((W)'(511)); else q <= x; end\n" ++
     "assign y = q; endmodule\n"
   let parsed ← Tools.SVParser.Lower.parseAndLowerNative source
   let module_ ← match parsed.modules with
@@ -299,17 +318,17 @@ def concreteNonliteralSizedCastSupported : Bool :=
     "assign y = {(3)'(x), (3)'(x)}; endmodule\n"
   exceptIsOk (Tools.SVParser.Lower.parseAndLowerNative source)
 
-def parameterizedGenerateRejected : Bool :=
+def parameterizedGenerateRetained : Bool :=
   let source := "module generated #(parameter W = 8) (input wire x, output wire y);\n" ++
     "generate if (W > 1) begin assign y = x; end else begin assign y = 1'b0; end endgenerate\n" ++
     "endmodule\n"
-  exceptIsError (Tools.SVParser.Lower.parseAndLowerNative source)
+  exceptIsOk (Tools.SVParser.Lower.parseAndLowerNative source)
 
-def parameterizedForRejected : Bool :=
+def parameterizedForRetained : Bool :=
   let source := "module looped #(parameter W = 8) (input wire [W-1:0] x, output reg [W-1:0] y);\n" ++
     "integer i; always @* begin for (i = 0; i < W; i = i + 1) y[i] = x[i]; end\n" ++
     "endmodule\n"
-  exceptIsError (Tools.SVParser.Lower.parseAndLowerNative source)
+  exceptIsOk (Tools.SVParser.Lower.parseAndLowerNative source)
 
 def noncanonicalFatalGenerateRejected : Bool :=
   let source := "module guarded #(parameter W = 8) (input wire x, output wire y);\n" ++
@@ -347,12 +366,15 @@ def legacyParameterizedWidthSpecializes : Bool :=
     module_.parameters.isEmpty && module_.inputs.head?.bind (·.ty.bitWidth) == some 8
   | _ => false
 
-def legacyHierarchyOverrideSpecializes : Bool :=
+def legacyHierarchyOverrideResult : Except String Sparkle.IR.AST.Design :=
   let source := "module child #(parameter W = 8) (input wire x, output wire y); " ++
     "generate if (W == 4) begin assign y = x; end else begin assign y = 1'b0; end endgenerate endmodule\n" ++
     "module top #(parameter P = 3) (input wire x, output wire y); " ++
-    "child #(.W(P+1)) u (.x(x), .y(y)); endmodule\n"
-  match Tools.SVParser.Lower.parseAndLowerFlat source with
+    "localparam PW = P + 1; child #(.W(PW)) u (.x(x), .y(y)); endmodule\n"
+  Tools.SVParser.Lower.parseAndLowerFlat source
+
+def legacyHierarchyOverrideSpecializes : Bool :=
+  match legacyHierarchyOverrideResult with
   | .ok { modules := [module_], .. } =>
     module_.body.any fun statement => match statement with
       | .assign "_gen_u_y" (.ref "_gen_u_x") => true
@@ -361,14 +383,10 @@ def legacyHierarchyOverrideSpecializes : Bool :=
   | _ => false
 
 def nativeHierarchyRoundTrip : Except String String := do
-  let source := "module native_child #(parameter W = 8) " ++
-    "(input wire [W-1:0] x, output wire [W-1:0] y); assign y = x; endmodule\n" ++
-    "module native_top #(parameter N = 8) " ++
-    "(input wire [N-1:0] a, input wire [N:0] b, output wire [N-1:0] z0, output wire [N:0] z1); " ++
-    "native_child #(.W(N)) u0 (.x(a), .y(z0)); " ++
-    "native_child #(.W(N+1)) u1 (.x(b), .y(z1)); endmodule\n"
+  let source ← Sparkle.Backend.Verilog.toVerilogDesignChecked {
+    topModule := nativeTopIR.name, modules := [nativeTopIR, nativeChildIR] }
   let design ← Tools.SVParser.Lower.parseAndLowerNative source
-  unless design.topModule == "native_top" do
+  unless design.topModule == nativeTopIR.name do
     throw s!"wrong native hierarchy root: {design.topModule}"
   Sparkle.Backend.Verilog.toVerilogDesignChecked design
 
@@ -377,10 +395,31 @@ def nativeHierarchyRoundTripOutput : String :=
   | .ok output => output
   | .error error => s!"/* ERROR: {error} */"
 
+def nativeHierarchyOverridesPreserved : Bool :=
+  match Sparkle.Backend.Verilog.toVerilogDesignChecked {
+      topModule := nativeTopIR.name, modules := [nativeTopIR, nativeChildIR] } with
+  | .error _ => false
+  | .ok source =>
+    match Tools.SVParser.Lower.parseAndLowerNative source with
+    | .error _ => false
+    | .ok design =>
+      match design.modules.find? (fun module_ => module_.name == nativeTopIR.name) with
+      | none => false
+      | some module_ =>
+        let hasDirectOverride := module_.body.any fun statement => match statement with
+          | .inst "native_child_ir" "u0" _ [("W", value)] =>
+            value == (.param "N" : Sparkle.IR.Type.DimExpr)
+          | _ => false
+        let hasDerivedOverride := module_.body.any fun statement => match statement with
+          | .inst "native_child_ir" "u1" _ [("W", value)] =>
+            value == (.add (.param "N") (.literal 1) : Sparkle.IR.Type.DimExpr)
+          | _ => false
+        hasDirectOverride && hasDerivedOverride
+
 def nativeWideComplementRoundTrip : Except String String := do
   let source := "module wide_not #(parameter W = 257) " ++
     "(output wire [W-1:0] y); " ++
-    "assign y = ~$unsigned(((W) > 0 ? (W) : 1)'(0)); endmodule\n"
+    "assign y = ~$unsigned((W)'(0)); endmodule\n"
   let design ← Tools.SVParser.Lower.parseAndLowerNative source
   let module_ ← match design.modules with
     | [module_] => pure module_
@@ -443,6 +482,30 @@ def symbolicSequentialResetSemantics : IO Bool := do
     return false
   return simulated.stdout.containsSubstr "PASS symbolic sequential resets"
 
+def symbolicShiftAmountSemantics (verilog : String) : IO Bool := do
+  let dir := "/tmp/sparkle_verilog_tests"
+  IO.FS.createDirAll dir
+  let sourcePath := s!"{dir}/symbolic_shift_amount.sv"
+  let executable := s!"{dir}/symbolic_shift_amount.vvp"
+  let bench :=
+    "module tb; logic [1:0] x; wire [1:0] y;\n" ++
+    "testNativeShiftAmount #(.width(2), .amount(4)) dut(._gen_sig(x), .out(y));\n" ++
+    "initial begin x=2'b01; #1; if (y !== 2'b00) $fatal(1); " ++
+    "$display(\"PASS symbolic shift amount\"); $finish; end endmodule\n"
+  IO.FS.writeFile sourcePath (verilog ++ "\n" ++ bench)
+  let compiled ← IO.Process.output {
+    cmd := "iverilog"
+    args := #["-g2012", "-s", "tb", "-o", executable, sourcePath]
+  }
+  if compiled.exitCode != 0 then
+    IO.eprintln s!"symbolic shift Icarus compile failed:\n{compiled.stderr}"
+    return false
+  let simulated ← IO.Process.output { cmd := "vvp", args := #[executable] }
+  if simulated.exitCode != 0 then
+    IO.eprintln s!"symbolic shift Icarus simulation failed:\n{simulated.stdout}{simulated.stderr}"
+    return false
+  return simulated.stdout.containsSubstr "PASS symbolic shift amount"
+
 -- ============================================================================
 -- Test Suite
 -- ============================================================================
@@ -463,6 +526,7 @@ structure VerilogOutputs where
   nativeZeroExtendLambdaVerilog : String
   nativeZeroExtendPartialVerilog : String
   nativeSetWidthNarrowVerilog : String
+  nativeShiftAmountVerilog : String
   nativeConstantVerilog : String
   nativeRegisterVerilog : String
   nativeMemoryVerilog : String
@@ -486,6 +550,9 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedToString `testNativeZeroExtendPartial [("width", 8)]
   let nativeSetWidthNarrowVerilog ←
     synthesizeParameterizedToString `testNativeSetWidthNarrow [("width", 8)]
+  let nativeShiftAmountVerilog ←
+    synthesizeParameterizedToString `testNativeShiftAmount
+      [("width", 8), ("amount", 3)]
   let nativeConstantVerilog ← synthesizeParameterizedToString `testNativeConstant [("width", 8)]
   let nativeRegisterVerilog ← synthesizeParameterizedToString `testNativeRegister [("width", 8)]
   let nativeMemoryVerilog ← synthesizeParameterizedToString `testNativeMemory
@@ -495,13 +562,13 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     generic4Verilog, generic16Verilog, closedWidthVerilog,
     nativeIdentityVerilog, nativeAddVerilog, nativeDerivedVerilog,
     nativeZeroExtendLambdaVerilog, nativeZeroExtendPartialVerilog,
-    nativeSetWidthNarrowVerilog,
+    nativeSetWidthNarrowVerilog, nativeShiftAmountVerilog,
     nativeConstantVerilog, nativeRegisterVerilog, nativeMemoryVerilog
   }
 
 /-- Create test suite from synthesized outputs -/
 def makeTests (outputs : VerilogOutputs)
-    (symbolicResetSemantics : Bool) : TestSeq :=
+    (symbolicResetSemantics symbolicShiftSemantics : Bool) : TestSeq :=
   let addModule := extractModule outputs.addVerilog "test_add"
   let hierTopModule := extractModule outputs.hierarchicalVerilog "test_hierarchical_alu"
   let nativeIRVerilog := toVerilog nativeWidthIR
@@ -565,15 +632,19 @@ def makeTests (outputs : VerilogOutputs)
     ) ++
     group "Native Symbolic Widths" (
       test "module declares an overrideable width parameter"
-        (outputs.nativeIdentityVerilog.containsSubstr "parameter width = 8") $
+        (outputs.nativeIdentityVerilog.containsSubstr "parameter [31:0] width = 8") $
       test "identity ports retain symbolic width"
-        (outputs.nativeIdentityVerilog.containsSubstr
-          "logic [(((width) > 0 ? (width) : 1) - 1):0]") $
+        (outputs.nativeIdentityVerilog.containsSubstr "input logic [" &&
+          outputs.nativeIdentityVerilog.containsSubstr "output logic [" &&
+          outputs.nativeIdentityVerilog.containsSubstr "'(width)" &&
+          !outputs.nativeIdentityVerilog.containsSubstr "input logic [7:0]") $
       test "arithmetic datapath retains symbolic width"
         (outputs.nativeAddVerilog.containsSubstr "assign _tmp_result_0 = (_gen_a + _gen_b)") $
       test "derived widths remain symbolic"
-        (outputs.nativeDerivedVerilog.containsSubstr
-          "logic [((((width + 1)) > 0 ? ((width + 1)) : 1) - 1):0]") $
+        (outputs.nativeDerivedVerilog.containsSubstr "input logic [" &&
+          outputs.nativeDerivedVerilog.containsSubstr "'(width)" &&
+          outputs.nativeDerivedVerilog.containsSubstr
+            "(width + 1) must be between 1 and 1048576") $
       test "zeroExtend lambda lowers to a native resize"
         (outputs.nativeZeroExtendLambdaVerilog.containsSubstr "$unsigned(" &&
           outputs.nativeZeroExtendLambdaVerilog.containsSubstr "width + 1") $
@@ -582,20 +653,40 @@ def makeTests (outputs : VerilogOutputs)
           outputs.nativeZeroExtendPartialVerilog.containsSubstr "width + 1") $
       test "setWidth narrowing lowers to a native resize"
         (outputs.nativeSetWidthNarrowVerilog.containsSubstr "$unsigned(" &&
-          outputs.nativeSetWidthNarrowVerilog.containsSubstr "parameter width = 8") $
+          outputs.nativeSetWidthNarrowVerilog.containsSubstr
+            "parameter [31:0] width = 8") $
+      test "Nat shift amount is not truncated to the data width"
+        symbolicShiftSemantics $
       test "parameter-sized constant uses an SV sized cast"
-        (outputs.nativeConstantVerilog.containsSubstr
-          "$unsigned(((width) > 0 ? (width) : 1)'(1))") $
+        (outputs.nativeConstantVerilog.containsSubstr "$unsigned(" &&
+          outputs.nativeConstantVerilog.containsSubstr "'(width)" &&
+          outputs.nativeConstantVerilog.containsSubstr "'(1));") $
       test "parameter-sized reset uses an SV sized cast"
-        (outputs.nativeRegisterVerilog.containsSubstr
-          "<= $unsigned(((width) > 0 ? (width) : 1)'(0))") $
+        (outputs.nativeRegisterVerilog.containsSubstr "<= $unsigned(" &&
+          outputs.nativeRegisterVerilog.containsSubstr "'(width)" &&
+          outputs.nativeRegisterVerilog.containsSubstr "'(0));") $
       test "memory exposes both native parameters"
-        (outputs.nativeMemoryVerilog.containsSubstr "parameter addrWidth = 4") $
-      test "memory depth and data width remain symbolic"
         (outputs.nativeMemoryVerilog.containsSubstr
-          "logic [(((dataWidth) > 0 ? (dataWidth) : 1) - 1):0] _tmp_result_0 [0:((((2 ** addrWidth)) > 0 ? ((2 ** addrWidth)) : 1) - 1)]") $
+            "parameter [31:0] addrWidth = 4" &&
+          outputs.nativeMemoryVerilog.containsSubstr
+            "parameter [31:0] dataWidth = 8") $
+      test "memory depth and data width remain symbolic"
+        (outputs.nativeMemoryVerilog.containsSubstr "logic [" &&
+          outputs.nativeMemoryVerilog.containsSubstr "'(dataWidth)" &&
+          outputs.nativeMemoryVerilog.containsSubstr " ** " &&
+          outputs.nativeMemoryVerilog.containsSubstr "'(addrWidth)" &&
+          outputs.nativeMemoryVerilog.containsSubstr "_tmp_result_0 [0:") $
       test "symbolic ranges are clamped before reporting a zero override"
-        (nativeIRVerilog.containsSubstr "((W) > 0 ? (W) : 1)") $
+        (nativeIRVerilog.containsSubstr "> 0 &&" &&
+          nativeIRVerilog.containsSubstr "<= 1048576" &&
+          nativeIRVerilog.containsSubstr "'(W)") $
+      test "symbolic slice widths receive the same upper-bound guard"
+        ((toVerilog sliceDimensionGuardIR).containsSubstr
+          "slice result width" &&
+         (toVerilog sliceDimensionGuardIR).containsSubstr
+          "must be between 1 and 1048576") $
+      test "hostile default shifts fail before allocating an unbounded Nat"
+        (exceptIsError (toVerilogChecked oversizedDefaultWorkIR)) $
       test "zero-width overrides receive a controlled fatal guard"
         (nativeIRVerilog.containsSubstr "Sparkle invalid hardware dimension") $
       test "negative Nat overrides receive a controlled fatal guard"
@@ -615,14 +706,17 @@ def makeTests (outputs : VerilogOutputs)
       test "verification-model generation rejects native parameters"
         (exceptIsError (Tools.SVParser.Verify.moduleToLean nativeWidthIR)) $
       test "SV parser retains a module parameter instead of a constant wire"
-        (parsedNativeWidthOutput.containsSubstr "parameter W = 8" &&
+        (parsedNativeWidthOutput.containsSubstr "parameter [31:0] W = 8" &&
           !parsedNativeWidthOutput.containsSubstr "assign W =") $
       test "SV parser retains W-1:0 as a native symbolic width"
-        (parsedNativeWidthOutput.containsSubstr "((W) > 0 ? (W) : 1)" &&
-          !parsedNativeWidthOutput.containsSubstr "[31:0]") $
+        (parsedNativeWidthOutput.containsSubstr "input logic [" &&
+          parsedNativeWidthOutput.containsSubstr "output logic [" &&
+          parsedNativeWidthOutput.containsSubstr "'(W)" &&
+          !parsedNativeWidthOutput.containsSubstr "input logic [31:0]") $
       test "backend safe symbolic ranges parse and emit again"
-        (generatedNativeRoundTripOutput.containsSubstr "parameter W = 8" &&
-          generatedNativeRoundTripOutput.containsSubstr "((W) > 0 ? (W) : 1)") $
+        (generatedNativeRoundTripOutput.containsSubstr "parameter [31:0] W = 8" &&
+          generatedNativeRoundTripOutput.containsSubstr "'(W)" &&
+          generatedNativeRoundTripOutput.containsSubstr "assign y = x") $
       test "backend logic declarations and parameter-sized constants round-trip"
         (generatedInternalWireRoundTripOutput.containsSubstr "logic" &&
           generatedInternalWireRoundTripOutput.containsSubstr "$unsigned(" &&
@@ -651,10 +745,10 @@ def makeTests (outputs : VerilogOutputs)
         legacyStandaloneSignedStillAccepted $
       test "concrete nonliteral sized casts lower to explicit resize nodes"
         concreteNonliteralSizedCastSupported $
-      test "parameter-dependent generate fails closed for native overrides"
-        parameterizedGenerateRejected $
-      test "parameter-dependent procedural for fails closed for native overrides"
-        parameterizedForRejected $
+      test "parameter-dependent generate is retained for native overrides"
+        parameterizedGenerateRetained $
+      test "parameter-dependent procedural for is retained for native overrides"
+        parameterizedForRetained $
       test "noncanonical user fatal-generate is not silently discarded"
         noncanonicalFatalGenerateRejected $
       test "dependent native parameter defaults fail closed"
@@ -668,9 +762,9 @@ def makeTests (outputs : VerilogOutputs)
       test "legacy hierarchy specializes parent-dependent child overrides"
         legacyHierarchyOverrideSpecializes $
       test "native hierarchy selects the root and preserves distinct overrides"
-        (nativeHierarchyRoundTripOutput.containsSubstr "module native_top" &&
-          nativeHierarchyRoundTripOutput.containsSubstr ".W(N)" &&
-          nativeHierarchyRoundTripOutput.containsSubstr ".W((N + 1))") $
+        (nativeHierarchyOverridesPreserved &&
+          nativeHierarchyRoundTripOutput.containsSubstr "module native_top_ir" &&
+          nativeHierarchyRoundTripOutput.containsSubstr "module native_child_ir") $
       test "wide bitwise complement remains width preserving"
         (nativeWideComplementRoundTripOutput.containsSubstr "~" &&
           nativeWideComplementRoundTripOutput.containsSubstr "$unsigned(" &&
@@ -679,7 +773,7 @@ def makeTests (outputs : VerilogOutputs)
         (nativeWideReductionAndRoundTripOutput.containsSubstr "~x" &&
           !nativeWideReductionAndRoundTripOutput.containsSubstr "32'hffffffff") $
       test "flattening preserves the parent parameter"
-        (flattenedNativeVerilog.containsSubstr "parameter N = 8") $
+        (flattenedNativeVerilog.containsSubstr "parameter [31:0] N = 8") $
       test "flattening substitutes each child override independently"
         (flattenedNativeVerilog.containsSubstr "(N + 1)" &&
           !flattenedNativeVerilog.containsSubstr "parameter W =")
@@ -718,5 +812,7 @@ def main : IO UInt32 := do
 
   -- Create and run tests
   let symbolicResetSemantics ← symbolicSequentialResetSemantics
-  let tests := makeTests outputs symbolicResetSemantics
+  let symbolicShiftSemantics ←
+    symbolicShiftAmountSemantics outputs.nativeShiftAmountVerilog
+  let tests := makeTests outputs symbolicResetSemantics symbolicShiftSemantics
   lspecIO (Std.HashMap.ofList [("verilog", [tests])]) []

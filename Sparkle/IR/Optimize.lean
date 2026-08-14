@@ -44,6 +44,7 @@ def buildWidthMap (m : Module) : WidthMap :=
 /-- Infer the possibly-symbolic bit-width of an expression. -/
 partial def inferWidth (wm : WidthMap) : Expr → DimExpr
   | .const _ w => w
+  | .paramConst _ w => w
   | .ref name => wm.getD name 0
   | .resize width _ => width
   | .slice _ hi lo => hi - lo + 1
@@ -145,6 +146,14 @@ partial def resolveSlice (dm : DefMap) (wm : WidthMap)
 
 /-- Fold constant expressions -/
 def foldConstants : Expr → Expr
+  | .paramConst value width =>
+    match value.toNat? with
+    | some concreteValue =>
+      let normalized := match width.toNat? with
+        | some concreteWidth => Expr.normalizeNatToWidth concreteValue concreteWidth
+        | none => concreteValue
+      .const (Int.ofNat normalized) width
+    | none => .paramConst value width
   -- Normalize through the source width before changing widths.  Simply
   -- relabelling `0x1ff#8` as a 16-bit constant would incorrectly produce
   -- 0x01ff instead of zero-extending the source value 0xff.
@@ -177,6 +186,7 @@ def foldConstants : Expr → Expr
 
 /-- Optimize a single expression by resolving slice chains and folding constants -/
 partial def optimizeExpr (dm : DefMap) (wm : WidthMap) : Expr → Expr
+  | .paramConst value width => foldConstants (.paramConst value width)
   | .resize width value =>
       foldConstants (.resize width (optimizeExpr dm wm value))
   | .slice (.ref name) hi lo => foldConstants (resolveSlice dm wm name hi lo 500)
@@ -192,6 +202,7 @@ partial def countExprUses (e : Expr) (counts : HashMap String Nat)
   match e with
   | .ref name => counts.insert name ((counts.getD name 0) + 1)
   | .const _ _ => counts
+  | .paramConst _ _ => counts
   | .resize _ value => countExprUses value counts
   | .slice inner _ _ => countExprUses inner counts
   | .concat args => args.foldl (fun acc a => countExprUses a acc) counts
@@ -204,7 +215,7 @@ def countAllUses (stmts : List Stmt) : HashMap String Nat :=
     match stmt with
     | .assign _ rhs => countExprUses rhs counts
     | .register _ _ _ input _ => countExprUses input counts
-    | .memory _ _ _ _ wa wd we ra _ _ =>
+    | .memory _ _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
     | .inst _ _ conns _ =>
       conns.foldl (fun acc (_, e) => countExprUses e acc) counts
@@ -215,8 +226,8 @@ def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
   | .assign lhs rhs => .assign lhs (optimizeExpr dm wm rhs)
   | .register output clock reset input initValue =>
     .register output clock reset (optimizeExpr dm wm input) initValue
-  | .memory name aw dw clk wa wd we ra rd cr =>
-    .memory name aw dw clk
+  | .memory name aw dw depth clk wa wd we ra rd cr =>
+    .memory name aw dw depth clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
       (optimizeExpr dm wm we) (optimizeExpr dm wm ra) rd cr
   | .inst modName instName conns parameterOverrides =>
@@ -234,6 +245,7 @@ partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
       | none => .ref name
     else .ref name
   | .const v w => .const v w
+  | .paramConst value width => .paramConst value width
   | .resize width value => .resize width (substituteExpr dm inlinable fuel value)
   | .slice e hi lo => .slice (substituteExpr dm inlinable fuel e) hi lo
   | .concat args => .concat (args.map (substituteExpr dm inlinable fuel ·))
@@ -268,7 +280,7 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
   ) ({} : HashMap String Bool)
   let memoryReadData := body.foldl (fun s stmt =>
     match stmt with
-    | .memory _ _ _ _ _ _ _ _ rd _ => s.insert rd true
+    | .memory _ _ _ _ _ _ _ _ _ rd _ => s.insert rd true
     | _ => s
   ) ({} : HashMap String Bool)
 
@@ -301,8 +313,8 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
       .assign lhs (substituteExpr dm inlinable 100 rhs)
     | .register output clock reset input initValue =>
       .register output clock reset (substituteExpr dm inlinable 100 input) initValue
-    | .memory name aw dw clk wa wd we ra rd cr =>
-      .memory name aw dw clk
+    | .memory name aw dw depth clk wa wd we ra rd cr =>
+      .memory name aw dw depth clk
         (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
         (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
     | .inst modName instName conns parameterOverrides =>
@@ -324,7 +336,10 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
 /-- Optimize a module: eliminate concat/slice chains, then remove dead code -/
 def optimizeModule (m : Module)
     (observableWires : Option (List String) := none) : Module :=
-  if m.isPrimitive then m
+  -- Native items can read declarations that the normalized-body use counter
+  -- cannot see.  Preserve the module verbatim until those items have been
+  -- lowered instead of pruning a live wire or changing procedural semantics.
+  if m.isPrimitive || !m.nativeItems.isEmpty then m
   else
     let wm := buildWidthMap m
     let dm := buildDefMap m.body

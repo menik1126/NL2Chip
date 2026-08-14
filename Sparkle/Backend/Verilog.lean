@@ -12,6 +12,13 @@ namespace Sparkle.Backend.Verilog
 open Sparkle.IR.AST
 open Sparkle.IR.Type
 
+/-- Maximum temporary packed width used to evaluate a retained mathematical
+    Nat expression.  The final hardware width/depth is independent of this
+    limit; it only prevents a hostile shift/power override from asking an SV
+    frontend to construct a multi-billion-bit intermediate before a guard can
+    report the invalid configuration. -/
+def maxNatWorkWidth : Nat := DimExpr.maxNatWorkWidth
+
 /-- Sanitize a name to be a valid Verilog identifier -/
 def sanitizeName (name : String) : String :=
   name.replace "." "_"
@@ -20,49 +27,148 @@ def sanitizeName (name : String) : String :=
     |>.replace "'" "_prime"
     |>.replace "#" ""
 
-/-- Emit a constant SystemVerilog expression used for widths and dimensions. -/
-partial def emitDimExpr : DimExpr → String
+/-- Raw rendering used only for the size of the work-width casts below.
+    Hardware dimensions and parameter values use `emitDimExpr`, which gives
+    every Nat subexpression an explicit, sufficient unsigned width. -/
+private partial def emitRawDimExpr : DimExpr → String
   | .literal value => toString value
   | .param name => sanitizeName name
-  | .add lhs rhs => s!"({emitDimExpr lhs} + {emitDimExpr rhs})"
+  | .add lhs rhs => s!"({emitRawDimExpr lhs} + {emitRawDimExpr rhs})"
   | .sub lhs rhs =>
       -- Lean Nat subtraction saturates at zero; unsigned SystemVerilog
       -- subtraction wraps, so retain the source semantics explicitly.
-      let lhs' := emitDimExpr lhs
-      let rhs' := emitDimExpr rhs
+      let lhs' := emitRawDimExpr lhs
+      let rhs' := emitRawDimExpr rhs
       s!"(({lhs'} >= {rhs'}) ? ({lhs'} - {rhs'}) : 0)"
-  | .mul lhs rhs => s!"({emitDimExpr lhs} * {emitDimExpr rhs})"
+  | .mul lhs rhs => s!"({emitRawDimExpr lhs} * {emitRawDimExpr rhs})"
   | .div lhs rhs =>
       -- `Nat.div lhs 0 = 0`; SystemVerilog division by zero instead yields X.
-      let lhs' := emitDimExpr lhs
-      let rhs' := emitDimExpr rhs
+      let lhs' := emitRawDimExpr lhs
+      let rhs' := emitRawDimExpr rhs
       s!"(({rhs'} == 0) ? 0 : ({lhs'} / {rhs'}))"
   | .mod lhs rhs =>
       -- `Nat.mod lhs 0 = lhs`; preserve that total Lean operation rather than
       -- relying on SystemVerilog's X-producing zero-divisor behavior.
-      let lhs' := emitDimExpr lhs
-      let rhs' := emitDimExpr rhs
+      let lhs' := emitRawDimExpr lhs
+      let rhs' := emitRawDimExpr rhs
       s!"(({rhs'} == 0) ? {lhs'} : ({lhs'} % {rhs'}))"
-  | .pow lhs rhs => s!"({emitDimExpr lhs} ** {emitDimExpr rhs})"
+  | .pow lhs rhs => s!"({emitRawDimExpr lhs} ** {emitRawDimExpr rhs})"
+  | .shl lhs rhs => s!"({emitRawDimExpr lhs} << {emitRawDimExpr rhs})"
+  | .shr lhs rhs => s!"({emitRawDimExpr lhs} >> {emitRawDimExpr rhs})"
+  | .bitAnd lhs rhs => s!"({emitRawDimExpr lhs} & {emitRawDimExpr rhs})"
+  | .bitOr lhs rhs => s!"({emitRawDimExpr lhs} | {emitRawDimExpr rhs})"
+  | .bitXor lhs rhs => s!"({emitRawDimExpr lhs} ^ {emitRawDimExpr rhs})"
+  | .clog2 value => s!"$clog2({emitRawDimExpr value})"
   | .min lhs rhs =>
-      let lhs' := emitDimExpr lhs
-      let rhs' := emitDimExpr rhs
+      let lhs' := emitRawDimExpr lhs
+      let rhs' := emitRawDimExpr rhs
       s!"(({lhs'} < {rhs'}) ? {lhs'} : {rhs'})"
   | .max lhs rhs =>
-      let lhs' := emitDimExpr lhs
-      let rhs' := emitDimExpr rhs
+      let lhs' := emitRawDimExpr lhs
+      let rhs' := emitRawDimExpr rhs
       s!"(({lhs'} > {rhs'}) ? {lhs'} : {rhs'})"
 
+/-- Evaluate the meta-level expression that determines a work width in an
+    explicit 64-bit unsigned context.  Checked emission accepts only
+    expressions whose own conservative value bound fits in 64 bits, so this
+    layer cannot itself wrap while computing a cast size. -/
+private partial def emitMetaNat64 (expression : DimExpr) : String :=
+  let wrap (body : String) : String := s!"$unsigned((64)'({body}))"
+  match expression with
+  | .literal value => wrap (toString value)
+  | .param name => wrap (sanitizeName name)
+  | .add lhs rhs => wrap s!"({emitMetaNat64 lhs} + {emitMetaNat64 rhs})"
+  | .sub lhs rhs =>
+      let lhs' := emitMetaNat64 lhs
+      let rhs' := emitMetaNat64 rhs
+      wrap s!"(({lhs'} >= {rhs'}) ? ({lhs'} - {rhs'}) : 0)"
+  | .mul lhs rhs => wrap s!"({emitMetaNat64 lhs} * {emitMetaNat64 rhs})"
+  | .div lhs rhs =>
+      let lhs' := emitMetaNat64 lhs
+      let rhs' := emitMetaNat64 rhs
+      wrap s!"(({rhs'} == 0) ? 0 : ({lhs'} / {rhs'}))"
+  | .mod lhs rhs =>
+      let lhs' := emitMetaNat64 lhs
+      let rhs' := emitMetaNat64 rhs
+      wrap s!"(({rhs'} == 0) ? {lhs'} : ({lhs'} % {rhs'}))"
+  | .pow lhs rhs => wrap s!"({emitMetaNat64 lhs} ** {emitMetaNat64 rhs})"
+  | .shl lhs rhs => wrap s!"({emitMetaNat64 lhs} << {emitMetaNat64 rhs})"
+  | .shr lhs rhs => wrap s!"({emitMetaNat64 lhs} >> {emitMetaNat64 rhs})"
+  | .bitAnd lhs rhs => wrap s!"({emitMetaNat64 lhs} & {emitMetaNat64 rhs})"
+  | .bitOr lhs rhs => wrap s!"({emitMetaNat64 lhs} | {emitMetaNat64 rhs})"
+  | .bitXor lhs rhs => wrap s!"({emitMetaNat64 lhs} ^ {emitMetaNat64 rhs})"
+  | .clog2 value =>
+      let value' := emitMetaNat64 value
+      wrap s!"(({value'} <= 1) ? 0 : $clog2({value'}))"
+  | .min lhs rhs =>
+      let lhs' := emitMetaNat64 lhs
+      let rhs' := emitMetaNat64 rhs
+      wrap s!"(({lhs'} < {rhs'}) ? {lhs'} : {rhs'})"
+  | .max lhs rhs =>
+      let lhs' := emitMetaNat64 lhs
+      let rhs' := emitMetaNat64 rhs
+      wrap s!"(({lhs'} > {rhs'}) ? {lhs'} : {rhs'})"
+
+/-- Render a mathematical Nat expression without allowing an outer packed
+    context (or an unsized literal's legacy width) to truncate intermediates.
+    The canonical wrapper is recovered by the SV parser only after it verifies
+    the same conservative bound. -/
+partial def emitNatValue (expression : DimExpr) : String :=
+  let expression := expression.normalize
+  let wrap (body : String) : String :=
+    let bound := emitMetaNat64 expression.natValueBitWidthBound
+    let safeBound := s!"(({bound} <= {maxNatWorkWidth}) ? {bound} : 1)"
+    s!"$unsigned(({safeBound})'({body}))"
+  match expression with
+  | .literal value => wrap (toString value)
+  | .param name => wrap (sanitizeName name)
+  | .add lhs rhs => wrap s!"({emitNatValue lhs} + {emitNatValue rhs})"
+  | .sub lhs rhs =>
+      let lhs' := emitNatValue lhs
+      let rhs' := emitNatValue rhs
+      wrap s!"(({lhs'} >= {rhs'}) ? ({lhs'} - {rhs'}) : 0)"
+  | .mul lhs rhs => wrap s!"({emitNatValue lhs} * {emitNatValue rhs})"
+  | .div lhs rhs =>
+      let lhs' := emitNatValue lhs
+      let rhs' := emitNatValue rhs
+      wrap s!"(({rhs'} == 0) ? 0 : ({lhs'} / {rhs'}))"
+  | .mod lhs rhs =>
+      let lhs' := emitNatValue lhs
+      let rhs' := emitNatValue rhs
+      wrap s!"(({rhs'} == 0) ? {lhs'} : ({lhs'} % {rhs'}))"
+  | .pow lhs rhs => wrap s!"({emitNatValue lhs} ** {emitNatValue rhs})"
+  | .shl lhs rhs => wrap s!"({emitNatValue lhs} << {emitNatValue rhs})"
+  | .shr lhs rhs => wrap s!"({emitNatValue lhs} >> {emitNatValue rhs})"
+  | .bitAnd lhs rhs => wrap s!"({emitNatValue lhs} & {emitNatValue rhs})"
+  | .bitOr lhs rhs => wrap s!"({emitNatValue lhs} | {emitNatValue rhs})"
+  | .bitXor lhs rhs => wrap s!"({emitNatValue lhs} ^ {emitNatValue rhs})"
+  | .clog2 value =>
+      let value' := emitNatValue value
+      wrap s!"(({value'} <= 1) ? 0 : $clog2({value'}))"
+  | .min lhs rhs =>
+      let lhs' := emitNatValue lhs
+      let rhs' := emitNatValue rhs
+      wrap s!"(({lhs'} < {rhs'}) ? {lhs'} : {rhs'})"
+  | .max lhs rhs =>
+      let lhs' := emitNatValue lhs
+      let rhs' := emitNatValue rhs
+      wrap s!"(({lhs'} > {rhs'}) ? {lhs'} : {rhs'})"
+
+/-- Emit a width, depth, index, or parameter override with Lean Nat semantics. -/
+def emitDimExpr (expression : DimExpr) : String := emitNatValue expression.normalize
+
 /-- Clamp a hardware dimension to one for declarations and sized casts.  Invalid
-    zero-valued parameter overrides must remain parseable so that the generated
-    constant generate guard can report a controlled error instead of triggering
-    front-end crashes while constructing a `[-1:0]` range. -/
+    or pathologically large parameter overrides must remain parseable so that
+    the generated constant generate guard can report a controlled error instead
+    of triggering front-end crashes while constructing a zero- or multi-billion-
+    bit range. -/
 def emitSafeDimension (dimension : DimExpr) : String :=
   match dimension.toNat? with
-  | some value => toString (Nat.max value 1)
+  | some value =>
+      if value > 0 && value <= maxNatWorkWidth then toString value else "1"
   | none =>
       let rendered := emitDimExpr dimension
-      s!"(({rendered}) > 0 ? ({rendered}) : 1)"
+      s!"((({rendered}) > 0 && ({rendered}) <= {maxNatWorkWidth}) ? ({rendered}) : 1)"
 
 /-- Emit the high endpoint of a nonempty packed/unpacked range. -/
 def emitRangeHigh (dimension : DimExpr) : String :=
@@ -125,6 +231,12 @@ partial def emitExpr (e : Expr) : String :=
       -- then make that result unsigned so later widening/comparison cannot
       -- silently sign-extend an unsized decimal literal.
       s!"$unsigned({emitSafeDimension width}'({value}))"
+
+  | .paramConst value width =>
+    -- A parameter constant is a Lean Nat expression materialized as an
+    -- unsigned packed value.  The sized context prevents unsized literals and
+    -- intermediate shifts from being silently limited to 32 bits.
+    s!"$unsigned(({emitSafeDimension width})'({emitNatValue value}))"
 
   | .ref name =>
     sanitizeName name
@@ -217,10 +329,9 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
       s!"{indent}        {sanitizeName output} <= {emitExpr input};\n" ++
       s!"{indent}end"
 
-  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
+  | .memory name _addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readData comboRead =>
     -- Generate memory array and always_ff block
-    let memSize := DimExpr.mkPow 2 addrWidth
-    let memDecl := s!"{indent}logic [{emitRangeHigh dataWidth}:0] {sanitizeName name} [0:{emitRangeHigh memSize}];"
+    let memDecl := s!"{indent}logic [{emitRangeHigh dataWidth}:0] {sanitizeName name} [0:{emitRangeHigh depth}];"
     if comboRead then
       -- Combinational read: assign readData = mem[readAddr]
       let assignRead := s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
@@ -251,6 +362,70 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
         s!".{sanitizeName parameterName}({emitDimExpr value})"
       " #(" ++ String.intercalate ", " entries ++ ")"
     s!"{indent}{sanitizeName moduleName}{parameterList} {sanitizeName instName} ({connList});"
+
+/-- Emit a parameter-only native generate condition. -/
+partial def emitNativeCondition : NativeCondition → String
+  | .nonzero value => s!"({emitDimExpr value} != 0)"
+  | .eq lhs rhs => s!"({emitDimExpr lhs} == {emitDimExpr rhs})"
+  | .ne lhs rhs => s!"({emitDimExpr lhs} != {emitDimExpr rhs})"
+  | .lt lhs rhs => s!"({emitDimExpr lhs} < {emitDimExpr rhs})"
+  | .le lhs rhs => s!"({emitDimExpr lhs} <= {emitDimExpr rhs})"
+  | .gt lhs rhs => s!"({emitDimExpr lhs} > {emitDimExpr rhs})"
+  | .ge lhs rhs => s!"({emitDimExpr lhs} >= {emitDimExpr rhs})"
+  | .and lhs rhs => s!"({emitNativeCondition lhs} && {emitNativeCondition rhs})"
+  | .or lhs rhs => s!"({emitNativeCondition lhs} || {emitNativeCondition rhs})"
+  | .not condition => s!"!({emitNativeCondition condition})"
+
+/-- Emit the canonical procedural subset retained for SystemVerilog. -/
+partial def emitProcStmt (statement : ProcStmt) (indent : String := "        ") : String :=
+  match statement with
+  | .blocking lhs rhs => s!"{indent}{emitExpr lhs} = {emitExpr rhs};"
+  | .ifElse condition then_ else_ =>
+      let thenBody := String.intercalate "\n"
+        (then_.map (emitProcStmt · (indent ++ "    ")))
+      let elseBody := String.intercalate "\n"
+        (else_.map (emitProcStmt · (indent ++ "    ")))
+      s!"{indent}if ({emitExpr condition}) begin\n{thenBody}\n{indent}end" ++
+        (if else_.isEmpty then "" else
+          s!" else begin\n{elseBody}\n{indent}end")
+  | .forLoop var init bound step inclusive body =>
+      let comparison := if inclusive then "<=" else "<"
+      let loopBody := String.intercalate "\n"
+        (body.map (emitProcStmt · (indent ++ "    ")))
+      s!"{indent}for ({sanitizeName var} = {init}; {sanitizeName var} {comparison} " ++
+        s!"{emitDimExpr bound}; {sanitizeName var} = {sanitizeName var} + {step}) begin\n" ++
+        loopBody ++ s!"\n{indent}end"
+
+/-- Emit one SystemVerilog-native module item.  A nested conditional generate
+    omits a second `generate/endgenerate` pair because generate regions cannot
+    be nested. -/
+partial def emitNativeItem (item : NativeItem) (indent : String := "    ")
+    (insideGenerate : Bool := false) : String :=
+  match item with
+  | .wireDecl name ty => s!"{indent}{emitType ty} {sanitizeName name};"
+  | .integerDecl name => s!"{indent}integer {sanitizeName name};"
+  | .contAssign lhs rhs => s!"{indent}assign {emitExpr lhs} = {emitExpr rhs};"
+  | .process .comb body =>
+      let statements := String.intercalate "\n"
+        (body.map (emitProcStmt · (indent ++ "    ")))
+      s!"{indent}always_comb begin\n{statements}\n{indent}end"
+  | .generateIf condition thenItems elseItems =>
+      let thenBody := String.intercalate "\n"
+        (thenItems.map (emitNativeItem · (indent ++ "    ") true))
+      let elseBody := String.intercalate "\n"
+        (elseItems.map (emitNativeItem · (indent ++ "    ") true))
+      let generatePrefix := if insideGenerate then "if" else "generate if"
+      let suffix := if insideGenerate then "" else " endgenerate"
+      s!"{indent}{generatePrefix} ({emitNativeCondition condition}) begin\n{thenBody}\n{indent}end" ++
+        (if elseItems.isEmpty then suffix else
+          s!" else begin\n{elseBody}\n{indent}end{suffix}")
+  | .inst moduleName instName connections parameterOverrides =>
+      let connectionList := String.intercalate ", " <| connections.map fun (name, value) =>
+        s!".{sanitizeName name}({emitExpr value})"
+      let parameterList := if parameterOverrides.isEmpty then "" else
+        " #(" ++ String.intercalate ", " (parameterOverrides.map fun (name, value) =>
+          s!".{sanitizeName name}({emitDimExpr value})") ++ ")"
+      s!"{indent}{sanitizeName moduleName}{parameterList} {sanitizeName instName} ({connectionList});"
 
 /-- Emit port declarations for module header -/
 def emitPortList (inputs : List Port) (outputs : List Port) : String :=
@@ -293,12 +468,23 @@ def emitDimensionGuards (m : Module) (indent : String := "    ") : String :=
     !dim.parameters.isEmpty
   let dimensionGuards := dimensions.zipIdx.map fun ((role, dimension), index) =>
       let rendered := emitDimExpr dimension
-      let message := (s!"Sparkle invalid hardware dimension in {role}: {dimension} must be positive")
+      let message := (s!"Sparkle invalid hardware dimension in {role}: {dimension} must be between 1 and {maxNatWorkWidth}")
         |>.replace "\\" "\\\\" |>.replace "\"" "\\\""
-      s!"{indent}generate if (!(({rendered}) > 0)) begin : sparkle_invalid_dimension_{index}\n" ++
+      s!"{indent}generate if (!((({rendered}) > 0) && (({rendered}) <= {maxNatWorkWidth}))) begin : sparkle_invalid_dimension_{index}\n" ++
       s!"{indent}    initial $fatal(1, \"{message}\");\n" ++
       s!"{indent}end endgenerate"
-  String.intercalate "\n" (parameterGuards ++ dimensionGuards)
+  let workExpressions := m.dimensionExpressions.foldl (fun result expression =>
+    let expression := expression.normalize
+    if expression.parameters.isEmpty || result.contains expression then result
+    else result ++ [expression]) []
+  let workWidthGuards := workExpressions.zipIdx.map fun (expression, index) =>
+    let bound := emitMetaNat64 expression.natValueBitWidthBound
+    let message := (s!"Sparkle Nat expression work width exceeds {maxNatWorkWidth} bits: {expression}")
+      |>.replace "\\" "\\\\" |>.replace "\"" "\\\""
+    s!"{indent}generate if (!(({bound}) <= {maxNatWorkWidth})) begin : sparkle_invalid_nat_work_width_{index}\n" ++
+    s!"{indent}    initial $fatal(1, \"{message}\");\n" ++
+    s!"{indent}end endgenerate"
+  String.intercalate "\n" (parameterGuards ++ dimensionGuards ++ workWidthGuards)
 
 /-- Emit the full module -/
 def emitModule (m : Module) : String :=
@@ -310,9 +496,10 @@ def emitModule (m : Module) : String :=
   else
     let parameterList := if m.parameters.isEmpty then "" else
       let entries := m.parameters.map fun parameter =>
-        -- Untyped parameters retain arbitrary-precision nonnegative integer
-        -- defaults instead of silently truncating at 32 bits.
-        s!"parameter {sanitizeName parameter.name} = {parameter.defaultValue}"
+        -- Sparkle's native Nat parameter contract is an explicit unsigned
+        -- 32-bit configuration value.  This makes the parameter leaf bound in
+        -- `natValueBitWidthBound` independent of tool-specific inference.
+        s!"parameter [31:0] {sanitizeName parameter.name} = {parameter.defaultValue}"
       " #(\n    " ++ String.intercalate ",\n    " entries ++ "\n)"
     let header := s!"// Generated by Sparkle HDL\n" ++
                   s!"// Module: {m.name}\n\n" ++
@@ -331,15 +518,39 @@ def emitModule (m : Module) : String :=
       let stmts := m.body.map (emitStmt · "    " m.wires)
       "\n" ++ String.intercalate "\n\n" stmts ++ "\n"
 
+    let nativeBody := if m.nativeItems.isEmpty then "" else
+      "\n" ++ String.intercalate "\n\n" (m.nativeItems.map emitNativeItem) ++ "\n"
+
     let footer := "\nendmodule\n"
 
-    header ++ wires ++ (if guards.isEmpty then "" else "\n" ++ guards ++ "\n") ++ body ++ footer
+    header ++ wires ++ (if guards.isEmpty then "" else "\n" ++ guards ++ "\n") ++
+      body ++ nativeBody ++ footer
 
 /-- Checked entry point for callers that need diagnostics instead of emitting
     malformed or ambiguous SystemVerilog. -/
 def toVerilogChecked (m : Module) : Except String String := do
   m.validateDimensions
   m.validateSanitizedNames sanitizeName
+  let lookupDefault := fun name =>
+    m.parameters.find? (fun parameter => parameter.name == name)
+      |>.map (·.defaultValue)
+  for (role, dimension) in m.positiveDimensions do
+    match dimension.eval? lookupDefault with
+    | some value =>
+        if value > maxNatWorkWidth then
+          throw s!"{role} evaluates to {value}, exceeding Sparkle's safe SystemVerilog dimension limit {maxNatWorkWidth}"
+    | none => pure () -- `validateDimensions` already reports this case.
+  for parameter in m.parameters do
+    if parameter.defaultValue > 0xffffffff then
+      throw s!"module '{m.name}' parameter '{parameter.name}' default {parameter.defaultValue} exceeds Sparkle's 32-bit native parameter contract"
+  for rawExpression in m.dimensionExpressions do
+    let expression := rawExpression.normalize
+    match expression.natValueBitWidthBound.natValueBitWidthBound.toNat? with
+    | some metaWidth =>
+        if metaWidth > 64 then
+          throw s!"module '{m.name}' Nat expression '{expression}' requires more than 64 bits to compute its symbolic work width; specialize or simplify the nested shift/power expression"
+    | none =>
+        throw s!"module '{m.name}' Nat expression '{expression}' has a parameter-dependent work-width calculation; specialize or simplify the nested shift/power expression"
   return emitModule m
 
 /-- Main entry point: Convert a Module to SystemVerilog -/

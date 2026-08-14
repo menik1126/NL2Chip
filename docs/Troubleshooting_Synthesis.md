@@ -139,14 +139,23 @@ Unsupported signed or context-dependent SystemVerilog cast semantics are
 rejected with a diagnostic instead of silently being treated as this unsigned
 resize operation.
 
-This support is for hardware dimensions, not arbitrary value-level evaluation
-of Lean `Nat` programs. A concrete value may have a symbolic result width, for
-example `BitVec.ofNat width 1`. The common all-ones forms
-`BitVec.ofNat width (2 ^ width - 1)` and `BitVec.allOnes width` are also lowered
-without freezing `width`. Other parameter-dependent constant values, such as
-`BitVec.ofNat width (width + 1)`, currently fail compilation. This fail-closed
-behavior prevents a module from silently changing its ports while retaining a
-constant computed only for the default configuration.
+Parameter-only Lean `Nat` values are retained as first-class `paramConst` IR.
+For example, `BitVec.ofNat width (width + 1)`, masks such as
+`(1 << bits) - 1`, shifts, division/modulo, powers, and `clog2` are evaluated at
+the selected native override rather than frozen at the default. SystemVerilog
+emission assigns explicit unsigned working widths to intermediate operations,
+including totalized Nat subtraction and division-by-zero behavior. Native Nat
+parameters follow a 32-bit unsigned contract; hardware dimensions and Nat
+working widths are guarded at 1,048,576 bits so hostile overrides fail before
+an HDL frontend attempts an enormous allocation.
+
+For imported SystemVerilog, parameter-dependent `generate if`, the supported
+canonical procedural `for` form, and zero-based 1R1W memories with symbolic
+depth are retained in native IR. Memory depth is independent of address width,
+so non-power-of-two depths remain exact. Generate-for, ambiguous/multi-port
+memories, signed or context-dependent sizing, and noncanonical loop forms are
+still outside this modeled subset and fail closed instead of being expanded at
+defaults or guessed as 8/32-bit logic.
 
 The parameter suffix is available on the IR and SystemVerilog entry points:
 `#synthesize`, `#synthesizeVerilog`, `#synthesizeDesign`,
@@ -160,9 +169,14 @@ The pass recursively specializes reachable children, cloning a child when two
 instances use different parameter values, and rejects unknown, unresolved, or
 zero-valued hardware dimensions. A closed fixed-width Lean wrapper remains a
 convenient alternative when a separately named concrete module is desired.
-The current CppSim execution backend supports packed operations through 64
-bits; a wider specialization is accepted by the IR/SystemVerilog path but is
-explicitly rejected by the C++/JIT commands instead of emitting skipped logic.
+The current CppSim execution backend supports scalar packed operations through
+64 bits. Passive, word-aligned concat/copy into wide output containers is also
+supported; other wider operations are explicitly rejected by the C++/JIT
+commands instead of emitting skipped logic.
+Specialization selects a native generate branch while retaining its lexical SV
+scope, and retained procedural loops remain native items. Until a normalization
+pass lowers those constructs to core IR, CppSim and automatic model extraction
+reject them explicitly; use the emitted SystemVerilog for those designs.
 
 The SV-to-Lean verification-model generator is likewise concrete-width today
 and rejects a retained-parameter module rather than guessing widths. This does

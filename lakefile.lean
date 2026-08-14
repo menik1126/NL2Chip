@@ -79,6 +79,22 @@ lean_exe «sized-cast-tests» where
   root := `Tests.SizedCastTests
   supportInterpreter := true
 
+lean_exe «symbolic-constant-tests» where
+  root := `Tests.SymbolicConstantTests
+  supportInterpreter := true
+
+lean_exe «native-generate-loop-tests» where
+  root := `Tests.NativeGenerateLoopTests
+  supportInterpreter := true
+
+lean_exe «symbolic-memory-depth-tests» where
+  root := `Tests.SymbolicMemoryDepthTests
+  supportInterpreter := true
+
+lean_exe «parser-fail-closed-tests» where
+  root := `Tests.ParserFailClosedTests
+  supportInterpreter := true
+
 lean_exe «sparkle-bitnet-verilog-dump» where
   root := `Tests.BitNet.SparkleBitNetVerilogDump
 
