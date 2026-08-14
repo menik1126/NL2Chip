@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -24,16 +25,32 @@ def cmd_lean_check(args: argparse.Namespace) -> None:
     path = PROJECT_ROOT / args.path
     with LeanREPL(project_dir=PROJECT_ROOT) as repl:
         result = repl.check_file(path)
+    verilog_blocks = list(getattr(result, "verilog_modules", []) or [])
+    if not verilog_blocks and result.verilog:
+        verilog_blocks = [result.verilog]
+    module_names = sorted({
+        match.group(1)
+        for block in verilog_blocks
+        for match in re.finditer(r"\bmodule\s+([A-Za-z_]\w*)\b", str(block))
+    })
+    required = sorted(set(args.require_module or []))
+    missing = sorted(set(required) - set(module_names))
     payload = {
-        "passed": result.passed,
+        "passed": bool(result.passed and not missing),
         "complete": result.complete,
         "elapsed": result.elapsed,
         "errors": result.errors,
         "warnings": result.warnings,
         "has_verilog": bool(result.verilog),
+        "verilog_module_count": len(module_names),
+        "verilog_modules": module_names,
+        "required_verilog_modules": required,
+        "missing_verilog_modules": missing,
         "error_text": result.error_text,
     }
     print(json.dumps(payload, indent=2))
+    if required and not payload["passed"]:
+        raise SystemExit(1)
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
@@ -55,6 +72,12 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
     lean = sub.add_parser("lean-check")
     lean.add_argument("path")
+    lean.add_argument(
+        "--require-module",
+        action="append",
+        default=[],
+        help="Require a generated Verilog module; repeat for a specialization family.",
+    )
     lean.set_defaults(func=cmd_lean_check)
     ev = sub.add_parser("eval")
     ev.add_argument("prob_id")

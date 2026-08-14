@@ -16,6 +16,7 @@ Returns a score dict for each problem.
 from __future__ import annotations
 
 import math
+import json
 import os
 import re
 import signal
@@ -23,6 +24,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from cvdp_specialization import FiniteParameterPlan, plan_from_dict
 
 
 DATASET_DIR = Path("verilog-eval/dataset_spec-to-rtl")
@@ -734,11 +737,67 @@ def _cvdp_signal_type_lookup(
     return lookup
 
 
+def _cvdp_internal_unpacked_arrays(
+    sv_code: str,
+    module_name: str | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Return internal unpacked arrays as name -> (element type, range)."""
+    _, _, body = _first_module_record(sv_code, module_name)
+    clean = _strip_sv_comments(body)
+    arrays: dict[str, tuple[str, str]] = {}
+    for match in re.finditer(
+        r"\b(?:logic|wire|reg)\s*(?:signed\s*)?"
+        r"(?P<packed>\[[^\]]+\])?\s*"
+        r"(?P<name>[A-Za-z_]\w*)\s*"
+        r"(?P<unpacked>\[[^\]]+\])\s*;",
+        clean,
+        re.DOTALL,
+    ):
+        arrays[match.group("name")] = (
+            _cvdp_normalize_type(match.group("packed") or ""),
+            match.group("unpacked"),
+        )
+    return arrays
+
+
+def _cvdp_match_internal_array(
+    name: str,
+    generated_arrays: dict[str, tuple[str, str]],
+    used: set[str],
+) -> str | None:
+    """Conservatively match a benchmark-visible internal array to Sparkle RTL."""
+    candidates = [candidate for candidate in generated_arrays if candidate not in used]
+    exact = [candidate for candidate in candidates if _ports_equivalent(candidate, name)]
+    if len(exact) == 1:
+        return exact[0]
+    # Generated Sparkle names often describe the memory's read value rather
+    # than the reference array. A unique memory is still unambiguous.
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _cvdp_unpacked_loop_bounds(unpacked_range: str) -> tuple[str, str] | None:
+    """Return ascending loop bounds for common unpacked array declarations."""
+    match = re.fullmatch(r"\[\s*(.+?)\s*:\s*(.+?)\s*\]", unpacked_range or "")
+    if not match:
+        return None
+    left, right = (part.strip() for part in match.groups())
+    if left == "0":
+        return "0", right
+    if right == "0":
+        return "0", left
+    if left.isdigit() and right.isdigit():
+        low, high = sorted((int(left), int(right)))
+        return str(low), str(high)
+    return None
+
+
 def _cvdp_name_forms(name: str) -> set[str]:
     base = _base_port_name(name)
     forms = {base, re.sub(r"[^a-z0-9]", "", base)}
-    variants = {base}
-    for prefix in ("o_", "out_", "output_", "predict_branch_", "predict_"):
+    variants = {base, re.sub(r"_\d+$", "", base)}
+    for prefix in ("o_", "out_", "output_", "predict_branch_", "predict_", "dmem_", "saved_", "req_"):
         if base.startswith(prefix):
             variants.add(base[len(prefix):])
     for suffix in ("_bit", "_flag", "_val", "_value", "_out", "_output", "_bv", "_signal", "_reg", "_r", "_o"):
@@ -784,6 +843,12 @@ def _cvdp_match_output_for_field(
             score = 65
         elif "pc" in out_forms and any(form.endswith("pc") for form in field_forms):
             score = 60
+        # Saved request registers are Sparkle state names; CVDP exposes the
+        # corresponding dmem_req_* observation ports.
+        elif field_compact.startswith("saved"):
+            semantic = re.sub(r"\d+$", "", field_compact[len("saved"):])
+            if any(form.startswith("req") and semantic in form for form in out_forms):
+                score = 75
         if score:
             scored.append((score, cand))
 
@@ -861,6 +926,59 @@ def _cvdp_infer_bundled_output_mapping(
     return mapping
 
 
+def _cvdp_assign_bundled_output_slices(
+    *,
+    sp_out_name: str,
+    sp_out_type: str,
+    remaining_outputs: list[tuple[str, str, str]],
+    sv_code: str,
+    sparkle_ports: list[tuple[str, str, str]],
+) -> list[tuple[str, int, int]]:
+    """Map a packed Sparkle tuple to every benchmark output when provable.
+
+    Sparkle lowers tuples MSB-first. Prefer a semantic field-name match, but
+    generated names such as _gen_enc1 often have no benchmark spelling.
+    In that case declaration order is safe only when all remaining field and
+    port widths agree exactly; otherwise leave the output unmapped.
+    """
+    sp_width = _cvdp_numeric_width(sp_out_type)
+    fields = _cvdp_infer_concat_fields(sv_code, sp_out_name) or []
+    if sp_width is None or not fields:
+        return []
+    type_lookup = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
+    field_widths = [_cvdp_expr_numeric_width(field, type_lookup) for field in fields]
+    if any(width is None for width in field_widths) or sum(field_widths) != sp_width:
+        return []
+
+    offset = sp_width
+    slices: list[tuple[str, int, int]] = []
+    used: set[str] = set()
+    unresolved: list[tuple[int, int, int]] = []
+    for field, field_width in zip(fields, field_widths):
+        high, low = offset - 1, offset - field_width
+        matched = _cvdp_match_output_for_field(field, remaining_outputs, used)
+        if matched and _cvdp_numeric_width(matched[1]) == field_width:
+            slices.append((matched[2], high, low))
+            used.add(matched[2])
+        else:
+            unresolved.append((field_width, high, low))
+        offset -= field_width
+
+    remaining = [port for port in remaining_outputs if port[2] not in used]
+    if len(remaining) == len(unresolved) and all(
+        _cvdp_numeric_width(port[1]) == field_width
+        for port, (field_width, _, _) in zip(remaining, unresolved)
+    ):
+        slices.extend(
+            (port[2], high, low)
+            for port, (_, high, low) in zip(remaining, unresolved)
+        )
+    # A subset can still be a sound semantic mapping (for example a bundle
+    # also carries an unobserved valid bit). The caller emits fallbacks only
+    # for genuinely unmapped benchmark outputs.
+    return slices
+
+
 def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
     """Infer CVDP top-level ports/parameters touched by cocotb harnesses."""
     py_files = {
@@ -872,6 +990,10 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
         content
         for path, content in py_files.items()
         if Path(path).name != "harness_library.py"
+    )
+    helper_py_text = "\n\n".join(
+        content for path, content in py_files.items()
+        if Path(path).name == "harness_library.py"
     )
     param_py_text = "\n\n".join(py_files.values())
     id_names = set(re.findall(r"\bdut\._id\s*\(\s*[\"']([A-Za-z_]\w*)[\"']", port_py_text))
@@ -894,6 +1016,40 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
     assigned.update(
         re.findall(r"\bdut\s*\[\s*[\"']([A-Za-z_]\w*)[\"']\s*\]\s*<=", port_py_text)
     )
+    # CVDP helper classes frequently drive interfaces through
+    # getattr(dut, f"{name}_suffix"). Recover literal helper prefixes and
+    # suffixes so those ports are not silently tied to zero in the wrapper.
+    for name_var, suffix in re.findall(
+        r"getattr\s*\(\s*dut\s*,\s*f[\"']\{([A-Za-z_]\w*)\}_([A-Za-z_]\w*)[\"']\s*\)",
+        param_py_text,
+    ):
+        prefixes = set(re.findall(
+            rf"\b{name_var}\s*=\s*[\"']([A-Za-z_]\w*)[\"']", param_py_text
+        ))
+        recovered = {f"{prefix}_{suffix}" for prefix in prefixes}
+        all_names.update(recovered)
+        assigned.update(recovered)
+    # Helpers can dynamically access bus ports using getattr(dut,
+    # f"{name}_suffix"). Pair each helper class's suffixes with prefixes from
+    # calls to that *same* class; cross-producting all helper prefixes creates
+    # fictitious DUT ports such as ex_if_req_addr_o.
+    for class_match in re.finditer(
+        r"\bclass\s+([A-Za-z_]\w*).*?(?=\nclass\s+|\Z)",
+        helper_py_text,
+        re.DOTALL,
+    ):
+        class_name, class_body = class_match.group(1), class_match.group(0)
+        suffixes = set(re.findall(
+            r"getattr\s*\(\s*dut\s*,\s*f[\"']\{name\}_([A-Za-z_]\w*)[\"']\s*\)",
+            class_body,
+        ))
+        prefixes = set(re.findall(
+            rf"\b{re.escape(class_name)}\s*\(\s*dut\s*,\s*[\"']([A-Za-z_]\w*)[\"']",
+            port_py_text,
+        ))
+        recovered = {f"{prefix}_{suffix}" for prefix in prefixes for suffix in suffixes}
+        all_names.update(recovered)
+        assigned.update(name for name in recovered if name.endswith(("_i", "_in")))
     clocked = set(re.findall(r"\bClock\s*\(\s*dut\.([A-Za-z_]\w*)\b", port_py_text))
 
     params: set[str] = set()
@@ -1026,15 +1182,32 @@ def generate_cvdp_wrapper(
     ref_code: str,
     harness_files: dict,
     sv_code: str = "",
+    expose_parameters: bool = True,
+    expected_ports_override: list[tuple[str, str, str]] | None = None,
+    reset_polarities: dict[str, str] | None = None,
+    strict_mapping: bool = False,
 ) -> str | None:
     """Generate a CVDP top wrapper matching cocotb's expected DUT interface."""
     usage = _cvdp_parse_harness_usage(harness_files)
     preferred_names = sorted(usage["ports"] | usage["params"])
-    raw_ref_ports = _parse_ref_module_ports(ref_code, preferred_names) or []
+    raw_ref_ports = (
+        expected_ports_override
+        if expected_ports_override is not None
+        else _parse_ref_module_ports(ref_code, preferred_names) or []
+    )
     ref_ports = [(d, _cvdp_normalize_type(t), n) for d, t, n in raw_ref_ports]
 
     by_name = {n: (d, t, n) for d, t, n in ref_ports}
     expected_ports = list(ref_ports)
+    ref_internal_arrays = (
+        {} if expected_ports_override is not None
+        else _cvdp_internal_unpacked_arrays(ref_code, design_name)
+    )
+    observed_internal_arrays = {
+        name: ref_internal_arrays[name]
+        for name in sorted(usage["ports"] - set(by_name))
+        if name in ref_internal_arrays
+    }
     sp_inputs = [(d, t, n) for d, t, n in sparkle_ports if d == "input"]
     sp_outputs = [(d, t, n) for d, t, n in sparkle_ports if d == "output"]
     bundled_type_by_output: dict[str, str] = {}
@@ -1042,18 +1215,23 @@ def generate_cvdp_wrapper(
         candidate_output_names = sorted(
             set(usage["outputs"]) | {n for d, _, n in ref_ports if d == "output"}
         )
-        pseudo_outputs = [("output", "logic", n) for n in candidate_output_names]
-        for out_port, _, field_type in _cvdp_infer_bundled_output_mapping(
-            sv_code,
-            sp_outputs[0][2],
-            pseudo_outputs,
-            sparkle_ports,
-        ):
-            if field_type:
-                bundled_type_by_output[out_port[2]] = field_type
+        if expected_ports_override is None or len(candidate_output_names) > 1:
+            pseudo_outputs = [("output", "logic", n) for n in candidate_output_names]
+            for out_port, _, field_type in _cvdp_infer_bundled_output_mapping(
+                sv_code,
+                sp_outputs[0][2],
+                pseudo_outputs,
+                sparkle_ports,
+            ):
+                if field_type:
+                    bundled_type_by_output[out_port[2]] = field_type
 
     for name in sorted(usage["ports"]):
         if name in by_name:
+            continue
+        if name in observed_internal_arrays:
+            continue
+        if expected_ports_override is not None:
             continue
         sp_match = _cvdp_match_port(name, sparkle_ports)
         if sp_match:
@@ -1075,13 +1253,36 @@ def generate_cvdp_wrapper(
             for d, t, n in expected_ports
         ]
 
+    if len(sp_outputs) == 1 and (
+        expected_ports_override is None
+        or sum(direction == "output" for direction, _, _ in expected_ports) > 1
+    ):
+        bundle_fields = _cvdp_infer_concat_fields(sv_code, sp_outputs[0][2]) or []
+        bundle_types = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
+        inferred = [
+            _cvdp_expr_numeric_width(field, bundle_types) for field in bundle_fields
+        ]
+        missing = [p for p in expected_ports if p[0] == "output" and p[2] not in bundled_type_by_output]
+        if len(missing) == len(inferred) and all(width is not None for width in inferred):
+            inferred_by_name = {
+                port[2]: ("logic" if width == 1 else f"logic [{width - 1}:0]")
+                for port, width in zip(missing, inferred)
+            }
+            expected_ports = [
+                (d, inferred_by_name.get(n, t) if d == "output" else t, n)
+                for d, t, n in expected_ports
+            ]
+
     if not expected_ports or not sparkle_mod_name:
         return None
 
     expected_inputs = [(d, t, n) for d, t, n in expected_ports if d == "input"]
     expected_outputs = [(d, t, n) for d, t, n in expected_ports if d == "output"]
-    param_decls = _cvdp_parse_module_parameters(ref_code, usage["params"])
-    param_names = set(usage["params"])
+    param_decls = (
+        _cvdp_parse_module_parameters(ref_code, usage["params"])
+        if expose_parameters else []
+    )
+    param_names = set(usage["params"]) if expose_parameters else set()
     for decl in param_decls:
         m = re.search(r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)", decl)
         if m:
@@ -1147,8 +1348,14 @@ def generate_cvdp_wrapper(
     if sp_outputs:
         lines.append("")
 
+    for name, (element_type, unpacked_range) in observed_internal_arrays.items():
+        lines.append(f"    {element_type} {name} {unpacked_range};")
+    if observed_internal_arrays:
+        lines.append("")
+
     lines.append(f"    {sparkle_mod_name} sparkle_dut (")
     inst_conns = []
+    matched_expected_inputs: set[str] = set()
     for d, _, sn in sparkle_ports:
         if d == "output":
             inst_conns.append(f"        .{sn}({sn}_wire)")
@@ -1159,12 +1366,88 @@ def generate_cvdp_wrapper(
             base = sn[5:] if sn.startswith("_gen_") else sn
             match = _cvdp_match_port(base, expected_inputs, direction="input")
             matched = match[2] if match else None
-        conn = _cvdp_bridge_reset_expr(sn, matched) if matched else "'0"
+        if (
+            matched is None
+            and expected_ports_override is not None
+            and sn.startswith("_gen_")
+            and _is_reset_like(sn)
+        ):
+            public_resets = [
+                name for _, _, name in expected_inputs if _is_reset_like(name)
+            ]
+            if len(public_resets) == 1:
+                matched = public_resets[0]
+        if (
+            matched
+            and expected_ports_override is not None
+            and sn == "rst"
+            and (reset_polarities or {}).get(matched) == "active-low"
+        ):
+            # Sparkle's implicit domain reset is active-high. A separate
+            # user-visible ``_gen_reset`` input still receives the raw signal
+            # so Lean's explicit resetLow/resetHigh logic remains authoritative.
+            conn = f"~{matched}"
+        elif (
+            matched
+            and expected_ports_override is not None
+            and sn.startswith("_gen_")
+            and _is_reset_like(sn)
+        ):
+            conn = matched
+        else:
+            if matched is None and strict_mapping:
+                return None
+            conn = _cvdp_bridge_reset_expr(sn, matched) if matched else "'0"
+        if matched is not None:
+            matched_expected_inputs.add(matched)
         inst_conns.append(f"        .{sn}({conn})")
+
+    if strict_mapping:
+        missing_public_inputs = {
+            name for _, _, name in expected_inputs
+            if name not in matched_expected_inputs
+        }
+        if missing_public_inputs:
+            return None
 
     lines.append(",\n".join(inst_conns))
     lines.append("    );")
     lines.append("")
+
+    generated_arrays = _cvdp_internal_unpacked_arrays(sv_code, sparkle_mod_name)
+    used_generated_arrays: set[str] = set()
+    for ref_name, (_, unpacked_range) in observed_internal_arrays.items():
+        generated_name = _cvdp_match_internal_array(
+            ref_name,
+            generated_arrays,
+            used_generated_arrays,
+        )
+        loop_bounds = _cvdp_unpacked_loop_bounds(unpacked_range)
+        if generated_name is None or loop_bounds is None:
+            reason = (
+                "could not be mapped uniquely to a Sparkle memory"
+                if generated_name is None
+                else f"has unsupported unpacked range {unpacked_range}"
+            )
+            lines.append(
+                f"    // CVDP adapter diagnostic: internal array {ref_name} was observed by the harness "
+                f"but {reason}."
+            )
+            continue
+        used_generated_arrays.add(generated_name)
+        loop_low, loop_high = loop_bounds
+        bridge_index = f"_cvdp_bridge_{ref_name}_i"
+        lines.extend([
+            "    generate",
+            f"        for (genvar {bridge_index} = {loop_low}; "
+            f"{bridge_index} <= {loop_high}; {bridge_index}++) begin : "
+            f"_cvdp_bridge_{ref_name}",
+            f"            assign {ref_name}[{bridge_index}] = "
+            f"sparkle_dut.{generated_name}[{bridge_index}];",
+            "        end",
+            "    endgenerate",
+            "",
+        ])
 
     assigned_outputs: set[str] = set()
     for _, _, rn in expected_outputs:
@@ -1176,58 +1459,46 @@ def generate_cvdp_wrapper(
     if len(sp_outputs) == 1:
         sp_out_d, sp_out_t, sp_out_n = sp_outputs[0]
         remaining = [(d, t, n) for d, t, n in expected_outputs if n not in assigned_outputs]
-        if len(remaining) == 1:
-            lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
-            assigned_outputs.add(remaining[0][2])
-        elif remaining:
+        if remaining:
             sp_w = _cvdp_numeric_width(sp_out_t)
             ref_widths = [(_cvdp_numeric_width(t), n) for _, t, n in remaining]
-            fields = _cvdp_infer_concat_fields(sv_code, sp_out_n) or []
-            type_lookup = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
-            field_assigned = False
-            if sp_w is not None and fields:
-                offset = sp_w
-                used_for_fields: set[str] = set()
-                field_assigns: list[tuple[str, int, int]] = []
-                unmatched_field_slices: list[tuple[str, int, int, int]] = []
-                all_widths_known = True
-                for field in fields:
-                    field_width = _cvdp_expr_numeric_width(field, type_lookup)
-                    if field_width is None:
-                        all_widths_known = False
-                        break
-                    high = offset - 1
-                    low = offset - field_width
-                    matched_out = _cvdp_match_output_for_field(
-                        field,
-                        remaining,
-                        used_for_fields,
-                    )
-                    matched_width = _cvdp_numeric_width(matched_out[1]) if matched_out else None
-                    if matched_out and (matched_width is None or matched_width == field_width):
-                        field_assigns.append((matched_out[2], high, low))
-                        used_for_fields.add(matched_out[2])
+            if (
+                expected_ports_override is not None
+                and
+                len(expected_outputs) == 1
+                and len(remaining) == 1
+                and sp_w is not None
+                and _cvdp_numeric_width(remaining[0][1]) == sp_w
+            ):
+                lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
+                assigned_outputs.add(remaining[0][2])
+                field_assigned = True
+            else:
+                field_assigns = _cvdp_assign_bundled_output_slices(
+                    sp_out_name=sp_out_n,
+                    sp_out_type=sp_out_t,
+                    remaining_outputs=remaining,
+                    sv_code=sv_code,
+                    sparkle_ports=sparkle_ports,
+                )
+                field_assigned = bool(field_assigns)
+                for n, high, low in field_assigns:
+                    if high == low:
+                        lines.append(f"    assign {n} = {sp_out_n}_wire[{low}];")
                     else:
-                        unmatched_field_slices.append((field, high, low, field_width))
-                    offset -= field_width
-                if all_widths_known and offset == 0:
-                    for _, high, low, field_width in unmatched_field_slices:
-                        width_matches = [
-                            p for p in remaining
-                            if p[2] not in used_for_fields
-                            and _cvdp_numeric_width(p[1]) == field_width
-                        ]
-                        if len(width_matches) == 1:
-                            out_port = width_matches[0]
-                            field_assigns.append((out_port[2], high, low))
-                            used_for_fields.add(out_port[2])
-                    for n, high, low in field_assigns:
-                        if high == low:
-                            lines.append(f"    assign {n} = {sp_out_n}_wire[{low}];")
-                        else:
-                            lines.append(f"    assign {n} = {sp_out_n}_wire[{high}:{low}];")
-                        assigned_outputs.add(n)
-                    field_assigned = bool(field_assigns)
+                        lines.append(f"    assign {n} = {sp_out_n}_wire[{high}:{low}];")
+                    assigned_outputs.add(n)
+            # A scalar/normal single output has no tuple concat to unpack.
+            # Preserve direct wiring for this established CVDP case.
+            if (
+                len(remaining) == 1
+                and not field_assigned
+                and not _cvdp_infer_concat_fields(sv_code, sp_out_n)
+                and (not strict_mapping or len(expected_outputs) == 1)
+            ):
+                lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
+                assigned_outputs.add(remaining[0][2])
+                field_assigned = True
 
             if (
                 not field_assigned
@@ -1258,6 +1529,8 @@ def generate_cvdp_wrapper(
 
     for _, _, rn in expected_outputs:
         if rn not in assigned_outputs:
+            if strict_mapping:
+                return None
             lines.append(
                 f"    // CVDP adapter fallback: output {rn} was not mapped from Sparkle output; "
                 "drive zero so simulation reports a functional mismatch."
@@ -1266,6 +1539,446 @@ def generate_cvdp_wrapper(
 
     lines.append("endmodule")
     return "\n".join(lines)
+
+
+def _strip_verilog_info_block(text: str) -> str:
+    """Return only complete SystemVerilog modules from a Lean info message."""
+    code = str(text or "")
+    start = code.find("// Generated by Sparkle HDL")
+    if start < 0:
+        start = code.find("module ")
+    if start < 0:
+        return ""
+    code = code[start:]
+    last_end = code.rfind("endmodule")
+    return code[: last_end + len("endmodule")].strip() if last_end >= 0 else ""
+
+
+def _specialize_sv_type(typ: str, values: dict[str, int]) -> str:
+    result = str(typ or "logic")
+    for name, value in sorted(values.items(), key=lambda item: -len(item[0])):
+        result = re.sub(rf"\b{re.escape(name)}\b", str(value), result)
+    result = re.sub(
+        r"(?<![$A-Za-z0-9_])(?:clog2|log2)\s*\(",
+        "$clog2(",
+        result,
+    )
+    return result
+
+
+def _safe_sv_int_expr(expr: str) -> int | None:
+    text = str(expr or "").strip()
+    while "$clog2" in text:
+        matches = list(re.finditer(r"\$clog2\s*\(([^()]*)\)", text))
+        if not matches:
+            return None
+        changed = False
+        for match in reversed(matches):
+            argument = _safe_sv_int_expr(match.group(1))
+            if argument is None or argument < 0:
+                continue
+            value = math.ceil(math.log2(max(1, argument)))
+            text = text[:match.start()] + str(value) + text[match.end():]
+            changed = True
+        if not changed:
+            return None
+    if not re.fullmatch(r"[0-9\s()+*/%<>&|^~-]+", text):
+        return None
+    try:
+        value = eval(text, {"__builtins__": {}}, {})
+    except Exception:
+        return None
+    if isinstance(value, (int, bool)):
+        return int(value)
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _concrete_sv_width(typ: str) -> int | None:
+    match = re.search(r"\[\s*(.+?)\s*:\s*(.+?)\s*\]", typ or "")
+    if not match:
+        return 1
+    high = _safe_sv_int_expr(match.group(1))
+    low = _safe_sv_int_expr(match.group(2))
+    if high is None or low is None:
+        return None
+    return abs(high - low) + 1
+
+
+def _fixed_logic_type(width: int) -> str:
+    return "logic" if width <= 1 else f"logic [{width - 1}:0]"
+
+
+def _infer_concrete_public_ports(
+    *,
+    public_ports: list[tuple[str, str, str]],
+    values: dict[str, int],
+    core_ports: list[tuple[str, str, str]],
+    core_sv: str,
+) -> tuple[list[tuple[str, str, str]] | None, list[str]]:
+    diagnostics: list[str] = []
+    specialized = [
+        (direction, _specialize_sv_type(typ, values), name)
+        for direction, typ, name in public_ports
+    ]
+    by_name = {name: (direction, typ, name) for direction, typ, name in core_ports}
+    core_outputs = [port for port in core_ports if port[0] == "output"]
+    public_outputs = [port for port in specialized if port[0] == "output"]
+    inferred_output_widths: dict[str, int] = {}
+    if len(core_outputs) == 1 and len(public_outputs) > 1:
+        mapping = _cvdp_infer_bundled_output_mapping(
+            core_sv,
+            core_outputs[0][2],
+            public_outputs,
+            core_ports,
+        )
+        for port, field, field_type in mapping:
+            width = _concrete_sv_width(field_type or "")
+            if width is not None:
+                inferred_output_widths[port[2]] = width
+
+    result = []
+    for direction, typ, name in specialized:
+        unspecified_width = not (typ or "").strip()
+        width = None if unspecified_width else _concrete_sv_width(typ)
+        match = _cvdp_match_port(name, core_ports, direction=direction)
+        core_width = _concrete_sv_width(match[1]) if match else None
+        if (
+            core_width is None
+            and direction == "output"
+            and len(core_outputs) == 1
+            and len(public_outputs) == 1
+        ):
+            core_width = _concrete_sv_width(core_outputs[0][1])
+        inferred = inferred_output_widths.get(name)
+        if unspecified_width and (core_width is not None or inferred is not None):
+            width = core_width if core_width is not None else inferred
+        if width is None:
+            width = core_width or inferred
+        if width is None:
+            diagnostics.append(f"could not determine concrete width of public port {name}")
+            continue
+        if not unspecified_width and core_width is not None and core_width != width:
+            diagnostics.append(
+                f"port {name} width mismatch: contract={width}, core={core_width}"
+            )
+        if not unspecified_width and inferred is not None and inferred != width:
+            diagnostics.append(
+                f"packed output {name} width mismatch: contract={width}, core field={inferred}"
+            )
+        result.append((direction, _fixed_logic_type(width), name))
+    if diagnostics or len(result) != len(public_ports):
+        return None, diagnostics
+    return result, []
+
+
+def _specialization_condition(values: dict[str, int]) -> str:
+    return " && ".join(f"({name} == {value})" for name, value in values.items())
+
+
+def _finite_case_expression(
+    plan: FiniteParameterPlan,
+    case_values: list[int],
+) -> str:
+    expression = str(case_values[0])
+    for case, value in reversed(list(zip(plan.cases, case_values))):
+        expression = f"({_specialization_condition(case.values)}) ? {value} : ({expression})"
+    return expression
+
+
+def _selector_port_type(
+    plan: FiniteParameterPlan,
+    widths: list[int],
+) -> str:
+    if all(width == 1 for width in widths):
+        return "logic"
+    return f"logic [({_finite_case_expression(plan, widths)})-1:0]"
+
+
+def _solve_derived_width_parameter(
+    *,
+    typ: str,
+    parameter_name: str,
+    case_values: dict[str, int],
+    concrete_width: int,
+) -> int | None:
+    if not re.search(rf"\b{re.escape(parameter_name)}\b", typ or ""):
+        return None
+    upper_bound = max(1024, concrete_width * 4 + 16)
+    matches = []
+    for value in range(1, upper_bound + 1):
+        values = {**case_values, parameter_name: value}
+        candidate = _concrete_sv_width(_specialize_sv_type(typ, values))
+        if candidate == concrete_width:
+            matches.append(value)
+            if len(matches) > 1:
+                break
+    return matches[0] if len(matches) == 1 else None
+
+
+def _public_derived_parameter_value(
+    *,
+    parameter_name: str,
+    case_values: dict[str, int],
+    public_text: str,
+) -> int | None:
+    """Evaluate the small derived-width formulas used by the public P0 tasks."""
+    name = parameter_name.upper()
+    if name == "BIT_WIDTH" and "DICE_MAX" in case_values:
+        return (max(1, case_values["DICE_MAX"] - 1)).bit_length() + 1
+    if name == "ENCODED_DATA" and {"DATA_WIDTH", "PARITY_BIT"} <= case_values.keys():
+        return case_values["DATA_WIDTH"] + case_values["PARITY_BIT"] + 1
+    if name == "ENCODED_DATA_BIT" and {"DATA_WIDTH", "PARITY_BIT"} <= case_values.keys():
+        encoded = case_values["DATA_WIDTH"] + case_values["PARITY_BIT"] + 1
+        return max(1, math.ceil(math.log2(max(1, encoded))))
+    if name == "COUNT_WIDTH" and "BIT_WIDTH" in case_values:
+        return max(1, math.ceil(math.log2(case_values["BIT_WIDTH"] + 1)))
+
+    text = re.sub(r"//.*", "", str(public_text or ""))
+    match = re.search(
+        rf"\b(?:parameter|localparam)\b[^;\n,]*\b{re.escape(parameter_name)}\b\s*=\s*([^,;\n)]+(?:\([^\n]*\)[^,;\n]*)?)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    expr = match.group(1).strip()
+    for key, value in sorted(case_values.items(), key=lambda item: -len(item[0])):
+        expr = re.sub(rf"\b{re.escape(key)}\b", str(value), expr)
+    expr = re.sub(
+        r"\$?clog2\s*\(\s*(\d+)\s*\)",
+        lambda m: str(max(1, math.ceil(math.log2(max(1, int(m.group(1))))))),
+        expr,
+        flags=re.IGNORECASE,
+    )
+    return _safe_sv_int_expr(expr)
+
+
+def _module_body(sv_code: str, module_name: str) -> str:
+    return _first_module_record(sv_code, module_name)[2]
+
+
+def _adapter_internal_array_bridges(
+    adapter: str,
+    design_name: str,
+) -> list[tuple[str, str, str]]:
+    """Return public array name, generated name, and unpacked range."""
+    records = []
+    for match in re.finditer(
+        rf"assign\s+([A-Za-z_]\w*)\[([^\]]+)\]\s*=\s*"
+        rf"sparkle_dut\.([A-Za-z_]\w*)\[\2\]",
+        adapter,
+    ):
+        records.append((match.group(1), match.group(3), match.group(2)))
+    return records
+
+
+def generate_cvdp_specialization_wrapper(
+    *,
+    design_name: str,
+    plan: FiniteParameterPlan,
+    modules: dict[str, str],
+    expected_ports: list[tuple[str, str, str]],
+    ref_code: str,
+    harness_files: dict,
+    derived_parameter_names: set[str] | None = None,
+    reset_polarities: dict[str, str] | None = None,
+    public_spec: str = "",
+) -> tuple[str | None, dict]:
+    """Build fixed adapters plus a parameter-only selector for a finite family."""
+    metadata = plan.to_dict()
+    metadata.update({
+        "module_status": [],
+        "selector_generated": False,
+        "unsupported_policy": "elaboration_error",
+    })
+    if not plan.supported:
+        metadata["error"] = "; ".join(plan.diagnostics)
+        return None, metadata
+    if not expected_ports:
+        metadata["error"] = "public benchmark interface has no ports"
+        return None, metadata
+
+    missing = [name for name in plan.expected_modules if name not in modules]
+    extra = sorted(set(modules) - set(plan.expected_modules))
+    metadata["missing_modules"] = missing
+    metadata["extra_modules"] = extra
+    if missing:
+        metadata["error"] = "missing concrete Sparkle modules: " + ", ".join(missing)
+        return None, metadata
+
+    adapter_blocks: list[str] = []
+    adapter_ports_by_case: list[list[tuple[str, str, str]]] = []
+    widths_by_port: dict[str, list[int]] = {name: [] for _, _, name in expected_ports}
+    for index, case in enumerate(plan.cases):
+        core_sv = modules[case.module_name]
+        core_name, core_ports = parse_module_ports(core_sv, module_name=case.module_name)
+        row = {
+            "parameters": case.values,
+            "module_name": case.module_name,
+            "compile_pass": bool(core_name and core_ports),
+        }
+        if not core_name or not core_ports:
+            row["error"] = "generated module or ports could not be parsed"
+            metadata["module_status"].append(row)
+            metadata["error"] = f"could not parse concrete module {case.module_name}"
+            return None, metadata
+
+        concrete_ports, port_diagnostics = _infer_concrete_public_ports(
+            public_ports=expected_ports,
+            values=case.values,
+            core_ports=core_ports,
+            core_sv=core_sv,
+        )
+        if concrete_ports is None:
+            row["compile_pass"] = False
+            row["error"] = "; ".join(port_diagnostics)
+            metadata["module_status"].append(row)
+            metadata["error"] = (
+                f"specialization contract mismatch for {case.module_name}: "
+                + row["error"]
+            )
+            return None, metadata
+        adapter_name = f"{case.module_name}__cvdp_adapter"
+        concrete_ref = (
+            f"module {adapter_name} (\n"
+            + ",\n".join(f"    {d} {t} {n}" for d, t, n in concrete_ports)
+            + "\n);\nendmodule"
+        )
+        adapter = generate_cvdp_wrapper(
+            design_name=adapter_name,
+            sparkle_mod_name=core_name,
+            sparkle_ports=core_ports,
+            ref_code=concrete_ref,
+            harness_files=harness_files,
+            sv_code=core_sv,
+            expose_parameters=False,
+            expected_ports_override=concrete_ports,
+            reset_polarities=reset_polarities,
+            strict_mapping=True,
+        )
+        if not adapter:
+            row["compile_pass"] = False
+            row["error"] = "could not generate fixed-width CVDP adapter"
+            metadata["module_status"].append(row)
+            metadata["error"] = f"could not adapt concrete module {case.module_name}"
+            return None, metadata
+        row["adapter_name"] = adapter_name
+        row["core_ports"] = core_ports
+        row["adapter_ports"] = concrete_ports
+        metadata["module_status"].append(row)
+        adapter_blocks.append(adapter)
+        adapter_ports_by_case.append(concrete_ports)
+        for _, typ, name in concrete_ports:
+            width = _concrete_sv_width(typ)
+            if width is None:
+                metadata["error"] = f"adapter port {name} is not concrete in {adapter_name}"
+                return None, metadata
+            widths_by_port[name].append(width)
+
+    usage = _cvdp_parse_harness_usage(harness_files)
+    defaults = plan.cases[0].values
+    param_decls = [
+        f"parameter integer {name} = {defaults[name]}" for name in plan.parameter_names
+    ]
+    localparam_decls: list[str] = []
+    derived_values: dict[str, list[int]] = {}
+    public_text = ref_code + "\n" + public_spec + "\n" + "\n".join(
+        str(content) for path, content in harness_files.items()
+        if str(path).endswith(".py")
+    )
+    for derived_name in sorted(derived_parameter_names or set()):
+        values: list[int] = []
+        for case_index, case in enumerate(plan.cases):
+            public_value = _public_derived_parameter_value(
+                parameter_name=derived_name,
+                case_values=case.values,
+                public_text=public_text,
+            )
+            candidates = []
+            for _, public_type, port_name in expected_ports:
+                inferred = _solve_derived_width_parameter(
+                    typ=public_type,
+                    parameter_name=derived_name,
+                    case_values=case.values,
+                    concrete_width=widths_by_port[port_name][case_index],
+                )
+                if inferred is not None:
+                    candidates.append(inferred)
+            inferred_value = candidates[0] if candidates and len(set(candidates)) == 1 else None
+            if public_value is not None and inferred_value not in {None, public_value}:
+                metadata["error"] = (
+                    f"derived public parameter {derived_name}={public_value} conflicts "
+                    f"with concrete module width inference {inferred_value} for {case.module_name}"
+                )
+                return None, metadata
+            value = public_value if public_value is not None else inferred_value
+            if value is None:
+                metadata["error"] = (
+                    f"could not infer derived public parameter {derived_name} "
+                    f"for {case.module_name}"
+                )
+                return None, metadata
+            values.append(value)
+        derived_values[derived_name] = values
+        localparam_decls.append(
+            f"localparam integer {derived_name} = {_finite_case_expression(plan, values)}"
+        )
+
+    selector_ports = [
+        (direction, _selector_port_type(plan, widths_by_port[name]), name)
+        for direction, _, name in expected_ports
+    ]
+
+    lines = [f"module {design_name}", " #("]
+    lines.append(",\n".join(f"    {decl}" for decl in param_decls))
+    lines.extend([
+        ")",
+        " (",
+        ",\n".join(f"    {d} {t} {n}" for d, t, n in selector_ports),
+        ");",
+        "",
+        *(f"    {decl};" for decl in localparam_decls),
+        "" if localparam_decls else "",
+        "    // P0 finite specialization: selector only; behavior lives in Lean-generated cores.",
+        "    generate",
+    ])
+    public_names = {name for _, _, name in expected_ports}
+    for index, (case, adapter_ports) in enumerate(zip(plan.cases, adapter_ports_by_case)):
+        keyword = "if" if index == 0 else "else if"
+        condition = _specialization_condition(case.values)
+        adapter_name = f"{case.module_name}__cvdp_adapter"
+        lines.append(f"        {keyword} ({condition}) begin : p0_case_{index}")
+        lines.append(f"            {adapter_name} impl (")
+        connections = [
+            f"                .{name}({name})"
+            for _, _, name in adapter_ports
+            if name in public_names
+        ]
+        lines.append(",\n".join(connections))
+        lines.append("            );")
+        lines.append("        end")
+    lines.extend([
+        "        else begin : p0_unsupported_parameter_combination",
+        "            initial $error(\"Unsupported finite Sparkle parameter combination\");",
+        "        end",
+        "    endgenerate",
+        "endmodule",
+    ])
+
+    metadata["selector_generated"] = True
+    metadata["selector_ports"] = selector_ports
+    metadata["parameter_declarations"] = param_decls
+    metadata["localparam_declarations"] = localparam_decls
+    metadata["derived_parameter_values"] = derived_values
+    metadata["harness_parameters"] = sorted(usage["params"])
+    full_code = "\n\n".join([
+        *(modules[case.module_name] for case in plan.cases),
+        *adapter_blocks,
+        "\n".join(lines),
+    ])
+    return full_code, metadata
 
 
 # ── Evaluator ────────────────────────────────────────────────────
@@ -1293,12 +2006,20 @@ class Evaluator:
             if str(sc_src) not in sys.path:
                 sys.path.insert(0, str(sc_src))
 
-    def evaluate(self, prob_id: str, run_dir: Path) -> dict:
+    def evaluate(
+        self,
+        prob_id: str,
+        run_dir: Path,
+        problem_info=None,
+    ) -> dict:
         """Run full evaluation for a single problem.
 
         Args:
             prob_id: e.g. "Prob001_zero"
             run_dir: directory for storing sim artifacts
+            problem_info: optional already-configured dataset ProblemInfo. This
+                carries run-local metadata such as a finite specialization
+                plan; callers that omit it retain the historical reload path.
 
         Returns dict with keys:
             compile_pass, sv_extracted, lint_pass, sim_status, sim_mismatches, detail
@@ -1328,6 +2049,17 @@ class Evaluator:
             "has_sorry": True,       # True = unverified (default), False = formally verified
             "detail": "",
         }
+        info = problem_info
+        if info is None and self.dataset_obj is not None:
+            info = self.dataset_obj.load_problem(prob_id)
+        plan_payload = (
+            (getattr(info, "metadata", {}) or {}).get("finite_parameter_plan")
+            if info is not None else None
+        )
+        finite_plan = plan_from_dict(plan_payload)
+        if finite_plan is not None:
+            result["finite_parameter_specialization"] = True
+            result["specialization_count"] = len(finite_plan.cases)
 
         # 1. Compile
         lean_file = self.project_root / "Generated" / f"{prob_id}.lean"
@@ -1336,6 +2068,7 @@ class Evaluator:
             return result
 
         sv_code = None
+        sv_modules: list[str] = []
 
         if self.lean_repl is not None:
             # ── Fast path: use persistent REPL (~0.1s) ──
@@ -1345,12 +2078,12 @@ class Evaluator:
                 return result
             result["compile_pass"] = True
             result["has_sorry"] = not repl_result.complete
-            sv_code = repl_result.verilog
-            # Strip trailing non-Verilog content (e.g., Lean comments after endmodule)
-            if sv_code:
-                last_end = sv_code.rfind('endmodule')
-                if last_end >= 0:
-                    sv_code = sv_code[:last_end + len('endmodule')]
+            sv_modules = [
+                cleaned
+                for block in getattr(repl_result, "verilog_modules", [])
+                if (cleaned := _strip_verilog_info_block(block))
+            ]
+            sv_code = sv_modules[0] if sv_modules else _strip_verilog_info_block(repl_result.verilog or "")
         else:
             # ── Fallback: lake build (~10s) ──
             try:
@@ -1372,7 +2105,45 @@ class Evaluator:
 
             result["compile_pass"] = True
             result["has_sorry"] = bool(re.search(r"declaration uses `sorry`", build_output))
-            sv_code = self._extract_sv(build_output)
+            sv_modules = self._extract_sv_modules(build_output)
+            sv_code = sv_modules[0] if sv_modules else ""
+
+        if finite_plan is not None:
+            modules_by_name = {}
+            for module_code in sv_modules:
+                module_name = parse_module_name(module_code)
+                if module_name:
+                    modules_by_name[module_name] = module_code
+            expected_ports = [
+                tuple(port) for port in (plan_payload or {}).get("expected_ports", [])
+            ]
+            specialized_sv, manifest = generate_cvdp_specialization_wrapper(
+                design_name=finite_plan.design_name,
+                plan=finite_plan,
+                modules=modules_by_name,
+                expected_ports=expected_ports,
+                ref_code=getattr(info, "ref_code", ""),
+                harness_files=(getattr(info, "metadata", {}) or {}).get("harness_files", {}),
+                derived_parameter_names=set(
+                    (plan_payload or {}).get("derived_parameter_names", [])
+                ),
+                reset_polarities=dict(
+                    (plan_payload or {}).get("reset_polarities", {})
+                ),
+                public_spec=getattr(info, "prompt_text", ""),
+            )
+            manifest_dir = run_dir / "specialization" / prob_id
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            (manifest_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2), encoding="utf-8"
+            )
+            result["specialization_manifest"] = str(manifest_dir / "manifest.json")
+            result["specialization_compile_pass"] = bool(specialized_sv)
+            result["specialization_modules_found"] = len(modules_by_name)
+            if not specialized_sv:
+                result["detail"] = "Finite specialization failed: " + str(manifest.get("error", "unknown error"))
+                return result
+            sv_code = specialized_sv
 
         # 2. Extract SystemVerilog
         if not sv_code:
@@ -1389,12 +2160,24 @@ class Evaluator:
         result["lint_pass"] = self._run_lint(sv_file)
 
         # Parse module name (needed for sim wrapper and synthesis)
-        sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
+        if finite_plan is not None:
+            sparkle_mod_name, sparkle_ports = parse_module_ports(
+                sv_code, module_name=finite_plan.design_name
+            )
+        else:
+            sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
 
         # 4. Simulation
-        sim_status, mismatches, detail = self._run_sim(
-            prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir
-        )
+        if finite_plan is not None and self.dataset_name == "cvdp":
+            sim_status, mismatches, detail = self._run_sim_cvdp(
+                prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir,
+                direct_top=True,
+                problem_info=info,
+            )
+        else:
+            sim_status, mismatches, detail = self._run_sim(
+                prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir
+            )
         result["sim_status"] = sim_status
         result["sim_mismatches"] = mismatches
         result["detail"] = detail
@@ -1451,11 +2234,44 @@ class Evaluator:
         return "\n".join(sv_lines) if sv_lines else ""
 
     @staticmethod
+    def _extract_sv_modules(build_output: str) -> list[str]:
+        modules: list[str] = []
+        current: list[str] = []
+        capturing = False
+        for line in build_output.splitlines():
+            cleaned = re.sub(r"^info:\s+\S+\s+", "", line)
+            if "// Generated by Sparkle HDL" in cleaned:
+                current = [cleaned]
+                capturing = True
+                continue
+            if not capturing:
+                continue
+            current.append(cleaned)
+            if cleaned.strip() == "endmodule":
+                modules.append("\n".join(current))
+                current = []
+                capturing = False
+        return modules
+
+    @staticmethod
     def _run_lint(sv_file: Path) -> bool:
         """Run iverilog lint check."""
+        command = ["iverilog", "-t", "null", "-g2012", str(sv_file)]
+        if shutil.which("iverilog") is None:
+            image = os.environ.get("OSS_SIM_IMAGE", "").strip()
+            if not image or shutil.which("docker") is None:
+                return False
+            mounted_dir = sv_file.resolve().parent
+            command = [
+                "docker", "run", "--rm",
+                "--entrypoint", "iverilog",
+                "-v", f"{mounted_dir}:/work:ro",
+                image,
+                "-t", "null", "-g2012", f"/work/{sv_file.name}",
+            ]
         try:
             comp = subprocess.run(
-                ["iverilog", "-t", "null", "-g2012", str(sv_file)],
+                command,
                 capture_output=True, text=True, timeout=30,
             )
             return comp.returncode == 0 and not comp.stderr.strip()
@@ -1680,12 +2496,15 @@ class Evaluator:
         sparkle_mod_name: str,
         sparkle_ports: list[tuple[str, str, str]],
         run_dir: Path,
+        *,
+        direct_top: bool = False,
+        problem_info=None,
     ) -> tuple[str, int, str]:
         """Run a CVDP cocotb harness in its Docker simulation image."""
         if self.dataset_obj is None:
             return "sim_error", -1, "CVDP dataset object not set on evaluator"
 
-        info = self.dataset_obj.load_problem(prob_id)
+        info = problem_info or self.dataset_obj.load_problem(prob_id)
         harness_files = info.metadata.get("harness_files", {})
         verilog_sources = info.metadata.get("verilog_sources", [])
         design_name = info.design_name
@@ -1699,38 +2518,46 @@ class Evaluator:
             shutil.rmtree(sim_dir)
         sim_dir.mkdir(parents=True, exist_ok=True)
 
-        image_name = os.environ.get("OSS_SIM_IMAGE", "nvidia/cvdp-sim:v1.0.0")
+        image_override = os.environ.get("OSS_SIM_IMAGE", "").strip()
+        image_name = image_override or "nvidia/cvdp-sim:v1.0.0"
         for rel_path, content in harness_files.items():
             out_path = sim_dir / rel_path
             out_path.parent.mkdir(parents=True, exist_ok=True)
             if rel_path == "docker-compose.yml":
                 content = str(content).replace("__OSS_SIM_IMAGE__", image_name)
+                if image_override:
+                    content = re.sub(
+                        r"(?m)^(\s*image\s*:\s*)nvidia/cvdp-sim:v1\.0\.0\s*$",
+                        lambda match: f"{match.group(1)}{image_name}",
+                        content,
+                    )
             out_path.write_text(str(content))
 
         target_mod_name, target_ports = parse_module_ports(sv_code, module_name=design_name)
-        if target_mod_name == design_name:
-            sparkle_mod_name, sparkle_ports = target_mod_name, target_ports
-        elif not sparkle_mod_name:
-            sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
+        if not (direct_top and target_mod_name == design_name):
+            if target_mod_name == design_name:
+                sparkle_mod_name, sparkle_ports = target_mod_name, target_ports
+            elif not sparkle_mod_name:
+                sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
 
-        if sparkle_mod_name:
-            inner_name = sparkle_mod_name
-            if sparkle_mod_name == design_name:
-                inner_name = f"{design_name}_sparkle_inner"
-                sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, inner_name)
+            if sparkle_mod_name:
+                inner_name = sparkle_mod_name
+                if sparkle_mod_name == design_name:
+                    inner_name = f"{design_name}_sparkle_inner"
+                    sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, inner_name)
 
-            wrapper = generate_cvdp_wrapper(
-                design_name=design_name,
-                sparkle_mod_name=inner_name,
-                sparkle_ports=sparkle_ports,
-                ref_code=info.ref_code,
-                harness_files=harness_files,
-                sv_code=sv_code,
-            )
-            if wrapper:
-                sv_code = f"{sv_code.rstrip()}\n\n{wrapper}\n"
-            elif sparkle_mod_name != design_name:
-                sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, design_name)
+                wrapper = generate_cvdp_wrapper(
+                    design_name=design_name,
+                    sparkle_mod_name=inner_name,
+                    sparkle_ports=sparkle_ports,
+                    ref_code=info.ref_code,
+                    harness_files=harness_files,
+                    sv_code=sv_code,
+                )
+                if wrapper:
+                    sv_code = f"{sv_code.rstrip()}\n\n{wrapper}\n"
+                elif sparkle_mod_name != design_name:
+                    sv_code = _rename_module_declaration(sv_code, sparkle_mod_name, design_name)
 
         def local_source_path(source: str) -> Path:
             if source.startswith("/code/"):
@@ -1753,6 +2580,28 @@ class Evaluator:
         if sim_mode != "docker":
             return self._run_sim_cvdp_local(sim_dir)
 
+        compose_path = sim_dir / "docker-compose.yml"
+        compose_text = compose_path.read_text(errors="replace")
+        required_mounts = {
+            str(local_source_path(source).parent.relative_to(sim_dir))
+            for source in verilog_sources
+        }
+        mount_lines = []
+        for rel_dir in sorted(required_mounts):
+            container_dir = "/code/" + rel_dir.strip("/")
+            mount_lines.append(f"      - ./{rel_dir}/:{container_dir}/:ro")
+        if mount_lines and "volumes:" in compose_text:
+            first_volume = re.search(r"(?m)^(\s*volumes\s*:\s*)$", compose_text)
+            if first_volume:
+                insert_at = first_volume.end()
+                compose_text = (
+                    compose_text[:insert_at]
+                    + "\n"
+                    + "\n".join(mount_lines)
+                    + compose_text[insert_at:]
+                )
+                compose_path.write_text(compose_text)
+
         compose = ["docker", "compose"]
         try:
             check = subprocess.run(
@@ -1765,11 +2614,17 @@ class Evaluator:
             compose = ["docker-compose"]
 
         service = "direct"
-        compose_text = (sim_dir / "docker-compose.yml").read_text(errors="replace")
+        compose_text = compose_path.read_text(errors="replace")
         service_match = re.search(r"^\s{2}([A-Za-z0-9_-]+):\s*$", compose_text, re.MULTILINE)
         if service_match:
             service = service_match.group(1)
 
+        proc = None
+        timed_out = False
+        run_error = None
+        cleanup_error = None
+        output = ""
+        cleanup = None
         try:
             proc = subprocess.run(
                 compose + [
@@ -1780,20 +2635,44 @@ class Evaluator:
                 cwd=str(sim_dir),
                 capture_output=True, text=True, timeout=180,
             )
-            cleanup = subprocess.run(
-                compose + ["-f", "docker-compose.yml", "down", "-v"],
-                cwd=str(sim_dir),
-                capture_output=True, text=True, timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            return "sim_error", -1, "CVDP docker simulation timeout"
-        except FileNotFoundError as e:
-            return "sim_error", -1, f"Docker compose not found: {e}"
+            output = (proc.stdout or "") + (proc.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            for stream in (exc.stdout, exc.stderr):
+                if isinstance(stream, bytes):
+                    output += stream.decode(errors="replace")
+                elif stream:
+                    output += str(stream)
+        except FileNotFoundError as exc:
+            run_error = f"Docker compose not found: {exc}"
+        finally:
+            try:
+                cleanup = subprocess.run(
+                    compose + [
+                        "-f", "docker-compose.yml", "down", "-v",
+                        "--remove-orphans",
+                    ],
+                    cwd=str(sim_dir),
+                    capture_output=True, text=True, timeout=60,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                cleanup_error = f"CVDP docker cleanup failed: {exc}"
 
-        output = proc.stdout + proc.stderr
-        if "cleanup" in locals() and cleanup.stdout:
-            output += "\n[CLEANUP]\n" + cleanup.stdout
+        if cleanup is not None:
+            cleanup_output = (cleanup.stdout or "") + (cleanup.stderr or "")
+            if cleanup_output:
+                output += "\n[CLEANUP]\n" + cleanup_output
         (sim_dir / "cvdp_output.txt").write_text(output)
+        if run_error is not None:
+            return "sim_error", -1, run_error
+        if timed_out:
+            detail = "CVDP docker simulation timeout"
+            if cleanup_error:
+                detail += f"; {cleanup_error}"
+            return "sim_error", -1, detail
+        if cleanup_error is not None:
+            return "sim_error", -1, cleanup_error
+        assert proc is not None
         tail = "\n".join(output.splitlines()[-40:])
         if proc.returncode == 0:
             return "sim_pass", 0, "CVDP harness passed"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import shlex
 import sys
 import threading
 import time
@@ -41,6 +42,7 @@ class CodexAgentHarnessRunner:
     wire_api: str = "responses"
     auto_chat_proxy: bool = True
     chat_proxy_timeout_s: float = 300.0
+    required_verilog_modules: tuple[str, ...] = ()
 
     @property
     def log_path(self) -> Path:
@@ -210,14 +212,21 @@ class CodexAgentHarnessRunner:
             time.sleep(2.0)
 
     def _codex_prompt(self, prompt: str, *, max_turns: int) -> str:
+        required_args = "".join(
+            f" --require-module {shlex.quote(name)}"
+            for name in self.required_verilog_modules
+        )
+        lean_check_command = (
+            ".venv/bin/python -m cktarchon.tools lean-check "
+            f"Generated/{self.prob_id}.lean{required_args}"
+        )
         return (
             self.system_prompt.rstrip()
             + "\n\n## Codex-agent execution notes\n"
             + f"- Target action budget: about {max_turns} tool/model steps; stop once `Generated/{self.prob_id}.lean` compiles.\n"
             + f"- Only edit `Generated/{self.prob_id}.lean` and scratch files under `cktarchon_work/{self.prob_id}/`.\n"
             + "- In this Codex path there is no direct `lean_check` function tool. Ignore instructions that say to pass code to `lean_check`.\n"
-            + "- For Lean feedback, run `.venv/bin/python -m cktarchon.tools lean-check Generated/"
-            + f"{self.prob_id}.lean` from the repository root.\n"
+            + f"- For Lean feedback, run `{lean_check_command}` from the repository root.\n"
             + "- `cktarchon.tools lean-check` checks the file path argument only; it does not read candidate code from stdin. Write the target file before checking it.\n"
             + "- Use `grep`/`find` rather than `rg`; `rg` is not installed on this H20 image.\n"
             + "- Leave benchmark, Sparkle, evaluator, and harness files unchanged.\n"
@@ -225,7 +234,7 @@ class CodexAgentHarnessRunner:
             + "## NL2Chip problem prompt\n"
             + prompt
             + "\n\n## Final CktArchon override\n"
-            + f"- The final answer should be brief. After `.venv/bin/python -m cktarchon.tools lean-check Generated/{self.prob_id}.lean` reports success, stop immediately.\n"
+            + f"- The final answer should be brief. After `{lean_check_command}` reports success, stop immediately.\n"
             + "- Do not perform extra Verilog review, simulation, pytest, cocotb, synthesis, or PPA checks inside CodexAgent.\n"
             + "- These instructions override any earlier generic workflow text that asks for final Verilog inspection.\n"
         )
