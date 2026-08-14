@@ -315,6 +315,77 @@ def test_evaluator_classifies_fixed_inner_as_parameter_contract_failure(
     assert result["diagnostics"][-1]["code"] == "native_parameter_contract_failed"
 
 
+def test_evaluator_reports_native_ppa_per_case_without_a_default_metric(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / "native_case.lean").write_text("-- checked by fake REPL\n")
+    evaluator = Evaluator(
+        project_root=tmp_path,
+        dataset="cvdp",
+        dataset_obj=object(),
+        lean_repl=_FakeRepl([GENERIC_XOR]),
+        enable_synth=True,
+        parameter_ppa_policy="per_configuration",
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_run_native_parameter_elaboration",
+        lambda **_kwargs: (
+            True,
+            [
+                {"parameters": case.values, "verilog_elaboration": "passed"}
+                for case in _plan().cases
+            ],
+            "ok",
+            "verilog_elaboration",
+        ),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_run_sim_cvdp",
+        lambda *_args, **_kwargs: ("sim_pass", 0, "ok"),
+    )
+    widths = iter((3, 17, 65))
+    calls = []
+
+    def fake_synth(case_id, concrete_sv, top_module, case_dir):
+        width = next(widths)
+        calls.append((case_id, concrete_sv, top_module, case_dir))
+        top = concrete_sv[concrete_sv.rindex("module native_xor"):]
+        assert f"WIDTH = {width}" in top
+        return {
+            "synth_pass": True,
+            "area_um2": float(width),
+            "cell_count": width,
+            "wns_ns": None,
+            "power_uw": None,
+        }
+
+    monkeypatch.setattr(evaluator, "_run_synthesis", fake_synth)
+    result = evaluator.evaluate(
+        "native_case",
+        tmp_path / "run",
+        problem_info=_native_info(),
+    )
+
+    assert len(calls) == 3
+    assert result["sim_status"] == "sim_pass"
+    assert result["synth_pass"] is True
+    assert result["ppa_status"] == "passed"
+    assert result["ppa_coverage"] == "all_public_configurations"
+    assert result["ppa_family_covered"] is True
+    assert result["area_um2"] is None
+    assert [row["area_um2"] for row in result["ppa_case_results"]] == [3.0, 17.0, 65.0]
+    manifest = __import__("json").loads(
+        Path(result["ppa_parameter_manifest"]).read_text()
+    )
+    assert manifest["source_sv_sha256"] == manifest["cases"][0]["source_sv_sha256"]
+    assert len({row["concrete_sv_sha256"] for row in manifest["cases"]}) == 3
+
+
 def test_explicit_generic_formal_policy_fails_closed_when_theorem_is_missing(
     tmp_path: Path,
 ):
@@ -400,3 +471,23 @@ def test_cli_rejects_p0_and_p3_parameter_modes_together(
     with pytest.raises(SystemExit) as exc:
         ckt_run.parse_args()
     assert exc.value.code == 2
+
+
+def test_cli_requires_an_active_native_ppa_flow(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    base = [
+        "cktarchon/run.py",
+        "--results-dir", "/tmp/result",
+        "--native-parameter-sweep",
+        "--require-native-ppa",
+    ]
+    monkeypatch.setattr(sys, "argv", base)
+    with pytest.raises(SystemExit) as exc:
+        ckt_run.parse_args()
+    assert exc.value.code == 2
+
+    monkeypatch.setattr(sys, "argv", [*base, "--synth"])
+    args = ckt_run.parse_args()
+    assert args.require_native_ppa is True
+    assert args.synth is True

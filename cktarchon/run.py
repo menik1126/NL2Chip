@@ -159,6 +159,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail evaluation when CppSim cannot cover every public parameter case.",
     )
+    p.add_argument(
+        "--native-ppa-policy",
+        choices=["off", "per_configuration"],
+        default="per_configuration",
+        help=(
+            "PPA policy used with --synth for native parameter families. "
+            "The supported mode binds and synthesizes every public configuration independently."
+        ),
+    )
+    p.add_argument(
+        "--require-native-ppa",
+        action="store_true",
+        help="Fail evaluation unless every requested PPA stage covers every public case.",
+    )
+    p.add_argument("--synth", action="store_true", help="Run ORFS synthesis and collect per-configuration area/cell metrics.")
+    p.add_argument("--pnr", action="store_true", help="Run per-configuration place and route; implies synthesis.")
+    p.add_argument("--drc", action="store_true", help="Run per-configuration DRC; implies place and route.")
+    p.add_argument("--lvs", action="store_true", help="Run per-configuration LVS; implies place and route.")
+    p.add_argument("--corners", action="store_true", help="Run multi-corner STA for every routed configuration; implies place and route.")
     p.add_argument("--workers", type=int, default=1, help="Concurrent problem workers; each receives an isolated Lean REPL.")
     p.add_argument("--archon-src", default=str(ARCHON_SRC), help="Official Archon src directory for codex-agent/archon-native harnesses.")
     p.add_argument("--codex-bin", default=None, help="Optional absolute path to the codex CLI for --harness codex-agent.")
@@ -202,7 +221,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--candidate-search-max", type=int, default=3, help="Maximum independent Lean candidate lineages in guided search.")
     p.add_argument("--guided-self-test-mode", choices=["guidance", "execute"], default="guidance", help="Use one public-spec TB as prompt guidance only (default), or run the legacy advisory-TB execution ablation.")
     p.add_argument("--candidate-stagnation-patience", type=int, default=2, help="Start a fresh candidate after this many non-improving attempts.")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.require_native_ppa and not args.native_parameter_sweep:
+        p.error("--require-native-ppa requires --native-parameter-sweep")
+    if args.require_native_ppa and args.native_ppa_policy == "off":
+        p.error("--require-native-ppa is incompatible with --native-ppa-policy off")
+    if args.require_native_ppa and not any(
+        (args.synth, args.pnr, args.drc, args.lvs, args.corners)
+    ):
+        p.error("--require-native-ppa requires --synth or a later physical-design stage")
+    return args
 
 
 def discover_problems(args: argparse.Namespace, ds: Any) -> list[str]:
@@ -1369,12 +1397,19 @@ def main() -> None:
         try:
             evaluator = Evaluator(
                 project_root=PROJECT_ROOT,
+                enable_synth=args.synth,
+                enable_pnr=args.pnr or args.corners,
+                enable_drc=args.drc,
+                enable_lvs=args.lvs,
+                enable_corners=args.corners,
                 dataset=args.dataset,
                 dataset_obj=ds,
                 lean_repl=repl,
                 parameter_formal_policy=args.native_formal_policy,
                 parameter_cppsim_policy=args.native_cppsim_policy,
                 parameter_cppsim_required=args.require_native_cppsim,
+                parameter_ppa_policy=args.native_ppa_policy,
+                parameter_ppa_required=args.require_native_ppa,
             )
             print(f"[{idx}/{len(problems)}] run {prob_id}")
             record = process_problem(prob_id, args=args, ds=ds, evaluator=evaluator, run_dir=run_dir, skill=skill, repl=repl)

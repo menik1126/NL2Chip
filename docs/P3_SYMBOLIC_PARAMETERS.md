@@ -145,3 +145,32 @@ soundly support packed ports wider than 64 bits; such cases are explicitly
 `unsupported`, so partial coverage cannot become family coverage.
 `--require-native-cppsim` turns any failed/unsupported case into an
 `unsupported_backend` evaluation failure.
+
+## PPA Per-Configuration Policy
+
+PPA is an elaborated-design property, so a metric from the default parameter
+value cannot represent a parameter family. With `--synth` and
+`--native-ppa-policy per_configuration`, the evaluator keeps the original
+generic SystemVerilog hash as the family identity, then creates one bound copy
+per public configuration by changing only the top module's parameter defaults.
+Each copy is synthesized in an isolated ORFS workspace. `--pnr`, `--drc`,
+`--lvs`, and `--corners` extend the same per-case flow rather than running only
+the default configuration.
+
+The evaluator writes
+`ppa_parameter_family/<prob_id>/manifest.json`. Every case records:
+
+- public parameter bindings and the shared generic `source_sv_sha256`;
+- a distinct `concrete_sv_sha256` for the elaborated configuration;
+- independent synthesis/P&R/DRC/LVS status and artifact directory;
+- area, cell count, WNS, and power when the requested backend reports them.
+- a structured failure stage (`parameter_contract`, `verilog_elaboration`,
+  `unsupported_backend`, or `infrastructure`) when a case does not complete.
+
+`family_covered=true` requires every requested stage to pass for every public
+configuration. Partial runs retain only their own case metrics; top-level
+`area_um2`, `cell_count`, `wns_ns`, and `power_uw` remain unset for a family so
+downstream reporting cannot accidentally present one width as the family.
+`--require-native-ppa` turns partial or unsupported coverage into a structured
+`unsupported_backend` failure. `--native-ppa-policy off` performs no default-
+width fallback.

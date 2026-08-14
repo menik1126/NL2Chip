@@ -37,8 +37,12 @@ from parameter_backends import (
     cppsim_policy_is_required_failure,
     evaluate_formal_parameter_policy,
     formal_policy_is_required_failure,
+    ppa_manifest_failure_stage,
+    ppa_policy_is_required_failure,
     run_cppsim_parameter_policy,
+    run_ppa_parameter_policy,
 )
+from orfs_runner import run_docker_command
 
 
 DATASET_DIR = Path("verilog-eval/dataset_spec-to-rtl")
@@ -2345,6 +2349,8 @@ class Evaluator:
         parameter_formal_policy: str = "auto",
         parameter_cppsim_policy: str = "off",
         parameter_cppsim_required: bool = False,
+        parameter_ppa_policy: str = "per_configuration",
+        parameter_ppa_required: bool = False,
     ):
         self.project_root = project_root.resolve()
         self.dataset_name = dataset.lower()
@@ -2360,12 +2366,8 @@ class Evaluator:
         self.parameter_formal_policy = parameter_formal_policy
         self.parameter_cppsim_policy = parameter_cppsim_policy
         self.parameter_cppsim_required = parameter_cppsim_required
-
-        if self.enable_synth:
-            # Add siliconcrew/src to path for synthesis tools
-            sc_src = self.project_root / "siliconcrew" / "src"
-            if str(sc_src) not in sys.path:
-                sys.path.insert(0, str(sc_src))
+        self.parameter_ppa_policy = parameter_ppa_policy
+        self.parameter_ppa_required = parameter_ppa_required
 
     def evaluate(
         self,
@@ -2407,6 +2409,10 @@ class Evaluator:
             "gls_synth_mismatches": -1,
             "gls_pnr_status": "not_run",     # post-PnR gate-level sim
             "gls_pnr_mismatches": -1,
+            "ppa_parameter_policy": "off",
+            "ppa_status": "not_run",
+            "ppa_coverage": "none",
+            "ppa_family_covered": False,
             "has_sorry": True,       # True = unverified (default), False = formally verified
             "detail": "",
             "failure_stage": None,
@@ -2762,35 +2768,88 @@ class Evaluator:
 
         # 5. Synthesis + PPA (optional)
         if self.enable_synth and result["sv_extracted"]:
-            synth_result = self._run_synthesis(
-                prob_id, sv_code, sparkle_mod_name or prob_id.lower(), run_dir
-            )
-            result.update(synth_result)
-
-            # 5b. Post-synthesis gate-level simulation
-            if self.enable_gls and result["synth_pass"]:
-                synth_dir = run_dir / "synth" / prob_id
-                gls_result = self._run_gls(
-                    prob_id, sv_code, sparkle_mod_name, sparkle_ports,
-                    run_dir, synth_dir, "post_synth",
+            if native_plan is not None:
+                ppa_dir = run_dir / "ppa_parameter_family" / prob_id
+                ppa_manifest = run_ppa_parameter_policy(
+                    sv_code=sv_code,
+                    top_module=sparkle_mod_name or native_plan.design_name,
+                    prob_id=prob_id,
+                    plan=native_plan,
+                    output_dir=ppa_dir,
+                    synth_runner=self._run_synthesis,
+                    pnr_runner=self._run_pnr if self.enable_pnr else None,
+                    requested_policy=self.parameter_ppa_policy,
+                    required=self.parameter_ppa_required,
+                    require_drc=self.enable_drc,
+                    require_lvs=self.enable_lvs,
                 )
-                result.update(gls_result)
-
-            # 6. Full P&R + DRC + LVS (optional)
-            if self.enable_pnr and result["synth_pass"]:
-                pnr_result = self._run_pnr(
+                ppa_manifest_path = ppa_dir / "manifest.json"
+                ppa_manifest_path.write_text(
+                    json.dumps(ppa_manifest, indent=2), encoding="utf-8"
+                )
+                result.update({
+                    "ppa_parameter_manifest": str(ppa_manifest_path),
+                    "ppa_parameter_policy": ppa_manifest["effective_policy"],
+                    "ppa_status": ppa_manifest["status"],
+                    "ppa_coverage": ppa_manifest["coverage"],
+                    "ppa_family_covered": ppa_manifest["family_covered"],
+                    "synth_pass": ppa_manifest["synthesis_family_covered"],
+                    "pnr_pass": ppa_manifest["pnr_family_covered"],
+                    "ppa_case_results": ppa_manifest["cases"],
+                    "ppa_metric_ranges": ppa_manifest["metric_ranges"],
+                })
+                if native_manifest is not None:
+                    native_manifest["ppa_parameter_family"] = {
+                        "manifest": str(ppa_manifest_path),
+                        "status": ppa_manifest["status"],
+                        "coverage": ppa_manifest["coverage"],
+                        "family_covered": ppa_manifest["family_covered"],
+                    }
+                    assert native_manifest_path is not None
+                    native_manifest_path.write_text(
+                        json.dumps(native_manifest, indent=2), encoding="utf-8"
+                    )
+                if ppa_policy_is_required_failure(ppa_manifest):
+                    detail = "PPA parameter policy failed: " + "; ".join(
+                        str(item.get("message") if isinstance(item, dict) else item)
+                        for item in ppa_manifest.get("diagnostics", [])
+                    )
+                    _record_failure(
+                        result,
+                        ppa_manifest_failure_stage(ppa_manifest),
+                        detail,
+                        code="ppa_parameter_policy_failed",
+                    )
+            else:
+                synth_result = self._run_synthesis(
                     prob_id, sv_code, sparkle_mod_name or prob_id.lower(), run_dir
                 )
-                result.update(pnr_result)
+                result.update(synth_result)
 
-                # 6b. Post-PnR gate-level simulation
-                if self.enable_gls and result["pnr_pass"]:
+                # 5b. Post-synthesis gate-level simulation
+                if self.enable_gls and result["synth_pass"]:
                     synth_dir = run_dir / "synth" / prob_id
                     gls_result = self._run_gls(
                         prob_id, sv_code, sparkle_mod_name, sparkle_ports,
-                        run_dir, synth_dir, "post_pnr",
+                        run_dir, synth_dir, "post_synth",
                     )
                     result.update(gls_result)
+
+                # 6. Full P&R + DRC + LVS (optional)
+                if self.enable_pnr and result["synth_pass"]:
+                    pnr_result = self._run_pnr(
+                        prob_id, sv_code, sparkle_mod_name or prob_id.lower(), run_dir
+                    )
+                    result.update(pnr_result)
+
+                    # 6b. Post-PnR gate-level simulation
+                    if self.enable_gls and result["pnr_pass"]:
+                        synth_dir = run_dir / "synth" / prob_id
+                        gls_result = self._run_gls(
+                            prob_id, sv_code, sparkle_mod_name, sparkle_ports,
+                            run_dir, synth_dir, "post_pnr",
+                        )
+                        result.update(gls_result)
 
         return result
 
@@ -3932,12 +3991,6 @@ class Evaluator:
             "power_uw": None,
         }
 
-        try:
-            from tools.run_docker import run_docker_command
-        except ImportError as e:
-            result["synth_error"] = f"Cannot import siliconcrew tools: {e}"
-            return result
-
         # Set up workspace directory
         synth_dir = run_dir / "synth" / prob_id
         synth_dir.mkdir(parents=True, exist_ok=True)
@@ -3972,7 +4025,8 @@ class Evaluator:
         results_dir = synth_dir / "orfs_results"
         logs_dir = synth_dir / "orfs_logs"
         reports_dir = synth_dir / "orfs_reports"
-        for d in [results_dir, logs_dir, reports_dir]:
+        objects_dir = synth_dir / "orfs_objects"
+        for d in [results_dir, logs_dir, reports_dir, objects_dir]:
             if d.exists():
                 shutil.rmtree(d)
             d.mkdir(parents=True, exist_ok=True)
@@ -3981,6 +4035,7 @@ class Evaluator:
             f"{results_dir}:/OpenROAD-flow-scripts/flow/results",
             f"{logs_dir}:/OpenROAD-flow-scripts/flow/logs",
             f"{reports_dir}:/OpenROAD-flow-scripts/flow/reports",
+            f"{objects_dir}:/OpenROAD-flow-scripts/flow/objects",
         ]
 
         # Run synthesis only (not the full flow)
@@ -4039,8 +4094,6 @@ class Evaluator:
         self, prob_id: str, sv_code: str, top_module: str, run_dir: Path
     ) -> dict:
         """Run full P&R (floorplan→place→CTS→route→finish) + DRC + LVS."""
-        from tools.run_docker import run_docker_command
-
         result: dict = {
             "pnr_pass": False,
             "gds_generated": False,
@@ -4103,6 +4156,7 @@ class Evaluator:
             f"{synth_dir / 'orfs_results'}:/OpenROAD-flow-scripts/flow/results",
             f"{synth_dir / 'orfs_logs'}:/OpenROAD-flow-scripts/flow/logs",
             f"{synth_dir / 'orfs_reports'}:/OpenROAD-flow-scripts/flow/reports",
+            f"{synth_dir / 'orfs_objects'}:/OpenROAD-flow-scripts/flow/objects",
         ]
 
         # ── Phase 1: Full P&R (finish picks up from synth) ──
@@ -4185,8 +4239,6 @@ class Evaluator:
         synth_dir: Path, volumes: list[str],
     ) -> dict:
         """Run STA at each PVT corner on the post-route netlist."""
-        from tools.run_docker import run_docker_command
-
         has_clk = bool(re.search(r'\binput\b.*\bclk\b', sv_code))
         corners_data: list[dict] = []
         platform_dir = "/OpenROAD-flow-scripts/flow/platforms/sky130hd"
@@ -4285,8 +4337,6 @@ class Evaluator:
     @staticmethod
     def _run_drc(synth_dir: Path, volumes: list[str]) -> dict:
         """Run KLayout DRC and parse violation count."""
-        from tools.run_docker import run_docker_command
-
         result: dict = {"drc_pass": None, "drc_violations": None}
         try:
             drc_result = run_docker_command(
@@ -4319,8 +4369,6 @@ class Evaluator:
     @staticmethod
     def _run_lvs(synth_dir: Path, volumes: list[str]) -> dict:
         """Run KLayout LVS, fixing sky130hd CDL 'short' keyword that KLayout can't parse."""
-        from tools.run_docker import run_docker_command
-
         result: dict = {"lvs_pass": None, "lvs_error": None}
 
         # sky130 CDL has two issues KLayout 0.30.x can't handle:
