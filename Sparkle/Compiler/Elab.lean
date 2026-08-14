@@ -152,10 +152,28 @@ def emitMemory (hint : String) (addrWidth dataWidth : Nat) (clk : String)
   set cs'
   return name
 
+def emitMemoryDim (hint : String) (addrWidth dataWidth : DimExpr) (clk : String)
+    (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr)
+    (named : Bool := false) : CompilerM String := do
+  let cs ← get
+  let (name, cs') := CircuitM.emitMemoryDim hint addrWidth dataWidth clk
+    writeAddr writeData writeEnable readAddr named cs
+  set cs'
+  return name
+
 def emitMemoryComboRead (hint : String) (addrWidth dataWidth : Nat) (clk : String)
     (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr) (named : Bool := false) : CompilerM String := do
   let cs ← get
   let (name, cs') := CircuitM.emitMemoryComboRead hint addrWidth dataWidth clk writeAddr writeData writeEnable readAddr named cs
+  set cs'
+  return name
+
+def emitMemoryComboReadDim (hint : String) (addrWidth dataWidth : DimExpr) (clk : String)
+    (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr)
+    (named : Bool := false) : CompilerM String := do
+  let cs ← get
+  let (name, cs') := CircuitM.emitMemoryComboReadDim hint addrWidth dataWidth clk
+    writeAddr writeData writeEnable readAddr named cs
   set cs'
   return name
 
@@ -1495,8 +1513,8 @@ mutual
       trace[sparkle.compiler] "→ memory (sync)"
       let addrWidthArg := args[args.size-6]!
       let dataWidthArg := args[args.size-5]!
-      let (addrWidth, _) ← extractNatLiteral addrWidthArg
-      let (dataWidth, _) ← extractNatLiteral dataWidthArg
+      let addrWidth ← extractDimExpr addrWidthArg
+      let dataWidth ← extractDimExpr dataWidthArg
       let writeAddr := args[args.size-4]!
       let writeData := args[args.size-3]!
       let writeEnable := args[args.size-2]!
@@ -1505,7 +1523,7 @@ mutual
       let wdW ← translateExprToWire writeData "mem_wdata"
       let weW ← translateExprToWire writeEnable "mem_we"
       let raW ← translateExprToWire readAddr "mem_raddr"
-      let w ← CompilerM.emitMemory hint addrWidth dataWidth "clk"
+      let w ← CompilerM.emitMemoryDim hint addrWidth dataWidth "clk"
         (.ref waW) (.ref wdW) (.ref weW) (.ref raW) (named := isNamed)
       return some w
 
@@ -1514,8 +1532,8 @@ mutual
       trace[sparkle.compiler] "→ memory (combo read)"
       let addrWidthArg := args[args.size-6]!
       let dataWidthArg := args[args.size-5]!
-      let (addrWidth, _) ← extractNatLiteral addrWidthArg
-      let (dataWidth, _) ← extractNatLiteral dataWidthArg
+      let addrWidth ← extractDimExpr addrWidthArg
+      let dataWidth ← extractDimExpr dataWidthArg
       let writeAddr := args[args.size-4]!
       let writeData := args[args.size-3]!
       let writeEnable := args[args.size-2]!
@@ -1524,7 +1542,7 @@ mutual
       let wdW ← translateExprToWire writeData "mem_wdata"
       let weW ← translateExprToWire writeEnable "mem_we"
       let raW ← translateExprToWire readAddr "mem_raddr"
-      let w ← CompilerM.emitMemoryComboRead hint addrWidth dataWidth "clk"
+      let w ← CompilerM.emitMemoryComboReadDim hint addrWidth dataWidth "clk"
         (.ref waW) (.ref wdW) (.ref weW) (.ref raW) (named := isNamed)
       return some w
 

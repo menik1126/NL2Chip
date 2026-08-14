@@ -13,6 +13,11 @@ namespace Sparkle.Backend.CppSim
 open Sparkle.IR.AST
 open Sparkle.IR.Type
 
+def requireConcreteDim (context : String) (dimension : DimExpr) : Nat :=
+  match dimension.toNat? with
+  | some value => value
+  | none => panic! s!"CppSim requires {context} specialization, found {dimension}"
+
 -- Helper to embed literal braces in string interpolation
 private def ob : String := "{"
 private def cb : String := "}"
@@ -313,6 +318,8 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
     , evalTickLocals := [s!"        {cppType} {nextName};"] }
 
   | .memory name addrWidth dataWidth _clock writeAddr writeData writeEnable readAddr readData comboRead =>
+    let addrWidth := requireConcreteDim "memory address width" addrWidth
+    let dataWidth := requireConcreteDim "memory data width" dataWidth
     let memSize := 2 ^ addrWidth
     let elemType := emitCppType (.bitVector dataWidth)
     let memName := sanitizeName name
@@ -524,7 +531,9 @@ def toCppSimDesign (d : Design)
 private def collectMemories (body : List Stmt) : List (String × Nat × Nat) :=
   body.filterMap fun stmt =>
     match stmt with
-    | .memory name addrWidth dataWidth .. => some (name, addrWidth, dataWidth)
+    | .memory name addrWidth dataWidth .. =>
+      some (name, requireConcreteDim "memory address width" addrWidth,
+        requireConcreteDim "memory data width" dataWidth)
     | _ => none
 
 /-- Collect (sanitizedName, width) for all registers ≤64 bits -/

@@ -144,31 +144,44 @@ def emitRegister (hint : String) (clock : String) (reset : String)
   - writeEnable: Write enable expression
   - readAddr: Read address expression
 -/
-def emitMemory (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+def emitMemoryDim (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr) (clock : String)
     (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
   let m ← getModule
   -- Add the read data output wire
-  let m := m.addWire { name := readDataName, ty := .bitVector dataWidth }
+  let m := m.addWire { name := readDataName, ty := hwTypeFromDim dataWidth }
   -- Add the memory statement
   let m := m.addStmt (.memory memName addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readDataName)
   setModule m
   return readDataName
 
+def emitMemory (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+    (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr)
+    (named : Bool := false) : CircuitM String :=
+  emitMemoryDim hint (.literal addrWidth) (.literal dataWidth) clock
+    writeAddr writeData writeEnable readAddr named
+
 /--
   Emit a memory with combinational (same-cycle) read.
   Returns the name of the read data output wire.
 -/
-def emitMemoryComboRead (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+def emitMemoryComboReadDim (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr)
+    (clock : String)
     (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
   let m ← getModule
-  let m := m.addWire { name := readDataName, ty := .bitVector dataWidth }
+  let m := m.addWire { name := readDataName, ty := hwTypeFromDim dataWidth }
   let m := m.addStmt (.memory memName addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readDataName (comboRead := true))
   setModule m
   return readDataName
+
+def emitMemoryComboRead (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+    (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr)
+    (named : Bool := false) : CircuitM String :=
+  emitMemoryComboReadDim hint (.literal addrWidth) (.literal dataWidth) clock
+    writeAddr writeData writeEnable readAddr named
 
 /--
   Emit a module instantiation.

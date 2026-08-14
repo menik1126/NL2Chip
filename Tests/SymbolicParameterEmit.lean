@@ -7,3 +7,4 @@ import Tests.SymbolicParameterCircuits
 #synthesizeParameterizedVerilog symbolicSliceLow [W := 8]
 #synthesizeParameterizedVerilog symbolicZeroExtend [W := 8]
 #synthesizeParameterizedVerilog symbolicRegister [W := 8]
+#synthesizeParameterizedVerilog symbolicMemory [ADDR_W := 3, DATA_W := 8]

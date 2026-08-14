@@ -27,3 +27,10 @@ def symbolicZeroExtend {dom : DomainConfig} {W : Nat}
 def symbolicRegister {dom : DomainConfig} {W : Nat}
     (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
   Signal.register (BitVec.ofNat W 1) x
+
+def symbolicMemory {dom : DomainConfig} {ADDR_W DATA_W : Nat}
+    (writeAddr : Signal dom (BitVec ADDR_W))
+    (writeData : Signal dom (BitVec DATA_W))
+    (writeEnable : Signal dom Bool)
+    (readAddr : Signal dom (BitVec ADDR_W)) : Signal dom (BitVec DATA_W) :=
+  Signal.memory writeAddr writeData writeEnable readAddr

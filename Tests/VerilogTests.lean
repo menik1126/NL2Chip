@@ -87,6 +87,7 @@ structure VerilogOutputs where
   symbolicSliceLowVerilog : String
   symbolicZeroExtendVerilog : String
   symbolicRegisterVerilog : String
+  symbolicMemoryVerilog : String
   rejectsUnretainedWidth : Bool
   rejectsMissingBinder : Bool
   rejectsDuplicateParameter : Bool
@@ -111,6 +112,8 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedToString `symbolicZeroExtend [("W", 8)]
   let symbolicRegisterVerilog ←
     synthesizeParameterizedToString `symbolicRegister [("W", 8)]
+  let symbolicMemoryVerilog ←
+    synthesizeParameterizedToString `symbolicMemory [("ADDR_W", 3), ("DATA_W", 8)]
   let rejectsUnretainedWidth ←
     parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
   let rejectsMissingBinder ←
@@ -126,6 +129,7 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
     symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
     symbolicSliceLowVerilog, symbolicZeroExtendVerilog, symbolicRegisterVerilog,
+    symbolicMemoryVerilog,
     rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
     rejectsZeroWidthDefault
   }
@@ -192,6 +196,15 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           (outputs.symbolicRegisterVerilog.containsSubstr "logic [W-1:0]") $
         test "register reset value is sized by W"
           (outputs.symbolicRegisterVerilog.containsSubstr "<= W'(1);")
+      ) ++
+      group "parameterized memory" (
+        test "memory retains address and data parameters"
+          (outputs.symbolicMemoryVerilog.containsSubstr "parameter integer ADDR_W = 3" &&
+           outputs.symbolicMemoryVerilog.containsSubstr "parameter integer DATA_W = 8") $
+        test "memory data storage retains DATA_W"
+          (outputs.symbolicMemoryVerilog.containsSubstr "logic [DATA_W-1:0]") $
+        test "memory depth retains ADDR_W"
+          (outputs.symbolicMemoryVerilog.containsSubstr "[0:((2 ** ADDR_W) - 1)]")
       ) ++
       group "fail-closed diagnostics" (
         test "rejects an unretained generic width" outputs.rejectsUnretainedWidth $

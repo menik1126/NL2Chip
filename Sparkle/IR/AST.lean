@@ -159,8 +159,8 @@ inductive Stmt where
       : Stmt
   | memory
       (name : String)         -- Memory instance name
-      (addrWidth : Nat)       -- Address width (size = 2^addrWidth)
-      (dataWidth : Nat)       -- Data width
+      (addrWidth : DimExpr)   -- Address width (size = 2^addrWidth)
+      (dataWidth : DimExpr)   -- Data width
       (clock : String)        -- Clock signal
       (writeAddr : Expr)      -- Write address port
       (writeData : Expr)      -- Write data port

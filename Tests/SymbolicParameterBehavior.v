@@ -18,6 +18,18 @@ module symbolic_parameter_behavior_tb;
     logic [64:0] reg65_in;
     wire [64:0] reg65_out;
 
+    logic [1:0] mem2_write_addr;
+    logic [2:0] mem2_write_data;
+    logic mem2_write_enable;
+    logic [1:0] mem2_read_addr;
+    wire [2:0] mem2_read_data;
+
+    logic [3:0] mem4_write_addr;
+    logic [16:0] mem4_write_data;
+    logic mem4_write_enable;
+    logic [3:0] mem4_read_addr;
+    wire [16:0] mem4_read_data;
+
     symbolicConcat #(.HI(3), .LO(5)) concat_dut (
         ._gen_hi(concat_hi),
         ._gen_lo(concat_lo),
@@ -46,6 +58,22 @@ module symbolic_parameter_behavior_tb;
         ._gen_x(reg65_in), .clk(clk), .rst(rst), .out(reg65_out)
     );
 
+    symbolicMemory #(.ADDR_W(2), .DATA_W(3)) mem2_dut (
+        ._gen_writeAddr(mem2_write_addr),
+        ._gen_writeData(mem2_write_data),
+        ._gen_writeEnable(mem2_write_enable),
+        ._gen_readAddr(mem2_read_addr),
+        .clk(clk), .rst(rst), .out(mem2_read_data)
+    );
+
+    symbolicMemory #(.ADDR_W(4), .DATA_W(17)) mem4_dut (
+        ._gen_writeAddr(mem4_write_addr),
+        ._gen_writeData(mem4_write_data),
+        ._gen_writeEnable(mem4_write_enable),
+        ._gen_readAddr(mem4_read_addr),
+        .clk(clk), .rst(rst), .out(mem4_read_data)
+    );
+
     initial begin
         concat_hi = 3'b101;
         concat_lo = 5'b10011;
@@ -56,6 +84,14 @@ module symbolic_parameter_behavior_tb;
         reg3_in = 3'b110;
         reg17_in = 17'b1_0101_1001_1110_0011;
         reg65_in = {1'b1, 64'h0123_4567_89ab_cdef};
+        mem2_write_addr = 2'd1;
+        mem2_write_data = 3'b101;
+        mem2_write_enable = 1'b0;
+        mem2_read_addr = 2'd0;
+        mem4_write_addr = 4'd3;
+        mem4_write_data = 17'h1_2345;
+        mem4_write_enable = 1'b0;
+        mem4_read_addr = 4'd0;
         #1;
 
         if (concat_out !== {concat_hi, concat_lo})
@@ -76,6 +112,46 @@ module symbolic_parameter_behavior_tb;
         #1;
         if (reg3_out !== reg3_in || reg17_out !== reg17_in || reg65_out !== reg65_in)
             $fatal(1, "symbolic register update failed");
+        clk = 1'b0;
+
+        mem2_write_enable = 1'b1;
+        mem4_write_enable = 1'b1;
+        #1;
+        clk = 1'b1;
+        #1;
+        clk = 1'b0;
+
+        mem2_write_enable = 1'b0;
+        mem4_write_enable = 1'b0;
+        mem2_read_addr = 2'd1;
+        mem4_read_addr = 4'd3;
+        #1;
+        clk = 1'b1;
+        #1;
+        if (mem2_read_data !== 3'b101 || mem4_read_data !== 17'h1_2345)
+            $fatal(1, "symbolic memory first-address read failed");
+        clk = 1'b0;
+
+        mem2_write_addr = 2'd2;
+        mem2_write_data = 3'b011;
+        mem2_write_enable = 1'b1;
+        mem4_write_addr = 4'd12;
+        mem4_write_data = 17'h0_abcd;
+        mem4_write_enable = 1'b1;
+        #1;
+        clk = 1'b1;
+        #1;
+        clk = 1'b0;
+
+        mem2_write_enable = 1'b0;
+        mem4_write_enable = 1'b0;
+        mem2_read_addr = 2'd2;
+        mem4_read_addr = 4'd12;
+        #1;
+        clk = 1'b1;
+        #1;
+        if (mem2_read_data !== 3'b011 || mem4_read_data !== 17'h0_abcd)
+            $fatal(1, "symbolic memory second-address read failed");
 
         $display("P3_SYMBOLIC_PARAMETER_BEHAVIOR_PASS");
         $finish;

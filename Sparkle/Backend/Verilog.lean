@@ -174,8 +174,11 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
 
   | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
     -- Generate memory array and always_ff block
-    let memSize := 2 ^ addrWidth
-    let memDecl := s!"{indent}logic [{dataWidth-1}:0] {sanitizeName name} [0:{memSize-1}];"
+    let lastAddress := match addrWidth.toNat? with
+      | some width => s!"{(2 ^ width) - 1}"
+      | none => s!"((2 ** {emitDimExpr addrWidth}) - 1)"
+    let memDecl :=
+      s!"{indent}{emitType (hwTypeFromDim dataWidth)} {sanitizeName name} [0:{lastAddress}];"
     if comboRead then
       -- Combinational read: assign readData = mem[readAddr]
       let assignRead := s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
