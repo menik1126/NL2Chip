@@ -16,6 +16,21 @@ This directory records public benchmark problem identifiers used by the rebuttal
 
 Each source run has 168 unique tasks, and their intersection is 168/168.
 
+## CVDP 12-task true-parameter subset
+
+`cvdp12_true_parameter_subset.txt` contains the 12 CVDP tasks used to stress
+finite specialization and native symbolic-parameter support.  These tasks have
+public CVDP parameter sweeps in the harness and are useful for quick regression
+checks while editing Sparkle parameter lowering or the CktArchon adapter.
+
+Example:
+
+```bash
+KEY_ENV=/path/to/key.env \
+RESULTS_DIR=/path/to/results/cvdp12_native_param \
+./scripts/run_cvdp12_native_param.sh
+```
+
 Example for the 72-task subset:
 
 ```bash

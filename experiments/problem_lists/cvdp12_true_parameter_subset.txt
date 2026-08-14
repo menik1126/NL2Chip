@@ -1,0 +1,17 @@
+# CVDP true-parameter stress subset used for P0/native-parameter rebuttal debugging.
+#
+# These 12 tasks were selected because the CVDP harness rebuilds or instantiates
+# the DUT under multiple public parameter settings.  They are intended for
+# testing finite specialization and native symbolic-parameter support.
+cvdp_copilot_word_reducer_0008
+cvdp_copilot_nbit_swizzling_0001
+cvdp_copilot_sync_lifo_0001
+cvdp_copilot_gf_multiplier_0021
+cvdp_copilot_car_parking_management_0001
+cvdp_copilot_hamming_code_tx_and_rx_0011
+cvdp_copilot_square_root_0003
+cvdp_copilot_filo_0005
+cvdp_copilot_digital_dice_roller_0004
+cvdp_copilot_restoring_division_0001
+cvdp_copilot_hamming_code_tx_and_rx_0009
+cvdp_copilot_axil_precision_counter_0001
