@@ -1151,6 +1151,31 @@ def finite_parameter_specialization_contract(info: ProblemInfo | None) -> str:
     return format_native_parameter_contract(native_plan) if native_plan else ""
 
 
+def formal_parameter_contract(info: ProblemInfo | None) -> str:
+    if info is None:
+        return ""
+    contract = dict((info.metadata or {}).get("formal_parameter_contract") or {})
+    if not contract:
+        return ""
+    lines = [
+        "### Formal Parameter Contract",
+        "",
+        f"- Scope: {contract.get('scope', 'functional_correctness')}",
+    ]
+    if contract.get("generic_theorem"):
+        lines.append(f"- Required generic theorem: `{contract['generic_theorem']}`")
+    if contract.get("case_theorem_template"):
+        lines.append(
+            f"- Required per-configuration theorem template: `{contract['case_theorem_template']}`"
+        )
+    if contract.get("obligation_text"):
+        lines.extend(["- Public proof obligation:", str(contract["obligation_text"])])
+    lines.append(
+        "The theorem(s) must compile without `sorry` or `admit`; merely defining a generic circuit is not a functional proof."
+    )
+    return "\n".join(lines)
+
+
 def benchmark_expected_port_names(info: ProblemInfo | None) -> tuple[set[str], set[str]]:
     if info is None:
         return set(), set()
@@ -1290,6 +1315,8 @@ def build_user_message(
     specialization_section = (
         f"{specialization_contract}\n\n" if specialization_contract else ""
     )
+    formal_contract = formal_parameter_contract(info)
+    formal_section = f"{formal_contract}\n\n" if formal_contract else ""
     if plan is not None:
         first = plan.cases[0]
         bindings = " ".join(
@@ -1357,6 +1384,7 @@ def build_user_message(
         f"### Natural Language Description\n\n{nl_desc}\n\n"
         f"{interface_section}"
         f"{specialization_section}"
+        f"{formal_section}"
         f"{ref_section}"
         f"### Your Task\n\n"
         f"Write a Sparkle HDL (Lean 4) implementation for this problem.\n\n"

@@ -135,6 +135,16 @@ def parse_args() -> argparse.Namespace:
             "verify parameter propagation, and elaborate every public sweep case."
         ),
     )
+    p.add_argument(
+        "--native-formal-policy",
+        choices=["off", "auto", "generic", "per_configuration"],
+        default="auto",
+        help=(
+            "Formal coverage policy for a native parameter family. `auto` uses an "
+            "explicit formal_parameter_contract when available and otherwise reports "
+            "unsupported without treating Lean elaboration as a functional proof."
+        ),
+    )
     p.add_argument("--workers", type=int, default=1, help="Concurrent problem workers; each receives an isolated Lean REPL.")
     p.add_argument("--archon-src", default=str(ARCHON_SRC), help="Official Archon src directory for codex-agent/archon-native harnesses.")
     p.add_argument("--codex-bin", default=None, help="Optional absolute path to the codex CLI for --harness codex-agent.")
@@ -1343,7 +1353,13 @@ def main() -> None:
         if pool is not None:
             repl = pool.acquire()
         try:
-            evaluator = Evaluator(project_root=PROJECT_ROOT, dataset=args.dataset, dataset_obj=ds, lean_repl=repl)
+            evaluator = Evaluator(
+                project_root=PROJECT_ROOT,
+                dataset=args.dataset,
+                dataset_obj=ds,
+                lean_repl=repl,
+                parameter_formal_policy=args.native_formal_policy,
+            )
             print(f"[{idx}/{len(problems)}] run {prob_id}")
             record = process_problem(prob_id, args=args, ds=ds, evaluator=evaluator, run_dir=run_dir, skill=skill, repl=repl)
             return idx, prob_id, record

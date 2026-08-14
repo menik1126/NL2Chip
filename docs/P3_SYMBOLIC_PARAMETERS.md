@@ -95,3 +95,28 @@ set `failure_stage` plus structured `diagnostics`. Stages are:
 - `simulation_mismatch`
 - `unsupported_backend`
 - `infrastructure`
+
+## Formal Coverage Policy
+
+CVDP supplies a simulation oracle, not a public Lean functional specification.
+Accordingly, a generic circuit definition that merely typechecks is recorded as
+formal `unsupported` with `coverage=none`; it is never reported as a functional
+proof. A benchmark or integration layer can provide an explicit
+`formal_parameter_contract` containing:
+
+- `scope`: the claim proved by the theorem(s)
+- `generic_theorem`: one theorem that quantifies/references every retained
+  parameter, or
+- `case_theorem_template`: a format string such as
+  `fifo_w{DATA_WIDTH}_d{DEPTH}_correct`
+- `obligation_text`: the public theorem statement/specification shown to the
+  agent
+- `required`: whether failure must stop evaluation
+
+`--native-formal-policy generic` accepts family coverage only when the named
+generic theorem is present and the complete Lean file passes without `sorry` or
+`admit`. `per_configuration` requires the rendered theorem for every public
+sweep case. Explicit policies fail closed with `unsupported_backend`; `auto`
+uses a supplied contract but otherwise records the lack of a formal oracle and
+continues simulation. Each run writes `formal/<prob_id>/manifest.json` so
+default-width, partial-case, and full-family claims remain distinguishable.

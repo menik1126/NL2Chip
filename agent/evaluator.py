@@ -33,6 +33,10 @@ from cvdp_native_parameters import (
     validate_native_parameter_ownership,
 )
 from cvdp_specialization import FiniteParameterPlan, plan_from_dict
+from parameter_backends import (
+    evaluate_formal_parameter_policy,
+    formal_policy_is_required_failure,
+)
 
 
 DATASET_DIR = Path("verilog-eval/dataset_spec-to-rtl")
@@ -2261,7 +2265,20 @@ def generate_cvdp_specialization_wrapper(
 class Evaluator:
     """Evaluate a Sparkle-generated .lean file: compile → extract SV → lint → sim → (synth+PPA) → (P&R+DRC+LVS)."""
 
-    def __init__(self, project_root: Path = Path("."), enable_synth: bool = False, enable_pnr: bool = False, enable_drc: bool = False, enable_lvs: bool = False, enable_corners: bool = False, enable_gls: bool = False, lean_repl=None, dataset: str = "verilogeval", dataset_obj=None):
+    def __init__(
+        self,
+        project_root: Path = Path("."),
+        enable_synth: bool = False,
+        enable_pnr: bool = False,
+        enable_drc: bool = False,
+        enable_lvs: bool = False,
+        enable_corners: bool = False,
+        enable_gls: bool = False,
+        lean_repl=None,
+        dataset: str = "verilogeval",
+        dataset_obj=None,
+        parameter_formal_policy: str = "auto",
+    ):
         self.project_root = project_root.resolve()
         self.dataset_name = dataset.lower()
         self.dataset_obj = dataset_obj  # Optional Dataset instance from dataset.py
@@ -2273,6 +2290,7 @@ class Evaluator:
         self.enable_lvs = enable_lvs
         self.enable_corners = enable_corners and self.enable_pnr  # corners require pnr
         self.lean_repl = lean_repl  # Optional LeanREPL instance for fast compilation
+        self.parameter_formal_policy = parameter_formal_policy
 
         if self.enable_synth:
             # Add siliconcrew/src to path for synthesis tools
@@ -2503,6 +2521,38 @@ class Evaluator:
                 )
                 return result
             sv_code = native_sv
+
+            formal_manifest = evaluate_formal_parameter_policy(
+                lean_source=lean_file.read_text(errors="replace"),
+                lean_complete=not result["has_sorry"],
+                plan=native_plan,
+                requested_policy=self.parameter_formal_policy,
+                contract=metadata.get("formal_parameter_contract"),
+            )
+            formal_dir = run_dir / "formal" / prob_id
+            formal_dir.mkdir(parents=True, exist_ok=True)
+            formal_manifest_path = formal_dir / "manifest.json"
+            formal_manifest_path.write_text(
+                json.dumps(formal_manifest, indent=2), encoding="utf-8"
+            )
+            result.update({
+                "formal_parameter_manifest": str(formal_manifest_path),
+                "formal_parameter_policy": formal_manifest["effective_policy"],
+                "formal_status": formal_manifest["status"],
+                "formal_coverage": formal_manifest["coverage"],
+                "formal_family_covered": formal_manifest["family_covered"],
+            })
+            if formal_policy_is_required_failure(formal_manifest):
+                detail = "Formal parameter policy failed: " + "; ".join(
+                    formal_manifest.get("diagnostics", [])
+                )
+                _record_failure(
+                    result,
+                    "unsupported_backend",
+                    detail,
+                    code="formal_parameter_policy_failed",
+                )
+                return result
 
         # 2. Extract SystemVerilog
         if not sv_code:

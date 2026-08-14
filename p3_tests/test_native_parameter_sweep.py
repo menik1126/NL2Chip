@@ -213,20 +213,23 @@ class _FakeRepl:
         )
 
 
-def _native_info():
+def _native_info(formal_contract=None):
     payload = native_plan_to_dict(_plan())
     payload["expected_ports"] = EXPECTED_PORTS
     payload["derived_parameter_names"] = []
     payload["reset_polarities"] = {}
+    metadata = {
+        "dataset": "cvdp",
+        "native_parameter_sweep_plan": payload,
+        "harness_files": HARNESS,
+    }
+    if formal_contract is not None:
+        metadata["formal_parameter_contract"] = formal_contract
     return SimpleNamespace(
         design_name="native_xor",
         ref_code=REF_XOR,
         prompt_text="parameter WIDTH",
-        metadata={
-            "dataset": "cvdp",
-            "native_parameter_sweep_plan": payload,
-            "harness_files": HARNESS,
-        },
+        metadata=metadata,
     )
 
 
@@ -272,6 +275,9 @@ def test_evaluator_native_path_keeps_all_modules_and_writes_one_hash_manifest(
     assert result["native_parameter_elaboration_pass"] is True
     assert result["sim_status"] == "sim_pass"
     assert result["failure_stage"] is None
+    assert result["formal_status"] == "unsupported"
+    assert result["formal_coverage"] == "none"
+    assert result["formal_family_covered"] is False
     assert observed["module_name"] == "native_xor"
     assert observed["direct_top"] is True
     assert "module child" in observed["sv_code"]
@@ -307,6 +313,33 @@ def test_evaluator_classifies_fixed_inner_as_parameter_contract_failure(
     assert result["sim_status"] == "not_run"
     assert result["failure_stage"] == "parameter_contract"
     assert result["diagnostics"][-1]["code"] == "native_parameter_contract_failed"
+
+
+def test_explicit_generic_formal_policy_fails_closed_when_theorem_is_missing(
+    tmp_path: Path,
+):
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / "native_case.lean").write_text("def no_proof := True\n")
+    evaluator = Evaluator(
+        project_root=tmp_path,
+        dataset="cvdp",
+        dataset_obj=object(),
+        lean_repl=_FakeRepl([GENERIC_XOR]),
+        parameter_formal_policy="generic",
+    )
+    result = evaluator.evaluate(
+        "native_case",
+        tmp_path / "run",
+        problem_info=_native_info({"generic_theorem": "native_xor_correct"}),
+    )
+    assert result["native_parameter_contract_pass"] is True
+    assert result["formal_status"] == "incomplete"
+    assert result["formal_family_covered"] is False
+    assert result["sv_extracted"] is False
+    assert result["sim_status"] == "not_run"
+    assert result["failure_stage"] == "unsupported_backend"
+    assert result["diagnostics"][-1]["code"] == "formal_parameter_policy_failed"
 
 
 def test_runner_configures_native_metadata_and_prompt_without_p0_aliases():
