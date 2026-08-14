@@ -353,7 +353,7 @@ def build_system_prompt(
         + "- Preserve benchmark clock, reset polarity, and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
         + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and `#synthesizeVerilog`; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
         + "- Keep repository exploration short: read at most three examples, then write a complete candidate and iterate from compiler feedback.\n"
-        + "- This H20 host may not have `rg`; use `grep` and `find` for repository searches.\n"
+        + "- Use the guarded `grep`, `glob`, and `list_directory` tools for repository searches; shell file-discovery commands are blocked so concurrent tasks cannot see each other's artifacts.\n"
         + "- If you need a directory listing, use `list_directory`; do not call `read_file` on directories.\n"
         + "- The key Sparkle synthesis rules are included below. Do not `cat` all of `docs/Troubleshooting_Synthesis.md`; if you need more detail, use `grep` for a narrow pattern.\n"
         + "- Prefer simple `Signal dom ... -> Signal dom ...` combinational helpers. Avoid pure helper functions with `match`, `if`, tuples, or recursion when their result depends on hardware signals.\n"

@@ -38,6 +38,31 @@ def test_path_guard_allows_only_problem_outputs(tmp_path: Path):
     assert not guard.is_write_allowed("agent/search.py")
 
 
+def test_path_guard_hides_peer_artifacts_and_credentials(tmp_path: Path):
+    guard = PathGuard(tmp_path, "prob_a")
+
+    assert guard.is_read_allowed("Generated")
+    assert guard.is_read_allowed("Generated/prob_a.lean")
+    assert guard.is_read_allowed("Generated/prob_a_helper.lean")
+    assert not guard.is_read_allowed("Generated/prob_b.lean")
+    assert guard.is_read_allowed("cktarchon_work")
+    assert guard.is_read_allowed("cktarchon_work/prob_a/notes.txt")
+    assert not guard.is_read_allowed("cktarchon_work/prob_b/notes.txt")
+    assert not guard.is_read_allowed("key.env")
+    assert not guard.is_read_allowed(".git/config")
+    assert guard.is_read_allowed("docs/P3_SYMBOLIC_PARAMETERS.md")
+
+
+def test_path_guard_blocks_shell_file_discovery_and_peer_modules(tmp_path: Path):
+    guard = PathGuard(tmp_path, "prob_a")
+
+    assert guard.bash_access_error("find Generated -name '*.lean'")
+    assert guard.bash_access_error("cat Generated/prob_a.lean")
+    assert guard.bash_access_error("lake build Generated.prob_b")
+    assert guard.bash_access_error("lake build Generated.prob_a") is None
+    assert guard.bash_access_error("lake build Sparkle") is None
+
+
 class _CompleteLeanResult:
     passed = True
     complete = True
@@ -79,6 +104,46 @@ def _anthropic_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Anthro
         system_prompt="test",
         lean_repl=_CompleteLeanRepl(),
     )
+
+
+def test_harness_read_tools_expose_only_current_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = _anthropic_runner(tmp_path, monkeypatch)
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / "prob_a.lean").write_text("own marker\n", encoding="utf-8")
+    (generated / "prob_b.lean").write_text("peer secret marker\n", encoding="utf-8")
+
+    assert runner._read_file("Generated/prob_a.lean") == "own marker\n"
+    denied = runner._execute_tool("read_file", {"path": "Generated/prob_b.lean"})
+    assert "Read denied" in denied
+    assert "peer secret marker" not in runner._grep("marker", ".")
+    assert runner._grep("own marker", ".").startswith("Generated/prob_a.lean:1:")
+
+    visible_glob = runner._glob("Generated/*.lean")
+    visible_listing = runner._list_directory("Generated")
+    assert "prob_a.lean" in visible_glob
+    assert "prob_b.lean" not in visible_glob
+    assert visible_listing == "prob_a.lean"
+
+
+def test_harness_bash_subprocess_does_not_receive_secret_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = _anthropic_runner(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "must-not-reach-subprocess")
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
+
+    monkeypatch.setattr("cktarchon.harness.subprocess.run", fake_run)
+    assert runner._bash("lake build Sparkle") == "ok\n"
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
 
 
 def test_harness_autosaves_complete_inline_lean_check(

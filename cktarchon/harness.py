@@ -32,6 +32,14 @@ RETRIABLE_PROVIDER_ERROR_PATTERNS = (
     "upstream request failed",
     "provider error",
 )
+BASH_FILE_INSPECTION_COMMANDS = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:cat|find|grep|rg|ls|tree|head|tail|sed|awk|less|more|xargs)"
+    r"(?=\s|$|[;&|()])"
+)
+SENSITIVE_ENV_NAME = re.compile(
+    r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)",
+    re.IGNORECASE,
+)
 
 TOOL_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "bash": ("command",),
@@ -119,7 +127,7 @@ def _validate_tool_inputs(
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "bash",
-        "description": "Run a shell command from the NL2Chip project root. Use for lake build, tests, and inspection; not for writing source files.",
+        "description": "Run build or check commands from the NL2Chip project root. Repository file inspection is available only through the guarded read_file, grep, glob, and list_directory tools.",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -128,7 +136,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "read_file",
-        "description": "Read a file relative to the NL2Chip project root.",
+        "description": "Read a task-visible file relative to the NL2Chip project root. Artifacts belonging to concurrent tasks are hidden.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -163,7 +171,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "grep",
-        "description": "Search text files under a path relative to the project root.",
+        "description": "Search task-visible text files under a path relative to the project root.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -176,7 +184,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "glob",
-        "description": "List files matching a glob relative to the project root.",
+        "description": "List task-visible files matching a glob relative to the project root.",
         "input_schema": {
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
@@ -185,7 +193,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "list_directory",
-        "description": "List directory entries relative to the project root.",
+        "description": "List task-visible directory entries relative to the project root.",
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -228,6 +236,44 @@ class PathGuard:
             raise ValueError(f"Path escapes project root: {rel_path}")
         return path
 
+    def _normalized_relative(self, rel_path: str) -> str:
+        path = self.resolve(rel_path)
+        relative = path.relative_to(self.project_root.resolve())
+        return relative.as_posix() or "."
+
+    def is_read_allowed(self, rel_path: str) -> bool:
+        try:
+            normalized = self._normalized_relative(rel_path)
+        except (ValueError, OSError):
+            return False
+        parts = Path(normalized).parts
+        if any(part in {".git", ".lake", ".venv", "__pycache__"} for part in parts):
+            return False
+        if any(part == "key.env" or part.endswith(".env") for part in parts):
+            return False
+        if normalized == "Generated":
+            return True
+        if normalized.startswith("Generated/"):
+            allowed = (
+                f"Generated/{self.prob_id}.lean",
+                f"Generated/{self.prob_id}_*.lean",
+            )
+            return any(fnmatch.fnmatch(normalized, pattern) for pattern in allowed)
+        if normalized == "cktarchon_work":
+            return True
+        if normalized.startswith("cktarchon_work/"):
+            own_root = f"cktarchon_work/{self.prob_id}"
+            return normalized == own_root or normalized.startswith(own_root + "/")
+        return True
+
+    def require_read_allowed(self, rel_path: str) -> Path:
+        if not self.is_read_allowed(rel_path):
+            raise PermissionError(
+                f"Read denied for {rel_path}. Concurrent task artifacts and credential files are isolated; "
+                f"only Generated/{self.prob_id}.lean and cktarchon_work/{self.prob_id}/ are visible in shared output directories."
+            )
+        return self.resolve(rel_path)
+
     def is_write_allowed(self, rel_path: str) -> bool:
         normalized = rel_path.strip().lstrip("./")
         allowed = [
@@ -244,6 +290,24 @@ class PathGuard:
                 f"Write denied for {rel_path}. Allowed outputs are Generated/{self.prob_id}.lean and cktarchon_work/{self.prob_id}/."
             )
         return self.resolve(rel_path)
+
+    def bash_access_error(self, command: str) -> str | None:
+        if BASH_FILE_INSPECTION_COMMANDS.search(command):
+            return (
+                "Repository file inspection through bash is disabled by concurrent-task isolation. "
+                "Use read_file, grep, glob, or list_directory; those tools hide artifacts from other tasks."
+            )
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9_])(?:\./)?(?:Generated|cktarchon_work)/[^\s;&|()\"']+",
+            command,
+        ):
+            rel_path = match.group(0).removeprefix("./").rstrip(",:")
+            if not self.is_read_allowed(rel_path) and not self.is_write_allowed(rel_path):
+                return f"Shell access denied for isolated task path {rel_path}."
+        for module_name in re.findall(r"\bGenerated\.([A-Za-z_][A-Za-z0-9_]*)", command):
+            if module_name != self.prob_id and not module_name.startswith(self.prob_id + "_"):
+                return f"Shell access denied for isolated task module Generated.{module_name}."
+        return None
 
 
 @dataclass
@@ -449,11 +513,18 @@ class AnthropicHarnessRunner:
         blocked = re.compile(r"\b(rm\s+-rf|git\s+reset|git\s+checkout|pkill|killall|sudo|scp|ssh)\b")
         if blocked.search(command):
             return "Error: command rejected by cktarchon safety policy"
+        if access_error := self.guard.bash_access_error(command):
+            return f"Error: {access_error}"
+        subprocess_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not SENSITIVE_ENV_NAME.search(key)
+        }
         try:
             proc = subprocess.run(
                 ["bash", "-lc", command],
                 cwd=self.project_root,
-                env={**os.environ, "LC_ALL": "C.UTF-8"},
+                env={**subprocess_env, "LC_ALL": "C.UTF-8"},
                 capture_output=True,
                 text=True,
                 timeout=BASH_TIMEOUT,
@@ -470,7 +541,7 @@ class AnthropicHarnessRunner:
         return output or "(no output)"
 
     def _read_file(self, rel_path: str, offset: Any = None, limit: Any = None) -> str:
-        path = self.guard.resolve(rel_path)
+        path = self.guard.require_read_allowed(rel_path)
         if path.exists() and path.is_dir():
             return self._list_directory(rel_path)
         if not path.exists() or not path.is_file():
@@ -550,7 +621,7 @@ class AnthropicHarnessRunner:
             })
 
     def _grep(self, pattern: str, rel_path: str, include: Any = None) -> str:
-        root = self.guard.resolve(rel_path)
+        root = self.guard.require_read_allowed(rel_path)
         if not root.exists():
             return f"Error: path not found: {rel_path}"
         try:
@@ -562,6 +633,8 @@ class AnthropicHarnessRunner:
         for path in sorted(files):
             rel = path.relative_to(self.project_root)
             if any(part in {".git", ".lake", ".venv", "__pycache__"} for part in rel.parts):
+                continue
+            if not self.guard.is_read_allowed(str(rel)):
                 continue
             if include and not fnmatch.fnmatch(path.name, str(include)):
                 continue
@@ -586,6 +659,8 @@ class AnthropicHarnessRunner:
                 continue
             if any(part in {".git", ".lake", ".venv", "__pycache__"} for part in rel.parts):
                 continue
+            if not self.guard.is_read_allowed(str(rel)):
+                continue
             rows.append(str(rel))
             if len(rows) >= MAX_GLOB_RESULTS:
                 rows.append(f"... [truncated at {MAX_GLOB_RESULTS} matches]")
@@ -593,12 +668,15 @@ class AnthropicHarnessRunner:
         return "\n".join(rows) if rows else f"No files matching {pattern!r}"
 
     def _list_directory(self, rel_path: str) -> str:
-        path = self.guard.resolve(rel_path)
+        path = self.guard.require_read_allowed(rel_path)
         if not path.exists() or not path.is_dir():
             return f"Error: directory not found: {rel_path}"
         rows = []
         for entry in sorted(path.iterdir()):
             if entry.name.startswith(".") or entry.name == "__pycache__":
+                continue
+            rel = entry.relative_to(self.project_root)
+            if not self.guard.is_read_allowed(str(rel)):
                 continue
             suffix = "/" if entry.is_dir() else ""
             rows.append(f"{entry.name}{suffix}")
@@ -608,7 +686,7 @@ class AnthropicHarnessRunner:
         if code is not None and str(code).strip():
             return self._lean_check_code(str(code))
         rel_path = str(path or f"Generated/{self.prob_id}.lean")
-        path = self.guard.resolve(rel_path)
+        path = self.guard.require_read_allowed(rel_path)
         if not path.exists():
             return f"Error: file not found: {rel_path}"
         if self.lean_repl is not None:
