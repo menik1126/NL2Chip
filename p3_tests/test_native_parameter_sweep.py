@@ -202,6 +202,58 @@ def test_generic_core_is_wrapped_with_explicit_parameter_forwarding():
     assert manifest["sv_sha256"] == manifest["cases"][0]["sv_sha256"]
 
 
+def test_native_wrapper_maps_symbolic_packed_field_by_semantics():
+    plan = FiniteParameterPlan(
+        design_name="square_root_seq",
+        parameter_names=("WIDTH",),
+        cases=tuple(
+            SpecializationCase(
+                parameters=(("WIDTH", width),),
+                module_name=f"unused_{width}",
+            )
+            for width in (2, 4, 8, 16)
+        ),
+    )
+    sv_code = """
+module square_root_seq #(parameter integer WIDTH = 2) (
+    input logic [WIDTH-1:0] _gen_num,
+    output logic [(1 + (WIDTH / 2))-1:0] out
+);
+    logic _gen_done;
+    logic [(WIDTH / 2)-1:0] _gen_regRoot;
+    assign _gen_done = 1'b0;
+    assign _gen_regRoot = _gen_num[(WIDTH / 2)-1:0];
+    assign out = {_gen_done, _gen_regRoot};
+endmodule
+"""
+    ref_code = """
+module square_root_seq #(parameter integer WIDTH = 2) (
+    input logic [WIDTH-1:0] num,
+    output logic done,
+    output logic [WIDTH/2-1:0] final_root
+);
+endmodule
+"""
+    expected_ports = [
+        ("input", "logic [WIDTH-1:0]", "num"),
+        ("output", "logic", "done"),
+        ("output", "logic [WIDTH/2-1:0]", "final_root"),
+    ]
+    design, manifest = prepare_cvdp_native_parameter_design(
+        sv_code=sv_code,
+        design_name="square_root_seq",
+        plan=plan,
+        expected_ports=expected_ports,
+        ref_code=ref_code,
+        harness_files={
+            "src/test_runner.py": "runner.build(parameters={\"WIDTH\": WIDTH})",
+        },
+    )
+    assert design is not None, manifest
+    assert manifest["contract_pass"] is True
+    assert "assign done = sparkle_dut._gen_done;" in design
+    assert "assign final_root = sparkle_dut._gen_regRoot;" in design
+
 @pytest.mark.skipif(shutil.which("iverilog") is None, reason="iverilog unavailable")
 def test_same_sv_elaborates_at_unseen_widths_3_17_and_65(tmp_path: Path):
     design, manifest = _prepare()

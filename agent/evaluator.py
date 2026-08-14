@@ -801,6 +801,11 @@ def _cvdp_numeric_width(typ: str) -> int | None:
     return abs(int(m.group(1)) - int(m.group(2))) + 1
 
 
+
+def _cvdp_symbolic_type_key(typ: str) -> str:
+    """Normalize simple symbolic packed types for strict field mapping."""
+    normalized = _cvdp_normalize_type(typ).lower()
+    return re.sub(r"[\s()]", "", normalized)
 def _cvdp_expr_numeric_width(expr: str, type_lookup: dict[str, str]) -> int | None:
     """Return a concrete width for a simple field expression, honoring slices."""
     text = expr.strip()
@@ -929,7 +934,7 @@ def _cvdp_name_forms(name: str) -> set[str]:
     base = _base_port_name(name)
     forms = {base, re.sub(r"[^a-z0-9]", "", base)}
     variants = {base, re.sub(r"_\d+$", "", base)}
-    for prefix in ("o_", "out_", "output_", "predict_branch_", "predict_", "dmem_", "saved_", "req_"):
+    for prefix in ("o_", "out_", "output_", "final_", "final", "reg_", "reg", "predict_branch_", "predict_", "dmem_", "saved_", "req_"):
         if base.startswith(prefix):
             variants.add(base[len(prefix):])
     for suffix in ("_bit", "_flag", "_val", "_value", "_out", "_output", "_bv", "_signal", "_reg", "_r", "_o"):
@@ -1632,6 +1637,25 @@ def generate_cvdp_wrapper(
 
     if len(sp_outputs) == 1:
         sp_out_d, sp_out_t, sp_out_n = sp_outputs[0]
+        remaining = [(d, t, n) for d, t, n in expected_outputs if n not in assigned_outputs]
+        for expected, field_expr, field_type in (
+            _cvdp_infer_bundled_output_mapping(
+                sv_code, sp_out_n, remaining, sparkle_ports
+            )
+            if strict_mapping and any(
+                _cvdp_numeric_width(port_type) is None
+                for _, port_type, _ in remaining
+            ) else []
+        ):
+            field_name = _cvdp_expr_signal_name(field_expr)
+            if (
+                field_name is None
+                or field_type is None
+                or _cvdp_symbolic_type_key(expected[1]) != _cvdp_symbolic_type_key(field_type)
+            ):
+                continue
+            lines.append(f"    assign {expected[2]} = sparkle_dut.{field_name};")
+            assigned_outputs.add(expected[2])
         remaining = [(d, t, n) for d, t, n in expected_outputs if n not in assigned_outputs]
         if remaining:
             sp_w = _cvdp_numeric_width(sp_out_t)
