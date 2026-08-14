@@ -1261,6 +1261,7 @@ def generate_cvdp_wrapper(
     reset_polarities: dict[str, str] | None = None,
     strict_mapping: bool = False,
     required_parameter_names: set[str] | None = None,
+    derived_parameter_expressions: dict[str, str] | None = None,
 ) -> str | None:
     """Generate a CVDP top wrapper matching cocotb's expected DUT interface."""
     usage = _cvdp_parse_harness_usage(harness_files)
@@ -1357,11 +1358,35 @@ def generate_cvdp_wrapper(
         _cvdp_parse_module_parameters(ref_code, usage["params"])
         if expose_parameters else []
     )
+    derived_expressions = dict(derived_parameter_expressions or {})
+    if expose_parameters and derived_expressions:
+        rewritten_decls = []
+        declared_derived: set[str] = set()
+        for decl in param_decls:
+            match = re.search(
+                r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)",
+                decl,
+            )
+            name = match.group(1) if match else None
+            if name in derived_expressions:
+                rewritten_decls.append(
+                    f"localparam integer {name} = {derived_expressions[name]}"
+                )
+                declared_derived.add(name)
+            else:
+                rewritten_decls.append(decl)
+        rewritten_decls.extend(
+            f"localparam integer {name} = {expression}"
+            for name, expression in derived_expressions.items()
+            if name not in declared_derived
+        )
+        param_decls = rewritten_decls
     param_names = set(usage["params"]) if expose_parameters else set()
     for decl in param_decls:
         m = re.search(r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)", decl)
         if m:
             param_names.add(m.group(1))
+    param_names.update(derived_expressions)
 
     wrapper_notes: list[str] = []
     if param_names:
@@ -1558,8 +1583,11 @@ def generate_cvdp_wrapper(
                 and
                 len(expected_outputs) == 1
                 and len(remaining) == 1
-                and sp_w is not None
-                and _cvdp_numeric_width(remaining[0][1]) == sp_w
+                and (
+                    sp_w is None
+                    or _cvdp_numeric_width(remaining[0][1]) is None
+                    or _cvdp_numeric_width(remaining[0][1]) == sp_w
+                )
             ):
                 lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
                 assigned_outputs.add(remaining[0][2])
@@ -1713,21 +1741,41 @@ def prepare_cvdp_native_parameter_design(
     reset_polarities: dict[str, str] | None = None,
 ) -> tuple[str | None, dict]:
     """Build one strict CVDP wrapper around a genuinely generic Sparkle core."""
-    required_parameters = list(dict.fromkeys([
-        *plan.parameter_names,
-        *(derived_parameter_names or []),
-    ]))
+    required_parameters = list(dict.fromkeys(plan.parameter_names))
+    derived_names = list(dict.fromkeys(derived_parameter_names or []))
+    public_text = ref_code + "\n" + "\n".join(
+        str(content) for path, content in harness_files.items()
+        if str(path).endswith(".py")
+    )
+    derived_expressions: dict[str, str] = {}
+    for name in derived_names:
+        expression = _public_derived_parameter_expression(
+            parameter_name=name,
+            public_text=public_text,
+        )
+        if expression is not None:
+            derived_expressions[name] = expression
     manifest = {
         "schema_version": 1,
         "mode": "native_parameter_sweep",
         "design_name": design_name,
         "required_parameters": required_parameters,
+        "derived_parameters": derived_names,
+        "derived_parameter_expressions": derived_expressions,
         "sweep_parameter_names": list(plan.parameter_names),
         "sweep_case_count": len(plan.cases),
         "one_emitted_dut": True,
         "contract_pass": False,
         "diagnostics": [],
     }
+    unresolved_derived = sorted(set(derived_names) - set(derived_expressions))
+    if unresolved_derived:
+        manifest["diagnostics"] = [
+            "could not recover symbolic expression for derived interface parameter(s): "
+            + ", ".join(unresolved_derived)
+        ]
+        manifest["error"] = manifest["diagnostics"][0]
+        return None, manifest
 
     core = select_native_core_module(
         sv_code,
@@ -1755,6 +1803,68 @@ def prepare_cvdp_native_parameter_design(
         required_parameters=required_parameters,
         expected_ports=expected_ports,
     )
+    core_outputs = [port for port in core_ports if port[0] == "output"]
+    expected_outputs = [port for port in expected_ports if port[0] == "output"]
+    packed_mapping = {}
+    if len(core_outputs) == 1 and len(expected_outputs) > 1:
+        packed_mapping = {
+            expected[2]: field_type
+            for expected, _field, field_type in _cvdp_infer_bundled_output_mapping(
+                sv_code,
+                core_outputs[0][2],
+                expected_outputs,
+                core_ports,
+            )
+            if field_type is not None
+        }
+    for case in plan.cases:
+        values = dict(case.values)
+        for name in derived_names:
+            value = _public_derived_parameter_value(
+                parameter_name=name,
+                case_values=values,
+                public_text=public_text,
+            )
+            if value is None:
+                diagnostics.append(
+                    f"could not evaluate derived interface parameter `{name}` for {case.values}"
+                )
+            else:
+                values[name] = value
+        symbolic_interface_names = set(required_parameters) | set(derived_names)
+        for direction, expected_type, expected_name in expected_ports:
+            if not _parameter_names_in_type(expected_type, symbolic_interface_names):
+                continue
+            expected_width = _concrete_sv_width(
+                _specialize_sv_type(expected_type, values)
+            )
+            matched = _cvdp_match_port(
+                expected_name, core_ports, direction=direction
+            )
+            core_type = matched[1] if matched is not None else None
+            if (
+                core_type is None
+                and direction == "output"
+                and len(core_outputs) == 1
+                and len(expected_outputs) == 1
+            ):
+                core_type = core_outputs[0][1]
+            if core_type is None and direction == "output":
+                core_type = packed_mapping.get(expected_name)
+            core_width = (
+                _concrete_sv_width(_specialize_sv_type(core_type, values))
+                if core_type is not None else None
+            )
+            if expected_width is None or core_width is None:
+                diagnostics.append(
+                    f"could not validate derived width of public port `{expected_name}` "
+                    f"for {case.values}"
+                )
+            elif expected_width != core_width:
+                diagnostics.append(
+                    f"derived width mismatch for public port `{expected_name}` at {case.values}: "
+                    f"contract={expected_width}, core={core_width}"
+                )
     manifest.update({
         "generated_core_module": core.name,
         "generated_core_parameters": list(core.parameter_names),
@@ -1785,6 +1895,7 @@ def prepare_cvdp_native_parameter_design(
         reset_polarities=reset_polarities or {},
         strict_mapping=True,
         required_parameter_names=set(required_parameters),
+        derived_parameter_expressions=derived_expressions,
     )
     if not wrapper:
         manifest["diagnostics"] = [
@@ -2037,6 +2148,43 @@ def _public_derived_parameter_value(
         flags=re.IGNORECASE,
     )
     return _safe_sv_int_expr(expr)
+
+
+def _public_derived_parameter_expression(
+    *,
+    parameter_name: str,
+    public_text: str,
+) -> str | None:
+    """Recover a symbolic SystemVerilog expression for a derived interface width."""
+    name = parameter_name.upper()
+    if name == "BIT_WIDTH" and re.search(r"\bDICE_MAX\b", public_text):
+        return "$clog2(DICE_MAX) + 1"
+    if name == "ENCODED_DATA" and all(
+        re.search(rf"\b{item}\b", public_text)
+        for item in ("DATA_WIDTH", "PARITY_BIT")
+    ):
+        return "DATA_WIDTH + PARITY_BIT + 1"
+    if name == "ENCODED_DATA_BIT" and re.search(r"\bENCODED_DATA\b", public_text):
+        return "$clog2(ENCODED_DATA)"
+    if name == "COUNT_WIDTH" and re.search(r"\bBIT_WIDTH\b", public_text):
+        return "$clog2(BIT_WIDTH + 1)"
+
+    text = re.sub(r"//.*", "", str(public_text or ""))
+    match = re.search(
+        rf"\b(?:parameter|localparam)\b[^;\n,]*\b{re.escape(parameter_name)}\b"
+        r"\s*=\s*([^,;\n)]+(?:\([^\n]*\)[^,;\n]*)?)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    expression = match.group(1).strip()
+    return re.sub(
+        r"(?<![$A-Za-z0-9_])(?:clog2|log2)\s*\(",
+        "$clog2(",
+        expression,
+        flags=re.IGNORECASE,
+    )
 
 
 def _cppsim_native_case_requests(

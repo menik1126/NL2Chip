@@ -305,10 +305,24 @@ def build_system_prompt(
         )
     elif native_plan:
         parameter_names = native_plan.get("parameter_names", [])
+        derived_expressions = dict(
+            native_plan.get("derived_parameter_expressions") or {}
+        )
+        derived_rule = ""
+        if derived_expressions:
+            rendered = ", ".join(
+                f"{name} = {expression}"
+                for name, expression in derived_expressions.items()
+            )
+            derived_rule = (
+                f"- Derived interface dimensions ({rendered}) must remain symbolic "
+                "expressions of retained parameters; they are not separate sweep binders.\n"
+            )
         design_rule = (
             f"- The output file is `Generated/{prob_id}.lean`, and one generic Lean function/top module must be `{design_name}`.\n"
             f"- Retain these Nat binders as native SystemVerilog parameters: {', '.join(parameter_names)}.\n"
             f"- Use `#synthesizeParameterizedVerilog {design_name} [...]` exactly once; do not enumerate concrete aliases.\n"
+            f"{derived_rule}"
             "- A Lean check is complete only when generated Verilog declares and uses every required parameter.\n"
         )
     elif design_name:
@@ -490,6 +504,7 @@ def configure_parameter_mode(
     _add_legacy_agent_path()
     from cvdp_specialization import discover_finite_parameter_plan
     from cvdp_native_parameters import native_plan_to_dict
+    from evaluator import _public_derived_parameter_expression
     import search
 
     plan = discover_finite_parameter_plan(
@@ -526,6 +541,27 @@ def configure_parameter_mode(
 
     payload["expected_ports"] = expected_ports
     payload["derived_parameter_names"] = derived_parameters
+    public_text = (
+        str(info.ref_code or "")
+        + "\n"
+        + str(info.prompt_text or "")
+        + "\n"
+        + "\n".join(
+            str(content)
+            for path, content in (metadata.get("harness_files", {}) or {}).items()
+            if str(path).endswith(".py")
+        )
+    )
+    payload["derived_parameter_expressions"] = {
+        name: expression
+        for name in derived_parameters
+        if (
+            expression := _public_derived_parameter_expression(
+                parameter_name=name,
+                public_text=public_text,
+            )
+        ) is not None
+    }
     reset_names = [
         name for direction, _, name in expected_ports
         if direction == "input" and search._port_kind(name) == "reset"

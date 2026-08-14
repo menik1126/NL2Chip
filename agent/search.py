@@ -1148,7 +1148,24 @@ def finite_parameter_specialization_contract(info: ProblemInfo | None) -> str:
     native_plan = native_plan_from_dict(
         (info.metadata or {}).get("native_parameter_sweep_plan")
     )
-    return format_native_parameter_contract(native_plan) if native_plan else ""
+    if native_plan is None:
+        return ""
+    contract = format_native_parameter_contract(native_plan)
+    payload = (info.metadata or {}).get("native_parameter_sweep_plan") or {}
+    derived = dict(payload.get("derived_parameter_expressions") or {})
+    if derived:
+        lines = [
+            "",
+            "### Derived Interface Dimensions",
+            "",
+            "These names are derived local dimensions, not independent sweep parameters. "
+            "Keep each expression symbolic in the generic Lean types; do not hardcode it "
+            "and do not add it to the retained-parameter command unless it is also listed "
+            "under Retained parameters.",
+        ]
+        lines.extend(f"- `{name} = {expression}`" for name, expression in derived.items())
+        contract += "\n" + "\n".join(lines)
+    return contract
 
 
 def formal_parameter_contract(info: ProblemInfo | None) -> str:
