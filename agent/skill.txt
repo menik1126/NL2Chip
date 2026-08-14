@@ -24,6 +24,32 @@ CVDP-style RTL translation under a small turn budget.
   `dffe`, or `Signal.register`). Apply `resetHigh`/`resetLow` to the next-state
   value before the register.
 
+## Native P3 Symbolic Parameters
+
+When the contract says Native Parameter Sweep (P3), this section overrides the
+concrete-width advice above. Keep every retained width symbolic: never replace it
+with its default, enumerate the public cases, or branch on a parameter value.
+
+- Put every retained width directly in the synthesized top definition header as an
+  implicit binder: {WIDTH : Nat}. A regular (WIDTH : Nat), a local let, or a
+  Signal width argument is not retained by the Verilog backend.
+- Use the binder in every dependent type, e.g. Signal dom (BitVec WIDTH) and
+  Signal dom (BitVec (DATA_WIDTH + PARITY_BIT + 1)).
+- For generic constants, use constructors such as BitVec.ofNat WIDTH 0; do not
+  replace WIDTH by a concrete numeral.
+- Synthesize exactly the same generic top with one default binding.
+
+Verified non-evaluation pattern:
+
+  def exampleNativeXor {dom : DomainConfig} {WIDTH : Nat}
+      (lhs rhs : Signal dom (BitVec WIDTH)) : Signal dom (BitVec WIDTH) :=
+    lhs ^^^ rhs
+
+  #synthesizeParameterizedVerilog exampleNativeXor [WIDTH := 8]
+
+Do not write (WIDTH : Nat) in this pattern: it causes the retained-parameter
+top-level-binder error and does not form a P3 generic module.
+
 ## Fixed Verified Examples (non-CVDP evaluation examples)
 
 ### Combinational logic and multiple output ports

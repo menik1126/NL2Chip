@@ -691,3 +691,14 @@ def test_cli_requires_an_active_native_ppa_flow(
     args = ckt_run.parse_args()
     assert args.require_native_ppa is True
     assert args.synth is True
+
+
+def test_native_parameter_skill_overrides_concrete_width_advice():
+    from search import load_skill
+
+    skill = load_skill()
+    assert "Native P3 Symbolic Parameters" in skill
+    assert "this section overrides the" in skill
+    assert "implicit binder: {WIDTH : Nat}" in skill
+    assert "replace WIDTH by a concrete numeral" in skill
+    assert "#synthesizeParameterizedVerilog exampleNativeXor [WIDTH := 8]" in skill
