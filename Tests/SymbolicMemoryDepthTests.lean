@@ -194,6 +194,43 @@ private def runSmallCppSim : IO Unit := do
   ensure (value == 0x55)
     s!"CppSim/JIT did not retain the last valid word of DEPTH=3 (got {value})"
 
+/-- A combinational memory read-data wire still appears in `reset()`.  When a
+    JIT caller requests a restricted observable-wire set, that wire must remain
+    a class member rather than becoming an `eval()` local which reset cannot
+    name. -/
+private def checkHiddenCombinationalReadData : IO Unit := do
+  let module_ : Module :=
+    { (Module.empty "hidden_combo_read_data") with
+      inputs :=
+        [{ name := "clk", ty := .bit },
+         { name := "read_addr", ty := .bitVector 2 }]
+      outputs := [{ name := "out", ty := .bitVector 8 }]
+      wires := [{ name := "hidden_read_data", ty := .bitVector 8 }]
+      body :=
+        [.memory "storage" 2 8 3 "clk"
+          (.const 0 2) (.const 0 8) (.const 0 1)
+          (.ref "read_addr") "hidden_read_data" true,
+         .assign "out" (.ref "hidden_read_data")] }
+  let design : Design :=
+    { topModule := module_.name, modules := [module_] }
+  let source ← requireOk
+    (Sparkle.Backend.CppSim.toCppSimJITChecked design
+      (observableWires := some []))
+  let sourcePath := s!"{tempDir}/hidden_combo_read_data.cpp"
+  IO.FS.createDirAll tempDir
+  IO.FS.writeFile sourcePath source
+  -- Compilation itself is the core regression: reset() must see the hidden
+  -- read-data declaration even though the JIT wrapper does not expose it.
+  let handle ← Sparkle.Core.JIT.JIT.compileAndLoad sourcePath
+  Sparkle.Core.JIT.JIT.reset handle
+  Sparkle.Core.JIT.JIT.setMem handle 0 2 0x5a
+  Sparkle.Core.JIT.JIT.setInput handle 0 2
+  Sparkle.Core.JIT.JIT.eval handle
+  let value ← Sparkle.Core.JIT.JIT.getOutput handle 0
+  Sparkle.Core.JIT.JIT.destroy handle
+  ensure (value == 0x5a)
+    s!"hidden combinational memory read returned {value}, expected 0x5a"
+
 /-- A synchronous-read memory exercises two semantics that cannot be checked
     by inspecting the allocation alone: out-of-range accesses fail safely, and
     a same-cycle read/write collision observes the old word (SV NBA ordering). -/
@@ -284,6 +321,51 @@ private def checkFailClosed : IO Unit := do
           (.const 0 21) "read_data" false] }
   ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked oversizedMemory))
     "CppSim accepted a concrete memory whose std::array depth exceeds the safe resource limit"
+  let _ ← requireOk (Sparkle.Backend.CppSim.toCppSimChecked oversizedMemory
+    (maxMemoryDepth := Sparkle.IR.Type.DimExpr.maxNatWorkWidth + 1))
+
+  -- Verilog uses the same conservative default, but the combined artifact
+  -- command may explicitly opt a known concrete memory into a larger limit.
+  -- That opt-in must affect only memory depth, never packed data widths or a
+  -- still-symbolic declaration.
+  let linuxDepth := 8388608
+  let largeVerilogMemory : Module :=
+    { (Module.empty "large_verilog_memory") with
+      body :=
+        [.memory "storage" 23 8 (.literal linuxDepth) "clk"
+          (.const 0 23) (.const 0 8) (.const 0 1)
+          (.const 0 23) "read_data" false] }
+  ensure (isError (Sparkle.Backend.Verilog.toVerilogChecked largeVerilogMemory))
+    "Verilog accepted an 8M memory without an explicit depth opt-in"
+  let largeVerilog ← requireOk <|
+    Sparkle.Backend.Verilog.toVerilogDesignChecked
+      { topModule := largeVerilogMemory.name, modules := [largeVerilogMemory] }
+      (maxMemoryDepth := linuxDepth)
+  ensure (contains largeVerilog "logic [7:0] storage [0:8388607];")
+    "explicit Verilog memory-depth opt-in did not emit the exact 8M declaration"
+  ensure (!contains largeVerilog "storage [0:0]")
+    "explicit Verilog memory-depth opt-in clamped the 8M declaration to one entry"
+
+  let oversizedDataWidth : Module :=
+    { (Module.empty "oversized_data_width") with
+      body :=
+        [.memory "storage" 1 (.literal linuxDepth) 2 "clk"
+          (.const 0 1) (.const 0 linuxDepth) (.const 0 1)
+          (.const 0 1) "read_data" false] }
+  ensure (isError (Sparkle.Backend.Verilog.toVerilogChecked oversizedDataWidth
+      (maxMemoryDepth := linuxDepth)))
+    "memory-depth opt-in incorrectly relaxed a packed data width"
+
+  let symbolicLargeDepth : Module :=
+    { (Module.empty "symbolic_large_depth") with
+      parameters := [{ name := "DEPTH", defaultValue := linuxDepth }]
+      body :=
+        [.memory "storage" 23 8 (.param "DEPTH") "clk"
+          (.const 0 23) (.const 0 8) (.const 0 1)
+          (.const 0 23) "read_data" false] }
+  ensure (isError (Sparkle.Backend.Verilog.toVerilogChecked symbolicLargeDepth
+      (maxMemoryDepth := linuxDepth)))
+    "memory-depth opt-in incorrectly relaxed a symbolic declaration"
 
   let undeclaredDepth :=
     "module undeclared_depth #(parameter AW=2, parameter DW=7) (input logic clk); " ++
@@ -332,6 +414,7 @@ def main : IO UInt32 := do
     checkParameterizedVerilog
     checkDepthSweep
     runSmallCppSim
+    checkHiddenCombinationalReadData
     checkSynchronousCppSemantics
     checkHierarchy
     checkFailClosed

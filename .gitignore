@@ -45,6 +45,7 @@ Thumbs.db
 plans/
 Sparkle/Verification/Generated/
 Examples/CDC/gen/
+verilator/generated_soc_cppsim.h
 verilator/generated_soc_jit.cpp
 
 # Python

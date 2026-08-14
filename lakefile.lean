@@ -71,6 +71,21 @@ lean_exe «sparkle» where
 lean_exe «sparkle-certify» where
   root := `Tools.SparkleCertify
 
+/-- Fixed-scope phase-one combinational compiler correctness checker. -/
+lean_exe «sparkle-comb-certify» where
+  root := `Tools.SparkleCombCertify
+  supportInterpreter := true
+
+/-- Runtime acceptance tests for the phase-one compiler-correctness theorem. -/
+lean_exe «comb-correctness-tests» where
+  root := `Tests.CombCorrectnessTests
+  supportInterpreter := true
+
+/-- Ordering and commit regressions for the linear circuit builder. -/
+lean_exe «builder-accumulation-tests» where
+  root := `Tests.BuilderAccumulationTests
+  supportInterpreter := true
+
 lean_exe «verilog-tests» where
   root := `Tests.VerilogTests
   supportInterpreter := true

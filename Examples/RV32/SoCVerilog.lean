@@ -77,6 +77,9 @@ def rv32iSoCSynth {dom : DomainConfig}
   -- Pack output: (pc, uart_valid, uart_data, satp, ptwPte, ptwVaddr)
   bundleAll! [pcReg, uartValidBV, prevStoreData, satpReg, ptwPteReg, ptwVaddrReg]
 
-#writeDesign rv32iSoCSynth "verilator/generated_soc.sv" "verilator/generated_soc_cppsim.h" SoCOutput.wireNames
+-- The Linux-capable model intentionally exposes 8M 32-bit DRAM word addresses.
+-- Keep the conservative default declaration/allocation limit for ordinary
+-- designs and opt in to this known, heap-allocated RV32 model explicitly.
+#writeDesign rv32iSoCSynth "verilator/generated_soc.sv" "verilator/generated_soc_cppsim.h" SoCOutput.wireNames maxMemoryDepth 8388608
 
 end Sparkle.Examples.RV32.SoCVerilog

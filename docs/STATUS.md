@@ -580,12 +580,12 @@ Synthesizable decoder pipeline: dequant → IDCT → reconstruct, all as Signal 
 | `docs/STATUS.md` | Added Phase 32 section |
 | `README.md` | Updated H.264 section + roadmap |
 
-#### Generated Verilog (12 files in `IP/Video/H264/gen/`)
+#### Generated artifacts (10 files in `.lake/build/gen/h264/`)
 
 | Module | SV Size | CppSim | JIT |
 |--------|---------|--------|-----|
 | `dequant` | 8 KB | `dequant_cppsim.h` | `dequant_jit.cpp` |
-| `idct` | 20 KB | `idct_cppsim.h` | `idct_jit.cpp` |
+| `idct` | 20 KB | — (Verilog-only) | — (Verilog-only) |
 | `reconstruct` | 7 KB | `reconstruct_cppsim.h` | `reconstruct_jit.cpp` |
 | `decoder_pipeline` | 29 KB | `decoder_pipeline_cppsim.h` | `decoder_pipeline_jit.cpp` |
 

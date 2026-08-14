@@ -263,9 +263,12 @@ def idctModule {dom : DomainConfig}
   bundleAll! [doneU32, grpU32, subU32]
 
 -- ============================================================================
--- Generate SystemVerilog + CppSim + JIT
+-- Generate the standalone SystemVerilog artifact.  The H.264 JIT tests use
+-- DecoderSynth's monolithic CppSim model; this submodule has no CppSim/JIT
+-- consumer, and its synthesized temporaries include packed values wider than
+-- the fixed-width CppSim scalar ABI.
 -- ============================================================================
 
-#writeDesign idctModule ".lake/build/gen/h264/idct.sv" ".lake/build/gen/h264/idct_cppsim.h"
+#writeVerilogDesign idctModule ".lake/build/gen/h264/idct.sv"
 
 end Sparkle.IP.Video.H264.IDCTSynth

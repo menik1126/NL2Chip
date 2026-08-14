@@ -176,6 +176,16 @@ def emitRangeHigh (dimension : DimExpr) : String :=
   | some value => toString (value - 1)
   | none => s!"({emitSafeDimension dimension} - 1)"
 
+/-- Emit a memory range under an explicit concrete-depth opt-in.  Parameter-
+    dependent depths deliberately keep the ordinary conservative limit and
+    guard; only a fully concrete memory declaration may use the larger cap. -/
+def emitMemoryRangeHigh (depth : DimExpr)
+    (maxMemoryDepth : Nat := maxNatWorkWidth) : String :=
+  match depth.toNat? with
+  | some value =>
+      if value > 0 && value <= maxMemoryDepth then toString (value - 1) else "0"
+  | none => emitRangeHigh depth
+
 /-- Convert HWType to Verilog type declaration -/
 def emitType (ty : HWType) : String :=
   match ty with
@@ -298,7 +308,8 @@ partial def emitExpr (e : Expr) : String :=
     The optional `wires` parameter provides wire declarations for register
     reset value width lookup. -/
 def emitStmt (stmt : Stmt) (indent : String := "    ")
-    (wires : List Port := []) : String :=
+    (wires : List Port := [])
+    (maxMemoryDepth : Nat := maxNatWorkWidth) : String :=
   match stmt with
   | .assign lhs rhs =>
     s!"{indent}assign {sanitizeName lhs} = {emitExpr rhs};"
@@ -331,7 +342,7 @@ def emitStmt (stmt : Stmt) (indent : String := "    ")
 
   | .memory name _addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readData comboRead =>
     -- Generate memory array and always_ff block
-    let memDecl := s!"{indent}logic [{emitRangeHigh dataWidth}:0] {sanitizeName name} [0:{emitRangeHigh depth}];"
+    let memDecl := s!"{indent}logic [{emitRangeHigh dataWidth}:0] {sanitizeName name} [0:{emitMemoryRangeHigh depth maxMemoryDepth}];"
     if comboRead then
       -- Combinational read: assign readData = mem[readAddr]
       let assignRead := s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
@@ -487,7 +498,8 @@ def emitDimensionGuards (m : Module) (indent : String := "    ") : String :=
   String.intercalate "\n" (parameterGuards ++ dimensionGuards ++ workWidthGuards)
 
 /-- Emit the full module -/
-def emitModule (m : Module) : String :=
+def emitModule (m : Module)
+    (maxMemoryDepth : Nat := maxNatWorkWidth) : String :=
   -- For primitive/blackbox modules, just emit a comment (actual module comes from vendor)
   if m.isPrimitive then
     s!"// Primitive module: {m.name}\n" ++
@@ -515,7 +527,7 @@ def emitModule (m : Module) : String :=
 
     let guards := emitDimensionGuards m
     let body := if m.body.isEmpty then "" else
-      let stmts := m.body.map (emitStmt · "    " m.wires)
+      let stmts := m.body.map (emitStmt · "    " m.wires maxMemoryDepth)
       "\n" ++ String.intercalate "\n\n" stmts ++ "\n"
 
     let nativeBody := if m.nativeItems.isEmpty then "" else
@@ -528,17 +540,30 @@ def emitModule (m : Module) : String :=
 
 /-- Checked entry point for callers that need diagnostics instead of emitting
     malformed or ambiguous SystemVerilog. -/
-def toVerilogChecked (m : Module) : Except String String := do
+def toVerilogChecked (m : Module)
+    (maxMemoryDepth : Nat := maxNatWorkWidth) : Except String String := do
+  if maxMemoryDepth == 0 then
+    throw "Sparkle SystemVerilog maximum memory depth must be positive"
   m.validateDimensions
   m.validateSanitizedNames sanitizeName
   let lookupDefault := fun name =>
     m.parameters.find? (fun parameter => parameter.name == name)
       |>.map (·.defaultValue)
+  let memoryDepthRoles : Std.HashSet String := Std.HashSet.ofList <|
+    m.body.filterMap fun statement => match statement with
+      | .memory name _ _ _ _ _ _ _ _ _ _ =>
+          some s!"module '{m.name}' memory '{name}' depth"
+      | _ => none
   for (role, dimension) in m.positiveDimensions do
     match dimension.eval? lookupDefault with
     | some value =>
-        if value > maxNatWorkWidth then
-          throw s!"{role} evaluates to {value}, exceeding Sparkle's safe SystemVerilog dimension limit {maxNatWorkWidth}"
+        -- A caller may explicitly accept a larger *concrete* memory.  Packed
+        -- widths, array sizes, address/data widths, and symbolic memory depths
+        -- all retain the global work/dimension limit.
+        let limit := if memoryDepthRoles.contains role && dimension.toNat?.isSome
+          then maxMemoryDepth else maxNatWorkWidth
+        if value > limit then
+          throw s!"{role} evaluates to {value}, exceeding Sparkle's safe SystemVerilog dimension limit {limit}"
     | none => pure () -- `validateDimensions` already reports this case.
   for parameter in m.parameters do
     if parameter.defaultValue > 0xffffffff then
@@ -551,7 +576,7 @@ def toVerilogChecked (m : Module) : Except String String := do
           throw s!"module '{m.name}' Nat expression '{expression}' requires more than 64 bits to compute its symbolic work width; specialize or simplify the nested shift/power expression"
     | none =>
         throw s!"module '{m.name}' Nat expression '{expression}' has a parameter-dependent work-width calculation; specialize or simplify the nested shift/power expression"
-  return emitModule m
+  return emitModule m maxMemoryDepth
 
 /-- Main entry point: Convert a Module to SystemVerilog -/
 def toVerilog (m : Module) : String :=
@@ -560,13 +585,17 @@ def toVerilog (m : Module) : String :=
   | .error message => s!"/* ERROR: {message} */\n"
 
 /-- Convert a full Design to SystemVerilog -/
-def toVerilogDesignChecked (d : Design) : Except String String := do
+def toVerilogDesignChecked (d : Design)
+    (maxMemoryDepth : Nat := maxNatWorkWidth) : Except String String := do
+  if maxMemoryDepth == 0 then
+    throw "Sparkle SystemVerilog maximum memory depth must be positive"
   for module_ in d.modules do
     let emittedName := sanitizeName module_.name
     for other in d.modules do
       if module_.name != other.name && emittedName == sanitizeName other.name then
         throw s!"module names '{module_.name}' and '{other.name}' both sanitize to '{emittedName}'"
-  let modules ← d.modules.mapM toVerilogChecked
+  let modules ← d.modules.mapM fun module_ =>
+    toVerilogChecked module_ maxMemoryDepth
   return String.intercalate "\n" modules
 
 def toVerilogDesign (d : Design) : String :=

@@ -465,6 +465,155 @@ private def checkCppSimPassiveWideAggregate : IO Unit := do
     #["-std=c++17", "-O2", "-x", "c++", sourcePath, "-o", executable]
   let _ ← runProcess "CppSim passive wide aggregate" executable #[]
 
+  -- Match the H.264 state-tuple shape more closely: once the right-hand
+  -- chain grows beyond 64 bits, later concat nodes combine a 16-bit scalar
+  -- with an existing non-word-aligned packed container.  Also read a
+  -- 42-bit slice spanning three backing words.
+  let bitPacked : Module :=
+    { (Module.empty "passive_bit_packed_aggregate") with
+      outputs :=
+        [{ name := "out", ty := .bitVector 82 },
+         { name := "cut", ty := .bitVector 42 }]
+      wires :=
+        [{ name := "low50", ty := .bitVector 50 },
+         { name := "wrapped8", ty := .bitVector 8 },
+         { name := "packed66", ty := .bitVector 66 }]
+      body :=
+        [.assign "low50" (.const 46990682563397 50),
+         -- The optimizer wraps this single-use structural scalar assignment
+         -- in an explicit 8-bit resize before inlining it into the wide concat.
+         .assign "wrapped8" (.const 52 8),
+         .assign "packed66" (.concat
+           [.const 18 8, .ref "wrapped8", .ref "low50"]),
+         .assign "out" (.concat [.const 43981 16, .ref "packed66"]),
+         .assign "cut" (.slice (.ref "out") 70 29)] }
+  let bitPackedDesign : Design :=
+    { topModule := bitPacked.name, modules := [bitPacked] }
+  let bitPackedCpp ← requireOk
+    (Sparkle.Backend.CppSim.toCppSimJITChecked bitPackedDesign)
+  let bitPackedMain :=
+    "\nint main() { void* s = jit_create(); jit_eval(s); " ++
+    "bool ok = jit_num_outputs() == 4 && " ++
+    "jit_get_output(s, 0) == 0xdef12345ULL && " ++
+    "jit_get_output(s, 1) == 0x48d02abcULL && " ++
+    "jit_get_output(s, 2) == 0x0002af34ULL && " ++
+    "jit_get_output(s, 3) == 0x1a2468155e6ULL; " ++
+    "jit_destroy(s); return ok ? 0 : 1; }\n"
+  let bitPackedSource := s!"{dir}/passive_bit_packed_aggregate.cpp"
+  let bitPackedExecutable := s!"{dir}/passive_bit_packed_aggregate"
+  IO.FS.writeFile bitPackedSource (bitPackedCpp ++ bitPackedMain)
+  let _ ← runProcess "g++ passive bit-packed aggregate" "g++"
+    #["-std=c++17", "-O2", "-x", "c++", bitPackedSource, "-o", bitPackedExecutable]
+  let _ ← runProcess "CppSim passive bit-packed aggregate" bitPackedExecutable #[]
+
+  -- Single-use scalar wires are inlined as explicit `.resize` nodes.  The
+  -- resize must remain a trusted materialization boundary when the optimized
+  -- expression is consumed by a passive wide concat.
+  let optimizedBitPackedDesign :=
+    Sparkle.IR.Optimize.optimizeDesign bitPackedDesign
+  let optimizedBitPackedTop ← requireTop optimizedBitPackedDesign
+  ensure (!optimizedBitPackedTop.wires.any (fun wire => wire.name == "wrapped8"))
+    "optimizer did not inline the scalar materialization fixture"
+  let optimizedBitPackedCpp ← requireOk
+    (Sparkle.Backend.CppSim.toCppSimJITChecked optimizedBitPackedDesign)
+  let optimizedBitPackedSource :=
+    s!"{dir}/passive_bit_packed_aggregate_optimized.cpp"
+  let optimizedBitPackedExecutable :=
+    s!"{dir}/passive_bit_packed_aggregate_optimized"
+  IO.FS.writeFile optimizedBitPackedSource
+    (optimizedBitPackedCpp ++ bitPackedMain)
+  let _ ← runProcess "g++ optimized passive bit-packed aggregate" "g++"
+    #["-std=c++17", "-O2", "-x", "c++", optimizedBitPackedSource,
+      "-o", optimizedBitPackedExecutable]
+  let _ ← runProcess "CppSim optimized passive bit-packed aggregate"
+    optimizedBitPackedExecutable #[]
+
+  -- Operations inside a passive wide leaf remain fail-closed.  This includes
+  -- optimizer-style resize markers: an outer assignment boundary cannot repair
+  -- nested BitVec-width semantics or C++ UB inside an arbitrary scalar tree.
+  let wideMulLeaf : Module :=
+    { (Module.empty "passive_wide_mul_leaf") with
+      inputs :=
+        [{ name := "a", ty := .bitVector 16 },
+         { name := "b", ty := .bitVector 16 }]
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat
+        [.const 1 49, .op .mul [.ref "a", .ref "b"]])] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked wideMulLeaf))
+    "CppSim accepted an unmaterialized multiplication in a passive wide leaf"
+
+  let resizedMulLeaf : Module :=
+    { (Module.empty "passive_wide_resized_mul_leaf") with
+      inputs :=
+        [{ name := "a", ty := .bitVector 16 },
+         { name := "b", ty := .bitVector 16 }]
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat
+        [.const 1 49, .resize 16 (.op .mul [.ref "a", .ref "b"])])] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked resizedMulLeaf))
+    "CppSim accepted a multiplication behind a materialization resize"
+
+  let resizedMuxAdd := Expr.resize 16 (.op .mux
+    [.const 1 1,
+     .op .add [.const 255 8, .const 1 8],
+     .const 0 16])
+  let resizedMuxAddLeaf : Module :=
+    { (Module.empty "passive_wide_resized_mux_add_leaf") with
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat [.const 1 49, resizedMuxAdd])] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked resizedMuxAddLeaf))
+    "CppSim accepted a nested mux/add tree behind a materialization resize"
+
+  let unsafeScalarTree := Expr.op .mux
+    [.op .eq [.op .add [.const 255 8, .const 1 8], .const 0 8],
+     .concat [.const 0 8, .const 171 8],
+     .const 205 16]
+  let wideScalarTree : Module :=
+    { (Module.empty "passive_wide_scalar_tree") with
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat [.const 1 49, unsafeScalarTree])] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked wideScalarTree))
+    "CppSim accepted an unmaterialized scalar operation tree in a passive wide leaf"
+
+  let malformedMaterialization : Module :=
+    { (Module.empty "passive_wide_malformed_materialization") with
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat
+        [.const 1 49, .resize 16 (.op .add [])])] }
+  ensure (isError
+      (Sparkle.Backend.CppSim.toCppSimChecked malformedMaterialization))
+    "CppSim accepted a wrong-arity operation behind a materialization resize"
+
+  let emptyConcatMaterialization : Module :=
+    { (Module.empty "passive_wide_empty_concat_materialization") with
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat
+        [.const 1 49, .resize 16 (.concat [])])] }
+  ensure (isError
+      (Sparkle.Backend.CppSim.toCppSimChecked emptyConcatMaterialization))
+    "CppSim accepted an empty concat behind a materialization resize"
+
+  let wideResizeMaterialization : Module :=
+    { (Module.empty "passive_wide_resize_materialization") with
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      wires := [{ name := "packed", ty := .bitVector 96 }]
+      body :=
+        [.assign "packed" (.concat [.const 1 32, .const 2 64]),
+         .assign "out" (.concat
+           [.const 1 1, .resize 64 (.ref "packed")])] }
+  ensure (isError
+      (Sparkle.Backend.CppSim.toCppSimChecked wideResizeMaterialization))
+    "CppSim accepted a wide packed ref behind a scalar materialization resize"
+
+  let malformedSliceMaterialization : Module :=
+    { (Module.empty "passive_wide_malformed_slice_materialization") with
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat
+        [.const 1 57, .resize 8 (.slice (.const 1 8) 0 1)])] }
+  ensure (isError
+      (Sparkle.Backend.CppSim.toCppSimChecked malformedSliceMaterialization))
+    "CppSim accepted an invalid slice behind a materialization resize"
+
   let wideArithmetic : Module :=
     { (Module.empty "wide_arithmetic") with
       outputs := [{ name := "out", ty := .bitVector 96 }]
@@ -472,12 +621,59 @@ private def checkCppSimPassiveWideAggregate : IO Unit := do
   ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked wideArithmetic))
     "CppSim accepted wide arithmetic as a passive aggregate"
 
-  let nonWordConcat : Module :=
-    { (Module.empty "non_word_concat") with
-      outputs := [{ name := "out", ty := .bitVector 88 }]
-      body := [.assign "out" (.concat [.const 1 24, .const 2 64])] }
-  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked nonWordConcat))
-    "CppSim accepted a non-word-aligned wide concat"
+  let selfConcat : Module :=
+    { (Module.empty "self_concat") with
+      outputs := [{ name := "out", ty := .bitVector 96 }]
+      body := [.assign "out" (.concat [.ref "out"])] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked selfConcat))
+    "CppSim accepted an alias-unsafe in-place passive concat"
+
+  let selfSliceConcat : Module :=
+    { (Module.empty "self_slice_concat") with
+      outputs := [{ name := "out", ty := .bitVector 96 }]
+      body := [.assign "out" (.concat
+        [.slice (.ref "out") 63 0, .const 0 32])] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked selfSliceConcat))
+    "CppSim accepted a passive concat that slices its cleared destination"
+
+  let nestedSelfSliceConcat : Module :=
+    { (Module.empty "nested_self_slice_concat") with
+      outputs := [{ name := "out", ty := .bitVector 96 }]
+      body := [.assign "out" (.concat
+        [.resize 64 (.slice (.ref "out") 63 0),
+         .const 0 32])] }
+  ensure (isError
+      (Sparkle.Backend.CppSim.toCppSimChecked nestedSelfSliceConcat))
+    "CppSim accepted a resize-wrapped reference to its cleared destination"
+
+  let sanitizedAlias : Module :=
+    { (Module.empty "sanitized_alias") with
+      outputs := [{ name := "out-a", ty := .bitVector 65 }]
+      wires := [{ name := "out_a", ty := .bitVector 65 }]
+      body :=
+        [.assign "out_a" (.concat [.const 1 1, .const 0 64]),
+         .assign "out-a" (.concat [.ref "out_a"])] }
+  match Sparkle.Backend.CppSim.toCppSimChecked sanitizedAlias with
+  | .ok _ =>
+      throw (IO.userError
+        "CppSim accepted distinct IR values that alias after C++ sanitization")
+  | .error message =>
+      ensure (contains message "collide as C++ identifier 'out_a'")
+        s!"CppSim returned the wrong sanitized-name collision error: {message}"
+
+  -- Exact port/wire reuse denotes one net and is common in lowered modules,
+  -- but both declarations must agree on its representation.
+  let conflictingDuplicate : Module :=
+    { (Module.empty "conflicting_duplicate_value") with
+      inputs := [{ name := "x", ty := .bitVector 8 }]
+      wires := [{ name := "x", ty := .bitVector 16 }] }
+  match Sparkle.Backend.CppSim.toCppSimChecked conflictingDuplicate with
+  | .ok _ =>
+      throw (IO.userError
+        "CppSim accepted one exact value name with conflicting packed types")
+  | .error message =>
+      ensure (contains message "has conflicting duplicate types")
+        s!"CppSim returned the wrong conflicting-type error: {message}"
 
   let wideInput : Module :=
     { (Module.empty "wide_input") with
@@ -492,15 +688,25 @@ private def checkCppSimPassiveWideAggregate : IO Unit := do
   ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked wideRegister))
     "CppSim accepted a wide register as a passive aggregate"
 
-  let wideSlice : Module :=
-    { (Module.empty "wide_slice") with
+  let wideResultSlice : Module :=
+    { (Module.empty "wide_result_slice") with
+      outputs := [{ name := "y", ty := .bitVector 65 }]
+      wires := [{ name := "packed", ty := .bitVector 96 }]
+      body :=
+        [.assign "packed" (.concat [.const 1 32, .const 2 64]),
+         .assign "y" (.slice (.ref "packed") 64 0)] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked wideResultSlice))
+    "CppSim accepted a wide-result slice from a passive packed container"
+
+  let outOfRangeSlice : Module :=
+    { (Module.empty "out_of_range_wide_slice") with
       outputs := [{ name := "y", ty := .bitVector 32 }]
       wires := [{ name := "packed", ty := .bitVector 96 }]
       body :=
         [.assign "packed" (.concat [.const 1 32, .const 2 64]),
-         .assign "y" (.slice (.ref "packed") 31 0)] }
-  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked wideSlice))
-    "CppSim accepted a slice from a wide packed container"
+         .assign "y" (.slice (.ref "packed") 110 79)] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked outOfRangeSlice))
+    "CppSim accepted an out-of-range slice from a passive packed container"
 
   let arrayLeaf : Module :=
     { (Module.empty "wide_concat_array_leaf") with
@@ -521,12 +727,71 @@ private def checkCppSimPassiveWideAggregate : IO Unit := do
   ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked nestedArrayIndex))
     "CppSim accepted an index whose result is still an unpacked array"
 
+  let resizedArrayLeaf : Module :=
+    { (Module.empty "wide_concat_resized_array_leaf") with
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      wires := [{ name := "bytes", ty := .array 4 (.bitVector 8) }]
+      body := [.assign "out" (.concat
+        [.const 1 33, .resize 32 (.ref "bytes")])] }
+  ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked resizedArrayLeaf))
+    "CppSim accepted an unpacked array behind a scalar materialization resize"
+
   let arrayTarget : Module :=
     { (Module.empty "wide_array_target") with
       outputs := [{ name := "out", ty := .array 3 (.bitVector 32) }]
       body := [.assign "out" (.concat [.const 1 32, .const 2 32, .const 3 32])] }
   ensure (isError (Sparkle.Backend.CppSim.toCppSimChecked arrayTarget))
     "CppSim accepted an unpacked array as a passive packed assignment target"
+
+  -- Unpacked arrays are valid CppSim class members, but none of the public JIT
+  -- value getters/setters has an aggregate ABI.  Reject only when such a value
+  -- is actually exposed by the top-level wrapper.
+  let jitArrayInput : Module :=
+    { (Module.empty "jit_array_input") with
+      inputs := [{ name := "bytes", ty := .array 4 (.bitVector 8) }]
+      outputs := [{ name := "out", ty := .bitVector 65 }]
+      body := [.assign "out" (.concat
+        [.const 1 57, .index (.ref "bytes") (.const 0 2)])] }
+  let _ ← requireOk (Sparkle.Backend.CppSim.toCppSimChecked jitArrayInput)
+  let jitArrayInputDesign : Design :=
+    { topModule := jitArrayInput.name, modules := [jitArrayInput] }
+  match Sparkle.Backend.CppSim.toCppSimJITChecked jitArrayInputDesign with
+  | .ok _ => throw (IO.userError "CppSim JIT accepted an unpacked array input")
+  | .error message =>
+      ensure (contains message "jit_set_input supports only scalar packed values")
+        s!"CppSim JIT returned the wrong array-input ABI error: {message}"
+
+  let jitArrayOutput : Module :=
+    { (Module.empty "jit_array_output") with
+      outputs := [{ name := "bytes", ty := .array 4 (.bitVector 8) }] }
+  let jitArrayOutputDesign : Design :=
+    { topModule := jitArrayOutput.name, modules := [jitArrayOutput] }
+  match Sparkle.Backend.CppSim.toCppSimJITChecked jitArrayOutputDesign with
+  | .ok _ => throw (IO.userError "CppSim JIT accepted an unpacked array output")
+  | .error message =>
+      ensure (contains message "jit_get_output supports only scalar packed values")
+        s!"CppSim JIT returned the wrong array-output ABI error: {message}"
+
+  let jitArrayWire : Module :=
+    { (Module.empty "jit_array_wire") with
+      wires :=
+        [{ name := "bytes", ty := .array 4 (.bitVector 8) },
+         { name := "_gen_bytes", ty := .array 4 (.bitVector 8) }] }
+  let jitArrayWireDesign : Design :=
+    { topModule := jitArrayWire.name, modules := [jitArrayWire] }
+  match Sparkle.Backend.CppSim.toCppSimJITChecked
+      jitArrayWireDesign (some ["bytes"]) with
+  | .ok _ =>
+      throw (IO.userError "CppSim JIT accepted an explicitly observable array wire")
+  | .error message =>
+      ensure (contains message "jit_get_wire supports only scalar packed values")
+        s!"CppSim JIT returned the wrong observable-array ABI error: {message}"
+  match Sparkle.Backend.CppSim.toCppSimJITChecked jitArrayWireDesign with
+  | .ok _ =>
+      throw (IO.userError "CppSim JIT accepted a default _gen_ array wire")
+  | .error message =>
+      ensure (contains message "jit_get_wire supports only scalar packed values")
+        s!"CppSim JIT returned the wrong _gen_-array ABI error: {message}"
 
 private def checkFailClosed : IO Unit := do
   let dataDependentCast :=

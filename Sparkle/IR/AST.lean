@@ -6,6 +6,8 @@
 -/
 
 import Sparkle.IR.Type
+import Std.Data.HashMap
+import Std.Data.HashSet
 
 namespace Sparkle.IR.AST
 
@@ -627,15 +629,40 @@ def validateSanitizedNames (m : Module) (sanitize : String → String) : Except 
     (m.parameters.map fun parameter => ("parameter", parameter.name)) ++
     ((m.inputs ++ m.outputs ++ m.wires).map fun port => ("port/wire", port.name)) ++
     nativeDeclarations
-  let distinctDeclarations := declarations.foldl (fun result declaration =>
-    if result.any (fun existing => existing == declaration) then result
-    else result ++ [declaration]) []
-  for (kind, name) in distinctDeclarations do
+  -- Record only exact declarations, as before, while indexing the first user
+  -- of every emitted spelling.  Keeping the earliest error position preserves
+  -- the old validation/error precedence without the old `distinct + countP`
+  -- quadratic scans.
+  let earlierError
+      (current candidate : Option (Nat × String)) : Option (Nat × String) :=
+    match current, candidate with
+    | none, result | result, none => result
+    | some old, some new => if new.1 < old.1 then some new else some old
+  let mut seenDeclarations : Std.HashSet (String × String) := {}
+  let mut firstBySanitized : Std.HashMap String (Nat × String × String) := {}
+  let mut earliestError : Option (Nat × String) := none
+  let mut distinctIndex := 0
+  for declaration in declarations do
+    if seenDeclarations.contains declaration then
+      continue
+    seenDeclarations := seenDeclarations.insert declaration
+    let (kind, name) := declaration
     let sanitized := sanitize name
     if sanitized.isEmpty then
-      throw s!"module '{m.name}' {kind} '{name}' sanitizes to an empty SystemVerilog identifier"
-    if distinctDeclarations.countP (fun (_, otherName) => sanitize otherName == sanitized) > 1 then
-      throw s!"module '{m.name}' has colliding SystemVerilog identifier '{sanitized}' after sanitizing {kind} '{name}'"
+      earliestError := earlierError earliestError <| some
+        (distinctIndex,
+          s!"module '{m.name}' {kind} '{name}' sanitizes to an empty SystemVerilog identifier")
+    match firstBySanitized.get? sanitized with
+    | some (firstIndex, firstKind, firstName) =>
+        earliestError := earlierError earliestError <| some
+          (firstIndex,
+            s!"module '{m.name}' has colliding SystemVerilog identifier '{sanitized}' after sanitizing {firstKind} '{firstName}'")
+    | none =>
+        firstBySanitized :=
+          firstBySanitized.insert sanitized (distinctIndex, kind, name)
+    distinctIndex := distinctIndex + 1
+  if let some (_, message) := earliestError then
+    throw message
 
 /-- Convert module to string (for debugging) -/
 def toString (m : Module) : String :=

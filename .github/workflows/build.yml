@@ -91,6 +91,25 @@ jobs:
     - name: Build Counter Formal Proofs (verilog! macro + auto-assert)
       run: lake build Sparkle.Verification.CounterProps
 
+    - name: Build certified combinational compiler proofs and checker
+      run: lake build sparkle-comb-certify Tests.CombCertificateTests Tests.CombElabTests
+
+    - name: Run certified combinational compiler acceptance tests
+      run: lake exe comb-correctness-tests
+
+    - name: Run linear circuit builder ordering tests
+      run: lake exe builder-accumulation-tests
+
+    - name: Set up Python for compiler certificate CLI tests
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+
+    - name: Run compiler certificate CLI fail-closed tests
+      run: |
+        python -m pip install 'pytest>=8,<10'
+        python -m pytest -q tests/test_sparkle_comb_certify_cli.py
+
     # ---- Synthesis Tests ----
 
     - name: Build SoC Verilog (generates verilator/ files)

@@ -126,14 +126,20 @@ def addOutput (name : String) (ty : HWType) : CompilerM Unit := do
   let ((), cs') := CircuitM.addOutput name ty cs
   set cs'
 
-/-- Look up the HW width of a wire by name (from wires, inputs, or outputs) -/
-def getWireWidth (wireName : String) : CompilerM DimExpr := do
+/-- Look up the hardware type of a value without materializing the builder's
+    pending wire list.  This keeps width-heavy lowering linear while ensuring
+    a wire is visible immediately after `makeWire`/register/memory emission. -/
+def getWireType (wireName : String) : CompilerM HWType := do
   let cs ← get
-  let allPorts := cs.module.wires ++ cs.module.inputs ++ cs.module.outputs
-  match allPorts.find? (fun p => p.name == wireName) with
-  | some p => return p.ty.width
+  match cs.findPort? wireName with
+  | some p => return p.ty
   | none => CompilerM.liftMetaM $ throwError
       s!"Internal Sparkle compiler error: wire '{wireName}' has no declared hardware type; refusing to assume an 8-bit width."
+
+/-- Look up the HW width of a wire by name (from pending/materialized wires,
+    inputs, or outputs). -/
+def getWireWidth (wireName : String) : CompilerM DimExpr := do
+  return (← getWireType wireName).width
 
 def emitRegister (hint : String) (clk : String) (rst : String) (input : Sparkle.IR.AST.Expr) (initVal : Int) (ty : HWType) (named : Bool := false) : CompilerM String := do
   let cs ← get
@@ -2073,16 +2079,8 @@ mutual
       let body := defnInfo.value
       let compiler : CompilerM String := do
         let resultWire ← translateExprToWire body "result" (isTopLevel := true)
-        -- Look up the actual wire type that was created
-        let cs ← get
-        let resultWireDecl := cs.module.wires.find? (fun (p : Port) => p.name == resultWire)
-        let outputType ← match resultWireDecl with
-          | some decl => pure decl.ty
-          | none =>
-            match cs.module.inputs.find? (fun p => p.name == resultWire) with
-            | some inputPort => pure inputPort.ty
-            | none => CompilerM.liftMetaM $ throwError
-                s!"Internal Sparkle compiler error: result wire '{resultWire}' has no declaration; refusing to assume an 8-bit output."
+        -- The result is normally still in the builder's pending wire list.
+        let outputType ← CompilerM.getWireType resultWire
         CompilerM.addOutput "out" outputType
         CompilerM.emitAssign "out" (.ref resultWire)
         return resultWire
@@ -2092,7 +2090,9 @@ mutual
         clockWire := none, resetWire := none
       }
       let (_, finalCircuitState) ← (compiler.run compilerState).run circuitState
-      let mut module := finalCircuitState.module
+      -- A synthesized module is an external/hierarchical commit point: expose
+      -- the complete ordered netlist, never the builder's materialized prefix.
+      let mut module := Sparkle.IR.Builder.materializeModule finalCircuitState
       let hasRegisters := module.body.any (fun stmt =>
         match stmt with
         | .register .. => true
@@ -2345,13 +2345,15 @@ def runDesignDRC (design : Sparkle.IR.AST.Design) : MetaM Unit := do
     for w in warnings do
       Lean.logWarning m!"{w}"
 
-def emitVerilogChecked (module : Sparkle.IR.AST.Module) : MetaM String :=
-  match Sparkle.Backend.Verilog.toVerilogChecked module with
+def emitVerilogChecked (module : Sparkle.IR.AST.Module)
+    (maxMemoryDepth : Nat := Sparkle.IR.Type.DimExpr.maxNatWorkWidth) : MetaM String :=
+  match Sparkle.Backend.Verilog.toVerilogChecked module maxMemoryDepth with
   | .ok verilog => pure verilog
   | .error message => throwError message
 
-def emitVerilogDesignChecked (design : Sparkle.IR.AST.Design) : MetaM String := do
-  match Sparkle.Backend.Verilog.toVerilogDesignChecked design with
+def emitVerilogDesignChecked (design : Sparkle.IR.AST.Design)
+    (maxMemoryDepth : Nat := Sparkle.IR.Type.DimExpr.maxNatWorkWidth) : MetaM String := do
+  match Sparkle.Backend.Verilog.toVerilogDesignChecked design maxMemoryDepth with
   | .ok verilog => pure verilog
   | .error message => throwError message
 
@@ -2512,25 +2514,27 @@ private opaque evalStringArray (name : Name) : TermElabM (Array String)
 /-- Core implementation for #writeDesign -/
 private def writeDesignCore (declName : Name) (svPath cppPath : String)
     (observableWires : Option (List String))
-    (parameterDefaults : List (String × Nat) := []) : TermElabM Unit := do
+    (parameterDefaults : List (String × Nat) := [])
+    (maxMemoryDepth : Nat := Sparkle.IR.Type.DimExpr.maxNatWorkWidth) : TermElabM Unit := do
   let parameterizedDesign ← synthesizeHierarchical declName parameterDefaults
   let design ← match Sparkle.IR.Specialize.specializeDesign
       parameterizedDesign parameterDefaults with
     | .ok design => pure design
     | .error message => throwError message
   if parameterizedDesign.modules.any (fun module_ => !module_.parameters.isEmpty) then
-    match Sparkle.Backend.CppSim.validateSpecializedDesign design with
+    match Sparkle.Backend.CppSim.validateSpecializedDesign design maxMemoryDepth with
     | .ok _ => pure ()
     | .error message => throwError message
   runDesignDRC design
   -- Generate every artifact from the same concrete specialization so that
   -- the Verilog, CppSim, and JIT models cannot silently disagree about widths.
   let optimized := Sparkle.IR.Optimize.optimizeDesign design
-  let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized with
+  let cpp ← match Sparkle.Backend.CppSim.toCppSimDesignChecked optimized none maxMemoryDepth with
     | .ok cpp => pure cpp
     | .error message => throwError m!"{message}. #writeDesign includes a fixed-width C++ simulator; use #writeVerilogDesign for native parameterized output, or synthesize a concrete wrapper."
   let jitOptimized := Sparkle.IR.Optimize.optimizeDesign design observableWires
-  let jitCpp ← match Sparkle.Backend.CppSim.toCppSimJITChecked jitOptimized observableWires with
+  let jitCpp ← match Sparkle.Backend.CppSim.toCppSimJITChecked
+      jitOptimized observableWires maxMemoryDepth with
     | .ok cpp => pure cpp
     | .error message => throwError message
   -- Ensure output directories exist
@@ -2539,7 +2543,7 @@ private def writeDesignCore (declName : Name) (svPath cppPath : String)
   if let some cppDir := (System.FilePath.mk cppPath).parent then
     IO.FS.createDirAll cppDir
   -- Verilog (unoptimized)
-  let verilog ← emitVerilogDesignChecked design
+  let verilog ← emitVerilogDesignChecked design maxMemoryDepth
   IO.FS.writeFile svPath verilog
   IO.println s!"Written {design.modules.length} modules to {svPath}"
   -- CppSim (optimized, no observableWires — keep all _gen_ as members for header)
@@ -2573,6 +2577,23 @@ elab "#writeDesign" id:ident svPath:str cppPath:str wiresId:ident : command => d
     let wiresName ← Lean.resolveGlobalConstNoOverload wiresId
     let wiresArr ← evalStringArray wiresName
     writeDesignCore declName svPath.getString cppPath.getString (some wiresArr.toList)
+
+/-- Combined command with observable wires and an explicit opt-in memory-depth
+    limit shared by checked SystemVerilog and CppSim emission.  The ordinary
+    command retains the conservative default limit, and the opt-in never
+    relaxes packed widths or symbolic memory declarations. -/
+elab "#writeDesign" id:ident svPath:str cppPath:str wiresId:ident
+    "maxMemoryDepth" limit:num : command => do
+  let declName ← Lean.Elab.Command.liftCoreM do
+    Lean.resolveGlobalConstNoOverload id
+  Lean.Elab.Command.liftTermElabM do
+    let wiresName ← Lean.resolveGlobalConstNoOverload wiresId
+    let wiresArr ← evalStringArray wiresName
+    let maxMemoryDepth := limit.getNat
+    if maxMemoryDepth == 0 then
+      throwError "#writeDesign maxMemoryDepth must be positive"
+    writeDesignCore declName svPath.getString cppPath.getString
+      (some wiresArr.toList) [] maxMemoryDepth
 
 elab "#writeDesign" id:ident svPath:str cppPath:str wiresId:ident "parameters" "[" defaults:sparkleParameterDefault,* "]" : command => do
   let declName ← Lean.Elab.Command.liftCoreM do

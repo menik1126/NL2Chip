@@ -237,8 +237,10 @@ emitting concrete C++/JIT artifacts; `#writeDesign` emits its SystemVerilog from
 the same specialization. Since the present CppSim execution backend supports
 scalar packed operations only through 64 bits, wider arithmetic
 specializations fail closed on the C++/JIT paths while concrete SystemVerilog
-remains available. Passive, word-aligned concat/copy into wide output
-containers is supported. The current SV-to-Lean verification-model generator
+remains available. The checked C++/JIT path supports passive, bit-exact packed
+concat/copy into wide output containers, including non-word-aligned fields;
+wide arithmetic and other active wide expressions remain fail-closed. The
+current SV-to-Lean verification-model generator
 also requires a concrete module. Source-level Lean theorems may still be
 written directly over a generic definition.
 
@@ -253,6 +255,74 @@ exists. Reports therefore use separate **Finite sweep** and **Universal Lean
 source theorem** evidence labels and never promote one into the other. The
 latter concerns Lean source semantics; without a separate compiler-correctness
 result, it does not by itself certify the emitted RTL.
+
+#### Verified explicit combinational compiler
+
+Sparkle also provides a separate, proof-carrying compiler path for the
+explicitly deep-embedded combinational language in
+`Sparkle.Compiler.CombCorrectness`. A design enters this path only as a
+`CertifiedCombDesign`, which contains a `CombDesign` together with a proof of
+`SupportedComb`. The public production compiler is
+`compileSupportedComb`; `compileSupportedComb_correct` and
+`compileSupportedComb_correct_total` prove source-to-Core-IR semantic
+preservation and non-vacuity for every legal parameter configuration and
+well-typed input environment.
+
+```lean
+import Sparkle.Compiler.CombElab
+
+open Sparkle.IR.Type
+open Sparkle.Compiler.CombCorrectness
+
+def passthrough : CombDesign :=
+  { name := "verified_passthrough"
+    parameters := [{ name := "W", defaultValue := 8 }]
+    inputs := [{ name := "x", width := .param "W" }]
+    outputs :=
+      [{ name := "y", width := .param "W", rhs := .ref "x" }] }
+
+theorem passthrough_supported : SupportedComb passthrough := by
+  simp [SupportedComb, configDomain, ParametersDeclared, dimensions,
+    passthrough, allBindings, BindingsScoped, CombExpr.refs,
+    CombExpr.dimensions, dimParameters]
+
+def certifiedPassthrough : CertifiedCombDesign :=
+  ⟨passthrough, passthrough_supported⟩
+
+#synthesizeComb certifiedPassthrough
+#synthesizeCombVerilog certifiedPassthrough
+-- #writeCombVerilog certifiedPassthrough "build/passthrough.sv"
+```
+
+`Sparkle.Compiler.CombElab.toCoreIRChecked` returns the exact module produced
+by `compileSupportedComb` after production preflight checks.
+`toVerilogChecked` and `#synthesizeCombVerilog` then invoke the existing
+SystemVerilog backend without optimization or specialization.
+
+The fixed-scope standalone checker emits a nonce-bound JSON certificate:
+
+```bash
+lake exe sparkle-comb-certify --nonce 0123456789abcdef0123456789abcdef
+```
+
+It accepts no caller-selected module or theorem name and certifies only the
+explicit `CertifiedCombDesign` to Core IR boundary described here.
+
+The proof scope is deliberately narrow:
+
+- Covered: explicit `CertifiedCombDesign` source semantics through
+  `compileSupportedComb` to the existing Core IR semantics, for all legal
+  symbolic widths.
+- Not covered: ordinary `Signal` definitions and their
+  `Compiler.Elab.synthesizeCombinational` MetaM frontend.
+- Not covered: `IR.Optimize`, `IR.Specialize`, SystemVerilog emission,
+  Yosys/OpenROAD, sequential state, memories, native generate blocks, or
+  native procedural loops.
+
+Accordingly, `#synthesizeVerilog` remains the ordinary unverified Signal
+frontend, while the distinct `#synthesizeComb*` names fail closed unless their
+argument is a closed `CertifiedCombDesign`. Emitting checked Verilog does not
+widen the phase-one certificate beyond explicit source-to-Core-IR lowering.
 
 For CVDP, functional simulation can exercise parameter overrides. When the
 harness exposes an exact finite configuration matrix, the evaluator runs

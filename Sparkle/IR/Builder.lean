@@ -15,10 +15,36 @@ open Sparkle.IR.Type
 /-- State for circuit building -/
 structure CircuitState where
   counter : Nat                -- Counter for generating unique names
-  module  : Module             -- The module being constructed
+  /-- Materialized prefix of the module being constructed.  Wires and body
+      statements produced on the hot path are accumulated separately below. -/
+  module  : Module
   design  : Design             -- The design being constructed (multi-module)
   usedNames : List String      -- Track used names to prevent collisions
+  /-- Newly-created wires, newest first.  Keeping this list reversed makes
+      each builder emission O(1); `materializeModule` restores source order. -/
+  pendingWiresRev : List Port := []
+  /-- Newly-created statements, newest first. -/
+  pendingBodyRev : List Stmt := []
   deriving Repr
+
+/-- Return the complete current module without changing the builder state.
+    `Module.addWire`/`Module.addStmt` intentionally retain their public append
+    semantics; only the builder's private accumulation strategy is linearized. -/
+def materializeModule (s : CircuitState) : Module :=
+  { s.module with
+    wires := if s.pendingWiresRev.isEmpty then s.module.wires
+      else s.module.wires ++ s.pendingWiresRev.reverse
+    body := if s.pendingBodyRev.isEmpty then s.module.body
+      else s.module.body ++ s.pendingBodyRev.reverse }
+
+/-- Look up a declared value while construction is still in progress.  Pending
+    wires are checked directly so callers do not materialize the whole module
+    merely to inspect one recently-created value. -/
+def CircuitState.findPort? (s : CircuitState) (name : String) : Option Port :=
+  s.pendingWiresRev.find? (fun port => port.name == name) <|>
+    s.module.wires.find? (fun port => port.name == name) <|>
+    s.module.inputs.find? (fun port => port.name == name) <|>
+    s.module.outputs.find? (fun port => port.name == name)
 
 /-- Circuit builder monad -/
 abbrev CircuitM := StateM CircuitState
@@ -31,16 +57,29 @@ def init (topModuleName : String) : CircuitState :=
   , module := Module.empty topModuleName
   , design := Design.empty topModuleName
   , usedNames := []
+  , pendingWiresRev := []
+  , pendingBodyRev := []
   }
 
 /-- Get the current module -/
 def getModule : CircuitM Module := do
   let s ← get
-  return s.module
+  return materializeModule s
+
+/-- Merge pending wires/statements into the materialized prefix and clear the
+    accumulators.  This is needed before replacing or externally committing a
+    module, but not on ordinary wire/statement emission. -/
+def commitPending : CircuitM Unit := do
+  modify fun s =>
+    { s with
+      module := materializeModule s
+      pendingWiresRev := []
+      pendingBodyRev := [] }
 
 /-- Set the module -/
 def setModule (m : Module) : CircuitM Unit := do
-  modify fun s => { s with module := m }
+  modify fun s =>
+    { s with module := m, pendingWiresRev := [], pendingBodyRev := [] }
 
 /-- Get the current design -/
 def getDesign : CircuitM Design := do
@@ -93,11 +132,12 @@ def reserveName (name : String) : CircuitM Unit := do
 def addParameter (name : String) (defaultValue : Nat := 1) : CircuitM Unit := do
   let cleanName := sanitizeName name
   reserveName cleanName
-  let m ← getModule
   -- Keep the source name in the IR so `DimExpr.param name` and the declaration
   -- use one namespace.  Backends sanitize both consistently; only the builder's
   -- used-name set needs the emitted spelling.
-  setModule (m.addParameter { name := name, defaultValue := defaultValue })
+  modify fun s =>
+    { s with module :=
+        s.module.addParameter { name := name, defaultValue := defaultValue } }
 
 /--
   Create a new wire with the given type.
@@ -105,8 +145,8 @@ def addParameter (name : String) (defaultValue : Nat := 1) : CircuitM Unit := do
 -/
 def makeWire (hint : String) (ty : HWType) (named : Bool := false) : CircuitM String := do
   let name ← freshName (sanitizeName hint) named
-  let m ← getModule
-  setModule (m.addWire { name := name, ty := ty })
+  modify fun s =>
+    { s with pendingWiresRev := { name := name, ty := ty } :: s.pendingWiresRev }
   return name
 
 /--
@@ -117,8 +157,7 @@ def makeWire (hint : String) (ty : HWType) (named : Bool := false) : CircuitM St
   Always use: .op .mux [cond, thenVal, elseVal] (exactly 3 arguments)
 -/
 def emitAssign (lhs : String) (rhs : Expr) : CircuitM Unit := do
-  let m ← getModule
-  setModule (m.addStmt (.assign lhs rhs))
+  modify fun s => { s with pendingBodyRev := .assign lhs rhs :: s.pendingBodyRev }
 
 /--
   Emit a register statement (D flip-flop).
@@ -127,12 +166,11 @@ def emitAssign (lhs : String) (rhs : Expr) : CircuitM Unit := do
 def emitRegister (hint : String) (clock : String) (reset : String)
     (input : Expr) (initValue : Int) (ty : HWType) (named : Bool := false) : CircuitM String := do
   let outputName ← freshName (sanitizeName hint) named
-  let m ← getModule
-  -- Add the output wire
-  let m := m.addWire { name := outputName, ty := ty }
-  -- Add the register statement
-  let m := m.addStmt (.register outputName clock reset input initValue)
-  setModule m
+  modify fun s =>
+    { s with
+      pendingWiresRev := { name := outputName, ty := ty } :: s.pendingWiresRev
+      pendingBodyRev :=
+        .register outputName clock reset input initValue :: s.pendingBodyRev }
   return outputName
 
 /--
@@ -153,13 +191,14 @@ def emitMemory (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr) (cloc
     (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
-  let m ← getModule
-  -- Add the read data output wire
-  let m := m.addWire { name := readDataName, ty := .bitVector dataWidth }
-  -- Add the memory statement
   let depth := DimExpr.mkPow 2 addrWidth
-  let m := m.addStmt (.memory memName addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readDataName)
-  setModule m
+  modify fun s =>
+    { s with
+      pendingWiresRev :=
+        { name := readDataName, ty := .bitVector dataWidth } :: s.pendingWiresRev
+      pendingBodyRev :=
+        .memory memName addrWidth dataWidth depth clock writeAddr writeData
+          writeEnable readAddr readDataName :: s.pendingBodyRev }
   return readDataName
 
 /--
@@ -170,11 +209,14 @@ def emitMemoryComboRead (hint : String) (addrWidth : DimExpr) (dataWidth : DimEx
     (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
-  let m ← getModule
-  let m := m.addWire { name := readDataName, ty := .bitVector dataWidth }
   let depth := DimExpr.mkPow 2 addrWidth
-  let m := m.addStmt (.memory memName addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readDataName (comboRead := true))
-  setModule m
+  modify fun s =>
+    { s with
+      pendingWiresRev :=
+        { name := readDataName, ty := .bitVector dataWidth } :: s.pendingWiresRev
+      pendingBodyRev :=
+        .memory memName addrWidth dataWidth depth clock writeAddr writeData
+          writeEnable readAddr readDataName (comboRead := true) :: s.pendingBodyRev }
   return readDataName
 
 /--
@@ -183,24 +225,23 @@ def emitMemoryComboRead (hint : String) (addrWidth : DimExpr) (dataWidth : DimEx
 def emitInstance (moduleName : String) (instName : String)
     (connections : List (String × Expr))
     (parameterOverrides : List (String × DimExpr) := []) : CircuitM Unit := do
-  let m ← getModule
-  setModule (m.addStmt (.inst moduleName instName connections parameterOverrides))
+  modify fun s =>
+    { s with pendingBodyRev :=
+        .inst moduleName instName connections parameterOverrides :: s.pendingBodyRev }
 
 /--
   Add an input port to the module.
 -/
 def addInput (name : String) (ty : HWType) : CircuitM Unit := do
   reserveName name
-  let m ← getModule
-  setModule (m.addInput { name := name, ty := ty })
+  modify fun s => { s with module := s.module.addInput { name := name, ty := ty } }
 
 /--
   Add an output port to the module.
 -/
 def addOutput (name : String) (ty : HWType) : CircuitM Unit := do
   reserveName name
-  let m ← getModule
-  setModule (m.addOutput { name := name, ty := ty })
+  modify fun s => { s with module := s.module.addOutput { name := name, ty := ty } }
 
 /--
   Run the circuit builder and extract the final module.
@@ -208,7 +249,7 @@ def addOutput (name : String) (ty : HWType) : CircuitM Unit := do
 def run (moduleName : String) (builder : CircuitM α) : Module × α :=
   let initialState := init moduleName
   let (result, finalState) := StateT.run builder initialState
-  (finalState.module, result)
+  (materializeModule finalState, result)
 
 /--
   Run the circuit builder and return only the module.
