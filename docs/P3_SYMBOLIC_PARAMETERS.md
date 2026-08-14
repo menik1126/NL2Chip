@@ -174,3 +174,22 @@ downstream reporting cannot accidentally present one width as the family.
 `--require-native-ppa` turns partial or unsupported coverage into a structured
 `unsupported_backend` failure. `--native-ppa-policy off` performs no default-
 width fallback.
+
+## Complete Regression Gate
+
+Run `scripts/verify_p3_toolchain.sh` with Lean, Icarus, a C++17 compiler, and
+the project Python environment on `PATH`. The gate fails if pytest skips any
+test, then checks the Sparkle build, Verilog unit tests, concrete CppSim
+specializations, and unseen-width RTL behavior. Set `P3_RUN_ORFS=1` to include
+the real two-width ORFS synthesis and P&R smoke; it verifies that the two
+elaborated widths produce independent cell metrics and that all requested
+family stages complete.
+
+On H20 the explicit invocation is:
+
+```bash
+PATH=/home/sgli/work/NL2Chip/.venv/bin:/home/sgli/.elan/toolchains/leanprover--lean4---v4.28.0-rc1/bin:/usr/local/bin:/usr/bin:/bin \
+P3_PYTHON=/home/sgli/work/NL2Chip/.venv/bin/python \
+P3_RUN_ORFS=1 \
+bash scripts/verify_p3_toolchain.sh
+```
