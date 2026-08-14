@@ -118,12 +118,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume-mode", choices=["passed", "completed"], default="completed")
     p.add_argument("--no-repl", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Skip agent generation and only evaluate existing Generated/<prob_id>.lean files.")
-    p.add_argument(
+    parameter_mode = p.add_mutually_exclusive_group()
+    parameter_mode.add_argument(
         "--finite-parameter-specialization",
         action="store_true",
         help=(
             "Enable the P0 CVDP path: synthesize every finite public parameter "
             "combination as a concrete Sparkle module and generate a selector wrapper."
+        ),
+    )
+    parameter_mode.add_argument(
+        "--native-parameter-sweep",
+        action="store_true",
+        help=(
+            "Enable the P3 CVDP path: emit one native generic SystemVerilog DUT, "
+            "verify parameter propagation, and elaborate every public sweep case."
         ),
     )
     p.add_argument("--workers", type=int, default=1, help="Concurrent problem workers; each receives an isolated Lean REPL.")
@@ -229,6 +238,10 @@ def build_system_prompt(
         (getattr(info, "metadata", {}) or {}).get("finite_parameter_plan")
         if info is not None else None
     )
+    native_plan = (
+        (getattr(info, "metadata", {}) or {}).get("native_parameter_sweep_plan")
+        if info is not None else None
+    )
     design_rule = ""
     if specialization_plan:
         module_names = [row["module_name"] for row in specialization_plan.get("cases", [])]
@@ -237,6 +250,14 @@ def build_system_prompt(
             f"- Reserve benchmark top name `{design_name}` for the evaluator-generated selector; do not define or synthesize it in Lean.\n"
             f"- Define and synthesize every concrete module listed in the P0 contract ({len(module_names)} total).\n"
             "- A Lean check is complete only when generated Verilog contains every required concrete module.\n"
+        )
+    elif native_plan:
+        parameter_names = native_plan.get("parameter_names", [])
+        design_rule = (
+            f"- The output file is `Generated/{prob_id}.lean`, and one generic Lean function/top module must be `{design_name}`.\n"
+            f"- Retain these Nat binders as native SystemVerilog parameters: {', '.join(parameter_names)}.\n"
+            f"- Use `#synthesizeParameterizedVerilog {design_name} [...]` exactly once; do not enumerate concrete aliases.\n"
+            "- A Lean check is complete only when generated Verilog declares and uses every required parameter.\n"
         )
     elif design_name:
         design_rule = (
@@ -261,7 +282,7 @@ def build_system_prompt(
         + f"- Write only `Generated/{prob_id}.lean` using the `write_file`/`edit_file` tools.\n"
         + design_rule
         + "- Treat the user's `Benchmark Interface Contract` as authoritative over guesses from examples or file names.\n"
-        + "- For CVDP parameters, follow the Benchmark Interface Contract and, when present, the Finite Parameter Specialization contract exactly.\n"
+        + "- For CVDP parameters, follow the Benchmark Interface Contract and the active P0/P3 parameter contract exactly.\n"
         + "- Match benchmark output names exactly. If you must return a packed output internally, construct an explicit named MSB-to-LSB concat so the CVDP wrapper can recover each output field.\n"
         + "- Preserve benchmark clock, reset polarity, and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
         + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and `#synthesizeVerilog`; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
@@ -312,9 +333,18 @@ def make_runner(
         (getattr(info, "metadata", {}) or {}).get("finite_parameter_plan")
         if info is not None else None
     )
-    required_modules = tuple(
-        row["module_name"] for row in (plan_payload or {}).get("cases", [])
+    native_payload = (
+        (getattr(info, "metadata", {}) or {}).get("native_parameter_sweep_plan")
+        if info is not None else None
     )
+    if plan_payload:
+        required_modules = tuple(
+            row["module_name"] for row in plan_payload.get("cases", [])
+        )
+    elif native_payload and getattr(info, "design_name", None):
+        required_modules = (str(info.design_name),)
+    else:
+        required_modules = ()
     if args.harness == "archon-native":
         run_archon_native_unavailable()
     if args.harness == "codex-agent":
@@ -375,15 +405,39 @@ def configure_finite_parameter_specialization(
     *,
     enabled: bool,
 ) -> Any:
+    return configure_parameter_mode(
+        info,
+        finite_enabled=enabled,
+        native_enabled=False,
+    )
+
+
+def configure_parameter_mode(
+    info: Any,
+    *,
+    finite_enabled: bool,
+    native_enabled: bool,
+) -> Any:
+    if finite_enabled and native_enabled:
+        raise ValueError(
+            "finite parameter specialization and native parameter sweep are mutually exclusive"
+        )
     metadata = dict(getattr(info, "metadata", {}) or {})
     metadata.pop("finite_parameter_plan", None)
-    if not enabled:
+    metadata.pop("native_parameter_sweep_plan", None)
+    mode = (
+        "finite_parameter_specialization"
+        if finite_enabled
+        else "native_parameter_sweep" if native_enabled else None
+    )
+    if mode is None:
         info.metadata = metadata
         return info
     if metadata.get("dataset") != "cvdp":
-        raise ValueError("finite parameter specialization is supported only for CVDP")
+        raise ValueError("CVDP parameter modes are supported only for CVDP")
     _add_legacy_agent_path()
     from cvdp_specialization import discover_finite_parameter_plan
+    from cvdp_native_parameters import native_plan_to_dict
     import search
 
     plan = discover_finite_parameter_plan(
@@ -392,15 +446,21 @@ def configure_finite_parameter_specialization(
     )
     if not plan.supported:
         raise ValueError(
-            "finite parameter specialization contract unavailable: "
+            f"{mode.replace('_', ' ')} contract unavailable: "
             + "; ".join(plan.diagnostics)
         )
-    payload = plan.to_dict()
-    metadata["finite_parameter_plan"] = payload
-    info.metadata = metadata
-    usage = search._parse_cvdp_harness_usage(
-        metadata.get("harness_files", {}) or {}
+    payload = (
+        plan.to_dict()
+        if mode == "finite_parameter_specialization"
+        else native_plan_to_dict(plan)
     )
+    metadata_key = (
+        "finite_parameter_plan"
+        if mode == "finite_parameter_specialization"
+        else "native_parameter_sweep_plan"
+    )
+    metadata[metadata_key] = payload
+    info.metadata = metadata
     prompt_parameters = search._p0_parse_parameters_from_prompt(
         info.prompt_text or ""
     )
@@ -422,7 +482,7 @@ def configure_finite_parameter_specialization(
         metadata.get("harness_files", {}) or {},
         reset_names,
     )
-    metadata["finite_parameter_plan"] = payload
+    metadata[metadata_key] = payload
     info.metadata = metadata
     return info
 
@@ -505,9 +565,10 @@ def process_problem_guided(
     import search
 
     problem_t0 = time.monotonic()
-    info = configure_finite_parameter_specialization(
+    info = configure_parameter_mode(
         ds.load_problem(prob_id),
-        enabled=bool(args.finite_parameter_specialization),
+        finite_enabled=bool(getattr(args, "finite_parameter_specialization", False)),
+        native_enabled=bool(getattr(args, "native_parameter_sweep", False)),
     )
     has_repl = repl is not None
     generated_target = PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
@@ -972,9 +1033,10 @@ def process_problem(
     import search
 
     problem_t0 = time.monotonic()
-    info = configure_finite_parameter_specialization(
+    info = configure_parameter_mode(
         ds.load_problem(prob_id),
-        enabled=bool(args.finite_parameter_specialization),
+        finite_enabled=bool(getattr(args, "finite_parameter_specialization", False)),
+        native_enabled=bool(getattr(args, "native_parameter_sweep", False)),
     )
     has_repl = repl is not None
     agent_stats = AgentStats()

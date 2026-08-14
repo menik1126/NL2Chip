@@ -43,6 +43,10 @@ from cvdp_specialization import (
     format_specialization_contract,
     plan_from_dict,
 )
+from cvdp_native_parameters import (
+    format_native_parameter_contract,
+    native_plan_from_dict,
+)
 from lean_repl import LeanREPLPool
 from report import generate_report
 
@@ -1000,6 +1004,8 @@ def _p0_benchmark_expected_ports(info: ProblemInfo | None) -> list[tuple[str, st
     harness_files = metadata.get("harness_files", {}) or {}
     usage = _parse_cvdp_harness_usage(harness_files)
     plan = plan_from_dict(metadata.get("finite_parameter_plan"))
+    if plan is None:
+        plan = native_plan_from_dict(metadata.get("native_parameter_sweep_plan"))
     plan_names = set(plan.parameter_names if plan is not None else ())
     prompt_parameters = _p0_parse_parameters_from_prompt(info.prompt_text or "")
     derived_symbol_names = prompt_parameters - plan_names
@@ -1074,7 +1080,7 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
     ref_mod, _ = parse_module_ports(info.ref_code or "")
     expected_ports = (
         _p0_benchmark_expected_ports(info)
-        if metadata.get("finite_parameter_plan")
+        if metadata.get("finite_parameter_plan") or metadata.get("native_parameter_sweep_plan")
         else _benchmark_expected_ports(info)
     )
 
@@ -1137,9 +1143,12 @@ def finite_parameter_specialization_contract(info: ProblemInfo | None) -> str:
     if info is None:
         return ""
     plan = plan_from_dict((info.metadata or {}).get("finite_parameter_plan"))
-    if plan is None:
-        return ""
-    return format_specialization_contract(plan)
+    if plan is not None:
+        return format_specialization_contract(plan)
+    native_plan = native_plan_from_dict(
+        (info.metadata or {}).get("native_parameter_sweep_plan")
+    )
+    return format_native_parameter_contract(native_plan) if native_plan else ""
 
 
 def benchmark_expected_port_names(info: ProblemInfo | None) -> tuple[set[str], set[str]]:
@@ -1147,7 +1156,10 @@ def benchmark_expected_port_names(info: ProblemInfo | None) -> tuple[set[str], s
         return set(), set()
     ports = (
         _p0_benchmark_expected_ports(info)
-        if (info.metadata or {}).get("finite_parameter_plan")
+        if (
+            (info.metadata or {}).get("finite_parameter_plan")
+            or (info.metadata or {}).get("native_parameter_sweep_plan")
+        )
         else _benchmark_expected_ports(info)
     )
     return (
@@ -1178,6 +1190,9 @@ def build_user_message(
     plan = plan_from_dict(
         (info.metadata or {}).get("finite_parameter_plan") if info else None
     )
+    native_plan = native_plan_from_dict(
+        (info.metadata or {}).get("native_parameter_sweep_plan") if info else None
+    )
 
     # VerilogEval uses TopModule via wrapper; other datasets instantiate the named DUT.
     if dataset_name == "verilogeval":
@@ -1193,6 +1208,19 @@ def build_user_message(
             "   - The harness automatically saves only a complete specialization family\n"
             "4. Fix any errors until every concrete module compiles\n"
             "5. Stop after the complete family passes Lean-check"
+        )
+    elif native_plan is not None and has_repl:
+        defaults = native_plan.cases[0].values if native_plan.cases else {}
+        bindings = ", ".join(
+            f"{name} := {defaults[name]}" for name in native_plan.parameter_names
+        )
+        compile_instructions = (
+            "3. Use `lean_check` on the complete file body, including exactly one "
+            f"`#synthesizeParameterizedVerilog {func_name} [{bindings}]` command\n"
+            "   - The check is complete only when generated Verilog declares every retained parameter and uses it in dependent dimensions\n"
+            "   - Do not generate one concrete alias per sweep value\n"
+            "4. Fix errors until the one generic module compiles\n"
+            "5. Inspect the generated parameter declarations and symbolic widths, then stop"
         )
     elif has_repl:
         compile_instructions = (
@@ -1239,6 +1267,12 @@ def build_user_message(
             "- Keep all behavior in the generic Lean core and concrete Lean aliases.\n"
             "- Use port names, reset polarity, cycle latency, and output packing from the benchmark contract.\n"
         )
+    elif native_plan is not None:
+        dataset_note = (
+            f"- The evaluator will wrap the one generic generated core as CVDP top `{design_name}` and forward every parameter explicitly.\n"
+            "- Keep all widths/depths symbolic; wrapper-only parameter declarations and fixed-width cores are rejected before simulation.\n"
+            "- Use port names, reset polarity, cycle latency, and output packing from the benchmark contract.\n"
+        )
     elif dataset_name in ("resbench", "cvdp", "realbench"):
         dataset_note = (
             f"- The evaluator expects the generated SystemVerilog top module to be `{design_name}`.\n"
@@ -1276,6 +1310,28 @@ def build_user_message(
             f"  {lean_identifier(design_name)}_core (dom := dom) {bindings} <all inputs>\n\n"
             f"#synthesizeVerilog {first.module_name}\n"
             "-- Repeat the eta-expanded alias and synthesize command for every listed case.\n"
+            "```\n"
+        )
+    elif native_plan is not None:
+        defaults = native_plan.cases[0].values if native_plan.cases else {}
+        binder_text = " ".join(
+            f"{{{name} : Nat}}" for name in native_plan.parameter_names
+        )
+        bindings = ", ".join(
+            f"{name} := {defaults[name]}" for name in native_plan.parameter_names
+        )
+        file_template = (
+            "The file must use one native generic design (replace placeholders with the full interface):\n"
+            "```lean\n"
+            "import Sparkle\n"
+            "import Sparkle.Compiler.Elab\n\n"
+            "open Sparkle.Core.Domain\n"
+            "open Sparkle.Core.Signal\n"
+            "open Sparkle.Library.RTL\n\n"
+            f"def {func_name} {{dom : DomainConfig}} {binder_text}\n"
+            "    (<parameter-dependent inputs>) : <parameter-dependent output type> :=\n"
+            "  <generic implementation>\n\n"
+            f"#synthesizeParameterizedVerilog {func_name} [{bindings}]\n"
             "```\n"
         )
     else:

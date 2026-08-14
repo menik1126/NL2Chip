@@ -63,3 +63,35 @@ widths.
 | Formal | Generic proof when supported, otherwise explicit per-configuration specialization |
 | CppSim | Explicit per-configuration specialization until its ABI supports symbolic widths |
 | PPA | Report per-configuration metrics; never reuse the default module metric for the family |
+
+## CVDP Native Sweep Runner
+
+Use `cktarchon/run.py --native-parameter-sweep` for the P3 path. It is mutually
+exclusive with `--finite-parameter-specialization` (the P0 compatibility path).
+The runner discovers only public build-parameter combinations, asks for one
+`#synthesizeParameterizedVerilog` design, and then enforces these checks before
+the benchmark simulation starts:
+
+1. One generated core declares and semantically uses every required parameter.
+2. Parameter-dependent public ports remain parameter-dependent on the core.
+3. The strict CVDP wrapper explicitly forwards each parameter as
+   `.PARAM(PARAM)` and maps every public input/output without zero fallbacks.
+4. Icarus elaborates the exact same saved SystemVerilog file once for every
+   public parameter combination using top-level `-P` overrides.
+
+The run writes
+`native_parameter_sweep/<prob_id>/manifest.json`. Every case carries the same
+`sv_sha256`; different hashes would mean regeneration/specialization and are not
+a valid native sweep. The manifest also records per-case Verilog elaboration.
+
+Evaluator failures retain the legacy free-form `detail` field and additionally
+set `failure_stage` plus structured `diagnostics`. Stages are:
+
+- `lean_elaboration`
+- `symbolic_dimension_lowering`
+- `verilog_extraction`
+- `parameter_contract`
+- `verilog_elaboration`
+- `simulation_mismatch`
+- `unsupported_backend`
+- `infrastructure`

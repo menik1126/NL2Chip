@@ -25,6 +25,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cvdp_native_parameters import (
+    native_plan_from_dict,
+    parse_native_modules,
+    select_native_core_module,
+    sv_sha256,
+    validate_native_parameter_ownership,
+)
 from cvdp_specialization import FiniteParameterPlan, plan_from_dict
 
 
@@ -40,6 +47,63 @@ LVS_TIMEOUT = 300
 STA_TIMEOUT = 120
 GLS_TIMEOUT = 120
 MIN_DIE_SIDE_UM = 50  # minimum die side for sky130hd PDN straps
+
+DIAGNOSTIC_STAGES = {
+    "lean_elaboration",
+    "symbolic_dimension_lowering",
+    "verilog_extraction",
+    "parameter_contract",
+    "verilog_elaboration",
+    "simulation_mismatch",
+    "unsupported_backend",
+    "infrastructure",
+}
+
+
+def _record_failure(
+    result: dict,
+    stage: str,
+    detail: str,
+    *,
+    code: str | None = None,
+) -> None:
+    if stage not in DIAGNOSTIC_STAGES:
+        raise ValueError(f"unknown diagnostic stage: {stage}")
+    result["failure_stage"] = stage
+    result["detail"] = detail
+    diagnostic = {"stage": stage, "message": detail}
+    if code:
+        diagnostic["code"] = code
+    result.setdefault("diagnostics", []).append(diagnostic)
+
+
+def _lean_diagnostic_stage(detail: str) -> str:
+    text = str(detail or "").lower()
+    symbolic_markers = (
+        "symbolic dimension",
+        "dimexpr",
+        "parameter-dependent",
+        "native parameter",
+        "unsupported dimension",
+    )
+    return (
+        "symbolic_dimension_lowering"
+        if any(marker in text for marker in symbolic_markers)
+        else "lean_elaboration"
+    )
+
+
+def _simulation_diagnostic_stage(status: str, detail: str) -> str | None:
+    if status == "sim_pass":
+        return None
+    if status == "sim_fail":
+        return "simulation_mismatch"
+    text = str(detail or "").lower()
+    if any(marker in text for marker in (
+        "compile failed", "iverilog", "syntax error", "elaboration",
+    )):
+        return "verilog_elaboration"
+    return "infrastructure"
 
 # ── sky130 cell simulation models (via volare PDK manager) ──────────
 SKY130_VOLARE_VERSION = "c6d73a35f524070e85faff4a6a9eef49553ebc2b"
@@ -1186,6 +1250,7 @@ def generate_cvdp_wrapper(
     expected_ports_override: list[tuple[str, str, str]] | None = None,
     reset_polarities: dict[str, str] | None = None,
     strict_mapping: bool = False,
+    required_parameter_names: set[str] | None = None,
 ) -> str | None:
     """Generate a CVDP top wrapper matching cocotb's expected DUT interface."""
     usage = _cvdp_parse_harness_usage(harness_files)
@@ -1353,7 +1418,23 @@ def generate_cvdp_wrapper(
     if observed_internal_arrays:
         lines.append("")
 
-    lines.append(f"    {sparkle_mod_name} sparkle_dut (")
+    core_module = next(
+        (module for module in parse_native_modules(sv_code) if module.name == sparkle_mod_name),
+        None,
+    )
+    core_parameters = list(core_module.parameter_names) if core_module else []
+    forwarded_parameters = [name for name in core_parameters if name in param_names]
+    if strict_mapping and set(required_parameter_names or ()) - param_names:
+        return None
+
+    if forwarded_parameters:
+        lines.append(f"    {sparkle_mod_name} #(")
+        lines.append(",\n".join(
+            f"        .{name}({name})" for name in forwarded_parameters
+        ))
+        lines.append("    ) sparkle_dut (")
+    else:
+        lines.append(f"    {sparkle_mod_name} sparkle_dut (")
     inst_conns = []
     matched_expected_inputs: set[str] = set()
     for d, _, sn in sparkle_ports:
@@ -1539,6 +1620,199 @@ def generate_cvdp_wrapper(
 
     lines.append("endmodule")
     return "\n".join(lines)
+
+
+def _parameter_names_in_type(typ: str, parameter_names: set[str]) -> set[str]:
+    return {
+        name for name in parameter_names
+        if re.search(rf"\b{re.escape(name)}\b", str(typ or ""))
+    }
+
+
+def validate_cvdp_native_parameter_contract(
+    *,
+    sv_code: str,
+    core_module_name: str,
+    core_ports: list[tuple[str, str, str]],
+    required_parameters: list[str],
+    expected_ports: list[tuple[str, str, str]],
+) -> list[str]:
+    """Validate that CVDP parameters reach the generated Sparkle core."""
+    modules = parse_native_modules(sv_code)
+    core = next((module for module in modules if module.name == core_module_name), None)
+    if core is None:
+        return [f"generated core module `{core_module_name}` could not be parsed"]
+
+    diagnostics = validate_native_parameter_ownership(
+        core,
+        required_parameters=required_parameters,
+    )
+    parameter_names = set(required_parameters)
+    core_outputs = [port for port in core_ports if port[0] == "output"]
+    expected_outputs = [port for port in expected_ports if port[0] == "output"]
+
+    for expected in expected_ports:
+        direction, expected_type, expected_name = expected
+        dependencies = _parameter_names_in_type(expected_type, parameter_names)
+        if not dependencies:
+            continue
+        matched = _cvdp_match_port(expected_name, core_ports, direction=direction)
+        if matched is None and direction == "output" and len(core_outputs) == 1:
+            # Sparkle represents tuple outputs as one packed port. The wrapper
+            # separately proves its field mapping before accepting the design.
+            matched = core_outputs[0]
+        if matched is None:
+            diagnostics.append(
+                f"parameter-dependent public port `{expected_name}` has no generated core port"
+            )
+            continue
+        core_dependencies = _parameter_names_in_type(matched[1], parameter_names)
+        if not dependencies <= core_dependencies:
+            missing = ", ".join(sorted(dependencies - core_dependencies))
+            diagnostics.append(
+                f"public port `{expected_name}` depends on {missing}, but generated core "
+                f"port `{matched[2]}` has fixed/non-matching type `{matched[1]}`"
+            )
+
+    if len(core_outputs) == 1 and len(expected_outputs) > 1:
+        public_dependencies = set().union(*(
+            _parameter_names_in_type(port[1], parameter_names)
+            for port in expected_outputs
+        ))
+        packed_dependencies = _parameter_names_in_type(
+            core_outputs[0][1], parameter_names
+        )
+        if not public_dependencies <= packed_dependencies:
+            missing = ", ".join(sorted(public_dependencies - packed_dependencies))
+            diagnostics.append(
+                f"packed generated output `{core_outputs[0][2]}` does not preserve "
+                f"public output parameter(s): {missing}"
+            )
+    return list(dict.fromkeys(diagnostics))
+
+
+def prepare_cvdp_native_parameter_design(
+    *,
+    sv_code: str,
+    design_name: str,
+    plan: FiniteParameterPlan,
+    expected_ports: list[tuple[str, str, str]],
+    ref_code: str,
+    harness_files: dict,
+    derived_parameter_names: list[str] | None = None,
+    reset_polarities: dict[str, str] | None = None,
+) -> tuple[str | None, dict]:
+    """Build one strict CVDP wrapper around a genuinely generic Sparkle core."""
+    required_parameters = list(dict.fromkeys([
+        *plan.parameter_names,
+        *(derived_parameter_names or []),
+    ]))
+    manifest = {
+        "schema_version": 1,
+        "mode": "native_parameter_sweep",
+        "design_name": design_name,
+        "required_parameters": required_parameters,
+        "sweep_parameter_names": list(plan.parameter_names),
+        "sweep_case_count": len(plan.cases),
+        "one_emitted_dut": True,
+        "contract_pass": False,
+        "diagnostics": [],
+    }
+
+    core = select_native_core_module(
+        sv_code,
+        required_parameters=required_parameters,
+        preferred_name=design_name,
+    )
+    if core is None:
+        parsed = parse_native_modules(sv_code)
+        declarations = ", ".join(
+            f"{module.name}({', '.join(module.parameter_names) or 'no parameters'})"
+            for module in parsed
+        ) or "none"
+        manifest["diagnostics"] = [
+            "no generated module owns every required native parameter; "
+            f"required={required_parameters}, generated={declarations}"
+        ]
+        manifest["error"] = manifest["diagnostics"][0]
+        return None, manifest
+
+    core_name, core_ports = parse_module_ports(sv_code, module_name=core.name)
+    diagnostics = validate_cvdp_native_parameter_contract(
+        sv_code=sv_code,
+        core_module_name=core.name,
+        core_ports=core_ports,
+        required_parameters=required_parameters,
+        expected_ports=expected_ports,
+    )
+    manifest.update({
+        "generated_core_module": core.name,
+        "generated_core_parameters": list(core.parameter_names),
+        "generated_core_ports": [list(port) for port in core_ports],
+    })
+    if diagnostics:
+        manifest["diagnostics"] = diagnostics
+        manifest["error"] = "; ".join(diagnostics)
+        return None, manifest
+
+    inner_name = core_name
+    wrapped_core_sv = sv_code
+    if core_name == design_name:
+        inner_name = f"{design_name}_sparkle_inner"
+        wrapped_core_sv = _rename_module_declaration(
+            wrapped_core_sv, core_name, inner_name
+        )
+
+    inner_ports = parse_module_ports(wrapped_core_sv, module_name=inner_name)[1]
+    wrapper = generate_cvdp_wrapper(
+        design_name=design_name,
+        sparkle_mod_name=inner_name,
+        sparkle_ports=inner_ports,
+        ref_code=ref_code,
+        harness_files=harness_files,
+        sv_code=wrapped_core_sv,
+        expected_ports_override=expected_ports,
+        reset_polarities=reset_polarities or {},
+        strict_mapping=True,
+        required_parameter_names=set(required_parameters),
+    )
+    if not wrapper:
+        manifest["diagnostics"] = [
+            "strict native CVDP wrapper could not map every parameter, input, and output"
+        ]
+        manifest["error"] = manifest["diagnostics"][0]
+        return None, manifest
+
+    missing_bindings = [
+        name for name in required_parameters
+        if not re.search(
+            rf"\.{re.escape(name)}\s*\(\s*{re.escape(name)}\s*\)", wrapper
+        )
+    ]
+    if missing_bindings:
+        manifest["diagnostics"] = [
+            "native wrapper does not forward core parameter(s): "
+            + ", ".join(missing_bindings)
+        ]
+        manifest["error"] = manifest["diagnostics"][0]
+        return None, manifest
+
+    final_sv = f"{wrapped_core_sv.rstrip()}\n\n{wrapper}\n"
+    design_hash = sv_sha256(final_sv)
+    manifest.update({
+        "contract_pass": True,
+        "wrapper_parameter_bindings": required_parameters,
+        "sv_sha256": design_hash,
+        "cases": [
+            {
+                "parameters": case.values,
+                "sv_sha256": design_hash,
+                "verilog_elaboration": "not_run",
+            }
+            for case in plan.cases
+        ],
+    })
+    return final_sv, manifest
 
 
 def _strip_verilog_info_block(text: str) -> str:
@@ -2048,23 +2322,44 @@ class Evaluator:
             "gls_pnr_mismatches": -1,
             "has_sorry": True,       # True = unverified (default), False = formally verified
             "detail": "",
+            "failure_stage": None,
+            "diagnostics": [],
         }
         info = problem_info
         if info is None and self.dataset_obj is not None:
             info = self.dataset_obj.load_problem(prob_id)
+        metadata = (getattr(info, "metadata", {}) or {}) if info is not None else {}
         plan_payload = (
-            (getattr(info, "metadata", {}) or {}).get("finite_parameter_plan")
+            metadata.get("finite_parameter_plan")
             if info is not None else None
         )
         finite_plan = plan_from_dict(plan_payload)
+        native_payload = metadata.get("native_parameter_sweep_plan")
+        native_plan = native_plan_from_dict(native_payload)
+        if finite_plan is not None and native_plan is not None:
+            _record_failure(
+                result,
+                "parameter_contract",
+                "finite specialization and native parameter sweep cannot be active together",
+                code="conflicting_parameter_modes",
+            )
+            return result
         if finite_plan is not None:
             result["finite_parameter_specialization"] = True
             result["specialization_count"] = len(finite_plan.cases)
+        if native_plan is not None:
+            result["native_parameter_sweep"] = True
+            result["native_parameter_sweep_case_count"] = len(native_plan.cases)
 
         # 1. Compile
         lean_file = self.project_root / "Generated" / f"{prob_id}.lean"
         if not lean_file.exists():
-            result["detail"] = f"Lean file not found: Generated/{prob_id}.lean"
+            _record_failure(
+                result,
+                "lean_elaboration",
+                f"Lean file not found: Generated/{prob_id}.lean",
+                code="lean_file_missing",
+            )
             return result
 
         sv_code = None
@@ -2074,7 +2369,13 @@ class Evaluator:
             # ── Fast path: use persistent REPL (~0.1s) ──
             repl_result = self.lean_repl.check_file(lean_file)
             if not repl_result.passed:
-                result["detail"] = f"Compile failed:\n{repl_result.error_text[:1000]}"
+                detail = f"Compile failed:\n{repl_result.error_text[:1000]}"
+                _record_failure(
+                    result,
+                    _lean_diagnostic_stage(detail),
+                    detail,
+                    code="lean_compile_failed",
+                )
                 return result
             result["compile_pass"] = True
             result["has_sorry"] = not repl_result.complete
@@ -2083,7 +2384,10 @@ class Evaluator:
                 for block in getattr(repl_result, "verilog_modules", [])
                 if (cleaned := _strip_verilog_info_block(block))
             ]
-            sv_code = sv_modules[0] if sv_modules else _strip_verilog_info_block(repl_result.verilog or "")
+            if native_plan is not None:
+                sv_code = "\n\n".join(sv_modules)
+            else:
+                sv_code = sv_modules[0] if sv_modules else _strip_verilog_info_block(repl_result.verilog or "")
         else:
             # ── Fallback: lake build (~10s) ──
             try:
@@ -2094,19 +2398,30 @@ class Evaluator:
                     cwd=str(self.project_root),
                 )
             except subprocess.TimeoutExpired:
-                result["detail"] = "lake build timeout"
+                _record_failure(
+                    result,
+                    "infrastructure",
+                    "lake build timeout",
+                    code="lean_build_timeout",
+                )
                 return result
 
             build_output = comp.stdout + "\n" + comp.stderr
             has_error = comp.returncode != 0 or re.search(r"error:", build_output)
             if has_error:
-                result["detail"] = f"Compile failed:\n{build_output[:1000]}"
+                detail = f"Compile failed:\n{build_output[:1000]}"
+                _record_failure(
+                    result,
+                    _lean_diagnostic_stage(detail),
+                    detail,
+                    code="lean_compile_failed",
+                )
                 return result
 
             result["compile_pass"] = True
             result["has_sorry"] = bool(re.search(r"declaration uses `sorry`", build_output))
             sv_modules = self._extract_sv_modules(build_output)
-            sv_code = sv_modules[0] if sv_modules else ""
+            sv_code = "\n\n".join(sv_modules) if native_plan is not None else (sv_modules[0] if sv_modules else "")
 
         if finite_plan is not None:
             modules_by_name = {}
@@ -2141,13 +2456,62 @@ class Evaluator:
             result["specialization_compile_pass"] = bool(specialized_sv)
             result["specialization_modules_found"] = len(modules_by_name)
             if not specialized_sv:
-                result["detail"] = "Finite specialization failed: " + str(manifest.get("error", "unknown error"))
+                _record_failure(
+                    result,
+                    "parameter_contract",
+                    "Finite specialization failed: " + str(manifest.get("error", "unknown error")),
+                    code="finite_specialization_failed",
+                )
                 return result
             sv_code = specialized_sv
 
+        native_manifest = None
+        native_manifest_path = None
+        if native_plan is not None:
+            expected_ports = [
+                tuple(port) for port in (native_payload or {}).get("expected_ports", [])
+            ]
+            native_sv, native_manifest = prepare_cvdp_native_parameter_design(
+                sv_code=sv_code or "",
+                design_name=native_plan.design_name,
+                plan=native_plan,
+                expected_ports=expected_ports,
+                ref_code=getattr(info, "ref_code", ""),
+                harness_files=metadata.get("harness_files", {}),
+                derived_parameter_names=list(
+                    (native_payload or {}).get("derived_parameter_names", [])
+                ),
+                reset_polarities=dict(
+                    (native_payload or {}).get("reset_polarities", {})
+                ),
+            )
+            manifest_dir = run_dir / "native_parameter_sweep" / prob_id
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            native_manifest_path = manifest_dir / "manifest.json"
+            native_manifest_path.write_text(
+                json.dumps(native_manifest, indent=2), encoding="utf-8"
+            )
+            result["native_parameter_manifest"] = str(native_manifest_path)
+            result["native_parameter_contract_pass"] = bool(native_sv)
+            if not native_sv:
+                _record_failure(
+                    result,
+                    "parameter_contract",
+                    "Native parameter contract failed: "
+                    + str((native_manifest or {}).get("error", "unknown error")),
+                    code="native_parameter_contract_failed",
+                )
+                return result
+            sv_code = native_sv
+
         # 2. Extract SystemVerilog
         if not sv_code:
-            result["detail"] = "Compiled but could not extract SystemVerilog"
+            _record_failure(
+                result,
+                "verilog_extraction",
+                "Compiled but could not extract SystemVerilog",
+                code="systemverilog_missing",
+            )
             return result
 
         result["sv_extracted"] = True
@@ -2159,16 +2523,57 @@ class Evaluator:
         # 3. Lint
         result["lint_pass"] = self._run_lint(sv_file)
 
+        if native_plan is not None:
+            elaboration_pass, case_results, detail, stage = (
+                self._run_native_parameter_elaboration(
+                    sv_file=sv_file,
+                    top_module=native_plan.design_name,
+                    plan=native_plan,
+                )
+            )
+            result["native_parameter_elaboration_pass"] = elaboration_pass
+            result["native_parameter_case_results"] = case_results
+            if native_manifest is not None:
+                by_parameters = {
+                    tuple(sorted(row["parameters"].items())): row
+                    for row in case_results
+                }
+                for row in native_manifest.get("cases", []):
+                    case_result = by_parameters.get(
+                        tuple(sorted(row["parameters"].items()))
+                    )
+                    if case_result:
+                        row.update(case_result)
+                native_manifest["all_cases_elaborated"] = elaboration_pass
+                if not elaboration_pass:
+                    native_manifest["error"] = detail
+                assert native_manifest_path is not None
+                native_manifest_path.write_text(
+                    json.dumps(native_manifest, indent=2), encoding="utf-8"
+                )
+            if not elaboration_pass:
+                _record_failure(
+                    result,
+                    stage,
+                    detail,
+                    code="native_case_elaboration_failed",
+                )
+                return result
+
         # Parse module name (needed for sim wrapper and synthesis)
         if finite_plan is not None:
             sparkle_mod_name, sparkle_ports = parse_module_ports(
                 sv_code, module_name=finite_plan.design_name
             )
+        elif native_plan is not None:
+            sparkle_mod_name, sparkle_ports = parse_module_ports(
+                sv_code, module_name=native_plan.design_name
+            )
         else:
             sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
 
         # 4. Simulation
-        if finite_plan is not None and self.dataset_name == "cvdp":
+        if (finite_plan is not None or native_plan is not None) and self.dataset_name == "cvdp":
             sim_status, mismatches, detail = self._run_sim_cvdp(
                 prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir,
                 direct_top=True,
@@ -2181,6 +2586,18 @@ class Evaluator:
         result["sim_status"] = sim_status
         result["sim_mismatches"] = mismatches
         result["detail"] = detail
+        failure_stage = _simulation_diagnostic_stage(sim_status, detail)
+        if failure_stage is not None:
+            _record_failure(
+                result,
+                failure_stage,
+                detail,
+                code=(
+                    "simulation_mismatch"
+                    if failure_stage == "simulation_mismatch"
+                    else "simulation_error"
+                ),
+            )
 
         # 5. Synthesis + PPA (optional)
         if self.enable_synth and result["sv_extracted"]:
@@ -2252,6 +2669,85 @@ class Evaluator:
                 current = []
                 capturing = False
         return modules
+
+    @staticmethod
+    def _run_native_parameter_elaboration(
+        *,
+        sv_file: Path,
+        top_module: str,
+        plan: FiniteParameterPlan,
+    ) -> tuple[bool, list[dict], str, str]:
+        """Elaborate every public CVDP configuration from the same SV file."""
+        iverilog = shutil.which("iverilog")
+        if iverilog is None:
+            return (
+                False,
+                [],
+                "iverilog is unavailable for native parameter elaboration",
+                "infrastructure",
+            )
+
+        case_results: list[dict] = []
+        for case in plan.cases:
+            command = [
+                iverilog,
+                "-g2012",
+                "-t", "null",
+                "-s", top_module,
+            ]
+            command.extend(
+                f"-P{top_module}.{name}={value}"
+                for name, value in case.parameters
+            )
+            command.append(str(sv_file))
+            row = {
+                "parameters": case.values,
+                "verilog_elaboration": "failed",
+                "command_parameters": [
+                    f"{name}={value}" for name, value in case.parameters
+                ],
+            }
+            try:
+                proc = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                row["detail"] = "iverilog elaboration timeout"
+                case_results.append(row)
+                return (
+                    False,
+                    case_results,
+                    "native parameter elaboration timed out for "
+                    + ", ".join(row["command_parameters"]),
+                    "infrastructure",
+                )
+            except FileNotFoundError as exc:
+                row["detail"] = str(exc)
+                case_results.append(row)
+                return False, case_results, str(exc), "infrastructure"
+
+            output = "\n".join(
+                part.strip() for part in (proc.stdout, proc.stderr) if part.strip()
+            )
+            row["returncode"] = proc.returncode
+            if output:
+                row["detail"] = output[-2000:]
+            if proc.returncode != 0:
+                case_results.append(row)
+                values = ", ".join(row["command_parameters"])
+                return (
+                    False,
+                    case_results,
+                    f"native parameter elaboration failed for {values}:\n{output[-2000:]}",
+                    "verilog_elaboration",
+                )
+            row["verilog_elaboration"] = "passed"
+            case_results.append(row)
+
+        return True, case_results, "all native parameter cases elaborated", "verilog_elaboration"
 
     @staticmethod
     def _run_lint(sv_file: Path) -> bool:
