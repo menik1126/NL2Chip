@@ -51,6 +51,11 @@ def getDesign : CircuitM Design := do
 def addModuleToDesign (m : Module) : CircuitM Unit := do
   modify fun s => { s with design := s.design.addModule m }
 
+/-- Add a retained parameter to the module being built. -/
+def addParameter (name : String) (defaultValue : Nat) : CircuitM Unit := do
+  let m ← getModule
+  setModule (m.addParameter { name, defaultValue })
+
 /-- Generate a fresh wire name.
     When `named=true` (user let-bindings), produces `_gen_{hint}` — stable across recompilations.
     When `named=false` (compiler intermediates), produces `_tmp_{hint}_{counter}` — numbered. -/

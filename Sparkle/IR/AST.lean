@@ -11,6 +11,12 @@ namespace Sparkle.IR.AST
 
 open Sparkle.IR.Type
 
+/-- A retained top-level Lean `Nat` binder exposed as a module parameter. -/
+structure Parameter where
+  name : String
+  defaultValue : Nat
+  deriving Repr, BEq, Inhabited
+
 /-- Port declaration (input/output of a module) -/
 structure Port where
   name : String
@@ -198,6 +204,7 @@ end Stmt
 -/
 structure Module where
   name        : String
+  parameters  : List Parameter := []
   inputs      : List Port
   outputs     : List Port
   wires       : List Port    -- Internal wires (ignored for primitives)
@@ -211,6 +218,7 @@ namespace Module
 /-- Create an empty module -/
 def empty (name : String) : Module :=
   { name := name
+  , parameters := []
   , inputs := []
   , outputs := []
   , wires := []
@@ -221,12 +229,17 @@ def empty (name : String) : Module :=
 /-- Create a primitive (blackbox) module with specified interface -/
 def primitive (name : String) (inputs : List Port) (outputs : List Port) : Module :=
   { name := name
+  , parameters := []
   , inputs := inputs
   , outputs := outputs
   , wires := []
   , body := []
   , isPrimitive := true
   }
+
+/-- Add a retained module parameter. -/
+def addParameter (m : Module) (parameter : Parameter) : Module :=
+  { m with parameters := m.parameters ++ [parameter] }
 
 /-- Add an input port -/
 def addInput (m : Module) (p : Port) : Module :=
@@ -246,11 +259,14 @@ def addStmt (m : Module) (s : Stmt) : Module :=
 
 /-- Convert module to string (for debugging) -/
 def toString (m : Module) : String :=
+  let parameterStr := String.intercalate ", "
+    (m.parameters.map fun p => s!"{p.name}={p.defaultValue}")
   let inputStr := String.intercalate ", " (m.inputs.map fun p => s!"{p.name}: {p.ty}")
   let outputStr := String.intercalate ", " (m.outputs.map fun p => s!"{p.name}: {p.ty}")
   let wireStr := String.intercalate ", " (m.wires.map fun p => s!"{p.name}: {p.ty}")
   let bodyStr := String.intercalate "\n  " (m.body.map Stmt.toString)
   s!"module {m.name}\n" ++
+  s!"  parameters: {parameterStr}\n" ++
   s!"  inputs:  {inputStr}\n" ++
   s!"  outputs: {outputStr}\n" ++
   s!"  wires:   {wireStr}\n" ++

@@ -45,6 +45,16 @@ def synthesizeParameterizedToString (declName : Name)
   let (module, _) ← synthesizeCombinationalWithParameters declName parameters
   return toVerilog module
 
+/-- Check that a rejected parameter contract reports the intended reason. -/
+def parameterizedSynthesisRejectsWith (declName : Name)
+    (parameters : List (String × Nat)) (needle : String) : Lean.MetaM Bool := do
+  try
+    let _ ← synthesizeCombinationalWithParameters declName parameters
+    return false
+  catch error =>
+    let message ← error.toMessageData.toString
+    return message.containsSubstr needle
+
 /-- Extract a specific module from multi-module Verilog output -/
 def extractModule (verilog : String) (moduleName : String) : String :=
   let lines := verilog.splitOn "\n"
@@ -73,6 +83,10 @@ structure VerilogOutputs where
   hierarchicalVerilog : String
   symbolicIdentityVerilog : String
   symbolicXorVerilog : String
+  rejectsUnretainedWidth : Bool
+  rejectsMissingBinder : Bool
+  rejectsDuplicateParameter : Bool
+  rejectsZeroWidthDefault : Bool
 
 /-- Synthesize all modules for testing -/
 def synthesizeAll : Lean.MetaM VerilogOutputs := do
@@ -85,9 +99,22 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedToString `symbolicIdentity [("W", 8)]
   let symbolicXorVerilog ←
     synthesizeParameterizedToString `symbolicXor [("W", 8)]
+  let rejectsUnretainedWidth ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
+  let rejectsMissingBinder ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [("MISSING", 8)]
+      "is not a top-level Nat binder"
+  let rejectsDuplicateParameter ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [("W", 8), ("W", 16)]
+      "must be unique"
+  let rejectsZeroWidthDefault ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [("W", 0)]
+      "must have a positive default"
   return {
     addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
-    symbolicIdentityVerilog, symbolicXorVerilog
+    symbolicIdentityVerilog, symbolicXorVerilog,
+    rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
+    rejectsZeroWidthDefault
   }
 
 /-- Create test suite from synthesized outputs -/
@@ -133,6 +160,12 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
           (outputs.symbolicXorVerilog.containsSubstr "input logic [W-1:0]") $
         test "emits XOR logic"
           (outputs.symbolicXorVerilog.containsSubstr " ^ ")
+      ) ++
+      group "fail-closed diagnostics" (
+        test "rejects an unretained generic width" outputs.rejectsUnretainedWidth $
+        test "rejects a requested name without a binder" outputs.rejectsMissingBinder $
+        test "rejects duplicate parameter names" outputs.rejectsDuplicateParameter $
+        test "rejects a zero hardware-width default" outputs.rejectsZeroWidthDefault
       )
     ) ++
     group "Hierarchical Circuits" (
@@ -178,7 +211,8 @@ def main : IO UInt32 := do
 
   -- Import required modules
   let env ← Lean.importModules
-    #[{module := `Sparkle.Compiler.Elab}, {module := `Sparkle.Backend.Verilog}, {module := `Tests.TestCircuits}]
+    #[{module := `Sparkle.Compiler.Elab}, {module := `Sparkle.Backend.Verilog},
+      {module := `Tests.TestCircuits}, {module := `Tests.SymbolicParameterCircuits}]
     {}
     (trustLevel := 1024)
 

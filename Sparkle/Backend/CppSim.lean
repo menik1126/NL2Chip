@@ -49,8 +49,12 @@ def emitCppType : HWType → String
     else  -- Wide type: use array of uint32_t words
       let nWords := (w + 31) / 32
       "std::array<uint32_t, " ++ toString nWords ++ ">"
+  | .bitVectorDim width =>
+    panic! s!"CppSim requires a concrete bit width, found {width}"
   | .array size elemType =>
     "std::array<" ++ emitCppType elemType ++ ", " ++ toString size ++ ">"
+  | .arrayDim size _ =>
+    panic! s!"CppSim requires a concrete array size, found {size}"
 
 /-- Check if a width needs masking (not a native C++ integer width) -/
 def needsMask (w : Nat) : Bool :=

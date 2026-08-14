@@ -33,6 +33,8 @@ instance : Inhabited Sparkle.IR.AST.Port := ⟨{ name := "default", ty := .bit }
 /-- Compiler state tracking variable mappings and context -/
 structure CompilerState where
   varMap : List (FVarId × String) := []  -- Map Lean variables to wire names
+  dimVarMap : List (FVarId × DimExpr) := [] -- Retained Nat binders to symbolic dimensions
+  parameterDefaults : List (String × Nat) := []
   clockWire : Option String := none       -- Name of clock wire (if any)
   resetWire : Option String := none       -- Name of reset wire (if any)
 
@@ -50,10 +52,29 @@ def lookupVar (fvarId : FVarId) : CompilerM (Option String) := do
   let s ← getCompilerState
   return s.varMap.lookup fvarId
 
+/-- Lookup a retained symbolic dimension variable. -/
+def lookupDimVar (fvarId : FVarId) : CompilerM (Option DimExpr) := do
+  let s ← getCompilerState
+  return s.dimVarMap.lookup fvarId
+
+/-- Lookup the requested SystemVerilog default for a top-level Nat binder. -/
+def lookupParameterDefault (name : String) : CompilerM (Option Nat) := do
+  let s ← getCompilerState
+  return s.parameterDefaults.lookup name
+
 /-- Execute an action with an additional variable mapping in scope -/
 def withVarMapping {α : Type} (fvarId : FVarId) (wireName : String) (k : CompilerM α) : CompilerM α := do
   let oldState ← getCompilerState
   let newState := { oldState with varMap := (fvarId, wireName) :: oldState.varMap }
+  withReader (fun _ => newState) k
+
+/-- Execute an action with a retained Nat binder in scope. -/
+def withDimVarMapping {α : Type} (fvarId : FVarId) (dimension : DimExpr)
+    (k : CompilerM α) : CompilerM α := do
+  let oldState ← getCompilerState
+  let newState := {
+    oldState with dimVarMap := (fvarId, dimension) :: oldState.dimVarMap
+  }
   withReader (fun _ => newState) k
 
 /-- Execute an action with a new local declaration in MetaM scope -/
@@ -139,6 +160,13 @@ def addModuleToDesign (m : Sparkle.IR.AST.Module) : CompilerM Unit := do
   let ((), cs') := CircuitM.addModuleToDesign m cs
   set cs'
 
+def addParameter (name : String) (defaultValue : Nat) : CompilerM Unit := do
+  let cs ← get
+  if cs.module.parameters.any (fun parameter => parameter.name == name) then
+    liftMetaM $ throwError s!"Duplicate retained hardware parameter '{name}'"
+  let ((), cs') := CircuitM.addParameter name defaultValue cs
+  set cs'
+
 end CompilerM
 
 /--
@@ -196,48 +224,74 @@ def isPrimitive (name : Name) : Bool :=
 def getOperator (name : Name) : Option Operator :=
   primitiveRegistry.lookup name
 
-partial def inferHWType (type : Lean.Expr) : MetaM (Option HWType) := do
-  let type ← whnf type
+partial def extractDimExpr (expr : Lean.Expr) : CompilerM DimExpr := do
+  let expr ← CompilerM.liftMetaM (whnf expr)
+  match expr with
+  | .lit (.natVal value) => return .literal value
+  | .fvar fvarId =>
+    match ← CompilerM.lookupDimVar fvarId with
+    | some dimension => return dimension
+    | none =>
+      let declaration ← CompilerM.liftMetaM fvarId.getDecl
+      CompilerM.liftMetaM $ throwError
+        (s!"Symbolic Nat binder '{declaration.userName}' is used as a hardware dimension " ++
+         "but was not retained as a module parameter.\n" ++
+         "Use the parameterized synthesis API and provide a default for this binder.")
+  | _ =>
+    let fn := expr.getAppFn
+    let args := expr.getAppArgs
+    match fn with
+    | .const name _ =>
+      let binary (constructor : DimExpr → DimExpr → DimExpr) : CompilerM DimExpr := do
+        if args.size < 2 then
+          CompilerM.liftMetaM $ throwError s!"Malformed symbolic dimension operation {name}"
+        let lhs ← extractDimExpr args[args.size - 2]!
+        let rhs ← extractDimExpr args[args.size - 1]!
+        return constructor lhs rhs
+      if name == ``Nat.add then binary .add
+      else if name == ``Nat.sub then binary .sub
+      else if name == ``Nat.mul then binary .mul
+      else if name == ``Nat.div then binary .div
+      else if name == ``Nat.mod then binary .mod
+      else if name == ``Nat.pow then binary .pow
+      else if name == ``Nat.min then binary .min
+      else if name == ``Nat.max then binary .max
+      else if name == ``OfNat.ofNat && args.size >= 2 then
+        extractDimExpr args[1]!
+      else
+        let rendered ← CompilerM.liftMetaM (ppExpr expr)
+        CompilerM.liftMetaM $ throwError
+          (s!"Unsupported symbolic hardware dimension '{rendered}'.\n" ++
+           "Supported operations: retained parameters, literals, +, -, *, /, %, ^, min, and max.")
+    | _ =>
+      let rendered ← CompilerM.liftMetaM (ppExpr expr)
+      CompilerM.liftMetaM $ throwError
+        s!"Unsupported symbolic hardware dimension '{rendered}'"
+
+partial def inferHWType (type : Lean.Expr) : CompilerM (Option HWType) := do
+  let type ← CompilerM.liftMetaM (whnf type)
   match type with
   | .app (.const ``BitVec _) width =>
-    -- Width can be direct literal or OfNat wrapper
-    let w ← extractWidth width
-    return some (if w == 1 then .bit else .bitVector w)
+    let width ← extractDimExpr width
+    return some (hwTypeFromDim width)
   | .const ``Bool _ =>
     return some .bit
   | .app (.app (.const ``Prod _) ty1) ty2 =>
     -- Product type: concatenate the two types
     match ← inferHWType ty1, ← inferHWType ty2 with
-    | some (.bitVector w1), some (.bitVector w2) => return some (.bitVector (w1 + w2))
-    | some .bit, some (.bitVector w2) => return some (.bitVector (1 + w2))
-    | some (.bitVector w1), some .bit => return some (.bitVector (w1 + 1))
-    | some .bit, some .bit => return some (.bitVector 2)
+    | some lhs, some rhs =>
+      return some (hwTypeFromDim (.add lhs.bitWidthDim rhs.bitWidthDim))
     | _, _ => return none
   | .app (.app (.const ``Sparkle.Core.Vector.HWVector _) elemType) size =>
-    -- HWVector α n: extract element type and size
-    let n ← extractWidth size
+    let size ← extractDimExpr size
     match ← inferHWType elemType with
-    | some hwElemType => return some (.array n hwElemType)
+    | some hwElemType =>
+      match size with
+      | .literal value => return some (.array value hwElemType)
+      | _ => return some (.arrayDim size hwElemType)
     | none => return none
   | _ =>
     return none
-where
-  extractWidth (e : Lean.Expr) : MetaM Nat := do
-    let e ← whnf e
-    match e with
-    | .lit (.natVal n) => return n
-    | .app fn _arg =>
-      let fnConst := fn.getAppFn
-      if fnConst.isConstOf ``OfNat.ofNat then
-        -- OfNat.ofNat Type n inst -> extract n
-        let args := e.getAppArgs
-        if args.size >= 2 then
-          extractWidth args[1]!
-        else
-          return 8
-      else
-        return 8
-    | _ => return 8
 
 
 def inferHWTypeFromSignal (signalType : Lean.Expr) : CompilerM HWType := do
@@ -247,21 +301,35 @@ def inferHWTypeFromSignal (signalType : Lean.Expr) : CompilerM HWType := do
     match signalConstr with
     | .const name _ =>
       if name.toString.endsWith "Signal" then
-        match ← CompilerM.liftMetaM (inferHWType innerType) with
+        match ← inferHWType innerType with
         | some hwType => return hwType
         | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {innerType}"
       else
-        match ← CompilerM.liftMetaM (inferHWType signalType) with
+        match ← inferHWType signalType with
         | some hwType => return hwType
         | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
     | _ =>
-      match ← CompilerM.liftMetaM (inferHWType signalType) with
+      match ← inferHWType signalType with
       | some hwType => return hwType
       | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
   | _ =>
-    match ← CompilerM.liftMetaM (inferHWType signalType) with
+    match ← inferHWType signalType with
     | some hwType => return hwType
     | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
+
+/-- Syntactically identify Signal binders so dimension errors are not swallowed
+    by the fallback path for erased configuration arguments. -/
+def isSignalBinderType (type : Lean.Expr) : CompilerM Bool := do
+  let type ← CompilerM.liftMetaM (whnf type)
+  match type.getAppFn with
+  | .const name _ => return name.toString.endsWith "Signal"
+  | _ => return false
+
+/-- Names of the declaration's top-level lambda binders, before introducing
+    local fvars. Used to reject misspelled parameter contracts deterministically. -/
+partial def topLevelBinderNames : Lean.Expr → List String
+  | .lam name _ body _ => name.toString :: topLevelBinderNames body
+  | _ => []
 
 /-- Helper to extract a Nat literal or OfNat.ofNat wrap. -/
 partial def extractNat (e : Lean.Expr) : CompilerM Nat := do
@@ -973,7 +1041,11 @@ mutual
           translateExprToWire bodyInst hint isTopLevel isNamed
 
     | .lam binderName binderType body _ => do
-      let isHWArg ← try
+      let isSignalArg ← isSignalBinderType binderType
+      let isHWArg ← if isSignalArg then
+        let _ ← inferHWTypeFromSignal binderType
+        pure true
+      else try
         let _ ← inferHWTypeFromSignal binderType
         pure true
       catch _ => pure false
@@ -993,10 +1065,28 @@ mutual
               -- Nested lambdas are also top-level if they're part of the function signature
               translateExprToWire bodyInst hint isTopLevel isNamed
       else
-          -- Logic argument (e.g. config): add to context but no wire/input
-          CompilerM.withLocalDecl binderName binderType fun fvar => do
-            let bodyInst := body.instantiate1 fvar
-            translateExprToWire bodyInst hint isTopLevel isNamed
+          let parameterDefault ← CompilerM.lookupParameterDefault binderName.toString
+          match parameterDefault with
+          | some defaultValue =>
+            let binderType' ← CompilerM.liftMetaM (whnf binderType)
+            if !binderType'.isConstOf ``Nat then
+              CompilerM.liftMetaM $ throwError
+                s!"Retained hardware parameter '{binderName}' must be a top-level Nat binder"
+            if defaultValue == 0 then
+              CompilerM.liftMetaM $ throwError
+                s!"Retained hardware parameter '{binderName}' must have a positive default"
+            CompilerM.addParameter binderName.toString defaultValue
+            CompilerM.withLocalDecl binderName binderType fun fvar => do
+              let fvarId := fvar.fvarId!
+              CompilerM.withDimVarMapping fvarId (.parameter binderName.toString) do
+                let bodyInst := body.instantiate1 fvar
+                translateExprToWire bodyInst hint isTopLevel isNamed
+          | none =>
+            -- Erased logic argument (for example DomainConfig): keep it in the
+            -- local context, but do not expose it as a hardware port.
+            CompilerM.withLocalDecl binderName binderType fun fvar => do
+              let bodyInst := body.instantiate1 fvar
+              translateExprToWire bodyInst hint isTopLevel isNamed
 
 
     | _ =>
@@ -1553,11 +1643,22 @@ mutual
       | .const name _ => return name
       | _ => CompilerM.liftMetaM $ throwError s!"Could not identify primitive in lambda body: {e}"
 
-  partial def synthesizeCombinational (declName : Name) : MetaM (Sparkle.IR.AST.Module × Sparkle.IR.AST.Design) := do
+  partial def synthesizeCombinationalWithParameters (declName : Name)
+      (parameters : List (String × Nat)) :
+      MetaM (Sparkle.IR.AST.Module × Sparkle.IR.AST.Design) := do
+    let hasDuplicate := parameters.any fun (name, _) =>
+      (parameters.filter fun (other, _) => other == name).length > 1
+    if hasDuplicate then
+      throwError "Retained hardware parameter names must be unique"
     let constInfo ← getConstInfo declName
     match constInfo with
     | .defnInfo defnInfo =>
       let body := defnInfo.value
+      let binderNames := topLevelBinderNames body
+      for (parameterName, _) in parameters do
+        if !binderNames.contains parameterName then
+          throwError
+            s!"Requested retained hardware parameter '{parameterName}' is not a top-level Nat binder of {declName}"
       let compiler : CompilerM String := do
         let resultWire ← translateExprToWire body "result" (isTopLevel := true)
         -- Look up the actual wire type that was created
@@ -1578,7 +1679,13 @@ mutual
         CompilerM.emitAssign "out" (.ref resultWire)
         return resultWire
       let circuitState := CircuitM.init declName.toString
-      let compilerState : CompilerState := { varMap := [], clockWire := none, resetWire := none }
+      let compilerState : CompilerState := {
+        varMap := [],
+        dimVarMap := [],
+        parameterDefaults := parameters,
+        clockWire := none,
+        resetWire := none
+      }
       let (_, finalCircuitState) ← (compiler.run compilerState).run circuitState
       let mut module := finalCircuitState.module
       let hasRegisters := module.body.any (fun stmt =>
@@ -1598,9 +1705,17 @@ mutual
         module := module.addInput { name := "clk", ty := .bit }
         if hasResetRegisters then
           module := module.addInput { name := "rst", ty := .bit }
+      for (parameterName, _) in parameters do
+        if !module.parameters.any (fun parameter => parameter.name == parameterName) then
+          throwError
+            s!"Requested retained hardware parameter '{parameterName}' is not a top-level Nat binder of {declName}"
       return (module, finalCircuitState.design)
     | _ =>
       throwError s!"Cannot synthesize {declName}: not a definition"
+
+  partial def synthesizeCombinational (declName : Name) :
+      MetaM (Sparkle.IR.AST.Module × Sparkle.IR.AST.Design) :=
+    synthesizeCombinationalWithParameters declName []
 end
 
 def printModule (m : Sparkle.IR.AST.Module) : MetaM Unit := do
@@ -1643,6 +1758,31 @@ elab "#synthesizeVerilog" id:ident : command => do
     let verilog := toVerilog module
     IO.println verilog
     IO.println "\n-- Verilog successfully generated!"
+
+declare_syntax_cat sparkleParameterBinding
+syntax ident " := " num : sparkleParameterBinding
+syntax (name := synthesizeParameterizedVerilog)
+  "#synthesizeParameterizedVerilog " ident " [" sparkleParameterBinding,* "]" : command
+
+/-- Emit one native parameterized module. The defaults select legal values for
+    diagnostics and downstream tools; they do not specialize the IR. -/
+elab_rules : command
+  | `(#synthesizeParameterizedVerilog $id:ident [$bindings:sparkleParameterBinding,*]) => do
+    let mut parameters : List (String × Nat) := []
+    for binding in bindings.getElems do
+      match binding with
+      | `(sparkleParameterBinding| $name:ident := $value:num) =>
+        parameters := parameters ++ [(name.getId.toString, value.getNat)]
+      | _ => throwUnsupportedSyntax
+    let declName ← Lean.Elab.Command.liftCoreM do
+      Lean.resolveGlobalConstNoOverload id
+    Lean.Elab.Command.liftTermElabM do
+      let (module, _) ← synthesizeCombinationalWithParameters declName parameters
+      let warnings := Sparkle.Compiler.DRC.checkRegisteredOutputs module
+      for warning in warnings do
+        IO.println s!"// {warning}"
+      IO.println (toVerilog module)
+      IO.println "\n// Native parameterized Verilog successfully generated."
 
 def synthesizeHierarchical (declName : Name) : MetaM Sparkle.IR.AST.Design := do
   let (module, design) ← synthesizeCombinational declName
