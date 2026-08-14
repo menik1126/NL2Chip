@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from cktarchon.run import (
     build_system_prompt,
     clear_generated_target,
     evaluate_with_infrastructure_retries,
+    parse_args,
 )
 from cktarchon.search_strategy import (
     CandidateTracker,
@@ -34,6 +36,37 @@ from cktarchon.responses_chat_proxy import (
 
 def test_model_alias_sonnet_45():
     assert model_alias("claude-sonnet-4.5") == "claude-sonnet-4-5-20250929"
+
+
+def test_sim_feedback_rewrite_routes_to_fresh_candidate_search(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(sys, "argv", [
+        "run.py",
+        "--results-dir",
+        "out",
+        "--sim-feedback",
+        "--max-turns",
+        "10",
+        "--sim-feedback-turn-budget",
+        "90",
+        "--sim-feedback-rewrite-patience",
+        "2",
+        "--sim-feedback-max-candidates",
+        "3",
+    ])
+    args = parse_args()
+
+    assert args.guided_search
+    assert args.disable_guided_self_test
+    assert args.candidate_stagnation_patience == 2
+    assert args.candidate_search_max == 3
+    assert args.max_turns + args.sim_feedback_turn_budget == 100
+
+def test_sim_feedback_rewrite_is_opt_in(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(sys, "argv", ["run.py", "--results-dir", "out", "--sim-feedback"])
+    args = parse_args()
+
+    assert not args.guided_search
+    assert not args.disable_guided_self_test
 
 
 def test_runtime_env_prioritizes_guarded_iverilog_wrapper(monkeypatch: pytest.MonkeyPatch):

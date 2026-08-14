@@ -196,6 +196,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim-feedback-turns-per-iter", type=int, default=None, help="Max agent turns for each individual simulation-feedback repair attempt.")
     p.add_argument("--sim-feedback-patience", type=int, default=2, help="Stop after this many non-improving feedback repairs; set 0 to disable.")
     p.add_argument(
+        "--sim-feedback-rewrite-patience",
+        type=int,
+        default=0,
+        help=(
+            "After this many non-improving ordinary feedback repairs, clear the active "
+            "Lean candidate and start a fresh architecture. Set 0 to disable rewrites."
+        ),
+    )
+    p.add_argument(
+        "--sim-feedback-max-candidates",
+        type=int,
+        default=3,
+        help="Maximum independent candidate lineages used by ordinary simulation feedback.",
+    )
+    p.add_argument(
         "--guided-search",
         action="store_true",
         help=(
@@ -230,6 +245,16 @@ def parse_args() -> argparse.Namespace:
         (args.synth, args.pnr, args.drc, args.lvs, args.corners)
     ):
         p.error("--require-native-ppa requires --synth or a later physical-design stage")
+    if args.sim_feedback_rewrite_patience < 0:
+        p.error("--sim-feedback-rewrite-patience must be non-negative")
+    if args.sim_feedback_rewrite_patience > 0:
+        if not args.sim_feedback:
+            p.error("--sim-feedback-rewrite-patience requires --sim-feedback")
+        if not args.guided_search:
+            args.guided_search = True
+            args.disable_guided_self_test = True
+            args.candidate_stagnation_patience = args.sim_feedback_rewrite_patience
+            args.candidate_search_max = args.sim_feedback_max_candidates
     return args
 
 
