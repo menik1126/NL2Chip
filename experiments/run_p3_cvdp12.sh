@@ -56,3 +56,5 @@ exec "${PYTHON_BIN}" -m cktarchon.run \
     --sim-feedback-max-candidates 3 \
     --guided-search \
     --disable-guided-self-test \
+    --candidate-search-max 3 \
+    --candidate-stagnation-patience 2 \
