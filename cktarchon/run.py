@@ -416,6 +416,8 @@ def build_system_prompt(
         + "- For comparisons other than equality, use Sparkle helpers such as `Signal.ult` or `Signal.slt` with same-width operands; do not use Lean `<`, `>`, `<=`, or `>=` on `Signal` values.\n"
         + "- For `Signal dom Bool`, avoid Lean `||` and `&&` over signals. Implement OR as `Signal.mux a (Signal.pure true) b` and AND as `Signal.mux a b (Signal.pure false)` unless a checked local example shows a better pattern.\n"
         + "- For tuple-valued signals, project with `.fst`/`.snd` or `projN!`; do not destructure with `let (a, b) := ...` in synthesizable code.\n"
+        + "- `dff init next` takes a plain initial payload, never a `Signal`: use `dff 0#W next` or `dff (0#A, 0#B) next`, not `dff (Signal.pure ...) next`.\n"
+        + "- Lean product types associate to the right. For a result declared `Signal dom (A x B x C)`, build `bundle2 a (bundle2 b c)` (or `bundleAll! [a, b, c]`); `bundle2 (bundle2 a b) c` has the wrong type.\n"
         + "- For packed `BitVec` outputs, prefer explicit `++` concatenation of sized Signal operands. Do not use `bundleAll!` to build a packed bit-vector result.\n"
         + "- For RTL bit manipulation, use `Sparkle.Library.RTL` helpers such as `bit`, `slice`, `zext`, and `trunc` when a local checked example confirms the expected type.\n"
         + "- Do not leave placeholders such as `sorry`, `admit`, or dummy zero outputs in the synthesized implementation.\n"

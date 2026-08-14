@@ -478,6 +478,8 @@ def test_system_prompt_contains_sparkle_hazard_rules():
     assert "Signal.ult" in prompt
     assert "avoid Lean `||` and `&&` over signals" in prompt
     assert "do not destructure with `let (a, b) := ...`" in prompt
+    assert "`dff init next` takes a plain initial payload" in prompt
+    assert "Lean product types associate to the right" in prompt
     assert "Do not use `bundleAll!` to build a packed bit-vector result" in prompt
     assert "Every inline `code` check must include" in prompt
     assert "The harness automatically saves" in prompt
