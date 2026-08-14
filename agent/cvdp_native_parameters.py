@@ -271,6 +271,10 @@ def format_native_parameter_contract(plan: FiniteParameterPlan) -> str:
         "- Defaults for Lean elaboration: "
         + ", ".join(f"{name}={defaults.get(name)}" for name in plan.parameter_names),
         f"- Public sweep configurations: {len(plan.cases)}",
+        "",
+        "Critical Lean syntax: every retained parameter must be a direct implicit top-level Nat binder "
+        "of the synthesized definition, e.g. def <top> {dom : DomainConfig} {WIDTH : Nat}. "
+        "Do not place it in a local let, structure, or runtime Signal argument.",
     ]
     for case in plan.cases:
         lines.append(

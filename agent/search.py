@@ -1377,6 +1377,7 @@ def build_user_message(
             "    (<parameter-dependent inputs>) : <parameter-dependent output type> :=\n"
             "  <generic implementation>\n\n"
             f"#synthesizeParameterizedVerilog {func_name} [{bindings}]\n"
+            "-- Keep every {NAME : Nat} binder in the exact def header above; never convert it to a local let or Signal.\n"
             "```\n"
         )
     else:

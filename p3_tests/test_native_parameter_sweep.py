@@ -583,6 +583,9 @@ def test_runner_configures_native_metadata_and_prompt_without_p0_aliases():
     assert "### Native Parameter Sweep (P3)" in prompt
     assert "#synthesizeParameterizedVerilog native_xor [WIDTH := 3]" in prompt
     assert "Do not enumerate sweep values" in prompt
+    assert "direct implicit top-level Nat binder" in prompt
+    assert "def native_xor {dom : DomainConfig} {WIDTH : Nat}" in prompt
+    assert "Keep every {NAME : Nat} binder in the exact def header" in prompt
     assert "Repeat the eta-expanded alias" not in prompt
 
 
