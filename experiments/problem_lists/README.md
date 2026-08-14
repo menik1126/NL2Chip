@@ -26,6 +26,8 @@ checks while editing Sparkle parameter lowering or the CktArchon adapter.
 Example:
 
 ```bash
+./scripts/setup_cvdp12_dataset.sh
+
 KEY_ENV=/path/to/key.env \
 RESULTS_DIR=/path/to/results/cvdp12_native_param \
 ./scripts/run_cvdp12_native_param.sh

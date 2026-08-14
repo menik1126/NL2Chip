@@ -6,9 +6,9 @@ set -euo pipefail
 #
 #   KEY_ENV=/path/to/key.env WORKERS=16 ./scripts/run_cvdp12_native_param.sh
 #
-# Expected external data location is the standard CVDP JSONL path supported by
-# agent/dataset.py, e.g. ../benchmarks/cvdp-benchmark-dataset/ or
-# ~/work/benchmarks/cvdp-benchmark-dataset/.
+# This repository includes the 12 relevant CVDP JSONL rows. If the dataset path
+# has not been installed yet, run:
+#   ./scripts/setup_cvdp12_dataset.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
