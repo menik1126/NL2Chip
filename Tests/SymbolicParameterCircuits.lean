@@ -47,3 +47,9 @@ def symbolicXorHierarchy {dom : DomainConfig} {W : Nat}
 def symbolicGenerateNot {dom : DomainConfig} {W : Nat}
     (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
   Signal.mapBits (fun bit => Bool.not bit) x
+
+/-- A symbolic-width feedback register. The explicit dff seed fixes the
+    loop state type without freezing the retained width W. -/
+def symbolicLoopXor {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  Signal.loop fun q => Signal.register (BitVec.ofNat W 0) (q ^^^ x)

@@ -95,6 +95,7 @@ structure VerilogOutputs where
   symbolicMemoryVerilog : String
   symbolicHierarchyVerilog : String
   symbolicGenerateVerilog : String
+  symbolicLoopVerilog : String
   rejectsUnretainedWidth : Bool
   rejectsMissingBinder : Bool
   rejectsDuplicateParameter : Bool
@@ -125,6 +126,8 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedDesignToString `symbolicXorHierarchy [("W", 8)]
   let symbolicGenerateVerilog ←
     synthesizeParameterizedToString `symbolicGenerateNot [("W", 8)]
+  let symbolicLoopVerilog ←
+    synthesizeParameterizedToString `symbolicLoopXor [("W", 8)]
   let rejectsUnretainedWidth ←
     parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
   let rejectsMissingBinder ←
@@ -141,6 +144,7 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
     symbolicSliceLowVerilog, symbolicZeroExtendVerilog, symbolicRegisterVerilog,
     symbolicMemoryVerilog, symbolicHierarchyVerilog, symbolicGenerateVerilog,
+    symbolicLoopVerilog,
     rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
     rejectsZeroWidthDefault
   }
