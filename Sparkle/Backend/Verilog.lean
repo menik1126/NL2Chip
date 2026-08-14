@@ -86,6 +86,8 @@ partial def emitExpr (e : Expr) : String :=
     else
       s!"{width}'d{value}"
 
+  | .constDim value width =>
+    s!"{emitDimExpr width}'({value})"
   | .ref name =>
     sanitizeName name
 

@@ -23,6 +23,12 @@ module symbolic_parameter_behavior_tb;
     wire [3:0] derived12_out;
     logic [3:0] derived16_in;
     wire [3:0] derived16_out;
+    logic [2:0] loop3_in;
+    wire [4:0] loop3_out;
+    logic [16:0] loop17_in;
+    wire [18:0] loop17_out;
+
+
 
 
     logic [1:0] mem2_write_addr;
@@ -94,6 +100,14 @@ module symbolic_parameter_behavior_tb;
         ._gen_x(derived16_in), .clk(clk), .rst(rst), .out(derived16_out)
     );
 
+    symbolicLoopBundle #(.W(3)) loop3_dut (
+        ._gen_x(loop3_in), .clk(clk), .rst(rst), .out(loop3_out)
+    );
+
+    symbolicLoopBundle #(.W(17)) loop17_dut (
+        ._gen_x(loop17_in), .clk(clk), .rst(rst), .out(loop17_out)
+    );
+
     symbolicMemory #(.ADDR_W(2), .DATA_W(3)) mem2_dut (
         ._gen_writeAddr(mem2_write_addr),
         ._gen_writeData(mem2_write_data),
@@ -147,6 +161,8 @@ module symbolic_parameter_behavior_tb;
         derived8_in = 3'b101;
         derived12_in = 4'b1101;
         derived16_in = 4'b0110;
+        loop3_in = 3'b101;
+        loop17_in = 17'h1_2345;
 
         mem2_write_addr = 2'd1;
         mem2_write_data = 3'b101;
@@ -188,6 +204,9 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic register reset sizing failed");
         if (derived8_out !== 3'd0 || derived12_out !== 4'd0 || derived16_out !== 4'd0)
             $fatal(1, "symbolic clog2 loop reset sizing failed");
+        if (loop3_out !== {3'd0, 1'b1, 1'b0} || loop17_out !== {17'd0, 1'b1, 1'b0})
+            $fatal(1, "symbolic-width comparison reset flags failed");
+
 
 
         rst = 1'b0;
@@ -198,6 +217,9 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic register update failed");
         if (derived8_out !== derived8_in || derived12_out !== derived12_in || derived16_out !== derived16_in)
             $fatal(1, "symbolic clog2 loop update failed");
+        if (loop3_out !== {loop3_in, 1'b0, 1'b0} || loop17_out !== {loop17_in, 1'b0, 1'b0})
+            $fatal(1, "symbolic-width comparison update flags failed");
+
 
         clk = 1'b0;
 

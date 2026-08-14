@@ -93,6 +93,7 @@ end Operator
 -/
 inductive Expr where
   | const (value : Int) (width : Nat) : Expr
+  | constDim (value : Int) (width : DimExpr) : Expr
   | ref (name : String) : Expr
   | op (operator : Operator) (args : List Expr) : Expr
   | concat (args : List Expr) : Expr
@@ -125,6 +126,7 @@ def mux (cond then_ else_ : Expr) : Expr := .op .mux [cond, then_, else_]
 
 /-- Convert expression to string (for debugging) -/
 partial def toString : Expr → String
+  | constDim v w => s!"{v}#{w}"
   | const v w => s!"{v}#{w}"
   | ref name => name
   | op operator args =>

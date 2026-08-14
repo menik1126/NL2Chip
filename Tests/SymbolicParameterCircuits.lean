@@ -54,6 +54,15 @@ def symbolicLoopXor {dom : DomainConfig} {W : Nat}
     (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
   Signal.loop fun q => Signal.register (BitVec.ofNat W 0) (q ^^^ x)
 
+
+/-- A symbolic-width feedback register with a packed, mixed-width output.
+    This covers the common RTL shape of a state value paired with status flags. -/
+def symbolicLoopBundle {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W × Bool × Bool) :=
+  let q := Signal.loop fun q => Signal.register (BitVec.ofNat W 0) (q ^^^ x)
+  let isZero : Signal dom Bool := q === BitVec.ofNat W 0
+  let isOne : Signal dom Bool := q === BitVec.ofNat W 1
+  bundle2 q (bundle2 isZero isOne)
 /-- A symbolic derived width used by depth-indexed state such as a FIFO pointer.
     ceiling-log2 DEPTH is preserved as the backend's symbolic clog2 expression. -/
 def symbolicDerivedLoop {dom : DomainConfig} {DEPTH : Nat}

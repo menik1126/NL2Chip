@@ -8,3 +8,5 @@ import Tests.SymbolicParameterCircuits
 #writeParameterizedCppSimDesign symbolicXorHierarchy [W := 17] "/tmp/p3_cppsim_hierarchy_w17.h"
 #writeParameterizedCppSimDesign symbolicGenerateNot [W := 3] "/tmp/p3_cppsim_generate_w3.h"
 #writeParameterizedCppSimDesign symbolicGenerateNot [W := 17] "/tmp/p3_cppsim_generate_w17.h"
+#writeParameterizedCppSimDesign symbolicLoopBundle [W := 3] "/tmp/p3_cppsim_loop_bundle_w3.h"
+#writeParameterizedCppSimDesign symbolicLoopBundle [W := 17] "/tmp/p3_cppsim_loop_bundle_w17.h"

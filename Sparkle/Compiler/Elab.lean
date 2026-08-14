@@ -499,6 +499,28 @@ partial def extractBitVecInitValue (expr : Lean.Expr) : CompilerM Nat := do
     else
       CompilerM.liftMetaM $ throwError s!"Expected register reset literal, got: {expr}"
 
+/-- Extract a BitVec literal while preserving a symbolic width expression. -/
+partial def extractBitVecLiteralDim (expr : Lean.Expr) : CompilerM (Nat × DimExpr) := do
+  let fn := expr.getAppFn
+  let args := expr.getAppArgs
+  match fn with
+  | .const name _ =>
+    if name == ``BitVec.ofNat && args.size >= 2 then
+      let width ← extractDimExpr args[args.size - 2]!
+      let value ← extractNat args[args.size - 1]!
+      return (value, width)
+    else if name == ``BitVec.ofFin && args.size >= 2 then
+      let width ← extractDimExpr args[0]!
+      let value ← extractNat args[1]!
+      return (value, width)
+    else
+      CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got application of {name}"
+  | _ =>
+    let reduced ← CompilerM.liftMetaM (whnf expr)
+    if reduced != expr then
+      extractBitVecLiteralDim reduced
+    else
+      CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
 /-- Extract a Nat literal from an expression -/
 def extractNatLiteral (expr : Lean.Expr) : CompilerM (Nat × Unit) := do
   let n ← extractNat expr
@@ -726,6 +748,18 @@ mutual
              | some wireName => return wireName
              | none => pure ()
            -- Try to extract the BitVec literal value
+           let literalDim? ← try
+             some <$> extractBitVecLiteralDim constValue
+           catch _ => pure none
+           match literalDim? with
+           | some (value, width) =>
+             let resWire ← CompilerM.makeWire hint (hwTypeFromDim width) (named := isNamed)
+             let literal := match width.toNat? with
+               | some concreteWidth => Sparkle.IR.AST.Expr.const (Int.ofNat value) concreteWidth
+               | none => Sparkle.IR.AST.Expr.constDim (Int.ofNat value) width
+             CompilerM.emitAssign resWire literal
+             return resWire
+           | none => pure ()
            let (value, width) ← try
              extractBitVecLiteral constValue
            catch _ =>

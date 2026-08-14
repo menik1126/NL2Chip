@@ -80,7 +80,7 @@ def applyMask (expr : String) (w : Nat) : String :=
 /-- Check if an IR expression produces a result that is already correctly masked.
     Invariant: every assignment applies a mask, so .ref reads yield masked values. -/
 partial def exprIsMasked (w : Nat) : Expr → Bool
-  | .const _ _ => true  -- constants are always exact
+  | .const _ _ | .constDim _ _ => true  -- constants are always exact
   | .ref _ => true  -- all wires are masked at their assignment site
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
   | .op .le_s _ | .op .gt_u _ | .op .gt_s _ | .op .ge_u _
@@ -130,6 +130,8 @@ def signedCastType (w : Nat) : String :=
 /-- Best-effort width inference for an expression -/
 partial def inferExprWidth (typeMap : List (String × HWType)) : Expr → Nat
   | .const _ w => w
+  | .constDim _ width =>
+    panic! s!"CppSim requires a concrete constant width, found {width}"
   | .ref name => lookupWidth typeMap name
   | .slice _ hi lo => hi - lo + 1
   | .sliceDim _ hi lo =>
@@ -167,6 +169,8 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
       s!"({cppType})0x{Nat.toDigits 16 unsigned.toNat |> String.ofList}ULL"
     else
       s!"({cppType}){value}ULL"
+  | .constDim _ width =>
+    panic! s!"CppSim requires a concrete constant width, found {width}"
 
   | .ref name =>
     sanitizeName name
@@ -408,7 +412,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
 /-- Collect all wire name references from an IR expression -/
 partial def collectExprRefs : Expr → List String
   | .ref name => [name]
-  | .const _ _ => []
+  | .const _ _ | .constDim _ _ => []
   | .slice inner _ _ => collectExprRefs inner
   | .sliceDim inner _ _ => collectExprRefs inner
   | .concat args => args.foldl (fun acc a => acc ++ collectExprRefs a) []

@@ -44,6 +44,7 @@ def buildWidthMap (m : Module) : WidthMap :=
 /-- Infer the bit-width of an expression -/
 partial def inferWidth (wm : WidthMap) : Expr → Nat
   | .const _ w => w
+  | .constDim _ _ => 0
   | .ref name => wm.getD name 0
   | .slice _ hi lo => hi - lo + 1
   | .sliceDim _ _ _ => 0
@@ -169,7 +170,7 @@ partial def countExprUses (e : Expr) (counts : HashMap String Nat)
     : HashMap String Nat :=
   match e with
   | .ref name => counts.insert name ((counts.getD name 0) + 1)
-  | .const _ _ => counts
+  | .const _ _ | .constDim _ _ => counts
   | .slice inner _ _ => countExprUses inner counts
   | .sliceDim inner _ _ => countExprUses inner counts
   | .concat args => args.foldl (fun acc a => countExprUses a acc) counts
@@ -218,6 +219,7 @@ partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
       | none => .ref name
     else .ref name
   | .const v w => .const v w
+  | .constDim v w => .constDim v w
   | .slice e hi lo => .slice (substituteExpr dm inlinable fuel e) hi lo
   | .sliceDim e hi lo => .sliceDim (substituteExpr dm inlinable fuel e) hi lo
   | .concat args => .concat (args.map (substituteExpr dm inlinable fuel ·))

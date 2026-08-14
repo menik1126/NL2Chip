@@ -57,6 +57,9 @@ def specializePort (bindings : Bindings) (moduleName : String) (port : Port) : E
 
 partial def specializeExpr (bindings : Bindings) (indices : Bindings) : Expr → Except String Expr
   | .const value width => return .const value width
+  | .constDim value width => do
+    let concreteWidth ← requireDimension bindings "constant width" width
+    return .const value concreteWidth
   | .ref name =>
     match indices.lookup name with
     | some value => return .const (Int.ofNat value) 32
