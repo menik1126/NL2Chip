@@ -157,6 +157,22 @@ def _simulation_diagnostic_stage(status: str, detail: str) -> str | None:
         return "verilog_elaboration"
     return "infrastructure"
 
+
+def _iverilog_failure_stage(output: str) -> str:
+    text = str(output or "").lower()
+    infrastructure_markers = (
+        "ivlpp: not found",
+        "/ivl/ivl: not found",
+        "iverilog: not found",
+        "no such file or directory",
+        "error while loading shared libraries",
+    )
+    return (
+        "infrastructure"
+        if any(marker in text for marker in infrastructure_markers)
+        else "verilog_elaboration"
+    )
+
 # ── sky130 cell simulation models (via volare PDK manager) ──────────
 SKY130_VOLARE_VERSION = "c6d73a35f524070e85faff4a6a9eef49553ebc2b"
 SKY130_VOLARE_VERILOG_DIR = (
@@ -3151,7 +3167,7 @@ class Evaluator:
                     False,
                     case_results,
                     f"native parameter elaboration failed for {values}:\n{output[-2000:]}",
-                    "verilog_elaboration",
+                    _iverilog_failure_stage(output),
                 )
             row["verilog_elaboration"] = "passed"
             case_results.append(row)

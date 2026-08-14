@@ -279,6 +279,34 @@ def clear_generated_target(project_root: Path, run_dir: Path, prob_id: str) -> s
     return str(backup)
 
 
+def evaluate_with_infrastructure_retries(
+    evaluator: Any,
+    prob_id: str,
+    run_dir: Path,
+    info: Any,
+    *,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    """Retry evaluator-only infrastructure failures without spending model turns."""
+    result: dict[str, Any] = {}
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        result = evaluator.evaluate(prob_id, run_dir, problem_info=info)
+        result["infrastructure_eval_attempts"] = attempt
+        if result.get("failure_stage") != "infrastructure":
+            return result
+        append_jsonl(run_dir / "events.jsonl", {
+            "prob_id": prob_id,
+            "event": "evaluator_infrastructure_retry",
+            "attempt": attempt,
+            "max_attempts": attempts,
+            "detail": str(result.get("detail") or "")[:1000],
+        })
+        if attempt < attempts:
+            time.sleep(0.5 * attempt)
+    return result
+
+
 def build_system_prompt(
     skill: str,
     prob_id: str,
@@ -770,7 +798,9 @@ def process_problem_guided(
 
     eval_t0 = time.monotonic()
     if generated_target.exists():
-        result = evaluator.evaluate(prob_id, run_dir, problem_info=info)
+        result = evaluate_with_infrastructure_retries(
+            evaluator, prob_id, run_dir, info
+        )
         if generation_error:
             result["generation_error"] = generation_error
     else:
@@ -838,6 +868,7 @@ def process_problem_guided(
     while (
         args.sim_feedback
         and result.get("sim_status") != "sim_pass"
+        and result.get("failure_stage") != "infrastructure"
         and budget.remaining > 0
         and sim_feedback_iterations < max(0, args.sim_feedback_max_iters)
     ):
@@ -947,7 +978,9 @@ def process_problem_guided(
 
         attempt_eval_t0 = time.monotonic()
         if generated_target.exists():
-            new_result = evaluator.evaluate(prob_id, run_dir, problem_info=info)
+            new_result = evaluate_with_infrastructure_retries(
+                evaluator, prob_id, run_dir, info
+            )
             if attempt_error:
                 new_result["generation_error"] = attempt_error
         else:
@@ -1170,7 +1203,9 @@ def process_problem(
     eval_t0 = time.monotonic()
     generated_target = PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
     if agent_error and generated_target.exists():
-        result = evaluator.evaluate(prob_id, run_dir, problem_info=info)
+        result = evaluate_with_infrastructure_retries(
+            evaluator, prob_id, run_dir, info
+        )
         result["agent_error"] = agent_error
         if result.get("detail"):
             result["detail"] = f"Agent ended with {agent_error}; evaluated generated file anyway.\n{result['detail']}"
@@ -1188,7 +1223,9 @@ def process_problem(
             "agent_error": agent_error,
         }
     else:
-        result = evaluator.evaluate(prob_id, run_dir, problem_info=info)
+        result = evaluate_with_infrastructure_retries(
+            evaluator, prob_id, run_dir, info
+        )
     eval_elapsed = time.monotonic() - eval_t0
 
     if (
@@ -1196,6 +1233,7 @@ def process_problem(
         and not args.eval_only
         and not agent_error
         and result.get("sim_status") != "sim_pass"
+        and result.get("failure_stage") != "infrastructure"
     ):
         best_result = result
         best_code = generated_target.read_text(errors="replace") if generated_target.exists() else None
@@ -1208,6 +1246,7 @@ def process_problem(
         sim_iter = 0
         while (
             result.get("sim_status") != "sim_pass"
+            and result.get("failure_stage") != "infrastructure"
             and sim_feedback_turns_remaining > 0
             and sim_iter < max(0, args.sim_feedback_max_iters)
         ):
@@ -1280,7 +1319,9 @@ def process_problem(
                 break
 
             repair_eval_t0 = time.monotonic()
-            new_result = evaluator.evaluate(prob_id, run_dir, problem_info=info)
+            new_result = evaluate_with_infrastructure_retries(
+                evaluator, prob_id, run_dir, info
+            )
             eval_elapsed += time.monotonic() - repair_eval_t0
             new_key = search.eval_progress_key(new_result)
             best_key = search.eval_progress_key(best_result)

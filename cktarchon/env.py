@@ -42,7 +42,6 @@ def ensure_runtime_env() -> None:
         str(project_root / ".venv" / "bin"),
         "/home/sgli/.elan/bin",
         "/home/sgli/.elan/toolchains/leanprover--lean4---v4.28.0-rc1/bin",
-        "/home/sgli/work/toolcache/iverilog_deb/extract/usr/bin",
         "/home/sgli/.local/bin",
         "/home/sgli/.local/share/mamba/bin",
     ]

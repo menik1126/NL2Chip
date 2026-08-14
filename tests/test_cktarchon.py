@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
 from cktarchon.codex_runner import CodexAgentHarnessRunner
-from cktarchon.env import model_alias
+from cktarchon.env import ensure_runtime_env, model_alias
 from cktarchon.harness import AnthropicHarnessRunner, PathGuard
 from cktarchon.logs import append_jsonl, parse_agent_log
-from cktarchon.run import already_done, build_system_prompt, clear_generated_target
+from cktarchon.run import (
+    already_done,
+    build_system_prompt,
+    clear_generated_target,
+    evaluate_with_infrastructure_retries,
+)
 from cktarchon.search_strategy import (
     CandidateTracker,
     TurnBudget,
@@ -28,6 +34,62 @@ from cktarchon.responses_chat_proxy import (
 
 def test_model_alias_sonnet_45():
     assert model_alias("claude-sonnet-4.5") == "claude-sonnet-4-5-20250929"
+
+
+def test_runtime_env_prioritizes_guarded_iverilog_wrapper(monkeypatch: pytest.MonkeyPatch):
+    raw_iverilog_bin = "/home/sgli/work/toolcache/iverilog_deb/extract/usr/bin"
+    guarded_bin = "/home/sgli/.local/bin"
+    original_exists = Path.exists
+    monkeypatch.setattr(
+        "cktarchon.env.Path.exists",
+        lambda path: str(path) in {raw_iverilog_bin, guarded_bin} or original_exists(path),
+    )
+    monkeypatch.setenv("PATH", f"{raw_iverilog_bin}:/usr/bin")
+
+    ensure_runtime_env()
+
+    parts = os.environ["PATH"].split(":")
+    assert parts.index(guarded_bin) < parts.index(raw_iverilog_bin)
+
+
+def test_evaluator_retries_infrastructure_without_model_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeEvaluator:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, prob_id, run_dir, problem_info=None):
+            self.calls += 1
+            if self.calls < 3:
+                return {
+                    "prob_id": prob_id,
+                    "failure_stage": "infrastructure",
+                    "detail": "temporary simulator unavailable",
+                }
+            return {
+                "prob_id": prob_id,
+                "failure_stage": None,
+                "compile_pass": True,
+                "sim_status": "sim_pass",
+            }
+
+    evaluator = FakeEvaluator()
+    monkeypatch.setattr("cktarchon.run.time.sleep", lambda _: None)
+
+    result = evaluate_with_infrastructure_retries(
+        evaluator,
+        "prob_a",
+        tmp_path,
+        SimpleNamespace(),
+    )
+
+    assert evaluator.calls == 3
+    assert result["sim_status"] == "sim_pass"
+    assert result["infrastructure_eval_attempts"] == 3
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert [event["attempt"] for event in events] == [1, 2]
 
 
 def test_path_guard_allows_only_problem_outputs(tmp_path: Path):

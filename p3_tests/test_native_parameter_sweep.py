@@ -23,6 +23,7 @@ from cvdp_specialization import (  # noqa: E402
 )
 from evaluator import (  # noqa: E402
     Evaluator,
+    _iverilog_failure_stage,
     _record_failure,
     prepare_cvdp_native_parameter_design,
 )
@@ -166,6 +167,15 @@ def test_native_plan_round_trip_keeps_sweep_cases_without_p0_modules():
         {"WIDTH": 17},
         {"WIDTH": 65},
     ]
+
+
+def test_iverilog_runtime_failures_are_not_reported_as_rtl_errors():
+    assert _iverilog_failure_stage(
+        "sh: /toolcache/usr/x86_64-linux-gnu/ivl/ivlpp: not found"
+    ) == "infrastructure"
+    assert _iverilog_failure_stage(
+        "dut.sv:12: syntax error"
+    ) == "verilog_elaboration"
 
 
 def test_parser_and_selector_find_the_parameter_owning_core():
