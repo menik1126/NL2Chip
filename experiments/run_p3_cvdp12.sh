@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 MAIN_ROOT="${MAIN_ROOT:-/home/sgli/work/NL2Chip}"
 KEY_ENV="${KEY_ENV:-${MAIN_ROOT}/key.env}"
 MODEL="${MODEL:-claude-sonnet-4.5}"
