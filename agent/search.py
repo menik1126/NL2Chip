@@ -2108,6 +2108,14 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "Use positive default bindings for every P3 parameter in "
             "`#synthesizeParameterizedVerilog`; zero-width defaults cannot form a valid RTL type."
         )
+    if "unsupported_symbolic_clog2" in codes:
+        hints.append(
+            "For a parameter-derived ceiling-log2 width, import `Sparkle.Library.RTL` and write "
+            "`clog2 DEPTH` directly in the `BitVec` type (or bind `let PTR_W := clog2 DEPTH`). "
+            "Do not spell it as `if ... then ... else Nat.log2 ...`: Lean expands that into "
+            "`Decidable.rec`, which cannot be preserved as a symbolic RTL dimension. "
+            "`clog2` is supported and lowers to SystemVerilog `$clog2(DEPTH)`."
+        )
     if "lean_hardware_type_inference" in codes:
         hints.append(
             "`Cannot infer hardware type` usually means a `Signal.loop` state, mux branch, "

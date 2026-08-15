@@ -38,6 +38,11 @@ def classify_lean_diagnostic(message: str) -> str:
         return "retained_parameter_not_top_level"
     if "zero-width default" in lowered:
         return "zero_width_parameter_default"
+    if (
+        "unsupported symbolic hardware dimension" in lowered
+        and ("log2" in lowered or "decidable.rec" in lowered)
+    ):
+        return "unsupported_symbolic_clog2"
     if "not a hardware module definition" in lowered:
         return "unsupported_hardware_definition"
     if "if-then-else" in lowered and "cannot be synthesized" in lowered:

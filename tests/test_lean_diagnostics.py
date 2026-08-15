@@ -53,6 +53,22 @@ def test_loop_diagnostic_gets_structural_repair_guidance():
     assert "outside that loop" in hint
 
 
+def test_symbolic_clog2_diagnostic_gets_supported_dimension_guidance():
+    errors = [{
+        "pos": {"line": 12, "column": 0},
+        "data": (
+            "Unsupported symbolic hardware dimension 'Decidable.rec (fun h => "
+            "Nat.log2 DEPTH)'."
+        ),
+    }]
+    records = build_lean_diagnostics(errors)
+    hint = lean_repair_playbook(records)
+
+    assert records[0]["code"] == "unsupported_symbolic_clog2"
+    assert "clog2 DEPTH" in hint
+    assert "$clog2(DEPTH)" in hint
+
+
 def test_hardware_type_diagnostic_rejects_bundleall_top_level_output():
     hint = lean_repair_playbook([{"code": "lean_hardware_type_inference"}])
 
