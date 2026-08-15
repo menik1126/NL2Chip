@@ -5121,6 +5121,19 @@ def generate_cvdp_wrapper(
         usage["params"] |= actual_constant_handles
 
     by_name = {n: (d, t, n) for d, t, n in expected_ports}
+
+    declared_wrapper_type_constants = (
+        set(parameter_contract.forwarded_names)
+        | set(parameter_contract.localparameter_names)
+    )
+
+    def has_unresolved_type_identifier(typ: str) -> bool:
+        identifiers = (
+            _cvdp_constant_expression_identifiers(typ)
+            - _CVDP_SV_CONSTANT_KEYWORDS
+        )
+        return bool(identifiers - declared_wrapper_type_constants)
+
     ref_internal_arrays = _cvdp_internal_unpacked_arrays(ref_code, design_name)
     observed_internal_arrays = {
         name: ref_internal_arrays[name]
@@ -5242,6 +5255,27 @@ def generate_cvdp_wrapper(
         whole_output_name = next(iter(usage["outputs"]))
         whole_output_type_by_name[whole_output_name] = sp_outputs[0][1]
 
+    # Prompt-only interfaces can use a derived width handle that is not a
+    # public wrapper constant (for example ENCODED_DATA or COUNT_WIDTH). With
+    # no exact target reference, the already-proven whole-output mapping may
+    # supply the core's symbolic type. Resolvable prompt types remain intact,
+    # so their independent width guard can still expose a disagreement.
+    if whole_output_type_by_name:
+        expected_ports = [
+            (
+                direction,
+                whole_output_type_by_name[name]
+                if (
+                    direction == "output"
+                    and name in whole_output_type_by_name
+                    and has_unresolved_type_identifier(typ)
+                ) else typ,
+                name,
+            )
+            for direction, typ, name in expected_ports
+        ]
+        by_name = {n: (d, t, n) for d, t, n in expected_ports}
+
     # An exact reference can be an older baseline than the harness. Extend it
     # only from exact core-port identity or from uniquely named provenance in
     # the core's single packed output. Any other new handle remains rejected.
@@ -5331,6 +5365,46 @@ def generate_cvdp_wrapper(
             for d, t, n in expected_ports
         ]
 
+    # Direct semantic-name provenance can resolve the same prompt-only type
+    # problem for an existing output. Do not use width, position, or a
+    # non-unique alias match as evidence.
+    if not exact_reference_present:
+        provisional_outputs = [
+            (d, t, n) for d, t, n in expected_ports if d == "output"
+        ]
+        bundle_fields_by_core_output = {
+            name: (_cvdp_infer_concat_fields(
+                sv_code, name, sparkle_mod_name
+            ) or [])
+            for _, _, name in sp_outputs
+        }
+        direct_output_type_by_name: dict[str, str] = {}
+        for expected_output in provisional_outputs:
+            _, expected_type, output_name = expected_output
+            if not has_unresolved_type_identifier(expected_type):
+                continue
+            candidates = [
+                port for port in sp_outputs
+                if (
+                    len(provisional_outputs) == 1
+                    or not bundle_fields_by_core_output[port[2]]
+                )
+            ]
+            core_output = _cvdp_match_port(
+                output_name, candidates, direction="output"
+            )
+            if core_output is not None:
+                direct_output_type_by_name[output_name] = core_output[1]
+        if direct_output_type_by_name:
+            expected_ports = [
+                (
+                    direction,
+                    direct_output_type_by_name.get(name, typ)
+                    if direction == "output" else typ,
+                    name,
+                )
+                for direction, typ, name in expected_ports
+            ]
 
     if not expected_ports or not sparkle_mod_name:
         return None
@@ -5423,6 +5497,7 @@ def generate_cvdp_wrapper(
     ] = {}
     used_expected_inputs: set[str] = set()
     ordinary_consumer_by_expected: dict[str, str] = {}
+    direct_input_type_by_name: dict[str, str] = {}
     ordinary_sp_inputs = [
         port for port in sp_inputs if port[2] not in {"clk", "rst"}
     ]
@@ -5455,6 +5530,11 @@ def generate_cvdp_wrapper(
         require_native_parameterized_core_port(sp_port, matched_port)
         connection = _cvdp_bridge_reset_expr(sn, matched_name)
         input_binding_by_core[sn] = (sp_port, matched_port, connection)
+        if (
+            not exact_reference_present
+            and has_unresolved_type_identifier(matched_port[1])
+        ):
+            direct_input_type_by_name[matched_name] = sp_port[1]
 
     # Sparkle's exact raw `clk`/`rst` ports are compiler ABI inputs, distinct
     # from source-level generated binders.  Prefer one unique structured
@@ -5523,6 +5603,20 @@ def generate_cvdp_wrapper(
     input_bindings = [
         input_binding_by_core[sp_port[2]] for sp_port in sp_inputs
     ]
+
+    # Apply an input type only after the ordinary one-to-one matcher has
+    # proved its semantic binding. Raw compiler ABI ports are ineligible, and
+    # exact-reference declarations remain authoritative.
+    if direct_input_type_by_name:
+        expected_ports = [
+            (
+                direction,
+                direct_input_type_by_name.get(name, typ)
+                if direction == "input" else typ,
+                name,
+            )
+            for direction, typ, name in expected_ports
+        ]
 
     unconsumed_inputs = [
         name for _, _, name in expected_inputs

@@ -2268,6 +2268,226 @@ def test_cvdp_no_exact_top_single_plain_output_mirrors_symbolic_core_type():
     assert "assign data_out = out_wire;" in wrapper
 
 
+@pytest.mark.skipif(
+    shutil.which("iverilog") is None or shutil.which("vvp") is None,
+    reason="Icarus Verilog is required for derived port-type regressions",
+)
+@pytest.mark.parametrize(
+    (
+        "case_name",
+        "design_name",
+        "core",
+        "sparkle_ports",
+        "harness",
+        "benchmark_ports",
+        "required_fragment",
+        "forbidden_fragment",
+    ),
+    [
+        (
+            "hamming-tx-whole-output",
+            "hamming_tx",
+            """
+            module sparkle_inner #(
+                parameter integer DATA_WIDTH = 4,
+                parameter integer PARITY_BIT = 3
+            ) (
+                input logic [DATA_WIDTH-1:0] _gen_data_in,
+                output logic [PARITY_BIT+DATA_WIDTH:0] out
+            );
+                assign out = _gen_data_in;
+            endmodule
+            """,
+            [
+                ("input", "logic [DATA_WIDTH-1:0]", "_gen_data_in"),
+                ("output", "logic [PARITY_BIT+DATA_WIDTH:0]", "out"),
+            ],
+            """
+            runner.build(parameters={
+                "DATA_WIDTH": DATA_WIDTH, "PARITY_BIT": PARITY_BIT,
+            })
+            dut.data_in.value = 0
+            int(dut.data_out.value)
+            """,
+            [
+                ("input", "logic [DATA_WIDTH-1:0]", "data_in"),
+                ("output", "logic [ENCODED_DATA-1:0]", "data_out"),
+            ],
+            "output logic [_cvdp_core_PARITY_BIT+_cvdp_core_DATA_WIDTH:0] data_out",
+            "output logic [ENCODED_DATA-1:0] data_out",
+        ),
+        (
+            "hamming-rx-direct-input",
+            "hamming_rx",
+            """
+            module sparkle_inner #(
+                parameter integer DATA_WIDTH = 4,
+                parameter integer PARITY_BIT = 3
+            ) (
+                input logic [PARITY_BIT+DATA_WIDTH:0] _gen_data_in,
+                output logic [DATA_WIDTH-1:0] _gen_data_out
+            );
+                assign _gen_data_out = _gen_data_in[DATA_WIDTH-1:0];
+            endmodule
+            """,
+            [
+                ("input", "logic [PARITY_BIT+DATA_WIDTH:0]", "_gen_data_in"),
+                ("output", "logic [DATA_WIDTH-1:0]", "_gen_data_out"),
+            ],
+            """
+            runner.build(parameters={
+                "DATA_WIDTH": DATA_WIDTH, "PARITY_BIT": PARITY_BIT,
+            })
+            dut.data_in.value = 0
+            int(dut.data_out.value)
+            """,
+            [
+                ("input", "logic [ENCODED_DATA-1:0]", "data_in"),
+                ("output", "logic [DATA_WIDTH-1:0]", "data_out"),
+            ],
+            "input logic [_cvdp_core_PARITY_BIT+_cvdp_core_DATA_WIDTH:0] data_in",
+            "input logic [ENCODED_DATA-1:0] data_in",
+        ),
+        (
+            "word-derived-count-handle",
+            "Bit_Difference_Counter",
+            """
+            module sparkle_inner #(parameter integer BIT_WIDTH = 4) (
+                input logic [BIT_WIDTH-1:0] _gen_input_A,
+                input logic [BIT_WIDTH-1:0] _gen_input_B,
+                output logic [$clog2(BIT_WIDTH+1)-1:0] out
+            );
+                assign out = _gen_input_A ^ _gen_input_B;
+            endmodule
+            """,
+            [
+                ("input", "logic [BIT_WIDTH-1:0]", "_gen_input_A"),
+                ("input", "logic [BIT_WIDTH-1:0]", "_gen_input_B"),
+                ("output", "logic [$clog2(BIT_WIDTH+1)-1:0]", "out"),
+            ],
+            """
+            runner.build(parameters={"BIT_WIDTH": BIT_WIDTH})
+            dut.input_A.value = 0
+            dut.input_B.value = 0
+            int(dut.bit_difference_count.value)
+            int(dut.COUNT_WIDTH.value)
+            """,
+            [
+                ("input", "logic [BIT_WIDTH-1:0]", "input_A"),
+                ("input", "logic [BIT_WIDTH-1:0]", "input_B"),
+                ("output", "logic [COUNT_WIDTH-1:0]", "bit_difference_count"),
+            ],
+            "localparam integer COUNT_WIDTH = $bits(bit_difference_count);",
+            "output logic [COUNT_WIDTH-1:0] bit_difference_count",
+        ),
+    ],
+    ids=[
+        "hamming-tx-whole-output",
+        "hamming-rx-direct-input",
+        "word-derived-count-handle",
+    ],
+)
+def test_cvdp_no_exact_derived_port_type_uses_proven_core_mapping(
+    tmp_path,
+    case_name,
+    design_name,
+    core,
+    sparkle_ports,
+    harness,
+    benchmark_ports,
+    required_fragment,
+    forbidden_fragment,
+):
+    wrapper = generate_cvdp_wrapper(
+        design_name=design_name,
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=sparkle_ports,
+        ref_code="module old_helper(output logic stale); endmodule",
+        harness_files={"src/test.py": harness},
+        sv_code=core,
+        benchmark_ports=benchmark_ports,
+    )
+
+    assert wrapper is not None
+    assert required_fragment in wrapper, case_name
+    assert forbidden_fragment not in wrapper, case_name
+    result = _run_iverilog_wrapper(
+        tmp_path, core + "\n" + wrapper, top=design_name
+    )
+    assert result.returncode == 0, case_name + result.stdout + result.stderr
+
+
+@pytest.mark.skipif(
+    shutil.which("iverilog") is None or shutil.which("vvp") is None,
+    reason="Icarus Verilog is required for prompt/core mismatch regression",
+)
+def test_cvdp_no_exact_resolvable_prompt_width_is_not_self_overridden(tmp_path):
+    core = """
+    module sparkle_inner #(parameter integer W = 8) (
+        input logic [2*W-1:0] _gen_data_in,
+        output logic y
+    );
+        assign y = ^_gen_data_in;
+    endmodule
+    """
+    wrapper = generate_cvdp_wrapper(
+        design_name="dut",
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=[
+            ("input", "logic [2*W-1:0]", "_gen_data_in"),
+            ("output", "logic", "y"),
+        ],
+        ref_code="module old_helper(output logic stale); endmodule",
+        harness_files={"src/test.py": """
+            runner.build(parameters={"W": W})
+            dut.data_in.value = 0
+            int(dut.y.value)
+        """},
+        sv_code=core,
+        benchmark_ports=[
+            ("input", "logic [W-1:0]", "data_in"),
+            ("output", "logic", "y"),
+        ],
+    )
+
+    assert wrapper is not None
+    assert "input logic [_cvdp_core_W-1:0] data_in" in wrapper
+    result = _run_iverilog_wrapper(tmp_path, core + "\n" + wrapper)
+    assert result.returncode != 0
+    assert "direct input width mismatch for data_in" in (
+        result.stdout + result.stderr
+    )
+
+
+def test_cvdp_no_exact_derived_type_rejects_ambiguous_direct_outputs():
+    error = pytest.raises(
+        CVDPAdapterContractError,
+        generate_cvdp_wrapper,
+        design_name="dut",
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=[
+            ("output", "logic [7:0]", "value"),
+            ("output", "logic [7:0]", "_gen_value"),
+        ],
+        ref_code="module old_helper(output logic stale); endmodule",
+        harness_files={"src/test.py": "int(dut.value.value)"},
+        sv_code="""
+        module sparkle_inner(
+            output logic [7:0] value,
+            output logic [7:0] _gen_value
+        );
+            assign value = '0;
+            assign _gen_value = '0;
+        endmodule
+        """,
+        benchmark_ports=[
+            ("output", "logic [DERIVED_WIDTH-1:0]", "value"),
+        ],
+    )
+
+    assert "could not be mapped safely" in str(error.value)
+
+
 def _cvdp_filo_hidden_status_wrapper() -> tuple[str, str]:
     core = """
     module sparkle_inner #(
