@@ -69,6 +69,23 @@ def test_symbolic_clog2_diagnostic_gets_supported_dimension_guidance():
     assert "$clog2(DEPTH)" in hint
 
 
+def test_symbolic_width_normalization_gets_concat_guidance():
+    errors = [{
+        "pos": {"line": 42, "column": 0},
+        "data": (
+            "Type mismatch\n"
+            "  a ++ b ++ c\n"
+            "has type BitVec (W + W + W)\n"
+            "but is expected to have type BitVec (3 * W)"
+        ),
+    }]
+    records = build_lean_diagnostics(errors)
+    hint = lean_repair_playbook(records)
+
+    assert records[0]["code"] == "symbolic_width_normalization"
+    assert "A + B + C" in hint
+
+
 def test_hardware_type_diagnostic_rejects_bundleall_top_level_output():
     hint = lean_repair_playbook([{"code": "lean_hardware_type_inference"}])
 

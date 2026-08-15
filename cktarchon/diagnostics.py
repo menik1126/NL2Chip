@@ -51,6 +51,12 @@ def classify_lean_diagnostic(message: str) -> str:
         return "invalid_signal_loop"
     if "cannot infer hardware type" in lowered:
         return "lean_hardware_type_inference"
+    if (
+        ("type mismatch" in lowered or "application type mismatch" in lowered)
+        and "bitvec" in lowered
+        and "*" in text and "+" in text
+    ):
+        return "symbolic_width_normalization"
     if "typeclass instance problem is stuck" in lowered:
         return "lean_typeclass_stuck"
     if "type mismatch" in lowered or "application type mismatch" in lowered:

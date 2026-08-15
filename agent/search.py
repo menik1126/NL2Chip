@@ -2116,6 +2116,14 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "`Decidable.rec`, which cannot be preserved as a symbolic RTL dimension. "
             "`clog2` is supported and lowers to SystemVerilog `$clog2(DEPTH)`."
         )
+    if "symbolic_width_normalization" in codes:
+        hints.append(
+            "Lean does not use arithmetic associativity/commutativity to coerce dependent "
+            "`BitVec` widths. Make annotations match the construction exactly: `a ++ b ++ c` "
+            "has width `A + B + C`, not `3 * A`. Keep concat field widths in explicit `+` "
+            "form, or use a checked `zext`/truncation boundary before assigning to a differently "
+            "written symbolic width."
+        )
     if "lean_hardware_type_inference" in codes:
         hints.append(
             "`Cannot infer hardware type` usually means a `Signal.loop` state, mux branch, "
