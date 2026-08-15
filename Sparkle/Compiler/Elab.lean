@@ -684,21 +684,10 @@ mutual
             let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
             let hwType ← inferHWTypeFromSignal exprType
             let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-            -- For mixed Signal/BitVec: use extractBitVecLiteral for the constant arg
-            let wireA ← if isSignal1 then
-              translateExprToWire arg1 "op_a" (isTopLevel := false)
-            else
-              let (cVal, cWidth) ← extractBitVecLiteral arg1
-              let constWire ← CompilerM.makeWire "op_const" (.bitVector cWidth)
-              CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
-              pure constWire
-            let wireB ← if isSignal2 then
-              translateExprToWire arg2 "op_b" (isTopLevel := false)
-            else
-              let (cVal, cWidth) ← extractBitVecLiteral arg2
-              let constWire ← CompilerM.makeWire "op_const" (.bitVector cWidth)
-              CompilerM.emitAssign constWire (.const (Int.ofNat cVal) cWidth)
-              pure constWire
+            -- A mixed operand may be a literal or a let-bound BitVec constant.
+            -- Let normal translation zeta-reduce the latter before lowering it.
+            let wireA ← translateExprToWire arg1 "op_a" (isTopLevel := false)
+            let wireB ← translateExprToWire arg2 "op_b" (isTopLevel := false)
             CompilerM.emitAssign resWire (.op op [.ref wireA, .ref wireB])
             return resWire
 
@@ -742,6 +731,16 @@ mutual
 
     -- 1. High-priority Signal Recognition (Avoid premature unfolding)
     if let .const name _ := fn then
+        -- Preserve a BitVec literal as one sized RTL constant. Do not unwrap it
+        -- to its Nat payload: local BitVec lets otherwise reach OfNat fallback.
+        if (name == ``BitVec.ofNat || name == ``BitVec.ofFin) && args.size >= 2 then
+          let (value, width) ← extractBitVecLiteralDim e
+          let resWire ← CompilerM.makeWire hint (hwTypeFromDim width) (named := isNamed)
+          match width.toNat? with
+          | some concreteWidth => CompilerM.emitAssign resWire (.const (Int.ofNat value) concreteWidth)
+          | none => CompilerM.emitAssign resWire (.constDim (Int.ofNat value) width)
+          return resWire
+
         -- OfNat.ofNat: numeric literal (e.g., 0#4, 0xFFFFF#20, 35)
         -- Must be checked BEFORE `.endsWith ".ofNat"` which would take args.back! (the instance)
         if name == ``OfNat.ofNat && args.size >= 3 then

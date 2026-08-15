@@ -91,3 +91,9 @@ def symbolicDerivedAlias {dom : DomainConfig} {DEPTH : Nat}
     (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 DEPTH))) : Signal dom (BitVec (Sparkle.Library.RTL.clog2 DEPTH)) :=
   let W := Sparkle.Library.RTL.clog2 DEPTH
   Signal.loop fun q => Signal.register (BitVec.ofNat W 0) (q ^^^ x)
+
+/-- A mixed Signal/BitVec operator may consume a local packed constant. -/
+def symbolicLetMaskXor {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  let mask : BitVec W := BitVec.ofNat W 1
+  x ^^^ mask

@@ -68,6 +68,10 @@ module symbolic_parameter_behavior_tb;
     logic [64:0] hier65_lhs;
     logic [64:0] hier65_rhs;
     wire [64:0] hier65_out;
+    logic [2:0] letmask3_in;
+    wire [2:0] letmask3_out;
+    logic [16:0] letmask17_in;
+    wire [16:0] letmask17_out;
 
     logic [2:0] generate3_in;
     wire [2:0] generate3_out;
@@ -184,6 +188,9 @@ module symbolic_parameter_behavior_tb;
         ._gen_lhs(hier65_lhs), ._gen_rhs(hier65_rhs), .out(hier65_out)
     );
 
+    symbolicLetMaskXor #(.W(3)) letmask3_dut (._gen_x(letmask3_in), .out(letmask3_out));
+    symbolicLetMaskXor #(.W(17)) letmask17_dut (._gen_x(letmask17_in), .out(letmask17_out));
+
     symbolicGenerateNot #(.W(3)) generate3_dut (
         ._gen_x(generate3_in), .out(generate3_out)
     );
@@ -234,6 +241,8 @@ module symbolic_parameter_behavior_tb;
         hier17_rhs = 17'h0_0ff0;
         hier65_lhs = {1'b1, 64'h0123_4567_89ab_cdef};
         hier65_rhs = {1'b0, 64'hffff_0000_ffff_0000};
+        letmask3_in = 3'b101;
+        letmask17_in = 17'h1_2345;
         generate3_in = 3'b101;
         generate17_in = 17'h1_2468;
         generate65_in = {1'b1, 64'h0123_4567_89ab_cdef};
@@ -249,6 +258,9 @@ module symbolic_parameter_behavior_tb;
             hier17_out !== (hier17_lhs ^ hier17_rhs) ||
             hier65_out !== (hier65_lhs ^ hier65_rhs))
             $fatal(1, "symbolic hierarchy parameter forwarding failed");
+        if (letmask3_out !== (letmask3_in ^ 3'd1) ||
+            letmask17_out !== (letmask17_in ^ 17'd1))
+            $fatal(1, "symbolic let-bound BitVec constant lowering failed");
         if (generate3_out !== ~generate3_in ||
             generate17_out !== ~generate17_in ||
             generate65_out !== ~generate65_in)
