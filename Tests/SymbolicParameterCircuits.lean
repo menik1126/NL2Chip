@@ -63,6 +63,15 @@ def symbolicLoopBundle {dom : DomainConfig} {W : Nat}
   let isZero : Signal dom Bool := q === BitVec.ofNat W 0
   let isOne : Signal dom Bool := q === BitVec.ofNat W 1
   bundle2 q (bundle2 isZero isOne)
+
+/-- A symbolic-width feedback register whose state is itself a packed pair.
+    This guards the tuple-state form used by multi-register control circuits. -/
+def symbolicPairLoop {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W × BitVec W) :=
+  Signal.loop fun state =>
+    let next := bundle2 (state.fst ^^^ x) state.snd
+    Signal.register (BitVec.ofNat W 0, BitVec.ofNat W 0) next
+
 /-- Compare symbolic-width state against a retained parameter value. -/
 def symbolicDepthCompare {dom : DomainConfig} {DEPTH : Nat}
     (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 (DEPTH + 1))))

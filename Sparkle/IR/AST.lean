@@ -164,7 +164,7 @@ inductive Stmt where
       (clock : String)       -- Clock signal name
       (reset : String)       -- Reset signal name
       (input : Expr)         -- Input expression
-      (initValue : Int)      -- Reset/initial value
+      (initValue : Expr)     -- Reset/initial value, including packed literals
       : Stmt
   | memory
       (name : String)         -- Memory instance name

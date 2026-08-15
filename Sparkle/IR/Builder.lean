@@ -131,6 +131,17 @@ def emitRegister (hint : String) (clock : String) (reset : String)
   -- Add the output wire
   let m := m.addWire { name := outputName, ty := ty }
   -- Add the register statement
+  let m := m.addStmt (.register outputName clock reset input (.const initValue ty.bitWidth))
+  setModule m
+  return outputName
+
+/-- Emit a register with an explicit packed reset expression. Compiler lowering
+    uses this form for symbolic-width tuple state. -/
+def emitRegisterExpr (hint : String) (clock : String) (reset : String)
+    (input initValue : Expr) (ty : HWType) (named : Bool := false) : CircuitM String := do
+  let outputName ← freshName (sanitizeName hint) named
+  let m ← getModule
+  let m := m.addWire { name := outputName, ty := ty }
   let m := m.addStmt (.register outputName clock reset input initValue)
   setModule m
   return outputName

@@ -151,9 +151,9 @@ def getWireWidthDim (wireName : String) : CompilerM DimExpr := do
   | none =>
     CompilerM.liftMetaM $ throwError s!"Cannot determine hardware width for wire '{wireName}'"
 
-def emitRegister (hint : String) (clk : String) (rst : String) (input : Sparkle.IR.AST.Expr) (initVal : Nat) (ty : HWType) (named : Bool := false) : CompilerM String := do
+def emitRegister (hint : String) (clk : String) (rst : String) (input initVal : Sparkle.IR.AST.Expr) (ty : HWType) (named : Bool := false) : CompilerM String := do
   let cs ← get
-  let (name, cs') := CircuitM.emitRegister hint clk rst input initVal ty named cs
+  let (name, cs') := CircuitM.emitRegisterExpr hint clk rst input initVal ty named cs
   set cs'
   return name
 
@@ -485,23 +485,27 @@ def extractBitVecLiteral (expr : Lean.Expr) : CompilerM (Nat × Nat) := do
   | _ =>
     CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
 
-/-- Extract a register reset value while retaining a symbolic BitVec width.
-    The register's inferred HWType remains the source of truth for sizing. -/
-partial def extractBitVecInitValue (expr : Lean.Expr) : CompilerM Nat := do
+/-- Extract a register reset expression while retaining symbolic BitVec widths.
+    Product literals become packed concats, matching Sparkle tuple lowering. -/
+partial def extractRegisterInitExpr (expr : Lean.Expr) : CompilerM Sparkle.IR.AST.Expr := do
   let fn := expr.getAppFn
   let args := expr.getAppArgs
   let value? ← match fn with
   | .const name _ =>
     if name == ``BitVec.ofNat && args.size >= 2 then
-      let _ ← extractDimExpr args[args.size - 2]!
-      pure (some (← extractNat args[args.size - 1]!))
+      let width ← extractDimExpr args[args.size - 2]!
+      let value ← extractNat args[args.size - 1]!
+      pure (some (.constDim (Int.ofNat value) width))
     else if name == ``BitVec.ofFin && args.size >= 2 then
-      let _ ← extractDimExpr args[0]!
-      pure (some (← extractNat args[1]!))
-    else if name == ``Bool.false then
-      pure (some 0)
-    else if name == ``Bool.true then
-      pure (some 1)
+      let width ← extractDimExpr args[0]!
+      let value ← extractNat args[1]!
+      pure (some (.constDim (Int.ofNat value) width))
+    else if name == ``Bool.false then pure (some (.const 0 1))
+    else if name == ``Bool.true then pure (some (.const 1 1))
+    else if name == ``Prod.mk && args.size >= 2 then
+      let lhs ← extractRegisterInitExpr args[args.size - 2]!
+      let rhs ← extractRegisterInitExpr args[args.size - 1]!
+      pure (some (.concat [lhs, rhs]))
     else pure none
   | _ => pure none
   match value? with
@@ -509,7 +513,7 @@ partial def extractBitVecInitValue (expr : Lean.Expr) : CompilerM Nat := do
   | none =>
     let reduced ← CompilerM.liftMetaM (whnf expr)
     if reduced != expr then
-      extractBitVecInitValue reduced
+      extractRegisterInitExpr reduced
     else
       CompilerM.liftMetaM $ throwError s!"Expected register reset literal, got: {expr}"
 
@@ -1341,12 +1345,14 @@ mutual
       trace[sparkle.compiler] "→ tuple projection (fst)"
       let s := args[args.size-1]!
       let wireS ← translateExprToWire s "s" (isTopLevel := false)
-      let totalWidth ← CompilerM.getWireWidth wireS
+      let totalWidth ← CompilerM.getWireWidthDim wireS
       let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
       let hwType ← inferHWTypeFromSignal exprType
       let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-      let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
-      CompilerM.emitAssign resWire (.slice (.ref wireS) (totalWidth - 1) (totalWidth - width))
+      let width := hwType.bitWidthDim
+      CompilerM.emitAssign resWire
+        (makeSliceExpr (.ref wireS) (DimExpr.mkSub totalWidth (.literal 1))
+          (DimExpr.mkSub totalWidth width))
       return some resWire
 
     -- Signal.snd (new readable syntax)
@@ -1357,8 +1363,9 @@ mutual
       let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
       let hwType ← inferHWTypeFromSignal exprType
       let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-      let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
-      CompilerM.emitAssign resWire (.slice (.ref wireS) (width - 1) 0)
+      let width := hwType.bitWidthDim
+      CompilerM.emitAssign resWire
+        (makeSliceExpr (.ref wireS) (DimExpr.mkSub width (.literal 1)) (.literal 0))
       return some resWire
 
     -- Signal.map f s: apply pure function f combinationally to signal s
@@ -1371,12 +1378,14 @@ mutual
       if f.isConstOf ``Prod.fst then
         trace[sparkle.compiler] "→ tuple projection (map fst)"
         let wireS ← translateExprToWire s "s" (isTopLevel := false)
-        let totalWidth ← CompilerM.getWireWidth wireS
+        let totalWidth ← CompilerM.getWireWidthDim wireS
         let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
         let hwType ← inferHWTypeFromSignal exprType
         let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-        let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
-        CompilerM.emitAssign resWire (.slice (.ref wireS) (totalWidth - 1) (totalWidth - width))
+        let width := hwType.bitWidthDim
+        CompilerM.emitAssign resWire
+          (makeSliceExpr (.ref wireS) (DimExpr.mkSub totalWidth (.literal 1))
+            (DimExpr.mkSub totalWidth width))
         return some resWire
       if f.isConstOf ``Prod.snd then
         trace[sparkle.compiler] "→ tuple projection (map snd)"
@@ -1384,8 +1393,9 @@ mutual
         let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
         let hwType ← inferHWTypeFromSignal exprType
         let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
-        let width := match hwType with | .bitVector w => w | .bit => 1 | _ => 8
-        CompilerM.emitAssign resWire (.slice (.ref wireS) (width - 1) 0)
+        let width := hwType.bitWidthDim
+        CompilerM.emitAssign resWire
+          (makeSliceExpr (.ref wireS) (DimExpr.mkSub width (.literal 1)) (.literal 0))
         return some resWire
 
       -- Generic fallback: translate f applied to the signal's wire value
@@ -1559,10 +1569,10 @@ mutual
       trace[sparkle.compiler] "→ register"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let initVal ← extractBitVecInitValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
+      let initVal ← extractRegisterInitExpr init
       let w ← CompilerM.emitRegister hint "clk" "rst" (.ref inputWire) initVal hwType (named := isNamed)
       return some w
 
@@ -1571,10 +1581,10 @@ mutual
       trace[sparkle.compiler] "→ registerNeg"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let initVal ← extractBitVecInitValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
+      let initVal ← extractRegisterInitExpr init
       -- Use "clk__neg" as clock name; backend detects suffix and emits @(negedge clk)
       let w ← CompilerM.emitRegister hint "clk__neg" "rst" (.ref inputWire) initVal hwType (named := isNamed)
       return some w
@@ -1584,10 +1594,10 @@ mutual
       trace[sparkle.compiler] "→ registerNoReset"
       let init := args[args.size-2]!
       let input := args[args.size-1]!
-      let initVal ← extractBitVecInitValue init
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
+      let initVal ← extractRegisterInitExpr init
       -- Use "clk__norst" as clock name; backend detects suffix and emits @(posedge clk) without reset
       let w ← CompilerM.emitRegister hint "clk__norst" "rst" (.ref inputWire) initVal hwType (named := isNamed)
       return some w
@@ -1598,11 +1608,11 @@ mutual
       let init := args[args.size-3]!
       let en := args[args.size-2]!
       let input := args[args.size-1]!
-      let initVal ← extractBitVecInitValue init
       let enWire ← translateExprToWire en "reg_en"
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
+      let initVal ← extractRegisterInitExpr init
       let muxWire ← CompilerM.makeWire (hint ++ "_mux") hwType
       let regWire ← CompilerM.emitRegister hint "clk" "rst" (.ref muxWire) initVal hwType (named := isNamed)
       CompilerM.emitAssign muxWire (.op .mux [.ref enWire, .ref inputWire, .ref regWire])

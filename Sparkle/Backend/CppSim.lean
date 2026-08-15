@@ -292,16 +292,6 @@ def emitGeneratedBitAssignment (typeMap : List (String × HWType))
   , resetBody := []
   , evalTickLocals := [] }
 
-/-- Emit a C++ constant expression for an init value with given width -/
-def emitInitValue (initValue : Int) (width : Nat) : String :=
-  let cppType := emitCppType (.bitVector width)
-  if initValue < 0 then
-    let modulus : Int := (2 : Int) ^ width
-    let unsigned := ((initValue % modulus) + modulus) % modulus
-    s!"({cppType})0x{Nat.toDigits 16 unsigned.toNat |> String.ofList}ULL"
-  else
-    s!"({cppType}){initValue}ULL"
-
 /-- Split a statement into declaration/eval/tick/reset parts -/
 def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
     (design : Option Design := none) : StmtParts :=
@@ -346,7 +336,8 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
     let nextName := s!"{outName}_next"
     let rawExpr := emitExpr typeMap input
     let inputExpr := if exprIsMasked width input then rawExpr else applyMask rawExpr width
-    let initExpr := emitInitValue initValue width
+    let rawInitExpr := emitExpr typeMap initValue
+    let initExpr := if exprIsMasked width initValue then rawInitExpr else applyMask rawInitExpr width
     { declarations := [s!"    {cppType} {outName};", s!"    {cppType} {nextName};"]
     , evalBody := [s!"        {nextName} = {inputExpr};"]
     , tickBody := [s!"        {outName} = {nextName};"]

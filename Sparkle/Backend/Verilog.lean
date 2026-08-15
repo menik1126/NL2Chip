@@ -133,13 +133,6 @@ partial def emitExpr (e : Expr) : String :=
         s!"({emitExpr arg1} {emitOperator operator} {emitExpr arg2})"
     | _ => s!"/* ERROR: operator {operator} with wrong arity */"
 
-/-- Emit a reset literal using the register's declared storage type. -/
-def emitTypedConstant (value : Int) : HWType → String
-  | .bit => emitExpr (.const value 1)
-  | .bitVector width => emitExpr (.const value width)
-  | .bitVectorDim width => s!"{emitDimExpr width}'({value})"
-  | ty => panic! s!"Register reset constants require a packed bit type, found {ty}"
-
 /-- Emit a single statement.
     The optional `wires` parameter provides wire declarations for register
     reset value width lookup. -/
@@ -166,9 +159,7 @@ partial def emitStmt (stmt : Stmt) (indent : String := "    ")
 
   | .register output clock reset input initValue =>
     -- Generate always_ff block for register
-    let resetValue := match wires.find? (fun p => p.name == output) with
-      | some port => emitTypedConstant initValue port.ty
-      | none => panic! s!"Missing declared register wire '{output}'"
+    let resetValue := emitExpr initValue
     -- If clock name ends with "__neg", emit negedge trigger (no reset for negedge regs)
     if clock.endsWith "__neg" then
       let baseClock := clock.dropRight 5

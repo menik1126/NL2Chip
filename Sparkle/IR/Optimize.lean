@@ -199,7 +199,7 @@ partial def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
   | .generateFor label index start stop body =>
     .generateFor label index start stop (body.map (optimizeStmt dm wm))
   | .register output clock reset input initValue =>
-    .register output clock reset (optimizeExpr dm wm input) initValue
+    .register output clock reset (optimizeExpr dm wm input) (optimizeExpr dm wm initValue)
   | .memory name aw dw clk wa wd we ra rd cr =>
     .memory name aw dw clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
@@ -235,7 +235,8 @@ partial def substituteStmt (dm : DefMap) (inlinable : HashMap String Bool) : Stm
   | .generateFor label index start stop body =>
     .generateFor label index start stop (body.map (substituteStmt dm inlinable))
   | .register output clock reset input initValue =>
-    .register output clock reset (substituteExpr dm inlinable 100 input) initValue
+    .register output clock reset (substituteExpr dm inlinable 100 input)
+      (substituteExpr dm inlinable 100 initValue)
   | .memory name aw dw clk wa wd we ra rd cr =>
     .memory name aw dw clk
       (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)

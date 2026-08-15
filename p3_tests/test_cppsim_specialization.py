@@ -44,6 +44,22 @@ CPP_CASES = {
         dut._gen_x = 0x12345; dut.eval();
         return dut.out == ((~0x12345) & 0x1ffff) ? 0 : 1;
     """,
+    "/tmp/p3_cppsim_pair_loop_w3.h": """
+        symbolicPairLoop dut;
+        dut.reset();
+        dut.eval();
+        if (dut.out != 0) return 1;
+        dut._gen_x = 0x5; dut.eval(); dut.tick(); dut.eval();
+        return dut.out == (0x5 << 3) ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_pair_loop_w17.h": """
+        symbolicPairLoop dut;
+        dut.reset();
+        dut.eval();
+        if (dut.out != 0) return 1;
+        dut._gen_x = 0x12345; dut.eval(); dut.tick(); dut.eval();
+        return dut.out == (0x12345ULL << 17) ? 0 : 1;
+    """,
     "/tmp/p3_cppsim_memory_a2_d8.h": """
         symbolicMemory dut;
         dut.reset();

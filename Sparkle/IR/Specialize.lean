@@ -107,7 +107,8 @@ partial def specializeStmt
     return result
   | .register output clock reset input initValue =>
     return [.register output clock reset
-      (← specializeExpr bindings indices input) initValue]
+      (← specializeExpr bindings indices input)
+      (← specializeExpr bindings indices initValue)]
   | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable
       readAddr readData comboRead => do
     let concreteAddr ← requireDimension bindings s!"memory '{name}' address width" addrWidth

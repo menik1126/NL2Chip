@@ -33,6 +33,10 @@ module symbolic_parameter_behavior_tb;
     wire [4:0] loop3_out;
     logic [16:0] loop17_in;
     wire [18:0] loop17_out;
+    logic [2:0] pair3_in;
+    wire [5:0] pair3_out;
+    logic [16:0] pair17_in;
+    wire [33:0] pair17_out;
     logic [3:0] depth8_in;
     wire depth8_out;
     logic [3:0] depth12_in;
@@ -131,6 +135,14 @@ module symbolic_parameter_behavior_tb;
     symbolicLoopBundle #(.W(17)) loop17_dut (
         ._gen_x(loop17_in), .clk(clk), .rst(rst), .out(loop17_out)
     );
+
+    symbolicPairLoop #(.W(3)) pair3_dut (
+        ._gen_x(pair3_in), .clk(clk), .rst(rst), .out(pair3_out)
+    );
+
+    symbolicPairLoop #(.W(17)) pair17_dut (
+        ._gen_x(pair17_in), .clk(clk), .rst(rst), .out(pair17_out)
+    );
     symbolicDepthCompare #(.DEPTH(8)) depth8_dut (
         ._gen_x(depth8_in), .clk(clk), .rst(rst), .out(depth8_out)
     );
@@ -202,6 +214,8 @@ module symbolic_parameter_behavior_tb;
         alias16_in = 4'b1100;
         loop3_in = 3'b101;
         loop17_in = 17'h1_2345;
+        pair3_in = 3'b101;
+        pair17_in = 17'h1_2345;
 
         depth8_in = 4'd8;
         depth12_in = 4'd12;
@@ -252,6 +266,8 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "parameter-valued symbolic comparison reset failed");
         if (loop3_out !== {3'd0, 1'b1, 1'b0} || loop17_out !== {17'd0, 1'b1, 1'b0})
             $fatal(1, "symbolic-width comparison reset flags failed");
+        if (pair3_out !== {3'd0, 3'd0} || pair17_out !== {17'd0, 17'd0})
+            $fatal(1, "symbolic packed-pair reset failed");
 
 
 
@@ -267,6 +283,8 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic clog2 alias update failed");
         if (loop3_out !== {loop3_in, 1'b0, 1'b0} || loop17_out !== {loop17_in, 1'b0, 1'b0})
             $fatal(1, "symbolic-width comparison update flags failed");
+        if (pair3_out !== {pair3_in, 3'd0} || pair17_out !== {pair17_in, 17'd0})
+            $fatal(1, "symbolic packed-pair update failed");
 
         if (depth8_out !== 1'b1 || depth12_out !== 1'b1 || depth16_out !== 1'b1)
             $fatal(1, "parameter-valued symbolic comparison failed");
