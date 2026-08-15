@@ -44,6 +44,8 @@ def classify_lean_diagnostic(message: str) -> str:
         return "unsupported_compile_time_branch"
     if "signal.loop argument must be a lambda" in lowered:
         return "invalid_signal_loop"
+    if "cannot infer hardware type" in lowered:
+        return "lean_hardware_type_inference"
     if "typeclass instance problem is stuck" in lowered:
         return "lean_typeclass_stuck"
     if "type mismatch" in lowered or "application type mismatch" in lowered:

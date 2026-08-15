@@ -2108,9 +2108,41 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "Use positive default bindings for every P3 parameter in "
             "`#synthesizeParameterizedVerilog`; zero-width defaults cannot form a valid RTL type."
         )
+    if "lean_hardware_type_inference" in codes:
+        hints.append(
+            "`Cannot infer hardware type` usually means a `Signal.loop` state, mux branch, "
+            "or tuple register payload lacks a concrete `Signal dom T` type. Annotate the "
+            "loop lambda parameter and local binding before its value, then make `dff`/"
+            "`Signal.register` receive a plain payload whose tuple shape exactly matches the state."
+        )
     return "\n".join(f"- {hint}" for hint in hints)
 
 
+def format_lean_source_context(
+    diagnostics: list[dict] | None,
+    current_lean: str | None,
+) -> str:
+    source_lines = str(current_lean or "").splitlines()
+    if not source_lines:
+        return ""
+    blocks: list[str] = []
+    seen_lines: set[int] = set()
+    for diagnostic in diagnostics or []:
+        match = re.match(r"(\d+)", str(diagnostic.get("location", "")))
+        if not match:
+            continue
+        line_number = int(match.group(1))
+        if line_number in seen_lines or not 1 <= line_number <= len(source_lines):
+            continue
+        seen_lines.add(line_number)
+        start = max(1, line_number - 2)
+        end = min(len(source_lines), line_number + 2)
+        snippet = []
+        for number in range(start, end + 1):
+            marker = ">" if number == line_number else " "
+            snippet.append("{} {:4d} | {}".format(marker, number, source_lines[number - 1]))
+        blocks.append("\n".join(snippet))
+    return truncate_text("\n\n".join(blocks), 1800, keep="head")
 def summarize_recent_attempts(attempts: list[dict]) -> str:
     if not attempts:
         return "None yet in this repair phase."
@@ -2324,6 +2356,7 @@ def build_sim_feedback(
     info: ProblemInfo | None = None,
     repair_target: str = "lean",
     current_sv: str | None = None,
+    current_lean: str | None = None,
 ) -> str:
     direct_verilog = repair_target == "verilog"
     if direct_verilog:
@@ -2366,6 +2399,19 @@ def build_sim_feedback(
                 "",
                 "### Targeted Lean Repair",
                 playbook,
+            ])
+        source_context = format_lean_source_context(
+            result.get("lean_diagnostics"),
+            current_lean if current_lean is not None else read_current_lean(prob_id),
+        )
+        if source_context:
+            lines.extend([
+                "",
+                "### Lean Source Context",
+                "The marked line is from the current generated Lean candidate.",
+                "```lean",
+                source_context,
+                "```",
             ])
     simulator_output = read_simulator_output(prob_id, run_dir)
     combined_detail = "\n".join(

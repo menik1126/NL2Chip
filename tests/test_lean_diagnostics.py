@@ -148,3 +148,30 @@ def test_raw_error_parser_extracts_lake_build_error_after_warnings():
     assert [record["location"] for record in records] == ["50:24", "81:9"]
     assert records[0]["code"] == "lean_syntax_error"
     assert "warning: ignored" not in records[0]["message"]
+
+def test_hardware_type_feedback_marks_generated_lean_source(tmp_path: Path):
+    errors = [{
+        "pos": {"line": 4, "column": 0},
+        "data": "Cannot infer hardware type from _uniq.17",
+    }]
+    records = build_lean_diagnostics(errors)
+    result = {
+        "compile_pass": False,
+        "sv_extracted": False,
+        "lint_pass": False,
+        "sim_status": "not_run",
+        "sim_mismatches": -1,
+        "detail": "Compile failed",
+        "lean_diagnostics": records,
+    }
+    feedback = build_sim_feedback(
+        prob_id="demo",
+        result=result,
+        iteration=0,
+        history=[],
+        run_dir=tmp_path,
+        current_lean="line one\nline two\nline three\nstate expression\nline five",
+    )
+
+    assert records[0]["code"] == "lean_hardware_type_inference"
+    assert "### Lean Source Context" in feedback
