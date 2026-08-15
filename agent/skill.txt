@@ -43,6 +43,13 @@ with its default, enumerate the public cases, or branch on a parameter value.
   Signal dom (BitVec (DATA_WIDTH + PARITY_BIT + 1)).
 - For generic constants, use constructors such as BitVec.ofNat WIDTH 0; do not
   replace WIDTH by a concrete numeral.
+- Do not hide a retained parameter or a derived width behind `let W := ...` in
+  hardware types. Write `BitVec (clog2 TOTAL_SPACES)` directly where it occurs.
+- When a symbolic-width arithmetic operand is a payload value, pass
+  `BitVec.ofNat W n` directly. Use `Signal.pure` only with an explicit
+  `Signal dom (BitVec W)` annotation; otherwise its domain can remain a Lean
+  metavariable and block synthesis.
+
 - Synthesize exactly the same generic top with one default binding.
 
 Verified non-evaluation pattern:
