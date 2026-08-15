@@ -139,3 +139,12 @@ def test_lean_check_output_does_not_duplicate_structured_errors():
     rendered = AnthropicHarnessRunner._format_lean_result(runner, result)
     assert rendered.count("Cannot instantiate List.foldl.match_1") == 1
     assert "_hygCtx" not in rendered
+
+
+def test_raw_error_parser_extracts_lake_build_error_after_warnings():
+    raw = """warning: ignored\nerror: Generated/demo.lean:50:24: expected ';' or line break\nerror: Generated/demo.lean:81:9: Unknown constant `Signal.not`\n"""
+    records = parse_lean_error_text(raw)
+
+    assert [record["location"] for record in records] == ["50:24", "81:9"]
+    assert records[0]["code"] == "lean_syntax_error"
+    assert "warning: ignored" not in records[0]["message"]

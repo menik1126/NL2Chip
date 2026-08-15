@@ -137,6 +137,14 @@ def parse_lean_error_text(text: str, *, max_entries: int = 8) -> list[dict[str, 
             "data": source[match.end():end].strip(),
         })
     if not errors:
+        lake_matches = list(re.finditer(r"(?m)^error: (.+?):(\d+):(\d+): (.*)$", source))
+        for index, match in enumerate(lake_matches):
+            end = lake_matches[index + 1].start() if index + 1 < len(lake_matches) else len(source)
+            errors.append({
+                "pos": {"line": match.group(2), "column": match.group(3)},
+                "data": source[match.start():end].strip(),
+            })
+    if not errors:
         errors = [{"pos": {}, "data": source.strip()}]
     return build_lean_diagnostics(errors, max_entries=max_entries)
 
