@@ -9,6 +9,9 @@ widths.
 
 - Only explicitly retained top-level Lean `Nat` binders become SystemVerilog
   parameters.
+  A local alias may derive a dimension from one of those binders, for example
+  `let PTR_W := clog2 DEPTH`; the alias must lower recursively to the retained
+  expression and must not replace the top-level binder itself.
 - Every retained parameter has a concrete SystemVerilog default, but changing
   the parameter must change all dependent ports, wires, registers, memories,
   slices, and instances.
@@ -25,7 +28,8 @@ widths.
 ### Gate P1: core dimensions and combinational logic
 
 - One retained parameter controls input, output, and internal wire widths.
-- Multiple parameters and derived addition/multiplication widths are preserved.
+- Multiple parameters, direct derived expressions, and local derived `Nat` aliases
+  (including `clog2`) are preserved in emitted SystemVerilog widths.
 - Bitwise and arithmetic operations preserve the generic width.
 - The same emitted module elaborates and simulates at unseen widths 3, 17, and
   65 without regenerating Lean or SystemVerilog.
