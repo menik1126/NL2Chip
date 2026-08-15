@@ -175,3 +175,6 @@ def test_hardware_type_feedback_marks_generated_lean_source(tmp_path: Path):
 
     assert records[0]["code"] == "lean_hardware_type_inference"
     assert "### Lean Source Context" in feedback
+    compact = compact_repair_feedback(feedback)
+    assert "### Lean Source Context" in compact
+    assert ">    4 | state expression" in compact

@@ -2207,6 +2207,8 @@ def compact_repair_feedback(feedback: str) -> str:
         ("Waveform Context", COMPACT_ASSERTION_CHARS),
         ("Cleaned Simulator Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
         ("Actionable Lean Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
+        ("Targeted Lean Repair", 1200),
+        ("Lean Source Context", 1800),
         ("Current Evaluation Summary", 900),
         ("Interface Diagnostics", COMPACT_INTERFACE_CHARS),
         ("Benchmark Interface Contract", COMPACT_INTERFACE_CHARS),
