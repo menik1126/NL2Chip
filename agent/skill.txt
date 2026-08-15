@@ -67,6 +67,17 @@ Verified non-evaluation pattern:
 Do not write (WIDTH : Nat) in this pattern: it causes the retained-parameter
 top-level-binder error and does not form a P3 generic module.
 
+## Common Lean API and Annotation Hazards
+
+- `Signal.mux cond thenSig elseSig` requires both branches to be Signals. Write
+  `Signal.mux cond (Signal.pure false) (Signal.pure true)` for Boolean constants
+  and `Signal.mux reset (Signal.pure (BitVec.ofNat W 0)) next` for BitVec
+  constants. Never pass bare `false`, `true`, or `BitVec.ofNat ...` as a mux
+  branch, and never write `Signal.pure Bool false` or `Signal.pure (BitVec W) x`.
+- Annotate a local binding before its value: `let v : Signal dom (BitVec 8) :=
+  zext x`. Do not write `let v := zext x : Signal dom (BitVec 8)`, which Lean
+  parses incorrectly in a `let` declaration.
+
 ## Fixed Verified Examples (non-CVDP evaluation examples)
 
 ### Combinational logic and multiple output ports
