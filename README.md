@@ -324,6 +324,70 @@ frontend, while the distinct `#synthesizeComb*` names fail closed unless their
 argument is a closed `CertifiedCombDesign`. Emitting checked Verilog does not
 widen the phase-one certificate beyond explicit source-to-Core-IR lowering.
 
+#### Proof-carrying ordinary `Signal` combinational subset
+
+A separate fail-closed reifier connects a deliberately small ordinary
+`Signal` source subset to the verified compiler above. The original declaration
+is a type index of the generated certificate; it is not a replaceable metadata
+field.
+
+```lean
+import Sparkle.Compiler.SignalCombElab
+
+open Sparkle.Core.Domain
+open Sparkle.Core.Signal
+
+def add2 {dom : DomainConfig} {W : Nat}
+    (a b : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  a + b
+
+#certifySignalComb add2
+#check add2.certifiedSignalComb
+#check add2.signalCombCorrectForWidth
+#synthesizeComb add2.certifiedComb
+```
+
+The command generates an original-indexed certificate, a closed
+`CertifiedCombDesign` alias for the existing production compiler, and
+correctness theorems covering every valid configuration and positive width. The
+theorem conclusion directly contains `(@add2 dom W a b).val time`; it proves
+successful source and Core evaluation with the same named output for every
+`W > 0`, every input stream, and every time. This is a quantified theorem, not
+a finite width sweep.
+
+The first release accepts exactly these forms:
+
+- implicit `{dom : DomainConfig} {W : Nat}`, followed by one or two explicit
+  `Signal dom (BitVec W)` inputs;
+- one `Signal dom (BitVec W)` output;
+- input passthrough and recursively nested uses of Sparkle's exact built-in
+  same-width Signal addition and XOR instances.
+
+The certified domain excludes `W = 0`. The reifier rejects alternate or
+derived port widths, Bool or tuple ports, helper calls, substituted operator
+instances, opaque/unsafe declarations, custom axioms, state, loops, memories,
+and hierarchy. Every generated declaration is checked for its expected
+declaration kind, safety where applicable, `sorry`, `implemented_by`, and an
+axiom allowlist. The executable carrier and production alias additionally
+undergo a current-module runtime-closure audit. The Meta reifier is not trusted
+to establish semantics: Lean's kernel checks the bridge whose type is indexed
+by the exact original function.
+
+The fixed-scope framework certificate is available separately:
+
+```bash
+lake exe sparkle-signal-comb-certify --nonce 0123456789abcdef0123456789abcdef
+```
+
+That checker certifies the fixed unary/binary framework theorems and closed
+non-vacuity witnesses; it does not load a caller-selected declaration. Each
+caller declaration carries its own kernel-checked bridge. The ordinary
+heuristic `Compiler.Elab` frontend, sequential logic, memories, hierarchy,
+optimization, specialization, and SystemVerilog emission remain outside this
+proof scope. The generated `certifiedComb` value may still be passed to the
+existing checked Verilog helpers, but that does not turn the backend into a
+proved pass.
+
 For CVDP, functional simulation can exercise parameter overrides. When the
 harness exposes an exact finite configuration matrix, the evaluator runs
 Yosys/OpenROAD once per concrete configuration. Use `--ppa-workers N` to set a

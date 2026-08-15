@@ -20,6 +20,7 @@ import Sparkle.Compiler.Elab
 import Sparkle.Compiler.DRC
 import Sparkle.Backend.Verilog
 import Sparkle.Compiler.CombElab
+import Sparkle.Compiler.SignalCombElab
 import Sparkle.Backend.VCD
 import Sparkle.Backend.CppSim
 import Sparkle.Verification.Temporal

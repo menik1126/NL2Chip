@@ -94,6 +94,17 @@ jobs:
     - name: Build certified combinational compiler proofs and checker
       run: lake build sparkle-comb-certify Tests.CombCertificateTests Tests.CombElabTests
 
+    - name: Build proof-carrying ordinary Signal combinational proofs and checker
+      run: |
+        lake build sparkle-signal-comb-certify Tests.SignalCombCorrectnessTests Tests.SignalCombElabTests Tests.SignalCombCertificateTests
+        lake env lean -DwarningAsError=true Sparkle/Compiler/SignalCombCorrectness.lean
+        lake env lean -DwarningAsError=true Sparkle/Compiler/SignalCombElab.lean
+        lake env lean -DwarningAsError=true Sparkle/Compiler/SignalCombCertificate.lean
+        lake env lean -DwarningAsError=true Tools/SparkleSignalCombCertify.lean
+        lake env lean -DwarningAsError=true Tests/SignalCombCorrectnessTests.lean
+        lake env lean -DwarningAsError=true Tests/SignalCombElabTests.lean
+        lake env lean -DwarningAsError=true Tests/SignalCombCertificateTests.lean
+
     - name: Run certified combinational compiler acceptance tests
       run: lake exe comb-correctness-tests
 
@@ -108,7 +119,9 @@ jobs:
     - name: Run compiler certificate CLI fail-closed tests
       run: |
         python -m pip install 'pytest>=8,<10'
-        python -m pytest -q tests/test_sparkle_comb_certify_cli.py
+        python -m pytest -q \
+          tests/test_sparkle_comb_certify_cli.py \
+          tests/test_sparkle_signal_comb_certify_cli.py
 
     # ---- Synthesis Tests ----
 

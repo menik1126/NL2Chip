@@ -76,6 +76,11 @@ lean_exe «sparkle-comb-certify» where
   root := `Tools.SparkleCombCertify
   supportInterpreter := true
 
+/-- Fixed-scope checker for the proof-carrying ordinary Signal combinational subset. -/
+lean_exe «sparkle-signal-comb-certify» where
+  root := `Tools.SparkleSignalCombCertify
+  supportInterpreter := true
+
 /-- Runtime acceptance tests for the phase-one compiler-correctness theorem. -/
 lean_exe «comb-correctness-tests» where
   root := `Tests.CombCorrectnessTests
