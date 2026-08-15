@@ -11,6 +11,7 @@ import Tests.SymbolicParameterCircuits
 #synthesizeParameterizedVerilogDesign symbolicXorHierarchy [W := 8]
 #synthesizeParameterizedVerilog symbolicLoopXor [W := 8]
 #synthesizeParameterizedVerilog symbolicDerivedLoop [DEPTH := 8]
+#synthesizeParameterizedVerilog symbolicDerivedAlias [DEPTH := 8]
 #synthesizeParameterizedVerilog symbolicLoopBundle [W := 8]
 #synthesizeParameterizedVerilog symbolicDepthCompare [DEPTH := 8]
 #synthesizeParameterizedVerilog symbolicGenerateNot [W := 8]

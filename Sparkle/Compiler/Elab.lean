@@ -277,6 +277,17 @@ partial def extractDimExpr (expr : Lean.Expr) : CompilerM DimExpr := do
   if rawFn.isConstOf (Lean.Name.str (Lean.Name.str (Lean.Name.str (Lean.Name.str Lean.Name.anonymous "Sparkle") "Library") "RTL") "clog2") && !rawArgs.isEmpty then
     return .clog2 (← extractDimExpr rawArgs.back!)
 
+  match expr with
+  | .fvar fvarId =>
+    match ← CompilerM.lookupDimVar fvarId with
+    | some dimension => return dimension
+    | none =>
+      let declaration ← CompilerM.liftMetaM fvarId.getDecl
+      if Lean.LocalDecl.isLet declaration then
+        if let some value := Lean.LocalDecl.value? declaration then
+          return ← extractDimExpr value
+  | _ => pure ()
+
   let expr ← CompilerM.liftMetaM (whnf expr)
   match expr with
   | .lit (.natVal value) => return .literal value
@@ -285,6 +296,9 @@ partial def extractDimExpr (expr : Lean.Expr) : CompilerM DimExpr := do
     | some dimension => return dimension
     | none =>
       let declaration ← CompilerM.liftMetaM fvarId.getDecl
+      if Lean.LocalDecl.isLet declaration then
+        if let some value := Lean.LocalDecl.value? declaration then
+          return ← extractDimExpr value
       CompilerM.liftMetaM $ throwError
         (s!"Symbolic Nat binder '{declaration.userName}' is used as a hardware dimension " ++
          "but was not retained as a module parameter.\n" ++

@@ -77,3 +77,8 @@ def symbolicDerivedLoop {dom : DomainConfig} {DEPTH : Nat}
     : Signal dom (BitVec (Sparkle.Library.RTL.clog2 DEPTH)) :=
   Signal.loop fun q =>
     Signal.register (BitVec.ofNat (Sparkle.Library.RTL.clog2 DEPTH) 0) (q ^^^ x)
+
+def symbolicDerivedAlias {dom : DomainConfig} {DEPTH : Nat}
+    (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 DEPTH))) : Signal dom (BitVec (Sparkle.Library.RTL.clog2 DEPTH)) :=
+  let W := Sparkle.Library.RTL.clog2 DEPTH
+  Signal.loop fun q => Signal.register (BitVec.ofNat W 0) (q ^^^ x)
