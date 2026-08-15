@@ -42,7 +42,8 @@ def test_skill_requires_outputs_outside_signal_loop():
 
     assert "`Signal.loop` returns feedback state, not final interface outputs" in prompt
     assert "Never return\n  a packed output bundle from the same loop body" in prompt
-    assert "Do not hide a retained parameter or a derived width behind `let W := ...`" in prompt
+    assert "A derived Nat width alias is\n  supported" in prompt
+    assert "exampleNativePointer" in prompt
     assert "Use `Signal.pure` only with an explicit" in prompt
 
 

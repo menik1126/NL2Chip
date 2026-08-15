@@ -2086,6 +2086,31 @@ def summarize_eval_result(result: dict | None) -> str:
     return "\n".join(lines)
 
 
+def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
+    """Return short, diagnosis-specific Lean repair guidance."""
+    codes = {str(item.get("code", "")) for item in (diagnostics or [])}
+    hints: list[str] = []
+    if "invalid_signal_loop" in codes:
+        hints.append(
+            "`Signal.loop` must return only its feedback register. Rewrite as "
+            "`let state := Signal.loop fun state => Signal.register init nextState`; "
+            "then derive and `bundleAll!` the public outputs outside that loop. "
+            "Do not return a port bundle from inside the loop body."
+        )
+    if "retained_parameter_not_top_level" in codes:
+        hints.append(
+            "For P3, put each retained parameter directly in the synthesized definition "
+            "header as `{WIDTH : Nat}`. Derived expressions such as `let PTR_W := clog2 DEPTH` "
+            "are allowed only after that top-level binder is present."
+        )
+    if "zero_width_parameter_default" in codes:
+        hints.append(
+            "Use positive default bindings for every P3 parameter in "
+            "`#synthesizeParameterizedVerilog`; zero-width defaults cannot form a valid RTL type."
+        )
+    return "\n".join(f"- {hint}" for hint in hints)
+
+
 def summarize_recent_attempts(attempts: list[dict]) -> str:
     if not attempts:
         return "None yet in this repair phase."
@@ -2335,6 +2360,13 @@ def build_sim_feedback(
             format_lean_diagnostics(result["lean_diagnostics"], max_chars=COMPACT_DIAGNOSTIC_CHARS),
             "```",
         ])
+        playbook = lean_repair_playbook(result.get("lean_diagnostics"))
+        if playbook:
+            lines.extend([
+                "",
+                "### Targeted Lean Repair",
+                playbook,
+            ])
     simulator_output = read_simulator_output(prob_id, run_dir)
     combined_detail = "\n".join(
         part for part in [str(result.get("detail") or ""), simulator_output] if part.strip()

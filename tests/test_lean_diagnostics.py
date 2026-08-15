@@ -16,7 +16,7 @@ from cktarchon.diagnostics import (  # noqa: E402
 )
 from cktarchon.harness import AnthropicHarnessRunner  # noqa: E402
 from evaluator import _record_lean_compile_failure  # noqa: E402
-from search import build_sim_feedback, compact_repair_feedback  # noqa: E402
+from search import build_sim_feedback, compact_repair_feedback, lean_repair_playbook  # noqa: E402
 
 
 OPAQUE_LOWERING_ERROR = """Cannot instantiate List.foldl.match_1: not a hardware module definition
@@ -44,6 +44,13 @@ def test_opaque_lowering_diagnostic_keeps_cause_and_omits_internal_term():
     assert "[internal Lean term omitted]" in rendered
     assert "_hygCtx" not in rendered
     assert len(rendered) < 1200
+
+
+def test_loop_diagnostic_gets_structural_repair_guidance():
+    hint = lean_repair_playbook([{"code": "invalid_signal_loop"}])
+
+    assert "return only its feedback register" in hint
+    assert "outside that loop" in hint
 
 
 def test_raw_error_parser_deduplicates_repl_location_aliases():

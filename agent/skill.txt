@@ -37,14 +37,18 @@ concrete-width advice above. Keep every retained width symbolic: never replace i
 with its default, enumerate the public cases, or branch on a parameter value.
 
 - Put every retained width directly in the synthesized top definition header as an
-  implicit binder: {WIDTH : Nat}. A regular (WIDTH : Nat), a local let, or a
-  Signal width argument is not retained by the Verilog backend.
+  implicit binder: {WIDTH : Nat}. A regular (WIDTH : Nat), moving the retained
+  binder itself into a local `let`, or a Signal width argument is not retained
+  by the Verilog backend.
 - Use the binder in every dependent type, e.g. Signal dom (BitVec WIDTH) and
   Signal dom (BitVec (DATA_WIDTH + PARITY_BIT + 1)).
 - For generic constants, use constructors such as BitVec.ofNat WIDTH 0; do not
   replace WIDTH by a concrete numeral.
-- Do not hide a retained parameter or a derived width behind `let W := ...` in
-  hardware types. Write `BitVec (clog2 TOTAL_SPACES)` directly where it occurs.
+- Do not hide a retained parameter itself behind `let W := ...`: the retained
+  binder must remain in the top definition header. A derived Nat width alias is
+  supported, however, e.g. `let PTR_W := clog2 DEPTH`; it remains `$clog2(DEPTH)`
+  in generated SystemVerilog. Use such aliases only for dimension expressions,
+  not as a replacement for the top-level retained binder.
 - When a symbolic-width arithmetic operand is a payload value, pass
   `BitVec.ofNat W n` directly. Use `Signal.pure` only with an explicit
   `Signal dom (BitVec W)` annotation; otherwise its domain can remain a Lean
@@ -108,6 +112,21 @@ def exampleStateWithFlag {dom : DomainConfig} {W : Nat}
 
 The final expression inside `Signal.loop` is the register for `q`. `bundle2`
 is outside the loop, after the feedback state has been defined.
+
+### Derived symbolic width alias
+
+```lean
+def exampleNativePointer {dom : DomainConfig} {DEPTH : Nat}
+    (x : Signal dom (BitVec (clog2 DEPTH))) : Signal dom (BitVec (clog2 DEPTH)) :=
+  let PTR_W := clog2 DEPTH
+  let q : Signal dom (BitVec PTR_W) :=
+    Signal.loop fun q => Signal.register (BitVec.ofNat PTR_W 0) (q ^^^ x)
+  q
+```
+
+`PTR_W` is a derived dimension, while `DEPTH` stays as the retained top-level
+parameter. The emitter preserves this as `$clog2(DEPTH)` rather than freezing
+the default elaboration width.
 
 ### Slicing and multiple output ports
 
