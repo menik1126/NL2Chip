@@ -23,6 +23,12 @@ module symbolic_parameter_behavior_tb;
     wire [3:0] derived12_out;
     logic [3:0] derived16_in;
     wire [3:0] derived16_out;
+    logic [2:0] alias8_in;
+    wire [2:0] alias8_out;
+    logic [3:0] alias12_in;
+    wire [3:0] alias12_out;
+    logic [3:0] alias16_in;
+    wire [3:0] alias16_out;
     logic [2:0] loop3_in;
     wire [4:0] loop3_out;
     logic [16:0] loop17_in;
@@ -106,6 +112,18 @@ module symbolic_parameter_behavior_tb;
         ._gen_x(derived16_in), .clk(clk), .rst(rst), .out(derived16_out)
     );
 
+    symbolicDerivedAlias #(.DEPTH(8)) alias8_dut (
+        ._gen_x(alias8_in), .clk(clk), .rst(rst), .out(alias8_out)
+    );
+
+    symbolicDerivedAlias #(.DEPTH(12)) alias12_dut (
+        ._gen_x(alias12_in), .clk(clk), .rst(rst), .out(alias12_out)
+    );
+
+    symbolicDerivedAlias #(.DEPTH(16)) alias16_dut (
+        ._gen_x(alias16_in), .clk(clk), .rst(rst), .out(alias16_out)
+    );
+
     symbolicLoopBundle #(.W(3)) loop3_dut (
         ._gen_x(loop3_in), .clk(clk), .rst(rst), .out(loop3_out)
     );
@@ -179,6 +197,9 @@ module symbolic_parameter_behavior_tb;
         derived8_in = 3'b101;
         derived12_in = 4'b1101;
         derived16_in = 4'b0110;
+        alias8_in = 3'b011;
+        alias12_in = 4'b1010;
+        alias16_in = 4'b1100;
         loop3_in = 3'b101;
         loop17_in = 17'h1_2345;
 
@@ -225,6 +246,8 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic register reset sizing failed");
         if (derived8_out !== 3'd0 || derived12_out !== 4'd0 || derived16_out !== 4'd0)
             $fatal(1, "symbolic clog2 loop reset sizing failed");
+        if (alias8_out !== 3'd0 || alias12_out !== 4'd0 || alias16_out !== 4'd0)
+            $fatal(1, "symbolic clog2 alias reset sizing failed");
         if (depth8_out !== 1'b0 || depth12_out !== 1'b0 || depth16_out !== 1'b0)
             $fatal(1, "parameter-valued symbolic comparison reset failed");
         if (loop3_out !== {3'd0, 1'b1, 1'b0} || loop17_out !== {17'd0, 1'b1, 1'b0})
@@ -240,6 +263,8 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic register update failed");
         if (derived8_out !== derived8_in || derived12_out !== derived12_in || derived16_out !== derived16_in)
             $fatal(1, "symbolic clog2 loop update failed");
+        if (alias8_out !== alias8_in || alias12_out !== alias12_in || alias16_out !== alias16_in)
+            $fatal(1, "symbolic clog2 alias update failed");
         if (loop3_out !== {loop3_in, 1'b0, 1'b0} || loop17_out !== {loop17_in, 1'b0, 1'b0})
             $fatal(1, "symbolic-width comparison update flags failed");
 
