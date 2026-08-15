@@ -53,6 +53,13 @@ def test_loop_diagnostic_gets_structural_repair_guidance():
     assert "outside that loop" in hint
 
 
+def test_hardware_type_diagnostic_rejects_bundleall_top_level_output():
+    hint = lean_repair_playbook([{"code": "lean_hardware_type_inference"}])
+
+    assert "bundleAll!" in hint
+    assert "bundle2" in hint
+
+
 def test_raw_error_parser_deduplicates_repl_location_aliases():
     raw = """[error 60:21] typeclass instance problem is stuck
   HXor (Signal dom (BitVec 8)) rhs out

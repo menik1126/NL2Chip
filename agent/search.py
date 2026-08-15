@@ -2113,7 +2113,9 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "`Cannot infer hardware type` usually means a `Signal.loop` state, mux branch, "
             "or tuple register payload lacks a concrete `Signal dom T` type. Annotate the "
             "loop lambda parameter and local binding before its value, then make `dff`/"
-            "`Signal.register` receive a plain payload whose tuple shape exactly matches the state."
+            "`Signal.register` receive a plain payload whose tuple shape exactly matches the state. "
+            "Do not use `bundleAll!` for a synthesized top-level tuple; build the declared output "
+            "shape with explicit nested `bundle2` calls or sized `++` concatenation."
         )
     return "\n".join(f"- {hint}" for hint in hints)
 
