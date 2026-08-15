@@ -704,7 +704,8 @@ class AnthropicHarnessRunner:
     def _lean_check_code(self, code: str) -> str:
         if self.lean_repl is not None:
             try:
-                result = self.lean_repl.check_code(_with_repl_opens(code))
+                repl_code = _with_repl_opens(_without_repl_imports(code))
+                result = self.lean_repl.check_code(repl_code)
                 self._remember_complete_candidate(code, result)
                 return self._format_lean_result(result)
             except Exception as exc:
@@ -937,3 +938,16 @@ def _with_repl_opens(code: str) -> str:
     if "open Sparkle.Library.RTL" in code or code.lstrip().startswith("import "):
         return code
     return "open Sparkle.Library.RTL\n\n" + code
+
+
+def _without_repl_imports(code: str) -> str:
+    """Drop file-only imports before sending source to the cached REPL.
+
+    `LeanREPL.check_code` starts from a Sparkle prelude environment, where an
+    `import` command is no longer legal. Keep the original source unchanged for
+    candidate autosave so a successful inline check still yields a standalone
+    Lean file.
+    """
+    return "\n".join(
+        line for line in code.splitlines() if not re.match(r"^\s*import\s+\S+\s*$", line)
+    )

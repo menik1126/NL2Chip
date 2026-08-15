@@ -187,7 +187,10 @@ class _CompleteLeanResult:
 
 
 class _CompleteLeanRepl:
+    last_code = ""
+
     def check_code(self, code: str):
+        self.last_code = code
         assert "def prob_a" in code
         return _CompleteLeanResult()
 
@@ -273,6 +276,26 @@ def test_harness_autosaves_complete_inline_lean_check(
     assert target.read_text(encoding="utf-8").startswith("import Sparkle\n")
     assert "#synthesizeVerilog prob_a" in target.read_text(encoding="utf-8")
     assert "auto_saved_candidate" in runner.log_path.read_text(encoding="utf-8")
+
+
+def test_inline_lean_check_strips_file_imports_only_for_cached_repl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = _anthropic_runner(tmp_path, monkeypatch)
+    source = (
+        "import Sparkle\n"
+        "import Sparkle.Compiler.Elab\n\n"
+        "open Sparkle.Core.Signal\n\n"
+        "def prob_a := 1\n"
+        "#synthesizeVerilog prob_a\n"
+    )
+
+    runner._lean_check_code(source)
+
+    assert "import Sparkle" not in runner.lean_repl.last_code
+    assert "open Sparkle.Core.Signal" in runner.lean_repl.last_code
+    assert (tmp_path / "Generated" / "prob_a.lean").read_text(encoding="utf-8") == source
 
 
 def test_harness_does_not_autosave_lean_only_check(
