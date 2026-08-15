@@ -47,6 +47,9 @@ def test_skill_requires_outputs_outside_signal_loop():
     assert "Use `Signal.pure` only with an explicit" in prompt
     assert "Signal.mux cond (Signal.pure false) (Signal.pure true)" in prompt
     assert "Do not write `let v := zext x : Signal dom (BitVec 8)`" in prompt
+    assert "Signal.loop fun (q : Signal dom (BitVec W)) =>" in prompt
+    assert "`Signal.const` and `Signal.not` are not Sparkle APIs" in prompt
+    assert "Do not use Lean `if`/`match` to select hardware behavior" in prompt
 
 
 def test_model_alias_sonnet_45():

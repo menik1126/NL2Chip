@@ -30,6 +30,12 @@ CVDP-style RTL translation under a small turn budget.
   nextState`, then derive and bundle all outputs outside the loop. Never return
   a packed output bundle from the same loop body that creates a register.
 
+- When a `Signal.loop` body performs arithmetic, muxing, slicing, or uses a
+  parameter-derived width, annotate the feedback argument before its value can
+  be inferred: `Signal.loop fun (q : Signal dom (BitVec W)) => ...`. Give the
+  initial register payload and every reset literal the same explicit width.
+  An unannotated loop state can leave its `DomainConfig` as a metavariable, so
+  later expressions such as `q + BitVec.ofNat W 1` will not elaborate.
 ## Native P3 Symbolic Parameters
 
 When the contract says Native Parameter Sweep (P3), this section overrides the
@@ -56,6 +62,11 @@ with its default, enumerate the public cases, or branch on a parameter value.
 
 - Synthesize exactly the same generic top with one default binding.
 
+- Do not use Lean `if`/`match` to select hardware behavior from a retained Nat
+  parameter (for example `if WIDTH % 8 == 0 then ...`). It is evaluated only
+  at Lean elaboration and would freeze the default case. Instead express one
+  generic datapath valid for every public sweep configuration; state any
+  required parameter constraint in a comment only.
 Verified non-evaluation pattern:
 
   def exampleNativeXor {dom : DomainConfig} {WIDTH : Nat}
@@ -78,6 +89,12 @@ top-level-binder error and does not form a P3 generic module.
   zext x`. Do not write `let v := zext x : Signal dom (BitVec 8)`, which Lean
   parses incorrectly in a `let` declaration.
 
+- `Signal.const` and `Signal.not` are not Sparkle APIs. Use `Signal.pure` for
+  a constant and `~~~` for Boolean inversion only when the operand is a
+  `Signal dom Bool`; otherwise choose an explicitly typed `Signal.mux`.
+- `sorry`, `admit`, and unfinished helper stubs are invalid generated hardware.
+  If a generic task needs a helper, finish it and Lean-check the complete top
+  before requesting synthesis.
 ## Fixed Verified Examples (non-CVDP evaluation examples)
 
 ### Combinational logic and multiple output ports
