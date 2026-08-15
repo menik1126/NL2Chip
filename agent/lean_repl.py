@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 import subprocess
@@ -19,7 +20,50 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 
-LAKE_PATH = os.environ.get("LAKE_PATH", os.path.expanduser("~/.elan/bin/lake"))
+_LAKE_FALLBACK_PATHS = (
+    Path.home() / ".elan" / "bin" / "lake",
+    # Compatibility with the original experiment environment. This is a
+    # validated fallback, never an unconditional host-specific default.
+    Path("/home/sgli/.elan/bin/lake"),
+)
+
+
+def _usable_executable(candidate: str) -> str | None:
+    """Resolve a command or path only when it names an executable file."""
+    expanded = os.path.expandvars(os.path.expanduser(candidate.strip()))
+    if not expanded:
+        return None
+    resolved = shutil.which(expanded)
+    return os.path.abspath(resolved) if resolved is not None else None
+
+
+def resolve_lake_path() -> str:
+    """Locate Lake without assuming the original experiment host's home."""
+    configured = os.environ.get("LAKE_PATH", "")
+    resolved = _usable_executable(configured)
+    if resolved is not None:
+        return resolved
+
+    resolved = shutil.which("lake")
+    if resolved is not None:
+        return os.path.abspath(resolved)
+
+    for fallback in _LAKE_FALLBACK_PATHS:
+        resolved = _usable_executable(str(fallback))
+        if resolved is not None:
+            return resolved
+
+    configured_detail = (
+        f" LAKE_PATH={configured!r} is not executable."
+        if configured.strip()
+        else ""
+    )
+    raise RuntimeError(
+        "Unable to locate an executable Lake binary."
+        f"{configured_detail} Set LAKE_PATH to an executable path or add "
+        "`lake` to PATH."
+    )
+
 
 SPARKLE_PRELUDE = """\
 import Sparkle
@@ -131,6 +175,7 @@ class LeanREPL:
         self.project_dir = Path(project_dir).resolve()
         self.timeout = timeout
         self.prelude = prelude
+        self.lake_path = resolve_lake_path()
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()  # protects _proc access
         self._prelude_env: int | None = None
@@ -141,7 +186,7 @@ class LeanREPL:
         """Start (or restart) the REPL subprocess."""
         self._close_proc()
         self._proc = subprocess.Popen(
-            [LAKE_PATH, "exe", "repl"],
+            [self.lake_path, "exe", "repl"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

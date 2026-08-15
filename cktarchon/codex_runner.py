@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,7 +12,16 @@ from .env import ensure_runtime_env
 from .logs import AgentStats, append_jsonl, parse_agent_log
 from .responses_chat_proxy import DEFAULT_BASE_URL_ENV, DEFAULT_KEY_ENV, auto_proxy_env
 
-DEFAULT_ARCHON_SRC = Path("/home/sgli/work/archon-official/src")
+BUDGET_ACCOUNTING_NOTE = (
+    "Codex was cancelled at its bounded action limit; final provider usage may be unavailable."
+)
+
+
+@dataclass(frozen=True)
+class _BudgetLogState:
+    counted_events: int = 0
+    in_flight_tool_calls: int = 0
+    saw_session_end: bool = False
 
 
 @dataclass
@@ -30,7 +39,7 @@ class CodexAgentHarnessRunner:
     role: str
     log_base: Path
     system_prompt: str
-    archon_src: Path = DEFAULT_ARCHON_SRC
+    archon_src: Path | str | None = None
     codex_bin: str | None = None
     effort: str | None = None
     sandbox: str = "danger-full-access"
@@ -41,6 +50,7 @@ class CodexAgentHarnessRunner:
     wire_api: str = "responses"
     auto_chat_proxy: bool = True
     chat_proxy_timeout_s: float = 300.0
+    budget_poll_interval_s: float = 0.1
 
     @property
     def log_path(self) -> Path:
@@ -73,6 +83,8 @@ class CodexAgentHarnessRunner:
                     },
                 )
 
+            ok = False
+            run_error: Exception | None = None
             raw: dict[str, object] = {}
             if codex_bin:
                 raw["bin"] = codex_bin
@@ -98,28 +110,72 @@ class CodexAgentHarnessRunner:
             )
             monitor.start()
             try:
-                ok = agent.run(
-                    full_prompt,
-                    cwd=self.project_root,
-                    log_base=self.log_base,
-                    env_overrides=env_overrides,
-                    idle_timeout_s=self.idle_timeout_s,
-                    max_attempts=self.max_attempts,
-                    cancel_event=cancel_event,
-                )
+                try:
+                    ok = agent.run(
+                        full_prompt,
+                        cwd=self.project_root,
+                        log_base=self.log_base,
+                        env_overrides=env_overrides,
+                        idle_timeout_s=self.idle_timeout_s,
+                        max_attempts=self.max_attempts,
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    run_error = exc
             finally:
                 cancel_event.set()
                 monitor.join(timeout=5)
+
+        budget_exhausted = self._budget_exceeded_logged()
+        if budget_exhausted:
+            append_jsonl(
+                self.log_path,
+                {
+                    "event": "cktarchon_accounting_incomplete",
+                    "runner": "codex-agent",
+                    "prob_id": self.prob_id,
+                    "detail": BUDGET_ACCOUNTING_NOTE,
+                },
+            )
         stats = parse_agent_log(self.log_path)
-        if not ok:
-            if self._budget_exceeded_logged():
-                append_jsonl(self.log_path, {
+
+        if budget_exhausted:
+            if self._candidate_available():
+                append_jsonl(
+                    self.log_path,
+                    {
+                        "event": "cktarchon_bounded_completion",
+                        "runner": "codex-agent",
+                        "prob_id": self.prob_id,
+                        "max_turns": max_turns,
+                        "candidate": str(self._candidate_path()),
+                        "detail": (
+                            "bounded generation completed at the action budget; "
+                            "the outer evaluator will check the retained candidate"
+                        ),
+                    },
+                )
+                return stats
+            append_jsonl(
+                self.log_path,
+                {
                     "event": "cktarchon_error",
                     "runner": "codex-agent",
                     "prob_id": self.prob_id,
-                    "detail": f"official Archon CodexAgent stopped after CktArchon max-turns budget {max_turns}",
-                })
-                raise RuntimeError(f"official Archon CodexAgent exceeded max-turns budget {max_turns}")
+                    "detail": (
+                        f"official Archon CodexAgent exhausted max-turns budget {max_turns} "
+                        "without creating a non-empty candidate"
+                    ),
+                },
+            )
+            raise RuntimeError(
+                f"official Archon CodexAgent exhausted max-turns budget {max_turns} "
+                f"without creating Generated/{self.prob_id}.lean"
+            )
+
+        if run_error is not None:
+            raise run_error.with_traceback(run_error.__traceback__)
+        if not ok:
             append_jsonl(self.log_path, {
                 "event": "cktarchon_error",
                 "runner": "codex-agent",
@@ -133,12 +189,27 @@ class CodexAgentHarnessRunner:
         return self.auto_chat_proxy and self.wire_api == "responses" and not self.base_url_env
 
     def _ensure_archon_importable(self) -> None:
-        if str(self.archon_src) not in sys.path:
-            sys.path.insert(0, str(self.archon_src))
+        configured = self.archon_src or os.environ.get("ARCHON_SRC")
+        if not configured:
+            raise RuntimeError(
+                "official Archon source is not configured for the codex-agent harness; "
+                "pass --archon-src PATH or set ARCHON_SRC"
+            )
+        source = Path(configured).expanduser().resolve()
+        if not source.is_dir():
+            raise RuntimeError(
+                f"official Archon src directory does not exist: {source}; "
+                "pass --archon-src PATH or set ARCHON_SRC"
+            )
+        self.archon_src = source
+        if str(source) not in sys.path:
+            sys.path.insert(0, str(source))
         try:
             import archon.agents.codex  # noqa: F401
         except Exception as exc:
-            raise RuntimeError(f"official Archon CodexAgent import failed from {self.archon_src}: {exc}") from exc
+            raise RuntimeError(
+                f"official Archon CodexAgent import failed from {source}: {exc}"
+            ) from exc
 
     def _resolve_codex_bin(self) -> str:
         if self.codex_bin:
@@ -154,14 +225,62 @@ class CodexAgentHarnessRunner:
             "Install Codex CLI/Node on this host, or use --harness anthropic-api for Claude API runs."
         )
 
+    def _candidate_path(self) -> Path:
+        return self.project_root / "Generated" / f"{self.prob_id}.lean"
+
+    def _candidate_available(self) -> bool:
+        try:
+            return bool(self._candidate_path().read_text(errors="replace").strip())
+        except OSError:
+            return False
+
     def _budget_exceeded_logged(self) -> bool:
         try:
             for line in self.log_path.read_text(errors="replace").splitlines():
-                if '"event": "cktarchon_budget_exceeded"' in line:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (row.get("event") or row.get("type")) == "cktarchon_budget_exceeded":
                     return True
         except OSError:
             return False
         return False
+
+    def _budget_log_state(self) -> _BudgetLogState:
+        counted_events = 0
+        in_flight_tool_calls = 0
+        saw_session_end = False
+        with self.log_path.open(errors="replace") as log_file:
+            for line in log_file:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event = row.get("event") or row.get("type")
+                if event == "session_end":
+                    saw_session_end = True
+                elif event == "text":
+                    counted_events += 1
+                elif event == "tool_call":
+                    counted_events += 1
+                    # Archon's normalized TodoWrite item is logged only as a
+                    # tool_call, even after completion; it intentionally has
+                    # no tool_result row. It is bookkeeping rather than a
+                    # subprocess/file mutation, so it must not hold the safe
+                    # stop boundary open forever.
+                    tool_name = str(row.get("tool") or row.get("name") or "").lower()
+                    if tool_name != "todowrite":
+                        in_flight_tool_calls += 1
+                elif event == "tool_result":
+                    in_flight_tool_calls = max(0, in_flight_tool_calls - 1)
+        return _BudgetLogState(
+            counted_events=counted_events,
+            in_flight_tool_calls=in_flight_tool_calls,
+            saw_session_end=saw_session_end,
+        )
 
     def _watch_turn_budget(self, max_turns: int, cancel_event: threading.Event) -> None:
         """Cancel Codex once the normalized Archon event budget is exhausted.
@@ -174,40 +293,38 @@ class CodexAgentHarnessRunner:
         """
         if max_turns <= 0:
             return
-        emitted = False
         while not cancel_event.is_set():
-            count = 0
-            saw_end = False
             try:
-                with self.log_path.open(errors="replace") as f:
-                    for line in f:
-                        if not line.strip():
-                            continue
-                        if '"event": "session_end"' in line:
-                            saw_end = True
-                        if '"event": "text"' in line or '"event": "tool_call"' in line:
-                            count += 1
+                state = self._budget_log_state()
             except OSError:
-                time.sleep(1.0)
+                cancel_event.wait(self.budget_poll_interval_s)
                 continue
-            if saw_end:
+            if state.saw_session_end:
                 return
-            if count >= max_turns:
-                if not emitted:
-                    append_jsonl(
-                        self.log_path,
-                        {
-                            "event": "cktarchon_budget_exceeded",
-                            "runner": "codex-agent",
-                            "prob_id": self.prob_id,
-                            "max_turns": max_turns,
-                            "counted_events": count,
-                        },
-                    )
-                    emitted = True
+            if state.counted_events >= max_turns:
+                # A tool_call entry is a started boundary. Cancelling there can
+                # kill an editor or compiler mid-write. Allow every started tool
+                # to produce its result, then stop at the first observable
+                # quiescent boundary. Small budget overshoot is preferable to
+                # corrupting the retained candidate.
+                if state.in_flight_tool_calls:
+                    cancel_event.wait(self.budget_poll_interval_s)
+                    continue
+                append_jsonl(
+                    self.log_path,
+                    {
+                        "event": "cktarchon_budget_exceeded",
+                        "runner": "codex-agent",
+                        "prob_id": self.prob_id,
+                        "max_turns": max_turns,
+                        "counted_events": state.counted_events,
+                        "in_flight_tool_calls": 0,
+                        "safe_boundary": True,
+                    },
+                )
                 cancel_event.set()
                 return
-            time.sleep(2.0)
+            cancel_event.wait(self.budget_poll_interval_s)
 
     def _codex_prompt(self, prompt: str, *, max_turns: int) -> str:
         return (

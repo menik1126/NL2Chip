@@ -118,6 +118,9 @@ jobs:
     - name: Run Verilog generation tests
       run: lake exe verilog-tests
 
+    - name: Run hardware-let provenance tests
+      run: lake exe provenance-tests
+
     - name: Run Compiler improvement tests (complement, lambda, hw_let)
       run: lake env lean Tests/CompilerTests.lean
 

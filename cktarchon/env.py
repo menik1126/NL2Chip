@@ -1,7 +1,17 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
+
+
+def _usable_executable(candidate: str) -> str | None:
+    """Resolve a command or path only when it names an executable file."""
+    expanded = os.path.expandvars(os.path.expanduser(candidate.strip()))
+    if not expanded:
+        return None
+    resolved = shutil.which(expanded)
+    return os.path.abspath(resolved) if resolved is not None else None
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -38,8 +48,11 @@ def model_alias(name: str) -> str:
 def ensure_runtime_env() -> None:
     """Expose Lean/Lake binaries used by the H20 NL2Chip experiments."""
     project_root = Path(__file__).resolve().parents[1]
+    configured_lake = _usable_executable(os.environ.get("LAKE_PATH", ""))
+    path_lake = shutil.which("lake")
     prefixes = [
         str(project_root / ".venv" / "bin"),
+        str(Path.home() / ".elan" / "bin"),
         "/home/sgli/.elan/bin",
         "/home/sgli/.elan/toolchains/leanprover--lean4---v4.28.0-rc1/bin",
         "/home/sgli/work/toolcache/iverilog_deb/extract/usr/bin",
@@ -52,4 +65,11 @@ def ensure_runtime_env() -> None:
         if Path(prefix).exists() and prefix not in parts:
             parts.insert(0, prefix)
     os.environ["PATH"] = os.pathsep.join(parts)
-    os.environ.setdefault("LAKE_PATH", "/home/sgli/.elan/bin/lake")
+
+    # Preserve a caller-provided LAKE_PATH only when it is usable. Historical
+    # launchers injected an H20-specific path that masked Lake on other hosts.
+    discovered_lake = configured_lake or path_lake or shutil.which("lake")
+    if discovered_lake is not None:
+        os.environ["LAKE_PATH"] = os.path.abspath(discovered_lake)
+    else:
+        os.environ.pop("LAKE_PATH", None)

@@ -41,13 +41,29 @@ def cmd_eval(args: argparse.Namespace) -> None:
     _agent_path()
     from dataset import Dataset
     from evaluator import Evaluator
+    import search
 
     load_env_file(PROJECT_ROOT / "key.env")
     ds = Dataset(args.dataset, project_root=PROJECT_ROOT)
     evaluator = Evaluator(project_root=PROJECT_ROOT, dataset=args.dataset, dataset_obj=ds)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(json.dumps(evaluator.evaluate(args.prob_id, run_dir), indent=2, default=str))
+    info = ds.load_problem(args.prob_id)
+    benchmark_port_resolver = getattr(search, "_benchmark_expected_ports", None)
+    benchmark_ports = (
+        benchmark_port_resolver(info) if benchmark_port_resolver is not None else None
+    )
+    if benchmark_ports is None:
+        result = evaluator.evaluate(args.prob_id, run_dir)
+    else:
+        result = evaluator.evaluate(
+            args.prob_id, run_dir, benchmark_ports=benchmark_ports
+        )
+    print(json.dumps(
+        result,
+        indent=2,
+        default=str,
+    ))
 
 
 def main() -> None:

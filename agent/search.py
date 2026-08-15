@@ -41,12 +41,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 from coding_agent import CodingAgent, create_message_with_retries, load_env
 from dataset import Dataset, ProblemInfo
 from evaluator import (
+    CVDP_ADAPTER_ERROR,
     CVDP_PARAMETERIZATION_UNSUPPORTED,
     Evaluator,
+    _cvdp_derived_reference_parameter_names,
     _cvdp_exact_parameter_sweep_plan,
     _cvdp_parameter_overrides,
+    _cvdp_required_benchmark_parameter_names,
+    _module_body_localparameter_declarations,
+    _module_localparameters,
     _module_parameters,
+    _module_records,
     _rename_module_declaration,
+    _strip_sv_comments,
     parse_module_ports,
 )
 try:
@@ -360,38 +367,173 @@ def _cvdp_parse_parameter_sweeps(
 
 
 def _parse_cvdp_harness_usage(harness_files: dict) -> dict[str, set[str]]:
-    py_text = "\n\n".join(
-        str(content) for path, content in harness_files.items() if str(path).endswith(".py")
-    )
-    id_names = set(re.findall(r"\bdut\._id\s*\(\s*[\"']([A-Za-z_]\w*)[\"']", py_text))
-    indexed_names = set(re.findall(r"\bdut\s*\[\s*[\"']([A-Za-z_]\w*)[\"']\s*\]", py_text))
-    all_names = (
-        set(re.findall(r"\bdut\.([A-Za-z_]\w*)\b", py_text))
-        | id_names
-        | indexed_names
-    ) - {"_log", "_id"}
-    assigned = set(re.findall(r"\bdut\.([A-Za-z_]\w*)\.value\s*=(?!=)", py_text))
-    assigned.update(
-        re.findall(r"\bdut\._id\s*\(\s*[\"']([A-Za-z_]\w*)[\"'][^)]*\)\.value\s*=(?!=)", py_text)
-    )
-    assigned.update(
-        re.findall(r"\bdut\s*\[\s*[\"']([A-Za-z_]\w*)[\"']\s*\]\.value\s*=(?!=)", py_text)
-    )
-    clocked = set(re.findall(r"\bClock\s*\(\s*dut\.([A-Za-z_]\w*)\b", py_text))
-
+    """Extract real cocotb DUT uses without scanning comments or strings."""
+    all_names: set[str] = set()
+    direct_names: set[str] = set()
+    assigned: set[str] = set()
+    clocked: set[str] = set()
     params: set[str] = set()
-    for body in re.findall(r"\b(?:parameter|parameters)\s*=\s*\{([^}]+)\}", py_text):
-        params.update(re.findall(r"[\"']([A-Za-z_]\w*)[\"']\s*:", body))
 
+    def direct_handle_name(node: ast.AST) -> str | None:
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "dut"
+            and node.attr not in {"_log", "_id"}
+        ):
+            return node.attr
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "dut"
+        ):
+            try:
+                name = ast.literal_eval(node.slice)
+            except Exception:
+                return None
+            return name if isinstance(name, str) and re.fullmatch(r"[A-Za-z_]\w*", name) else None
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "dut"
+            and node.func.attr == "_id"
+            and node.args
+        ):
+            try:
+                name = ast.literal_eval(node.args[0])
+            except Exception:
+                return None
+            return name if isinstance(name, str) and re.fullmatch(r"[A-Za-z_]\w*", name) else None
+        return None
+
+    def dict_parameter_names(node: ast.AST) -> set[str]:
+        if not isinstance(node, ast.Dict):
+            return set()
+        result: set[str] = set()
+        for key in node.keys:
+            if key is None:
+                continue
+            try:
+                name = ast.literal_eval(key)
+            except Exception:
+                continue
+            if isinstance(name, str) and re.fullmatch(r"[A-Za-z_]\w*", name):
+                result.add(name)
+        return result
+
+    for path, content in harness_files.items():
+        if not str(path).endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(textwrap.dedent(str(content)))
+        except SyntaxError:
+            continue
+
+        parameter_dicts: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = dict_parameter_names(value)
+                for target in targets:
+                    if isinstance(target, ast.Name) and names:
+                        parameter_dicts[target.id] = names
+                        if target.id.lower() in {"parameter", "parameters"}:
+                            params.update(names)
+
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "dut"
+                and node.attr not in {"_log", "_id"}
+            ):
+                all_names.add(node.attr)
+            elif isinstance(node, (ast.Subscript, ast.Call)):
+                name = direct_handle_name(node)
+                if name:
+                    all_names.add(name)
+
+            if isinstance(node, ast.Attribute) and node.attr == "value":
+                name = direct_handle_name(node.value)
+                if name:
+                    direct_names.add(name)
+
+            if isinstance(node, ast.Call):
+                func_name = (
+                    node.func.attr if isinstance(node.func, ast.Attribute)
+                    else node.func.id if isinstance(node.func, ast.Name)
+                    else ""
+                )
+                for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                    name = direct_handle_name(argument)
+                    if name:
+                        direct_names.add(name)
+                        if func_name == "Clock":
+                            clocked.add(name)
+                for keyword in node.keywords:
+                    if keyword.arg not in {"parameter", "parameters"}:
+                        continue
+                    names = dict_parameter_names(keyword.value)
+                    if isinstance(keyword.value, ast.Name):
+                        names.update(parameter_dicts.get(keyword.value.id, set()))
+                    params.update(names)
+
+            targets: list[ast.AST] = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            elif isinstance(node, ast.AugAssign):
+                targets = [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and target.attr == "value":
+                    name = direct_handle_name(target.value)
+                    if name:
+                        assigned.add(name)
+
+    all_names.difference_update({"_log", "_id"})
+    direct_names.difference_update({"_log", "_id"})
     reset_like = {name for name in all_names if _port_kind(name) == "reset"}
     clock_like = {name for name in all_names if _port_kind(name) == "clock"}
     inputs = (assigned | clocked | reset_like | clock_like) - params
     ports = all_names - params
     return {
         "ports": ports,
+        "direct_ports": direct_names - params,
         "inputs": inputs & ports,
         "outputs": ports - inputs,
         "params": params,
+    }
+
+
+def _module_internal_signal_names(sv_code: str, module_name: str) -> set[str]:
+    """Return identifiers already owned by the exact baseline module body.
+
+    SystemVerilog permits internal objects with builtin, typedef, enum, struct,
+    interface, and user-defined types. Conservatively treating every body
+    identifier as baseline-owned avoids promoting any of those cocotb-visible
+    hierarchy handles to a top-level port. An explicit prompt declaration can
+    still promote a name because the merge subtracts ``explicit_names``.
+    """
+    record = next(
+        (candidate for candidate in _module_records(sv_code) if candidate[0] == module_name),
+        None,
+    )
+    if record is None:
+        return set()
+    body = _strip_sv_comments(record[2])
+    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", body))
+
+
+def _module_nonport_constant_names(sv_code: str, module_name: str) -> set[str]:
+    return {
+        parameter.name
+        for parameter in (
+            *_module_localparameters(sv_code, module_name),
+            *_module_body_localparameter_declarations(sv_code, module_name),
+        )
     }
 
 
@@ -479,7 +621,7 @@ def _format_port(direction: str, typ: str, name: str, reset_polarities: dict[str
 
 def _clean_prompt_cell(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", str(text))
-    text = text.replace("`", "").replace("**", "")
+    text = text.replace("`", "").replace("**", "").replace("__", "")
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -488,7 +630,13 @@ def _prompt_size_to_type(size_text: str) -> str:
     size = _clean_prompt_cell(size_text)
     if not size:
         return "logic"
+    packed = re.fullmatch(r"\[\s*(.+?)\s*\]", size)
+    if packed:
+        return f"logic [{packed.group(1)}]"
     lower = size.lower()
+    if size.isdigit():
+        width = int(size)
+        return "logic" if width <= 1 else f"logic [{width - 1}:0]"
     if re.search(r"\b1\s*-?\s*(?:bit|bits?)?\b", lower) and not re.search(r"[\w$]\s*[*+:-]", size):
         return "logic"
     m = re.search(r"\b(\d+)\s*-?\s*(?:bit|bits?)\b", lower)
@@ -502,117 +650,389 @@ def _prompt_size_to_type(size_text: str) -> str:
     return f"logic [{expr}-1:0]"
 
 
-def _prompt_heading(line: str) -> tuple[bool, str]:
-    stripped = str(line or "").strip()
-    heading = _clean_prompt_cell(stripped).lower().strip("# :-")
-    is_heading = stripped.startswith("#") or bool(
-        re.fullmatch(r"(?:inputs?|outputs?|parameters?)", heading)
+def _normalize_prompt_heading(text: str) -> str:
+    heading = _clean_prompt_cell(text).strip().strip("# :-")
+    heading = re.sub(r"^\d+\s*[.)]\s*", "", heading)
+    return re.sub(r"\s+", " ", heading).strip().lower()
+
+
+def _prompt_section_kind(heading: str) -> str | None:
+    normalized = _normalize_prompt_heading(heading)
+    if re.fullmatch(
+        r"(?:(?:module|design)\s+)?parameters?|parameter (?:table|definitions?)|parameterization",
+        normalized,
+    ):
+        return "parameter"
+    if re.fullmatch(r"inputs?|input (?:signals?|ports?)", normalized):
+        return "input"
+    if re.fullmatch(r"outputs?|output (?:signals?|ports?)", normalized):
+        return "output"
+    return None
+
+
+def _prompt_interface_container(heading: str) -> bool:
+    normalized = _normalize_prompt_heading(heading)
+    return bool(
+        re.fullmatch(
+            r"(?:module )?interface(?: specifications?)?|"
+            r"interface of (?:the )?module(?: .+)?|design specifications?|i/o ports?",
+            normalized,
+        )
     )
-    return is_heading, heading
+
+
+def _prompt_excluded_section(heading: str) -> bool:
+    """Return whether a section contains examples rather than declarations."""
+    normalized = _normalize_prompt_heading(heading)
+    return bool(
+        re.search(
+            r"\b(?:examples?|computations?(?: steps?)?|waveforms?|wave diagrams?|"
+            r"timing diagrams?|test vectors?)\b|"
+            r"^sample (?:operation|usage|values?)\b|"
+            r"^(?:expected|observed) (?:values?|results?)\b",
+            normalized,
+        )
+    )
+
+
+def _prompt_heading_info(line: str) -> tuple[int | None, str]:
+    """Parse markdown and CVDP's bold/numbered pseudo-headings."""
+    stripped = str(line or "").strip()
+    markdown = re.match(r"^(#{1,6})\s*(.*?)\s*#*\s*$", stripped)
+    if markdown:
+        return len(markdown.group(1)), _normalize_prompt_heading(markdown.group(2))
+
+    list_item = bool(re.match(r"^(?:[-*+]|\d+[.)])\s+", stripped))
+    body = re.sub(r"^(?:(?:[-*+]|\d+[.)])\s+)", "", stripped)
+    bold_match = re.fullmatch(r"(?:\*\*|__)(.*?)(?:\*\*|__)\s*:?", body)
+    candidate = bold_match.group(1) if bold_match else body
+    normalized = _normalize_prompt_heading(candidate)
+    if _prompt_section_kind(normalized) or _prompt_interface_container(normalized):
+        return 7, normalized
+    standalone_heading = (
+        bold_match is not None
+        or (not list_item and len(stripped) <= 120 and stripped.rstrip().endswith(":"))
+    )
+    if standalone_heading and _prompt_excluded_section(normalized):
+        return 7, normalized
+    return None, normalized
+
+
+def _prompt_heading(line: str) -> tuple[bool, str]:
+    level, heading = _prompt_heading_info(line)
+    return level is not None, heading
 
 
 def _parse_prompt_declaration(text: str) -> tuple[str, str] | None:
-    declaration = _clean_prompt_cell(text)
-    match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)\s*(\[[^\]]+\])\s*$", declaration)
+    declaration = _clean_prompt_cell(text).strip().rstrip(":;,.")
+    declaration = re.sub(r"^(?:input|output|inout)\s+", "", declaration, flags=re.IGNORECASE)
+    if "=" in declaration or re.search(r"\b\d+\s*'[sS]?[bBoOdDhH]", declaration):
+        return None
+
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_$]*)\s*\((.*?)\)", declaration)
+    if match:
+        name, size = match.groups()
+        packed_range = re.search(r"\[[^\]]+\]", size)
+        return (f"logic {packed_range.group(0)}" if packed_range else "logic"), name
+
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_$]*)\s*(\[[^\]]+\])", declaration)
     if match:
         name, packed_range = match.groups()
         return f"logic {packed_range}", name
-    match = re.search(r"(?:(\[[^\]]+\])\s*)?([A-Za-z_][A-Za-z0-9_$]*)\s*$", declaration)
-    if not match:
+
+    match = re.fullmatch(r"(\[[^\]]+\])\s*([A-Za-z_][A-Za-z0-9_$]*)", declaration)
+    if match:
+        packed_range, name = match.groups()
+        return f"logic {packed_range}", name
+
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_$]*)", declaration)
+    return ("logic", match.group(1)) if match else None
+
+
+def _prompt_list_body(raw_line: str) -> str | None:
+    match = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(.*?)\s*$", raw_line)
+    return match.group(1) if match else None
+
+
+def _prompt_list_declaration(
+    body: str,
+    *,
+    allow_bare: bool = False,
+) -> tuple[str, str] | None:
+    """Return a strongly marked declaration fragment and its description."""
+    patterns = (
+        r"^(?:\*\*|__)(.*?)(?:\*\*|__)\s*:?(.*)$",
+        r"^`([^`]+)`\s*:?(.*)$",
+        r"^([A-Za-z_][A-Za-z0-9_$]*(?:\s*\([^)]*\)|\s*\[[^\]]+\])?|"
+        r"\[[^\]]+\]\s*[A-Za-z_][A-Za-z0-9_$]*)\s*:(.*)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, body)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+    if allow_bare:
+        return body.strip(), ""
+    return None
+
+
+def _prompt_description_is_example_value(text: str) -> bool:
+    cleaned = _clean_prompt_cell(text).strip()
+    literal_suffix = (
+        r"(?:\s*\([^)]*\)|"
+        r"\s+(?:cycles?|clocks?|ticks?|ns|us|ms|seconds?))?[.;]?"
+    )
+    return bool(
+        re.match(
+            r"^(?:=\s*)?(?:\d+\s*)?'[sS]?[bBoOdDhH][0-9a-fA-F_xXzZ?]+\b",
+            cleaned,
+        )
+        or re.fullmatch(rf"[+-]?\d+(?:\.\d+)?{literal_suffix}", cleaned)
+        or re.fullmatch(rf"[+-]?0[xX][0-9a-fA-F_]+{literal_suffix}", cleaned)
+        or re.fullmatch(rf"[+-]?0[bB][01_]+{literal_suffix}", cleaned)
+        or re.fullmatch(rf"[+-]?0[oO][0-7_]+{literal_suffix}", cleaned)
+        or re.fullmatch(rf"'[01xXzZ]{literal_suffix}", cleaned)
+        or re.fullmatch(
+            rf"(?:true|false|null|none){literal_suffix}",
+            cleaned,
+            re.IGNORECASE,
+        )
+        or re.fullmatch(r"[\"'].*[\"']", cleaned)
+        or re.match(r"^[A-Za-z_][A-Za-z0-9_$]*\s*=", cleaned)
+    )
+
+
+def _prompt_width_from_text(
+    text: str,
+    *,
+    known_symbols: set[str] | None = None,
+) -> str | None:
+    raw = str(text or "")
+    cleaned = _clean_prompt_cell(text)
+    packed_range = re.search(r"\[[^\]]*:[^\]]*\]", cleaned)
+    if packed_range:
+        return _prompt_size_to_type(packed_range.group(0))
+    defined_range = re.search(
+        r"\b(?:defined|sized|declared)\s+as\s+(\[[^\]]+\])",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if defined_range:
+        return _prompt_size_to_type(defined_range.group(1))
+    parenthesized = re.search(
+        r"\(\s*([^()]{1,96}?)\s*-?\s*bits?\s*\)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if parenthesized:
+        width = parenthesized.group(1).strip()
+        identifiers = set(re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*", width))
+        quoted = set(re.findall(r"`([A-Za-z_$][A-Za-z0-9_$]*)`", raw))
+        if width.isdigit() or (
+            identifiers
+            and identifiers <= (known_symbols or set()) | quoted
+        ):
+            return _prompt_size_to_type(width)
+    immediate = re.match(
+        r"^\s*(\d+|[A-Za-z_$][A-Za-z0-9_$]*(?:\s*[*+\-/]\s*[A-Za-z0-9_$()]+)*)\s*-?\s*bits?\b",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if immediate:
+        width = immediate.group(1).strip()
+        identifiers = set(re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*", width))
+        quoted = set(re.findall(r"`([A-Za-z_$][A-Za-z0-9_$]*)`", raw))
+        if width.isdigit() or (
+            identifiers
+            and identifiers <= (known_symbols or set()) | quoted
+        ):
+            return _prompt_size_to_type(width)
+    return None
+
+
+def _prompt_parameter_from_body(
+    body: str,
+    *,
+    allow_bare: bool = False,
+) -> str | None:
+    declaration = _prompt_list_declaration(body, allow_bare=allow_bare)
+    candidate = declaration[0] if declaration else ""
+    if not candidate:
+        default_sentence = re.match(
+            r"^The\s+default\s+value\s+of\s+`([A-Za-z_][A-Za-z0-9_$]*)`(?![A-Za-z0-9_$])",
+            body,
+            re.IGNORECASE,
+        )
+        candidate = default_sentence.group(1) if default_sentence else ""
+    candidate = _clean_prompt_cell(candidate).strip().rstrip(":")
+    candidate = re.sub(
+        r"^(?:parameter|localparam)(?:\s+(?:int|integer|logic))?\s+",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    if "=" in candidate:
         return None
-    packed_range, name = match.groups()
-    typ = f"logic {packed_range}" if packed_range else "logic"
-    return typ, name
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_$]*)", candidate)
+    return match.group(1) if match else None
 
 
-def _parse_parameters_from_prompt(prompt_text: str) -> set[str]:
-    """Extract public module-parameter names from markdown tables and bullets."""
-    parameters: set[str] = set()
-    in_parameters = False
-    for raw_line in str(prompt_text or "").splitlines():
-        line = raw_line.strip()
-        is_heading, heading = _prompt_heading(line)
-        if is_heading:
-            in_parameters = bool(
-                re.fullmatch(
-                    r"(?:(?:module|design)\s+)?parameters?|parameter table",
-                    heading,
-                )
-            )
-            continue
-        if not in_parameters:
-            continue
-
-        candidate = ""
-        if "|" in line:
-            cells = [_clean_prompt_cell(cell) for cell in line.strip("|").split("|")]
-            cells = [cell for cell in cells if cell]
-            if not cells:
-                continue
-            candidate = cells[0]
-            if candidate.lower() in {"parameter", "name"} or re.match(r"^:?-{2,}:?$", candidate):
-                continue
-        else:
-            bullet = re.match(r"^\s*[-*+]\s+(?:\*\*)?`([^`]+)`", raw_line)
-            if not bullet:
-                continue
-            candidate = bullet.group(1)
-
-        names = re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", candidate)
-        names = [name for name in names if name.lower() not in {"parameter", "int", "integer", "logic"}]
-        if names:
-            parameters.add(names[-1])
-    return parameters
+def _prompt_parameter_is_derived(text: str) -> bool:
+    cleaned = _clean_prompt_cell(text)
+    return bool(
+        re.search(
+            r"\b(?:dynamically\s+)?calculated\b|"
+            r"\bcalculate(?:s|d)?\s+the\s+(?:width|number|size)\b|"
+            r"\b(?:derived|computed)\s+from\b",
+            cleaned,
+            re.IGNORECASE,
+        )
+    )
 
 
-def _apply_prompt_parameters(
-    harness_usage: dict[str, set[str]], prompt_text: str
-) -> dict[str, set[str]]:
-    usage = {key: set(values) for key, values in harness_usage.items()}
-    usage.setdefault("params", set()).update(_parse_parameters_from_prompt(prompt_text))
-    for key in ("ports", "inputs", "outputs"):
-        usage.setdefault(key, set()).difference_update(usage["params"])
-    return usage
+@dataclass
+class _PromptInterface:
+    ports: list[tuple[str, str, str]] = field(default_factory=list)
+    parameters: set[str] = field(default_factory=set)
+    derived_parameters: set[str] = field(default_factory=set)
+    complete_directions: set[str] = field(default_factory=set)
 
 
-def _parse_ports_from_prompt(prompt_text: str) -> list[tuple[str, str, str]]:
-    """Extract benchmark-declared ports from CVDP markdown tables and bullets.
-
-    This intentionally reads only public problem text, not hidden simulator
-    assertions. It is used when CVDP has no public reference RTL.
-    """
-    ports: list[tuple[str, str, str]] = []
-    direction_table_ports: list[tuple[str, str, str]] = []
-    direction: str | None = None
-    seen: set[tuple[str, str]] = set()
-    direction_table_seen: set[tuple[str, str]] = set()
+def _parse_prompt_interface(prompt_text: str) -> _PromptInterface:
+    """Parse only declarative interface sections from a CVDP prompt."""
+    result = _PromptInterface()
+    port_index: dict[str, int] = {}
+    port_priority: dict[str, int] = {}
+    section: str | None = None
+    blocked_level: int | None = None
     table_header: list[str] | None = None
+    last_port: str | None = None
+    last_parameter: str | None = None
+    in_fence = False
+    pseudo_excluded = False
+    nearest_markdown_heading = ""
+    non_signal_labels = {
+        "action", "behavior", "check", "computation", "description",
+        "implementation", "initialization", "purpose", "transition", "update",
+    }
+
+    def add_port(direction: str, typ: str, name: str, priority: int) -> None:
+        if (
+            not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", name)
+            or name.lower() in non_signal_labels
+        ):
+            return
+        entry = (direction, typ or "logic", name)
+        if name in port_index:
+            if priority < port_priority[name]:
+                return
+            result.ports[port_index[name]] = entry
+            port_priority[name] = priority
+            return
+        port_index[name] = len(result.ports)
+        port_priority[name] = priority
+        result.ports.append(entry)
+
     for raw_line in str(prompt_text or "").splitlines():
-        line = raw_line.strip()
-        is_heading, heading = _prompt_heading(line)
-        if is_heading:
+        stripped = raw_line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            section = None
             table_header = None
-            if re.fullmatch(r"(?:inputs?|input ports?)", heading):
-                direction = "input"
-                continue
-            if re.fullmatch(r"(?:outputs?|output ports?)", heading):
-                direction = "output"
-                continue
-            direction = None
+            last_port = None
+            last_parameter = None
             continue
-        if re.fullmatch(r"-{3,}", line):
-            direction = None
-            table_header = None
+        if in_fence:
             continue
 
-        if "|" in line:
-            cells = [_clean_prompt_cell(cell) for cell in line.strip("|").split("|")]
-            cells = [cell for cell in cells if cell]
-            if len(cells) < 2:
+        level, heading = _prompt_heading_info(raw_line)
+        markdown_heading = level is not None and level <= 6
+        if pseudo_excluded:
+            if level is not None and _prompt_interface_container(heading):
+                pseudo_excluded = False
+            else:
                 continue
-            normalized = [cell.lower() for cell in cells]
-            if all(re.fullmatch(r":?-{2,}:?", cell) for cell in normalized):
+        if markdown_heading:
+            nearest_markdown_heading = heading
+        if markdown_heading and blocked_level is not None and level <= blocked_level:
+            blocked_level = None
+        if blocked_level is not None:
+            continue
+        if level is not None and _prompt_excluded_section(heading):
+            if markdown_heading:
+                blocked_level = level
+                section = None
+                table_header = None
+                last_port = None
+                last_parameter = None
+            else:
+                raw_body = re.sub(
+                    r"^(?:(?:[-*+]|\d+[.)])\s+)",
+                    "",
+                    stripped,
+                )
+                pure_bold = bool(
+                    re.fullmatch(r"(?:\*\*|__).*?(?:\*\*|__)\s*:?", raw_body)
+                )
+                title_scope = bool(re.fullmatch(
+                    r"(?:(?:(?:usage|worked|simulation) )?"
+                    r"(?:examples?|computations?|waveforms?)|"
+                    r"for examples?)",
+                    heading,
+                ))
+                if pure_bold or title_scope:
+                    pseudo_excluded = True
+                    section = None
+                    table_header = None
+                    last_port = None
+                    last_parameter = None
+            continue
+        if level is not None:
+            kind = _prompt_section_kind(heading)
+            pseudo_in_behavior = (
+                not markdown_heading
+                and kind in {"input", "output"}
+                and bool(re.match(
+                    r"^(?:when\b|module behavior\b|behavioral\b|functional requirements?\b)",
+                    nearest_markdown_heading,
+                ))
+            )
+            if pseudo_in_behavior:
                 continue
+            if markdown_heading or kind or _prompt_interface_container(heading):
+                section = kind
+                table_header = None
+                last_port = None
+                last_parameter = None
+            if kind in {"input", "output"}:
+                result.complete_directions.add(kind)
+            continue
+
+        # Explicit modification prose is additive, not a closed-world port
+        # list. This covers prompts such as gf_mac's two new status outputs.
+        for prose in re.finditer(
+            r"\b(?:introduce|add)\s+(?:(?:a|an|another|new|additional)\s+)*"
+            r"(input|output)\s+(?:signal|port)\s*,?\s*`([A-Za-z_][A-Za-z0-9_$]*)`",
+            raw_line,
+            re.IGNORECASE,
+        ):
+            add_port(prose.group(1).lower(), "logic", prose.group(2), 0)
+
+        if "|" in stripped:
+            cells = [_clean_prompt_cell(cell) for cell in stripped.strip("|").split("|")]
+            normalized = [_normalize_prompt_heading(cell) for cell in cells]
+            if all(not cell or re.fullmatch(r":?-{2,}:?", cell) for cell in normalized):
+                continue
+
+            if section == "parameter":
+                candidate = cells[0] if cells else ""
+                if _normalize_prompt_heading(candidate) not in {"parameter", "name", "parameter name"}:
+                    name = _prompt_parameter_from_body(f"`{candidate}`:")
+                    if name:
+                        result.parameters.add(name)
+                        if _prompt_parameter_is_derived(" ".join(cells[1:])):
+                            result.derived_parameters.add(name)
+                continue
+
             if any(cell in {"direction", "dir"} for cell in normalized) and any(
                 cell in {"port", "port name", "signal", "signal name", "name"}
                 for cell in normalized
@@ -620,110 +1040,127 @@ def _parse_ports_from_prompt(prompt_text: str) -> list[tuple[str, str, str]]:
                 table_header = normalized
                 continue
             if table_header is None:
-                if normalized[0] in {"port", "port name", "signal", "signal name", "name"}:
+                if normalized and normalized[0] in {
+                    "port", "port name", "signal", "signal name", "name"
+                }:
                     table_header = normalized
                 continue
 
             def column_index(names: set[str]) -> int | None:
-                return next((idx for idx, value in enumerate(table_header or []) if value in names), None)
+                return next(
+                    (idx for idx, value in enumerate(table_header or []) if value in names),
+                    None,
+                )
 
             name_idx = column_index({"port", "port name", "signal", "signal name", "name"})
             width_idx = column_index({"width", "size", "bits", "bit width"})
             direction_idx = column_index({"direction", "dir"})
             if name_idx is None or name_idx >= len(cells):
                 continue
-            row_direction = direction
+            row_direction = section
             if direction_idx is not None and direction_idx < len(cells):
                 value = cells[direction_idx].strip().lower()
-                if value in {"input", "in"}:
-                    row_direction = "input"
-                elif value in {"output", "out"}:
-                    row_direction = "output"
-                else:
-                    continue
-            if not row_direction:
+                row_direction = (
+                    "input" if value in {"input", "in"}
+                    else "output" if value in {"output", "out"}
+                    else None
+                )
+            if row_direction not in {"input", "output"}:
                 continue
-            name = cells[name_idx].strip()
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_$]*$", name):
-                continue
-            typ = _prompt_size_to_type(cells[width_idx]) if width_idx is not None and width_idx < len(cells) else "logic"
-            target = direction_table_ports if direction_idx is not None else ports
-            target_seen = direction_table_seen if direction_idx is not None else seen
-        else:
-            if not direction:
-                continue
-            bullet = re.match(r"^\s*[-*+]\s+(?:\*\*)?`([^`]+)`", raw_line)
-            if not bullet:
-                continue
-            parsed = _parse_prompt_declaration(bullet.group(1))
+            parsed = _parse_prompt_declaration(cells[name_idx])
             if not parsed:
                 continue
-            typ, name = parsed
-            remainder = raw_line[bullet.end():]
-            explicit_width = re.search(
-                r"(?:\(|\b)(\d+)\s*-?\s*(?:bit|bits)\b",
-                remainder,
-                flags=re.IGNORECASE,
-            )
-            if explicit_width:
-                typ = _prompt_size_to_type(f"{explicit_width.group(1)} bit")
-            row_direction = direction
-            target = ports
-            target_seen = seen
-
-        key = (row_direction, name)
-        if key in target_seen:
+            embedded_typ, name = parsed
+            typ = embedded_typ
+            if width_idx is not None and width_idx < len(cells) and cells[width_idx]:
+                typ = _prompt_size_to_type(cells[width_idx])
+            add_port(row_direction, typ, name, 2)
+            result.complete_directions.add(row_direction)
+            last_port = name
             continue
-        target_seen.add(key)
-        target.append((row_direction, typ, name))
-    return direction_table_ports or ports
+
+        body = _prompt_list_body(raw_line)
+        numbered_declaration = bool(re.match(r"^\s*\d+[.)]\s+", raw_line))
+        if section == "parameter" and body is not None:
+            name = _prompt_parameter_from_body(body, allow_bare=numbered_declaration)
+            if name:
+                result.parameters.add(name)
+                last_parameter = name
+                if _prompt_parameter_is_derived(body):
+                    result.derived_parameters.add(name)
+            elif last_parameter and _prompt_parameter_is_derived(body):
+                result.derived_parameters.add(last_parameter)
+            continue
+
+        if section in {"input", "output"} and body is not None:
+            declaration = _prompt_list_declaration(
+                body,
+                allow_bare=numbered_declaration,
+            )
+            if declaration and not _prompt_description_is_example_value(declaration[1]):
+                parsed = _parse_prompt_declaration(declaration[0])
+                if parsed:
+                    typ, name = parsed
+                    described_typ = (
+                        _prompt_width_from_text(
+                            declaration[0], known_symbols=result.parameters
+                        )
+                        or _prompt_width_from_text(
+                            declaration[1], known_symbols=result.parameters
+                        )
+                    )
+                    add_port(section, described_typ if typ == "logic" and described_typ else typ, name, 1)
+                    last_port = name
+                    continue
+
+        if section in {"input", "output"} and last_port:
+            described_typ = _prompt_width_from_text(
+                raw_line, known_symbols=result.parameters
+            )
+            if described_typ and last_port in port_index:
+                idx = port_index[last_port]
+                old_direction, _, name = result.ports[idx]
+                result.ports[idx] = (old_direction, described_typ, name)
+
+    return result
+
+
+def _parse_parameters_from_prompt(prompt_text: str) -> set[str]:
+    """Extract public module-parameter names from declarative prompt sections."""
+    return _parse_prompt_interface(prompt_text).parameters
+
+
+def _apply_prompt_parameters(
+    harness_usage: dict[str, set[str]], prompt_text: str
+) -> dict[str, set[str]]:
+    usage = {key: set(values) for key, values in harness_usage.items()}
+    usage.setdefault("params", set()).update(_parse_parameters_from_prompt(prompt_text))
+    for key in ("ports", "direct_ports", "inputs", "outputs"):
+        usage.setdefault(key, set()).difference_update(usage["params"])
+    return usage
+
+
+def _parse_ports_from_prompt(prompt_text: str) -> list[tuple[str, str, str]]:
+    """Extract benchmark-declared ports from declarative prompt sections.
+
+    Example/computation/waveform sections and fenced context code are excluded;
+    they describe values and implementation details, not the public interface.
+    """
+    return _parse_prompt_interface(prompt_text).ports
 
 
 def _benchmark_expected_ports(info: ProblemInfo | None) -> list[tuple[str, str, str]]:
     if info is None:
         return []
     metadata = info.metadata or {}
-    harness_usage: dict[str, set[str]] = {"ports": set(), "inputs": set(), "outputs": set(), "params": set()}
-    if metadata.get("dataset") == "cvdp":
-        harness_files = metadata.get("harness_files", {}) or {}
-        harness_usage = _parse_cvdp_harness_usage(harness_files)
-        harness_usage = _apply_prompt_parameters(harness_usage, info.prompt_text or "")
-
-    ref_mod, ref_ports = parse_module_ports(info.ref_code or "", module_name=info.design_name or None)
-    if info.design_name and ref_mod != info.design_name:
-        ref_ports = []
-    prompt_ports = _parse_ports_from_prompt(info.prompt_text or "")
-    if ref_ports:
-        # A parsed target-module declaration is authoritative. Cocotb can also
-        # access internal hierarchy, so harness-only names are not necessarily
-        # top-level ports and must not be appended here.
-        return ref_ports
-
-    source_ports = prompt_ports
-
-    expected_ports: list[tuple[str, str, str]] = []
-    if source_ports:
-        expected_ports.extend(source_ports)
-        seen = {name for _, _, name in expected_ports}
-        for name in sorted(harness_usage["ports"] - seen):
-            direction = "input" if name in harness_usage["inputs"] or _port_kind(name) in {"clock", "reset"} else "output"
-            expected_ports.append((direction, "logic", name))
-        return expected_ports
-
-    for name in sorted(harness_usage["ports"]):
-        direction = "input" if name in harness_usage["inputs"] or _port_kind(name) in {"clock", "reset"} else "output"
-        expected_ports.append((direction, "logic", name))
-    return expected_ports
-
-
-def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
-    """Summarize benchmark-visible interface facts without including testbench source."""
-    if info is None:
-        return ""
-    metadata = info.metadata or {}
     design_name = info.design_name
-    harness_usage: dict[str, set[str]] = {"ports": set(), "inputs": set(), "outputs": set(), "params": set()}
-
+    harness_usage: dict[str, set[str]] = {
+        "ports": set(),
+        "direct_ports": set(),
+        "inputs": set(),
+        "outputs": set(),
+        "params": set(),
+    }
     if metadata.get("dataset") == "cvdp":
         harness_files = metadata.get("harness_files", {}) or {}
         env_text = str(harness_files.get("src/.env", ""))
@@ -734,9 +1171,139 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
             parameter.name
             for parameter in _module_parameters(info.ref_code or "", design_name)
         )
-        for key in ("ports", "inputs", "outputs"):
-            harness_usage[key].difference_update(harness_usage["params"])
-        param_values, param_combos = _cvdp_parse_parameter_sweeps(harness_files, harness_usage["params"])
+        for key in ("ports", "direct_ports", "inputs", "outputs"):
+            harness_usage.setdefault(key, set()).difference_update(harness_usage["params"])
+
+    ref_mod, ref_ports = parse_module_ports(
+        info.ref_code or "",
+        module_name=design_name or None,
+    )
+    if design_name and ref_mod != design_name:
+        ref_ports = []
+
+    prompt_interface = _parse_prompt_interface(info.prompt_text or "")
+    prompt_ports = prompt_interface.ports
+    explicit_names = {name for _, _, name in prompt_ports}
+    baseline_nonports = (
+        _module_internal_signal_names(info.ref_code or "", design_name)
+        | _module_nonport_constant_names(info.ref_code or "", design_name)
+    )
+    required_handles = harness_usage.get("direct_ports", set()) - (
+        baseline_nonports - explicit_names
+    )
+    if ref_ports:
+        required_handles.difference_update(name for _, _, name in ref_ports)
+
+    def handle_direction(name: str) -> str:
+        if name in harness_usage.get("inputs", set()) or _port_kind(name) in {"clock", "reset"}:
+            return "input"
+        return "output"
+
+    if not ref_ports:
+        expected = list(prompt_ports)
+        seen = {name for _, _, name in expected}
+        for name in sorted(required_handles - seen):
+            direction = handle_direction(name)
+            if direction in prompt_interface.complete_directions:
+                continue
+            expected.append((direction, "logic", name))
+        return expected
+
+    # CVDP's exact target module is the pre-modification baseline, not a
+    # closed-world declaration of the requested final module. Dedicated prompt
+    # Input(s)/Output(s) sections replace that direction; additive prose and
+    # direct top-level harness handles extend the untouched baseline. Internal
+    # hierarchical handles are absent from ``required_handles`` by design.
+    expected: list[tuple[str, str, str]] = []
+    for direction in ("input", "output"):
+        prompt_direction = [port for port in prompt_ports if port[0] == direction]
+        if direction in prompt_interface.complete_directions and prompt_direction:
+            selected = list(prompt_direction)
+        else:
+            selected = [
+                port
+                for port in ref_ports
+                if port[0] == direction and port[2] not in explicit_names
+            ]
+            selected.extend(prompt_direction)
+
+        seen = {name for _, _, name in selected}
+        for name in sorted(required_handles - seen):
+            if (
+                handle_direction(name) == direction
+                and direction not in prompt_interface.complete_directions
+            ):
+                selected.append((direction, "logic", name))
+                seen.add(name)
+        expected.extend(selected)
+
+    expected.extend(port for port in ref_ports if port[0] not in {"input", "output"})
+    return expected
+
+
+def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
+    """Summarize benchmark-visible interface facts without including testbench source."""
+    if info is None:
+        return ""
+    metadata = info.metadata or {}
+    design_name = info.design_name
+    harness_usage: dict[str, set[str]] = {
+        "ports": set(),
+        "direct_ports": set(),
+        "inputs": set(),
+        "outputs": set(),
+        "params": set(),
+    }
+    prompt_interface = _parse_prompt_interface(info.prompt_text or "")
+    derived_symbols: set[str] = set()
+
+    if metadata.get("dataset") == "cvdp":
+        harness_files = metadata.get("harness_files", {}) or {}
+        env_text = str(harness_files.get("src/.env", ""))
+        design_name = _parse_env_value(env_text, "TOPLEVEL") or design_name
+        raw_harness_usage = _parse_cvdp_harness_usage(harness_files)
+        harness_parameters = set(raw_harness_usage["params"])
+        ref_parameters = {
+            parameter.name
+            for parameter in _module_parameters(info.ref_code or "", design_name)
+        }
+        reference_derived_parameters = (
+            _cvdp_derived_reference_parameter_names(
+                info.ref_code or "", design_name
+            )
+        )
+        ref_constants = _module_nonport_constant_names(
+            info.ref_code or "",
+            design_name,
+        )
+        derived_symbols = (
+            prompt_interface.derived_parameters
+            | reference_derived_parameters
+            | (raw_harness_usage.get("direct_ports", set()) & ref_constants)
+        ) - harness_parameters
+        overrideable_parameters = (
+            harness_parameters
+            | ref_parameters
+            | (prompt_interface.parameters - prompt_interface.derived_parameters)
+        ) - derived_symbols
+
+        harness_usage = _apply_prompt_parameters(
+            raw_harness_usage,
+            info.prompt_text or "",
+        )
+        harness_usage["params"] = overrideable_parameters
+        nonport_symbols = (
+            prompt_interface.parameters
+            | ref_constants
+            | overrideable_parameters
+            | derived_symbols
+        )
+        for key in ("ports", "direct_ports", "inputs", "outputs"):
+            harness_usage.setdefault(key, set()).difference_update(nonport_symbols)
+        param_values, param_combos = _cvdp_parse_parameter_sweeps(
+            harness_files,
+            overrideable_parameters,
+        )
     else:
         param_values, param_combos = {}, []
 
@@ -773,6 +1340,15 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
             "Use a top-level Lean `Nat` binder with the exact benchmark parameter name and synthesize it with "
             "`#synthesizeVerilog <design> parameters [PARAM := <nonnegative-default>]`. Sparkle then emits a native "
             "SystemVerilog module parameter that must actually occur in the affected ports, state, memories, or logic."
+        )
+    if derived_symbols:
+        lines.append(
+            "- Derived interface symbols (not independent sweep parameters): "
+            + ", ".join(sorted(derived_symbols))
+        )
+        lines.append(
+            "- Derived-symbol requirement: compute these symbols from the active benchmark parameters for every "
+            "configuration; do not expose them as unrelated output ports or freeze them to a default-width constant."
         )
 
     inputs = [p for p in expected_ports if p[0] == "input"]
@@ -973,14 +1549,23 @@ def classify_failure_record(record: dict) -> dict[str, str]:
             "failure_family": "unsupported",
         }
 
-    if record.get("unsupported_parameterization"):
+    detail = str(record.get("detail", "") or record.get("error_msg", "")).lower()
+    if (
+        record.get("unsupported_parameterization")
+        or CVDP_PARAMETERIZATION_UNSUPPORTED.lower() in detail
+    ):
         return {
             "failure_stage": "simulation",
             "failure_category": "parameterization_contract",
             "failure_family": "interface",
         }
 
-    detail = str(record.get("detail", "") or record.get("error_msg", "")).lower()
+    if record.get("adapter_error") or CVDP_ADAPTER_ERROR.lower() in detail:
+        return {
+            "failure_stage": "simulation",
+            "failure_category": "adapter_contract_error",
+            "failure_family": "interface",
+        }
     compile_pass = bool(record.get("compile_pass", False))
     sim_status = record.get("sim_status", "not_run")
 
@@ -1012,7 +1597,20 @@ def classify_failure_record(record: dict) -> dict[str, str]:
         }
 
     if sim_status == "sim_error":
-        if "compile failed" in detail or "could not generate" in detail or "could not parse" in detail:
+        rtl_build_error = (
+            "iverilog compile failed" in detail
+            or "during build/elaboration" in detail
+            or "error(s) during elaboration" in detail
+            or "unable to bind parameter" in detail
+            or "dimensions must be constant" in detail
+            or ("calledprocesserror" in detail and "iverilog" in detail)
+        )
+        if (
+            rtl_build_error
+            or "compile failed" in detail
+            or "could not generate" in detail
+            or "could not parse" in detail
+        ):
             category = "rtl_compile_or_interface_error"
             family = "syntax_or_compile"
         elif "timeout" in detail:
@@ -1166,6 +1764,31 @@ def extract_sim_diagnostics(detail: str | None, max_chars: int = SIM_DIAGNOSTIC_
         return ""
 
     lines = [line.rstrip() for line in text.splitlines()]
+    # cocotb redirects the Icarus build stream to ``sim.log``.  Pytest then
+    # reports only a generic CalledProcessError, whose traceback can easily
+    # consume the diagnostic budget before the actual elaboration error is
+    # reached.  Select simulator-native build diagnostics in a separate pass
+    # so they cannot be starved by pytest/Python traceback noise.
+    icarus_re = re.compile(
+        r"(CVDP_ADAPTER_ERROR|CVDP_FIXED_CORE_PARAMETERIZATION_UNSUPPORTED|"
+        r"Unable to bind|Dimensions must be constant|during elaboration|"
+        r"Unknown module type|Unable to find the root module|"
+        r"(?:^|:\d+(?::\d+)?:)\s*(?:syntax\s+)?error:)",
+        re.IGNORECASE,
+    )
+    icarus_lines: list[str] = []
+    icarus_seen: set[str] = set()
+    for line in lines:
+        compact = re.sub(r"\s+", " ", line.strip())
+        if not compact or compact in icarus_seen or not icarus_re.search(compact):
+            continue
+        icarus_seen.add(compact)
+        icarus_lines.append(compact)
+        if len(icarus_lines) >= 80:
+            break
+    if icarus_lines:
+        return truncate_text("\n".join(icarus_lines), max_chars, keep="tail")
+
     picked: list[str] = []
     seen: set[str] = set()
 
@@ -1543,13 +2166,18 @@ def read_current_sv(prob_id: str, run_dir: Path) -> str:
 
 
 def read_simulator_output(prob_id: str, run_dir: Path) -> str:
+    sim_root = run_dir / "cvdp_sim" / prob_id
     candidates = [
-        run_dir / "cvdp_sim" / prob_id / "cvdp_local_output.txt",
+        ("Icarus build log", sim_root / "rundir" / "sim.log"),
+        ("CVDP pytest/cocotb output", sim_root / "cvdp_local_output.txt"),
     ]
-    for path in candidates:
+    chunks = []
+    for label, path in candidates:
         if path.exists():
-            return path.read_text(errors="replace")
-    return ""
+            content = path.read_text(errors="replace").strip()
+            if content:
+                chunks.append(f"[{label}]\n{content}")
+    return "\n\n".join(chunks)
 
 
 def bool_status(value) -> str:
@@ -1809,8 +2437,11 @@ def build_sim_feedback(
         evaluation_summary,
     ]
     simulator_output = read_simulator_output(prob_id, run_dir)
+    # Put simulator artifacts first.  In particular, Icarus build diagnostics
+    # live in ``sim.log`` while pytest's tail often contains only the Python
+    # subprocess traceback that wrapped the failed elaboration.
     combined_detail = "\n".join(
-        part for part in [str(result.get("detail") or ""), simulator_output] if part.strip()
+        part for part in [simulator_output, str(result.get("detail") or "")] if part.strip()
     )
     sim_diagnostics = extract_sim_diagnostics(combined_detail, SIM_DIAGNOSTIC_CHARS)
     benchmark_contract = format_benchmark_interface_contract(info)
@@ -2210,8 +2841,13 @@ def _cvdp_direct_sv_requires_parameter_sweep(
     has_overrides, _parameter_names, unresolved = _cvdp_parameter_overrides(
         harness_files
     )
+    benchmark_parameters = _cvdp_required_benchmark_parameter_names(
+        ref_code=info.ref_code or "",
+        design_name=info.design_name,
+        harness_files=harness_files,
+    )
     reference_has_parameters = bool(
-        _module_parameters(info.ref_code or "", info.design_name)
+        benchmark_parameters - set(_parameter_names)
     )
     top_has_parameters = bool(
         sv_code and _module_parameters(sv_code, info.design_name)
@@ -2236,12 +2872,10 @@ def _cvdp_direct_sv_parameter_plan(
     _has_overrides, observed_names, _unresolved = _cvdp_parameter_overrides(
         harness_files
     )
-    parameter_names = set(observed_names)
-    parameter_names.update(
-        parameter.name
-        for parameter in _module_parameters(
-            info.ref_code or "", info.design_name
-        )
+    parameter_names = _cvdp_required_benchmark_parameter_names(
+        ref_code=info.ref_code or "",
+        design_name=info.design_name,
+        harness_files=harness_files,
     )
     if sv_code:
         parameter_names.update(
@@ -2361,6 +2995,7 @@ def evaluate_verilog_candidate(
             sparkle_mod_name,
             sparkle_ports,
             eval_dir,
+            benchmark_ports=_benchmark_expected_ports(info),
             direct_top=True,
         )
     else:
@@ -2890,6 +3525,16 @@ def _process_one_problem_inner(
 
     # Load problem info from dataset
     info = evaluator.dataset_obj.load_problem(prob_id) if evaluator.dataset_obj else None
+    benchmark_ports = (
+        _benchmark_expected_ports(info) if info is not None else None
+    )
+
+    def evaluate_candidate(active_evaluator):
+        if benchmark_ports is None:
+            return active_evaluator.evaluate(prob_id, run_dir)
+        return active_evaluator.evaluate(
+            prob_id, run_dir, benchmark_ports=benchmark_ports
+        )
     condition_sv, condition_sv_path = load_conditioning_sv(args.condition_sv_dir, prob_id)
     user_msg = build_user_message(
         prob_id,
@@ -2973,7 +3618,7 @@ def _process_one_problem_inner(
         )
 
     eval_t0 = time.monotonic()
-    result = sim_evaluator.evaluate(prob_id, run_dir)
+    result = evaluate_candidate(sim_evaluator)
     eval_elapsed = time.monotonic() - eval_t0
     repair_stats_total = {
         "input_tokens": 0,
@@ -3095,7 +3740,7 @@ def _process_one_problem_inner(
                 break
 
             repair_eval_t0 = time.monotonic()
-            new_result = sim_evaluator.evaluate(prob_id, run_dir)
+            new_result = evaluate_candidate(sim_evaluator)
             eval_elapsed += time.monotonic() - repair_eval_t0
             sim_feedback_history.append({
                 "phase": "sim_feedback",
@@ -3160,7 +3805,7 @@ def _process_one_problem_inner(
         if eval_progress_key(best_result) > eval_progress_key(result) and lean_file.exists():
             lean_file.write_text(best_code)
             restore_eval_t0 = time.monotonic()
-            result = sim_evaluator.evaluate(prob_id, run_dir)
+            result = evaluate_candidate(sim_evaluator)
             eval_elapsed += time.monotonic() - restore_eval_t0
             sim_feedback_history.append({
                 "phase": "sim_feedback",
@@ -3175,7 +3820,7 @@ def _process_one_problem_inner(
             description=f"[cyan]{prob_id}[/cyan]  Backend evaluation...",
         )
         backend_eval_t0 = time.monotonic()
-        result = evaluator.evaluate(prob_id, run_dir)
+        result = evaluate_candidate(evaluator)
         eval_elapsed += time.monotonic() - backend_eval_t0
 
     # Phase 2b: generation-time synthesis feedback.
@@ -3242,7 +3887,7 @@ def _process_one_problem_inner(
                 })
                 break
 
-            new_result = evaluator.evaluate(prob_id, run_dir)
+            new_result = evaluate_candidate(evaluator)
             entry = {
                 "iteration": synth_iter + 1,
                 "compile_pass": new_result.get("compile_pass"),
@@ -3380,7 +4025,7 @@ def _process_one_problem_inner(
                     break
 
                 # Re-evaluate
-                new_result = evaluator.evaluate(prob_id, run_dir)
+                new_result = evaluate_candidate(evaluator)
                 repair_attempts.append({
                     "phase": "PPA",
                     "iteration": ppa_iter + 1,
@@ -3533,7 +4178,7 @@ def _process_one_problem_inner(
                 })
                 break
 
-            new_result = evaluator.evaluate(prob_id, run_dir)
+            new_result = evaluate_candidate(evaluator)
             new_candidate = ArchCandidate(
                 index=arch_iter + 1,
                 code=lean_file.read_text(),
@@ -3566,7 +4211,7 @@ def _process_one_problem_inner(
         best = select_best_candidate(arch_candidates, constraints)
         if best.index != arch_candidates[-1].index:
             lean_file.write_text(best.code)
-            result = evaluator.evaluate(prob_id, run_dir)
+            result = evaluate_candidate(evaluator)
         else:
             result = new_result  # already the latest
 

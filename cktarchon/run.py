@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+import fcntl
+import hashlib
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,7 +33,6 @@ from .search_strategy import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ARCHON_SRC = Path("/home/sgli/work/archon-official/src")
 
 COMPACT_SPARKLE_GENERATION_SKILL = """You are an expert hardware engineer translating natural-language RTL specifications into Sparkle HDL, a Lean 4 hardware DSL.
 
@@ -55,7 +59,8 @@ def <target_module> {dom : DomainConfig}
 ## Core Types
 - `Signal dom (BitVec N)` is an N-bit hardware signal.
 - `Signal dom Bool` is a hardware condition signal.
-- Clock/reset are implicit in `DomainConfig`; do not add clock/reset ports unless the benchmark spec has explicit user-visible ports.
+- Sparkle's hardware clock is implicit in `DomainConfig` and synthesizes as the core `clk` port. Never declare a clock `Signal` binder in the Lean function, even when the Benchmark Interface Contract lists a public clock; the CVDP wrapper maps that public clock to implicit `clk`.
+- A benchmark-visible reset remains an explicit input: declare the exact benchmark reset name as a `Signal dom Bool` binder and apply `resetHigh` for active-high or `resetLow` for active-low to the register D-path. The CVDP wrapper maps this binder and holds Sparkle's separate implicit ABI `rst` deasserted so the selected D-path semantics are preserved.
 - Multi-output Sparkle functions return tuple signals, e.g. `Signal dom (BitVec 8 × BitVec 1)` with `bundle2`.
 
 ## Stable Sparkle Operators
@@ -119,7 +124,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-repl", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Skip agent generation and only evaluate existing Generated/<prob_id>.lean files.")
     p.add_argument("--workers", type=int, default=1, help="Concurrent problem workers; each receives an isolated Lean REPL.")
-    p.add_argument("--archon-src", default=str(ARCHON_SRC), help="Official Archon src directory for codex-agent/archon-native harnesses.")
+    p.add_argument(
+        "--archon-src",
+        default=None,
+        help=(
+            "Official Archon src directory for codex-agent/archon-native harnesses. "
+            "Overrides the ARCHON_SRC environment variable; one of them is required "
+            "for those harnesses."
+        ),
+    )
     p.add_argument("--codex-bin", default=None, help="Optional absolute path to the codex CLI for --harness codex-agent.")
     p.add_argument("--codex-effort", default=None, help="Optional model_reasoning_effort passed to codex exec.")
     p.add_argument("--codex-sandbox", default="danger-full-access", help="Codex sandbox mode.")
@@ -171,10 +184,17 @@ def discover_problems(args: argparse.Namespace, ds: Any) -> list[str]:
         if args.filter:
             pattern = re.compile(args.filter)
             problems = [pid for pid in problems if pattern.search(pid)]
+        # Preserve the first occurrence so repeated lines cannot schedule two
+        # workers against the same Generated/<prob_id>.lean target.
+        problems = list(dict.fromkeys(problems))
         if args.limit:
             problems = problems[: args.limit]
         return problems
-    return ds.discover_problems(limit=args.limit, filter_re=args.filter)
+    problems = ds.discover_problems(limit=None, filter_re=args.filter)
+    problems = list(dict.fromkeys(problems))
+    if args.limit:
+        problems = problems[: args.limit]
+    return problems
 
 
 def already_done(run_parent: Path, prob_id: str, mode: str) -> bool:
@@ -196,18 +216,245 @@ def already_done(run_parent: Path, prob_id: str, mode: str) -> bool:
     return False
 
 
+def generated_candidate_available(target: Path) -> bool:
+    """Return whether *target* contains a usable, non-whitespace candidate."""
+
+    try:
+        return bool(target.read_text(errors="replace").strip())
+    except OSError:
+        return False
+
+
+class GeneratedCandidateTransaction:
+    """Serialize and protect one problem's ``Generated`` candidate lifecycle.
+
+    The per-problem advisory lock is held from before the old candidate is
+    staged through generation and evaluation. The old file is moved atomically
+    within ``Generated``; the results-directory copy is only an audit backup.
+    """
+
+    def __init__(
+        self,
+        project_root: Path,
+        run_dir: Path,
+        prob_id: str,
+        *,
+        read_only: bool = False,
+    ):
+        self.project_root = project_root
+        self.run_dir = run_dir
+        self.prob_id = prob_id
+        self.target = project_root / "Generated" / f"{prob_id}.lean"
+        self.read_only = read_only
+        self.backup_path: Path | None = None
+        self._staged_original: Path | None = None
+        self._lock_file: Any | None = None
+        self._lock_acquired = False
+        self._entered = False
+        self._had_preexisting = False
+        self.restored = False
+        self.restore_error: str | None = None
+        self._discarded = False
+
+    @property
+    def backup(self) -> str | None:
+        return str(self.backup_path) if self.backup_path is not None else None
+
+    def __enter__(self) -> GeneratedCandidateTransaction:
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        lock_dir = self.target.parent / ".cktarchon_locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.prob_id).strip("._")[:48]
+        digest = hashlib.sha256(self.prob_id.encode("utf-8")).hexdigest()[:16]
+        lock_path = lock_dir / f"{safe_name or 'problem'}-{digest}.lock"
+        self._lock_file = lock_path.open("a+b")
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)
+            self._lock_acquired = True
+            self._entered = True
+            if not self.read_only:
+                self._stage_preexisting()
+        except BaseException:
+            try:
+                if self._staged_original is not None:
+                    self._restore_staged_original()
+            finally:
+                self._release_lock()
+            raise
+        return self
+
+    def _stage_preexisting(self) -> None:
+        if not os.path.lexists(self.target):
+            return
+        self._had_preexisting = True
+        staged = self.target.with_name(
+            f".{self.target.name}.preexisting-{uuid.uuid4().hex}"
+        )
+        self._staged_original = staged
+        os.replace(self.target, staged)
+
+        backup_dir = self.run_dir / "preexisting_generated"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / f"{self.prob_id}.lean"
+        if backup.exists():
+            backup = backup_dir / f"{self.prob_id}_{uuid.uuid4().hex}.lean"
+        fd, temporary_name = tempfile.mkstemp(
+            dir=backup_dir,
+            prefix=f".{backup.name}.copy-",
+        )
+        os.close(fd)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copy2(staged, temporary)
+            os.replace(temporary, backup)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.backup_path = backup
+
+    @staticmethod
+    def _path_has_nonempty_candidate(path: Path) -> bool:
+        try:
+            return bool(path.read_text(errors="replace").strip())
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise
+
+    def has_new_candidate(self) -> bool:
+        """Strictly check the current target without treating I/O errors as empty."""
+
+        return self._path_has_nonempty_candidate(self.target)
+
+    def _archive_detached_candidate(self, detached: Path) -> None:
+        """Keep a raced inode linked on the target filesystem for late writers."""
+
+        conflict_dir = self.target.parent / ".cktarchon_conflicts"
+        conflict_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.prob_id).strip("._")[:48]
+        destination = conflict_dir / (
+            f"{safe_name or 'problem'}-{uuid.uuid4().hex}.lean"
+        )
+        # Same-filesystem rename preserves a directory entry even when an
+        # uncooperative writer still holds the detached inode open and writes
+        # only after our first content check.
+        os.replace(detached, destination)
+
+    def restore_preexisting(self) -> bool:
+        """Restore the staged original without clobbering a non-empty new file."""
+
+        if self.has_new_candidate():
+            return False
+
+        # Never unlink the path after a separate availability check. Atomically
+        # detach exactly the inode currently at the target, then classify that
+        # detached file. A writer that swapped in a non-empty candidate during
+        # the race therefore has its file reinstalled or archived, not deleted.
+        detached: Path | None = None
+        if os.path.lexists(self.target):
+            detached = self.target.with_name(
+                f".{self.target.name}.restore-observed-{uuid.uuid4().hex}"
+            )
+            try:
+                os.replace(self.target, detached)
+            except FileNotFoundError:
+                detached = None
+        if detached is not None:
+            if self._path_has_nonempty_candidate(detached):
+                try:
+                    os.link(detached, self.target)
+                except FileExistsError:
+                    self._archive_detached_candidate(detached)
+                else:
+                    detached.unlink()
+                return False
+            # Even an artifact that is blank *now* may have a writer holding an
+            # open descriptor. Archive its inode before restoring the old path;
+            # a late write then remains recoverable instead of targeting an
+            # already-unlinked inode.
+            self._archive_detached_candidate(detached)
+
+        restored = self._restore_staged_original()
+        self.restored = restored
+        return restored
+
+    def _restore_staged_original(self) -> bool:
+        staged = self._staged_original
+        if staged is None or not staged.exists():
+            return False
+        try:
+            # link(2) fails with EEXIST instead of overwriting a candidate that
+            # appeared concurrently between the availability check and install.
+            os.link(staged, self.target)
+        except FileExistsError:
+            if self.has_new_candidate():
+                return False
+            raise RuntimeError(
+                f"refused to overwrite concurrent Generated candidate: {self.target}"
+            )
+        staged.unlink()
+        self._staged_original = None
+        return True
+
+    def discard_preexisting(self) -> None:
+        """Commit the historical clear-only helper's removal semantics."""
+
+        if self._staged_original is not None:
+            self._staged_original.unlink(missing_ok=True)
+            self._staged_original = None
+        self._discarded = True
+
+    def _release_lock(self) -> None:
+        if self._lock_file is None:
+            return
+        try:
+            if self._lock_acquired:
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._lock_file.close()
+            self._lock_file = None
+            self._lock_acquired = False
+            self._entered = False
+
+    def __exit__(self, exc_type: Any, exc: BaseException | None, traceback: Any) -> bool:
+        cleanup_error: Exception | None = None
+        try:
+            if self.read_only:
+                return False
+            if not self._discarded and self._staged_original is not None:
+                if self.has_new_candidate():
+                    self._staged_original.unlink(missing_ok=True)
+                    self._staged_original = None
+                else:
+                    try:
+                        self.restore_preexisting()
+                    except Exception as restore_exc:
+                        self.restore_error = f"{type(restore_exc).__name__}: {restore_exc}"
+                        cleanup_error = restore_exc
+            elif (
+                self._staged_original is None
+                and not self._had_preexisting
+                and not self.has_new_candidate()
+            ):
+                # Use the same detach/archive path; never check then unlink.
+                self.restore_preexisting()
+        finally:
+            self._release_lock()
+
+        if cleanup_error is not None:
+            if exc is not None and hasattr(exc, "add_note"):
+                exc.add_note(f"candidate restoration also failed: {cleanup_error}")
+                return False
+            raise cleanup_error
+        return False
+
+
 def clear_generated_target(project_root: Path, run_dir: Path, prob_id: str) -> str | None:
-    target = project_root / "Generated" / f"{prob_id}.lean"
-    if not target.exists():
-        return None
-    backup_dir = run_dir / "preexisting_generated"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup = backup_dir / f"{prob_id}.lean"
-    if backup.exists():
-        backup = backup_dir / f"{prob_id}_{time.time_ns()}.lean"
-    shutil.copy2(target, backup)
-    target.unlink()
-    return str(backup)
+    """Atomically clear one target under the same transaction lock as generation."""
+
+    with GeneratedCandidateTransaction(project_root, run_dir, prob_id) as transaction:
+        backup = transaction.backup
+        transaction.discard_preexisting()
+        return backup
 
 
 def build_system_prompt(
@@ -243,7 +490,9 @@ def build_system_prompt(
         + "- Treat the user's `Benchmark Interface Contract` as authoritative over guesses from examples or file names.\n"
         + "- For CVDP parameters, use a top-level Lean `Nat` binder with the exact benchmark parameter name and `#synthesizeVerilog <design> parameters [PARAM := <nonnegative-default>]`. Sparkle emits the native SystemVerilog module parameter; it must actually determine the relevant datapath, state, memory, or logic. Defaults may be zero for offsets, but every derived hardware width and array length must remain positive. The evaluator rejects declaration-only parameters and fixed-width cores hidden behind an adapter.\n"
         + "- Match benchmark output names exactly. If you must return a packed output internally, construct an explicit named MSB-to-LSB concat so the CVDP wrapper can recover each output field.\n"
-        + "- Preserve benchmark clock, reset polarity, and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
+        + "- For CVDP, a benchmark-visible clock is supplied only through Sparkle's implicit domain `clk`, which the wrapper maps to the public clock. Never declare a clock `Signal` binder, even when the public interface lists one; doing so creates a duplicate clock input.\n"
+        + "- A benchmark-visible reset is different: declare its exact public name as a `Signal dom Bool` binder and apply `resetHigh` or `resetLow` according to polarity before `dff`/`dffe`. The wrapper maps that explicit reset binder while holding Sparkle's separate implicit ABI `rst` deasserted, preserving D-path reset semantics.\n"
+        + "- Preserve benchmark reset polarity and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
         + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and `#synthesizeVerilog`; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
         + "- Keep repository exploration short: read at most three examples, then write a complete candidate and iterate from compiler feedback.\n"
         + "- This H20 host may not have `rg`; use `grep` and `find` for repository searches.\n"
@@ -264,10 +513,28 @@ def build_system_prompt(
     )
 
 
-def run_archon_native_unavailable() -> None:
+def configured_archon_src(cli_value: str | Path | None) -> Path | None:
+    """Resolve explicit CLI-over-environment Archon source configuration."""
+
+    value = cli_value or os.environ.get("ARCHON_SRC")
+    if not value:
+        return None
+    return Path(value).expanduser()
+
+
+def run_archon_native_unavailable(archon_src: str | Path | None) -> None:
     # The shape is explicit so future CLI-backed Archon runners can plug in here.
-    if str(ARCHON_SRC) not in sys.path:
-        sys.path.insert(0, str(ARCHON_SRC))
+    source = configured_archon_src(archon_src)
+    if source is None:
+        raise RuntimeError(
+            "archon-native harness requires an explicit official Archon src directory; "
+            "pass --archon-src PATH or set ARCHON_SRC"
+        )
+    source = source.resolve()
+    if not source.is_dir():
+        raise RuntimeError(f"official Archon src directory does not exist: {source}")
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
     try:
         from archon.agent import build_runner  # noqa: F401
     except Exception as exc:
@@ -289,7 +556,7 @@ def make_runner(
     repl: Any | None,
 ) -> Any:
     if args.harness == "archon-native":
-        run_archon_native_unavailable()
+        run_archon_native_unavailable(getattr(args, "archon_src", None))
     if args.harness == "codex-agent":
         from .codex_runner import CodexAgentHarnessRunner
 
@@ -300,7 +567,7 @@ def make_runner(
             role=role,
             log_base=log_base,
             system_prompt=build_system_prompt(skill, prob_id, info, args.prompt_profile),
-            archon_src=Path(args.archon_src),
+            archon_src=configured_archon_src(getattr(args, "archon_src", None)),
             codex_bin=args.codex_bin,
             effort=args.codex_effort,
             sandbox=args.codex_sandbox,
@@ -332,6 +599,56 @@ def merge_agent_stats(total: AgentStats, extra: AgentStats) -> None:
     total.compile_checks += extra.compile_checks
     for name, count in extra.tool_counts.items():
         total.tool_counts[name] = total.tool_counts.get(name, 0) + count
+    total.budget_exhausted = total.budget_exhausted or extra.budget_exhausted
+    total.usage_accounting_complete = (
+        total.usage_accounting_complete and extra.usage_accounting_complete
+    )
+    for note in extra.usage_accounting_notes:
+        if note not in total.usage_accounting_notes:
+            total.usage_accounting_notes.append(note)
+
+
+def agent_stats_observed(stats: AgentStats) -> bool:
+    return bool(stats.turns or stats.input_tokens or stats.output_tokens or stats.tool_counts) or (
+        stats.budget_exhausted or not stats.usage_accounting_complete
+    )
+
+
+def rounded_agent_elapsed(seconds: float) -> float:
+    rounded = round(seconds, 3)
+    if seconds > 0 and rounded == 0:
+        return 0.001
+    return rounded
+
+
+def accumulate_summary_record(summary: dict[str, Any], record: dict[str, Any]) -> None:
+    """Add one final problem record to the run summary.
+
+    Failure classification is authoritative for generation failures. Such
+    records commonly have sim_status=not_run because no simulator was reached;
+    counting them as sim_error hides the real agent failure rate.
+    """
+
+    if record.get("compile_pass"):
+        summary["compile_pass"] += 1
+    summary["sim_feedback_attempts"] += int(record.get("sim_feedback_iterations") or 0)
+    if record.get("sim_feedback_success"):
+        summary["sim_feedback_success"] += 1
+
+    status = record.get("sim_status")
+    is_agent_error = (
+        record.get("failure_category") == "agent_error"
+        or bool(record.get("agent_error"))
+        or status == "agent_error"
+    )
+    if is_agent_error:
+        summary["agent_error"] += 1
+    elif status == "sim_pass":
+        summary["sim_pass"] += 1
+    elif status == "sim_fail":
+        summary["sim_fail"] += 1
+    else:
+        summary["sim_error"] += 1
 
 
 def search_total_turn_budget(args: argparse.Namespace) -> int:
@@ -412,6 +729,7 @@ def process_problem_guided(
     run_dir: Path,
     skill: str,
     repl: Any | None,
+    candidate_transaction: GeneratedCandidateTransaction,
 ) -> dict[str, Any]:
     """Run public-spec-guided, multi-candidate search under one turn ledger."""
 
@@ -420,9 +738,22 @@ def process_problem_guided(
 
     problem_t0 = time.monotonic()
     info = ds.load_problem(prob_id)
+    benchmark_port_resolver = getattr(search, "_benchmark_expected_ports", None)
+    benchmark_ports = (
+        benchmark_port_resolver(info) if benchmark_port_resolver is not None else None
+    )
+
+    def evaluate_candidate():
+        if benchmark_ports is None:
+            return evaluator.evaluate(prob_id, run_dir)
+        return evaluator.evaluate(
+            prob_id, run_dir, benchmark_ports=benchmark_ports
+        )
     has_repl = repl is not None
-    generated_target = PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
-    preexisting_generated_backup = clear_generated_target(PROJECT_ROOT, run_dir, prob_id)
+    generated_target = candidate_transaction.target
+    preexisting_generated_backup = candidate_transaction.backup
+    preexisting_generated_restored = False
+    preexisting_generated_restore_error: str | None = None
     budget = TurnBudget(search_total_turn_budget(args))
     planner_stats = AgentStats()
     generation_stats = AgentStats()
@@ -485,10 +816,16 @@ def process_problem_guided(
                     )
         except Exception as exc:
             planner_error = f"{type(exc).__name__}: {exc}"
-            parsed_stats = parse_agent_log(planner.log_path)
-            if parsed_stats.turns or parsed_stats.input_tokens or parsed_stats.output_tokens:
-                planner_stats = parsed_stats
-                budget.consume(planner_stats.turns)
+            try:
+                parsed_stats = parse_agent_log(planner.log_path)
+                if agent_stats_observed(parsed_stats):
+                    planner_stats = parsed_stats
+                    budget.consume(planner_stats.turns)
+            except Exception as parse_exc:
+                planner_error += (
+                    "; planner log parsing also failed: "
+                    f"{type(parse_exc).__name__}: {parse_exc}"
+                )
         agent_elapsed += time.monotonic() - planner_t0
     elif args.harness != "anthropic-api":
         planner_error = "LLM self-test planner skipped because guided planning currently uses the Anthropic API harness."
@@ -497,42 +834,57 @@ def process_problem_guided(
 
     full_guide_text = format_self_test_guidance(guide, include_testbench=True) if self_test_enabled else ""
     plan_only_text = format_self_test_guidance(guide, include_testbench=False) if self_test_enabled else ""
-    user_message = search.build_user_message(
-        prob_id,
-        has_repl=has_repl,
-        info=info,
-        dataset_name=evaluator.dataset_name,
-        condition_sv=None,
-    ) + (("\n\n" + full_guide_text) if full_guide_text else "")
 
     generation_limit = budget.session_limit(args.max_turns)
     generation_error: str | None = None
     if generation_limit > 0:
         log_base = run_dir / "logs" / prob_id / "generate"
-        runner = make_runner(
-            args=args,
-            prob_id=prob_id,
-            role="ckt-generator-candidate-1",
-            log_base=log_base,
-            skill=skill,
-            info=info,
-            repl=repl,
-        )
         generation_t0 = time.monotonic()
         try:
+            user_message = search.build_user_message(
+                prob_id,
+                has_repl=has_repl,
+                info=info,
+                dataset_name=evaluator.dataset_name,
+                condition_sv=None,
+            ) + (("\n\n" + full_guide_text) if full_guide_text else "")
+            runner = make_runner(
+                args=args,
+                prob_id=prob_id,
+                role="ckt-generator-candidate-1",
+                log_base=log_base,
+                skill=skill,
+                info=info,
+                repl=repl,
+            )
             generation_stats = runner.run(user_message, max_turns=generation_limit)
         except Exception as exc:
             generation_error = f"{type(exc).__name__}: {exc}"
             agent_errors.append(f"initial generation: {generation_error}")
-            parsed_stats = parse_agent_log(Path(str(log_base) + ".jsonl"))
-            if parsed_stats.turns or parsed_stats.input_tokens or parsed_stats.output_tokens or parsed_stats.tool_counts:
-                generation_stats = parsed_stats
+            try:
+                parsed_stats = parse_agent_log(Path(str(log_base) + ".jsonl"))
+                if agent_stats_observed(parsed_stats):
+                    generation_stats = parsed_stats
+            except Exception as parse_exc:
+                generation_error += (
+                    "; agent log parsing also failed: "
+                    f"{type(parse_exc).__name__}: {parse_exc}"
+                )
+                agent_errors[-1] = f"initial generation: {generation_error}"
         budget.consume(generation_stats.turns)
         agent_elapsed += time.monotonic() - generation_t0
+    else:
+        generation_error = "Initial generation received no turn budget."
+        agent_errors.append(f"initial generation: {generation_error}")
+
+    initial_candidate_available = candidate_transaction.has_new_candidate()
+    if not initial_candidate_available and generation_error is None:
+        generation_error = "Initial generation did not create a non-empty Lean candidate."
+        agent_errors.append(f"initial generation: {generation_error}")
 
     eval_t0 = time.monotonic()
-    if generated_target.exists():
-        result = evaluator.evaluate(prob_id, run_dir)
+    if initial_candidate_available:
+        result = evaluate_candidate()
         if generation_error:
             result["generation_error"] = generation_error
     else:
@@ -547,7 +899,7 @@ def process_problem_guided(
         }
     eval_elapsed += time.monotonic() - eval_t0
 
-    code = generated_target.read_text(errors="replace") if generated_target.exists() else None
+    code = generated_target.read_text(errors="replace") if initial_candidate_available else None
     tracker = CandidateTracker(
         snapshot_root=run_dir / "candidates",
         prob_id=prob_id,
@@ -684,33 +1036,47 @@ def process_problem_guided(
             log_name = f"candidate_{tracker.candidate_id}_repair_{sim_feedback_iterations}"
 
         log_base = run_dir / "logs" / prob_id / log_name
-        attempt_runner = make_runner(
-            args=args,
-            prob_id=prob_id,
-            role=role,
-            log_base=log_base,
-            skill=skill,
-            info=info,
-            repl=repl,
-        )
         attempt_error: str | None = None
         attempt_t0 = time.monotonic()
         attempt_stats = AgentStats()
         try:
+            attempt_runner = make_runner(
+                args=args,
+                prob_id=prob_id,
+                role=role,
+                log_base=log_base,
+                skill=skill,
+                info=info,
+                repl=repl,
+            )
             attempt_stats = attempt_runner.run(prompt, max_turns=turn_limit)
         except Exception as exc:
             attempt_error = f"{type(exc).__name__}: {exc}"
             agent_errors.append(f"{phase} {sim_feedback_iterations}: {attempt_error}")
-            parsed_stats = parse_agent_log(Path(str(log_base) + ".jsonl"))
-            if parsed_stats.turns or parsed_stats.input_tokens or parsed_stats.output_tokens or parsed_stats.tool_counts:
-                attempt_stats = parsed_stats
+            try:
+                parsed_stats = parse_agent_log(Path(str(log_base) + ".jsonl"))
+                if agent_stats_observed(parsed_stats):
+                    attempt_stats = parsed_stats
+            except Exception as parse_exc:
+                attempt_error += (
+                    "; agent log parsing also failed: "
+                    f"{type(parse_exc).__name__}: {parse_exc}"
+                )
+                agent_errors[-1] = (
+                    f"{phase} {sim_feedback_iterations}: {attempt_error}"
+                )
         merge_agent_stats(repair_stats_total, attempt_stats)
         budget.consume(attempt_stats.turns)
         agent_elapsed += time.monotonic() - attempt_t0
 
+        attempt_candidate_available = candidate_transaction.has_new_candidate()
+        if not attempt_candidate_available and attempt_error is None:
+            attempt_error = "Agent attempt did not create a non-empty Lean candidate."
+            agent_errors.append(f"{phase} {sim_feedback_iterations}: {attempt_error}")
+
         attempt_eval_t0 = time.monotonic()
-        if generated_target.exists():
-            new_result = evaluator.evaluate(prob_id, run_dir)
+        if attempt_candidate_available:
+            new_result = evaluate_candidate()
             if attempt_error:
                 new_result["generation_error"] = attempt_error
         else:
@@ -724,7 +1090,11 @@ def process_problem_guided(
                 "detail": attempt_error or "Agent attempt did not create a Lean candidate.",
             }
         eval_elapsed += time.monotonic() - attempt_eval_t0
-        new_code = generated_target.read_text(errors="replace") if generated_target.exists() else None
+        new_code = (
+            generated_target.read_text(errors="replace")
+            if attempt_candidate_available
+            else None
+        )
 
         if fresh_candidate:
             observation = tracker.start_candidate(
@@ -805,6 +1175,25 @@ def process_problem_guided(
     if tracker.global_best_result is not None:
         result = tracker.global_best_result
 
+    if not candidate_transaction.has_new_candidate():
+        terminal_generation_error = (
+            generation_error or "Guided search did not create a non-empty Lean candidate."
+        )
+        result["agent_error"] = terminal_generation_error
+        result["generation_error"] = terminal_generation_error
+        result["detail"] = terminal_generation_error
+        result["sim_status"] = "agent_error"
+        try:
+            preexisting_generated_restored = candidate_transaction.restore_preexisting()
+        except Exception as exc:
+            preexisting_generated_restore_error = f"{type(exc).__name__}: {exc}"
+            result["agent_error"] += (
+                "; failed to restore preexisting Generated candidate: "
+                f"{preexisting_generated_restore_error}"
+            )
+            result["generation_error"] = result["agent_error"]
+            result["detail"] = result["agent_error"]
+
     all_stats = AgentStats()
     merge_agent_stats(all_stats, planner_stats)
     merge_agent_stats(all_stats, generation_stats)
@@ -816,6 +1205,9 @@ def process_problem_guided(
         "agent_output_tokens": all_stats.output_tokens,
         "agent_compile_checks": all_stats.compile_checks,
         "agent_tool_counts": all_stats.tool_counts,
+        "agent_budget_exhausted": all_stats.budget_exhausted,
+        "agent_usage_accounting_complete": all_stats.usage_accounting_complete,
+        "agent_usage_accounting_notes": all_stats.usage_accounting_notes,
         "agent_turn_budget": args.max_turns,
         "prompt_profile": args.prompt_profile,
         "agent_generation_turns": generation_stats.turns,
@@ -842,7 +1234,7 @@ def process_problem_guided(
         "sim_feedback_success": sim_feedback_success,
         "sim_feedback_turn_budget": max(0, budget.total - planner_stats.turns - generation_stats.turns),
         "sim_feedback_turns_remaining": budget.remaining,
-        "agent_elapsed_seconds": round(agent_elapsed, 3),
+        "agent_elapsed_seconds": rounded_agent_elapsed(agent_elapsed),
         "eval_elapsed_seconds": round(eval_elapsed, 3),
         "elapsed_seconds": round(time.monotonic() - problem_t0, 3),
         "harness": args.harness,
@@ -851,6 +1243,10 @@ def process_problem_guided(
     }
     if preexisting_generated_backup:
         record["preexisting_generated_backup"] = preexisting_generated_backup
+    if preexisting_generated_restored:
+        record["preexisting_generated_restored"] = True
+    if preexisting_generated_restore_error:
+        record["preexisting_generated_restore_error"] = preexisting_generated_restore_error
     try:
         record.update(search.classify_failure_record(result))
     except Exception:
@@ -860,7 +1256,7 @@ def process_problem_guided(
     return record
 
 
-def process_problem(
+def _process_problem_standard(
     prob_id: str,
     *,
     args: argparse.Namespace,
@@ -869,28 +1265,40 @@ def process_problem(
     run_dir: Path,
     skill: str,
     repl: Any | None,
+    candidate_transaction: GeneratedCandidateTransaction | None,
 ) -> dict[str, Any]:
-    if getattr(args, "guided_search", False) and not args.eval_only:
-        return process_problem_guided(
-            prob_id,
-            args=args,
-            ds=ds,
-            evaluator=evaluator,
-            run_dir=run_dir,
-            skill=skill,
-            repl=repl,
-        )
     _add_legacy_agent_path()
     import search
 
     problem_t0 = time.monotonic()
     info = ds.load_problem(prob_id)
+    benchmark_port_resolver = getattr(search, "_benchmark_expected_ports", None)
+    benchmark_ports = (
+        benchmark_port_resolver(info) if benchmark_port_resolver is not None else None
+    )
+
+    def evaluate_candidate():
+        if benchmark_ports is None:
+            return evaluator.evaluate(prob_id, run_dir)
+        return evaluator.evaluate(
+            prob_id, run_dir, benchmark_ports=benchmark_ports
+        )
     has_repl = repl is not None
+    generated_target = (
+        candidate_transaction.target
+        if candidate_transaction is not None
+        else PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
+    )
     agent_stats = AgentStats()
     repair_stats_total = AgentStats()
     agent_elapsed = 0.0
     agent_error: str | None = None
-    preexisting_generated_backup: str | None = None
+    preexisting_generated_backup = (
+        candidate_transaction.backup if candidate_transaction is not None else None
+    )
+    preexisting_generated_restored = False
+    preexisting_generated_restore_error: str | None = None
+    generated_candidate_from_agent = False
     sim_feedback_history: list[dict[str, Any]] = []
     sim_feedback_turn_budget = 0
     sim_feedback_turns_remaining = 0
@@ -898,38 +1306,66 @@ def process_problem(
     sim_feedback_iterations = 0
 
     if not args.eval_only:
-        preexisting_generated_backup = clear_generated_target(PROJECT_ROOT, run_dir, prob_id)
-        user_message = search.build_user_message(
-            prob_id,
-            has_repl=has_repl,
-            info=info,
-            dataset_name=evaluator.dataset_name,
-            condition_sv=None,
-        )
         log_base = run_dir / "logs" / prob_id / "generate"
-        runner = make_runner(
-            args=args,
-            prob_id=prob_id,
-            role="ckt-generator",
-            log_base=log_base,
-            skill=skill,
-            info=info,
-            repl=repl,
-        )
+        t0 = time.monotonic()
         try:
-            t0 = time.monotonic()
+            user_message = search.build_user_message(
+                prob_id,
+                has_repl=has_repl,
+                info=info,
+                dataset_name=evaluator.dataset_name,
+                condition_sv=None,
+            )
+            runner = make_runner(
+                args=args,
+                prob_id=prob_id,
+                role="ckt-generator",
+                log_base=log_base,
+                skill=skill,
+                info=info,
+                repl=repl,
+            )
             agent_stats = runner.run(user_message, max_turns=args.max_turns)
-            agent_elapsed = time.monotonic() - t0
         except Exception as exc:
             agent_error = f"{type(exc).__name__}: {exc}"
-            parsed_stats = parse_agent_log(Path(str(log_base) + ".jsonl"))
-            if parsed_stats.turns or parsed_stats.input_tokens or parsed_stats.output_tokens or parsed_stats.tool_counts:
-                agent_stats = parsed_stats
+            try:
+                parsed_stats = parse_agent_log(Path(str(log_base) + ".jsonl"))
+                if agent_stats_observed(parsed_stats):
+                    agent_stats = parsed_stats
+            except Exception as parse_exc:
+                agent_error += (
+                    "; agent log parsing also failed: "
+                    f"{type(parse_exc).__name__}: {parse_exc}"
+                )
+        finally:
+            agent_elapsed += time.monotonic() - t0
+
+        generated_candidate_from_agent = (
+            candidate_transaction.has_new_candidate()
+            if candidate_transaction is not None
+            else generated_candidate_available(generated_target)
+        )
+        if not generated_candidate_from_agent:
+            if agent_error is None:
+                agent_error = (
+                    "Agent returned without creating a non-empty "
+                    f"Generated/{prob_id}.lean candidate"
+                )
+            try:
+                preexisting_generated_restored = bool(
+                    candidate_transaction
+                    and candidate_transaction.restore_preexisting()
+                )
+            except Exception as exc:
+                preexisting_generated_restore_error = f"{type(exc).__name__}: {exc}"
+                agent_error = (
+                    f"{agent_error}; failed to restore preexisting Generated candidate: "
+                    f"{preexisting_generated_restore_error}"
+                )
 
     eval_t0 = time.monotonic()
-    generated_target = PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
-    if agent_error and generated_target.exists():
-        result = evaluator.evaluate(prob_id, run_dir)
+    if agent_error and generated_candidate_from_agent:
+        result = evaluate_candidate()
         result["agent_error"] = agent_error
         if result.get("detail"):
             result["detail"] = f"Agent ended with {agent_error}; evaluated generated file anyway.\n{result['detail']}"
@@ -947,7 +1383,7 @@ def process_problem(
             "agent_error": agent_error,
         }
     else:
-        result = evaluator.evaluate(prob_id, run_dir)
+        result = evaluate_candidate()
     eval_elapsed = time.monotonic() - eval_t0
 
     if (
@@ -1019,17 +1455,15 @@ def process_problem(
                 info=info,
                 repl=repl,
             )
+            repair_t0 = time.monotonic()
             try:
-                repair_t0 = time.monotonic()
                 repair_turn_limit = sim_feedback_turns_remaining
                 if args.sim_feedback_turns_per_iter is not None:
                     repair_turn_limit = min(repair_turn_limit, max(0, args.sim_feedback_turns_per_iter))
                 if repair_turn_limit <= 0:
                     break
                 repair_stats = repair_runner.run(compact_prompt, max_turns=repair_turn_limit)
-                repair_elapsed = time.monotonic() - repair_t0
                 merge_agent_stats(repair_stats_total, repair_stats)
-                agent_elapsed += repair_elapsed
                 sim_feedback_turns_remaining = max(0, sim_feedback_turns_remaining - repair_stats.turns)
             except Exception as exc:
                 sim_feedback_history.append({
@@ -1039,13 +1473,32 @@ def process_problem(
                     "remaining_turns": sim_feedback_turns_remaining,
                 })
                 break
+            finally:
+                agent_elapsed += time.monotonic() - repair_t0
+
+            repair_candidate_available = (
+                candidate_transaction.has_new_candidate()
+                if candidate_transaction is not None
+                else generated_candidate_available(generated_target)
+            )
+            if not repair_candidate_available:
+                sim_feedback_history.append({
+                    "phase": "sim_feedback",
+                    "iteration": sim_iter,
+                    "note": "Agent returned without a non-empty repair candidate; restored the prior best without evaluating the empty artifact.",
+                    "remaining_turns": sim_feedback_turns_remaining,
+                })
+                if best_code is not None:
+                    generated_target.write_text(best_code, encoding="utf-8")
+                result = best_result
+                break
 
             repair_eval_t0 = time.monotonic()
-            new_result = evaluator.evaluate(prob_id, run_dir)
+            new_result = evaluate_candidate()
             eval_elapsed += time.monotonic() - repair_eval_t0
             new_key = search.eval_progress_key(new_result)
             best_key = search.eval_progress_key(best_result)
-            candidate_exists = generated_target.exists()
+            candidate_exists = repair_candidate_available
             improved = new_key > best_key
             generation_incomplete = not bool(best_result.get("compile_pass"))
             accepted = candidate_exists and (generation_incomplete or new_key >= best_key)
@@ -1102,30 +1555,30 @@ def process_problem(
             generated_target.write_text(best_code, encoding="utf-8")
             result = best_result
 
+    all_stats = AgentStats()
+    merge_agent_stats(all_stats, agent_stats)
+    merge_agent_stats(all_stats, repair_stats_total)
     record = {
         "prob_id": prob_id,
         "agent_turns": agent_stats.turns,
-        "agent_input_tokens": agent_stats.input_tokens + repair_stats_total.input_tokens,
-        "agent_output_tokens": agent_stats.output_tokens + repair_stats_total.output_tokens,
-        "agent_compile_checks": agent_stats.compile_checks + repair_stats_total.compile_checks,
-        "agent_tool_counts": {
-            **agent_stats.tool_counts,
-            **{
-                name: agent_stats.tool_counts.get(name, 0) + count
-                for name, count in repair_stats_total.tool_counts.items()
-            },
-        },
+        "agent_input_tokens": all_stats.input_tokens,
+        "agent_output_tokens": all_stats.output_tokens,
+        "agent_compile_checks": all_stats.compile_checks,
+        "agent_tool_counts": all_stats.tool_counts,
+        "agent_budget_exhausted": all_stats.budget_exhausted,
+        "agent_usage_accounting_complete": all_stats.usage_accounting_complete,
+        "agent_usage_accounting_notes": all_stats.usage_accounting_notes,
         "agent_turn_budget": args.max_turns,
         "prompt_profile": args.prompt_profile,
         "agent_generation_turns": agent_stats.turns,
-        "agent_turns_total": agent_stats.turns + repair_stats_total.turns,
+        "agent_turns_total": all_stats.turns,
         "sim_feedback_enabled": bool(args.sim_feedback),
         "sim_feedback_iterations": sim_feedback_iterations,
         "sim_feedback_success": sim_feedback_success,
         "sim_feedback_turn_budget": sim_feedback_turn_budget,
         "sim_feedback_turns_remaining": sim_feedback_turns_remaining,
         "sim_feedback_history": sim_feedback_history,
-        "agent_elapsed_seconds": round(agent_elapsed, 3),
+        "agent_elapsed_seconds": rounded_agent_elapsed(agent_elapsed),
         "eval_elapsed_seconds": round(eval_elapsed, 3),
         "elapsed_seconds": round(time.monotonic() - problem_t0, 3),
         "harness": args.harness,
@@ -1134,6 +1587,10 @@ def process_problem(
     }
     if preexisting_generated_backup:
         record["preexisting_generated_backup"] = preexisting_generated_backup
+    if preexisting_generated_restored:
+        record["preexisting_generated_restored"] = True
+    if preexisting_generated_restore_error:
+        record["preexisting_generated_restore_error"] = preexisting_generated_restore_error
     try:
         record.update(search.classify_failure_record(result))
     except Exception:
@@ -1141,6 +1598,57 @@ def process_problem(
     record.update(result)
     append_jsonl(run_dir / "results.jsonl", record)
     return record
+
+
+def process_problem(
+    prob_id: str,
+    *,
+    args: argparse.Namespace,
+    ds: Any,
+    evaluator: Any,
+    run_dir: Path,
+    skill: str,
+    repl: Any | None,
+) -> dict[str, Any]:
+    """Process one problem under a single Generated-candidate transaction."""
+
+    if args.eval_only:
+        with GeneratedCandidateTransaction(
+            PROJECT_ROOT, run_dir, prob_id, read_only=True
+        ) as transaction:
+            return _process_problem_standard(
+                prob_id,
+                args=args,
+                ds=ds,
+                evaluator=evaluator,
+                run_dir=run_dir,
+                skill=skill,
+                repl=repl,
+                candidate_transaction=transaction,
+            )
+
+    with GeneratedCandidateTransaction(PROJECT_ROOT, run_dir, prob_id) as transaction:
+        if getattr(args, "guided_search", False):
+            return process_problem_guided(
+                prob_id,
+                args=args,
+                ds=ds,
+                evaluator=evaluator,
+                run_dir=run_dir,
+                skill=skill,
+                repl=repl,
+                candidate_transaction=transaction,
+            )
+        return _process_problem_standard(
+            prob_id,
+            args=args,
+            ds=ds,
+            evaluator=evaluator,
+            run_dir=run_dir,
+            skill=skill,
+            repl=repl,
+            candidate_transaction=transaction,
+        )
 
 
 def main() -> None:
@@ -1217,20 +1725,7 @@ def main() -> None:
                     }
                     append_jsonl(run_dir / "results.jsonl", record)
                 with summary_lock:
-                    if record.get("compile_pass"):
-                        summary["compile_pass"] += 1
-                    summary["sim_feedback_attempts"] += int(record.get("sim_feedback_iterations") or 0)
-                    if record.get("sim_feedback_success"):
-                        summary["sim_feedback_success"] += 1
-                    status = record.get("sim_status")
-                    if status == "sim_pass":
-                        summary["sim_pass"] += 1
-                    elif status == "sim_fail":
-                        summary["sim_fail"] += 1
-                    elif status == "agent_error":
-                        summary["agent_error"] += 1
-                    else:
-                        summary["sim_error"] += 1
+                    accumulate_summary_record(summary, record)
                 print(f"[{idx}/{len(problems)}] done {prob_id}: compile={record.get('compile_pass')} lint={record.get('lint_pass')} sim={record.get('sim_status')} turns={record.get('agent_turns_total')} tok={record.get('agent_input_tokens')}+{record.get('agent_output_tokens')}")
     finally:
         if pool is not None:

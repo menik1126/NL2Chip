@@ -17,6 +17,7 @@ import Sparkle.IR.Specialize
 import Sparkle.Compiler.DRC
 import Sparkle.Core.Signal
 import Sparkle.Core.Vector
+import Sparkle.Library.RTL
 
 namespace Sparkle.Compiler.Elab
 
@@ -38,6 +39,10 @@ structure CompilerState where
   parameterDefaults : List (String × Nat) := []
   clockWire : Option String := none       -- Name of clock wire (if any)
   resetWire : Option String := none       -- Name of reset wire (if any)
+  /-- Records only wires created by the current root translation.  Recursive
+      translations install their own recorder (normally none), so a returned
+      nested-let wire cannot be mistaken for the root's result. -/
+  rootWireRecorder : Option (IO.Ref (Option String)) := none
 
 /-- Compiler monad: combines CircuitM builder with MetaM -/
 abbrev CompilerM := ReaderT CompilerState (StateT CircuitState MetaM)
@@ -91,12 +96,21 @@ def withLetDecl {α : Type} (name : Name) (type : Lean.Expr) (value : Lean.Expr)
 /-- Lift MetaM into CompilerM -/
 def liftMetaM {α : Type} (m : MetaM α) : CompilerM α :=
   liftM m
+/-- Record a wire only for the active root lowering invocation. -/
+private def recordRootWire (name : String) : CompilerM Unit := do
+  if let some recorder := (← getCompilerState).rootWireRecorder then
+    let record : MetaM Unit :=
+      liftM <| Lean.Core.liftIOCore
+        (recorder.set (some name) : IO Unit)
+    liftMetaM record
+
 
 /-- Lift CircuitM operations by modifying the circuit state -/
 def makeWire (hint : String) (ty : HWType) (named : Bool := false) : CompilerM String := do
   let cs ← get
   let (name, cs') := CircuitM.makeWire hint ty named cs
   set cs'
+  recordRootWire name
   return name
 
 def emitAssign (lhs : String) (rhs : Sparkle.IR.AST.Expr) : CompilerM Unit := do
@@ -145,6 +159,7 @@ def emitRegister (hint : String) (clk : String) (rst : String) (input : Sparkle.
   let cs ← get
   let (name, cs') := CircuitM.emitRegister hint clk rst input initVal ty named cs
   set cs'
+  recordRootWire name
   return name
 
 def emitMemory (hint : String) (addrWidth dataWidth : DimExpr) (clk : String)
@@ -152,6 +167,7 @@ def emitMemory (hint : String) (addrWidth dataWidth : DimExpr) (clk : String)
   let cs ← get
   let (name, cs') := CircuitM.emitMemory hint addrWidth dataWidth clk writeAddr writeData writeEnable readAddr named cs
   set cs'
+  recordRootWire name
   return name
 
 def emitMemoryComboRead (hint : String) (addrWidth dataWidth : DimExpr) (clk : String)
@@ -159,6 +175,7 @@ def emitMemoryComboRead (hint : String) (addrWidth dataWidth : DimExpr) (clk : S
   let cs ← get
   let (name, cs') := CircuitM.emitMemoryComboRead hint addrWidth dataWidth clk writeAddr writeData writeEnable readAddr named cs
   set cs'
+  recordRootWire name
   return name
 
 def emitInstance (moduleName : String) (instName : String)
@@ -809,8 +826,32 @@ def extractBitVecArray (expr : Lean.Expr) : CompilerM (Array (Nat × DimExpr)) :
   | _ =>
     CompilerM.liftMetaM $ throwError s!"Expected Array expression, got: {expr}"
 
+/-- A hardware-let value already carries its source-level name only when the
+    translation created that exact stable name during this let.  The freshness
+    check is important for aliases and shadowed lets: an older `_gen_x` wire is
+    not the named result of a new `let x := ...`. -/
+private def isFreshGeneratedLetName
+    (usedBefore : List String) (hint wireName : String) : Bool :=
+  if usedBefore.contains wireName then false
+  else
+    let base := s!"_gen_{CircuitM.sanitizeName hint}"
+    if wireName == base then true
+    else
+      let numberedPrefix := base ++ "_"
+      if wireName.startsWith numberedPrefix then
+        let suffix := wireName.drop numberedPrefix.length
+        !suffix.isEmpty && suffix.toString.toList.all (fun c => c.isDigit)
+      else false
+
 mutual
-  partial def translateExprToWire (e : Lean.Expr) (hint : String := "wire") (isTopLevel : Bool := false) (isNamed : Bool := false) : CompilerM String := do
+  partial def translateExprToWire (e : Lean.Expr) (hint : String := "wire")
+      (isTopLevel : Bool := false) (isNamed : Bool := false)
+      (rootWireRecorder : Option (IO.Ref (Option String)) := none) : CompilerM String := do
+    withReader
+        (fun state => { state with rootWireRecorder := rootWireRecorder }) do
+      translateExprToWireCore e hint isTopLevel isNamed
+
+  partial def translateExprToWireCore (e : Lean.Expr) (hint : String) (isTopLevel isNamed : Bool) : CompilerM String := do
     trace[sparkle.compiler] "translateExprToWire hint={hint} isTopLevel={isTopLevel}"
     -- 0. Handle free variables first (before any whnf)
     if let .fvar fvarId := e then
@@ -953,6 +994,14 @@ mutual
           let resWire ← CompilerM.makeWire hint .bit (named := isNamed)
           CompilerM.emitAssign resWire (.const 0 1)
           return resWire
+        -- Bool and BitVec 1 have the same packed one-bit representation in the
+        -- IR.  Preserve the operand reference instead of lowering these RTL
+        -- representation casts into a mux/equality tree; this also keeps tuple
+        -- leaf provenance available to downstream consumers.
+        if (name == ``Sparkle.Library.RTL.boolToBV1 ||
+            name == ``Sparkle.Library.RTL.bv1ToBool) && args.size >= 1 then
+          return ← translateExprToWire args.back! hint (isNamed := isNamed)
+
 
         -- OfNat.mk: unwrap the constructor to its value
         if name == ``OfNat.mk && args.size >= 1 then
@@ -1428,9 +1477,42 @@ mutual
 
     | .letE name type value body _ => do
       -- For any let binding, just use normal let handling
-      if let some _ ← inferHWTypeFromSignal? type then
-        -- Hardware let: translate value to wire
-        let valueWire ← translateExprToWire value name.toString (isTopLevel := false) (isNamed := true)
+      if let some hwType ← inferHWTypeFromSignal? type then
+        -- Hardware let: translate the value under a recorder owned only by
+        -- this root invocation.  Recursive translations install a fresh
+        -- (normally empty) recorder, so string similarity alone is never
+        -- accepted as evidence that the returned wire belongs to this let.
+        let usedBefore := (← get).usedNames
+        let makeRecorder : MetaM (IO.Ref (Option String)) :=
+          liftM <| Lean.Core.liftIOCore
+            (IO.mkRef (none : Option String) : IO (IO.Ref (Option String)))
+        let rootRecorder ← CompilerM.liftMetaM makeRecorder
+        let rawValueWire ←
+          translateExprToWire value name.toString (isTopLevel := false)
+            (isNamed := true) (rootWireRecorder := some rootRecorder)
+        let readRecorder : MetaM (Option String) :=
+          liftM <| Lean.Core.liftIOCore
+            (rootRecorder.get : IO (Option String))
+        let rootValueWire ← CompilerM.liftMetaM readRecorder
+        -- Most operators create and return their named result directly.  Loops,
+        -- aliases, identity wrappers, and nested lets return another wire and
+        -- therefore receive one same-typed alias at this boundary.  Keep
+        -- unpacked arrays out of the packed provenance contract.
+        let valueWire ← match hwType with
+          | .bit | .bitVector _ => do
+            if rootValueWire == some rawValueWire &&
+                isFreshGeneratedLetName usedBefore name.toString rawValueWire then
+              pure rawValueWire
+            else
+              -- This alias belongs to the current let, not to any enclosing
+              -- root translation whose RHS happens to be this let expression.
+              let aliasWire ← withReader
+                  (fun state => { state with rootWireRecorder := none }) do
+                CompilerM.makeWire name.toString hwType (named := true)
+              if aliasWire != rawValueWire then
+                CompilerM.emitAssign aliasWire (.ref rawValueWire)
+              pure aliasWire
+          | .array _ _ => pure rawValueWire
         CompilerM.withLocalDecl name type fun fvar => do
           let fvarId := fvar.fvarId!
           CompilerM.withVarMapping fvarId valueWire do
