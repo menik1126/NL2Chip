@@ -24,6 +24,12 @@ CVDP-style RTL translation under a small turn budget.
   `dffe`, or `Signal.register`). Apply `resetHigh`/`resetLow` to the next-state
   value before the register.
 
+- `Signal.loop` returns feedback state, not final interface outputs. Its lambda
+  must end in `dff`, `dffe`, or `Signal.register`. For a counter/FIFO/FSM with
+  several ports, first bind `let state := Signal.loop fun state => ... dff init
+  nextState`, then derive and bundle all outputs outside the loop. Never return
+  a packed output bundle from the same loop body that creates a register.
+
 ## Native P3 Symbolic Parameters
 
 When the contract says Native Parameter Sweep (P3), this section overrides the
@@ -80,6 +86,21 @@ def exampleCounter {dom : DomainConfig}
 The `rstN` input is sampled on the implicit domain clock and has priority over
 the enable because `resetLow` wraps the already enable-selected next state. Do
 not add a synthetic clock port unless the contract explicitly exposes one.
+
+### Parameterized state with outputs outside the feedback loop
+
+```lean
+def exampleStateWithFlag {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W × BitVec 1) :=
+  let q : Signal dom (BitVec W) :=
+    Signal.loop fun q =>
+      Signal.register (BitVec.ofNat W 0) (q ^^^ x)
+  let active := boolToBV1 (nonZero q)
+  bundle2 q active
+```
+
+The final expression inside `Signal.loop` is the register for `q`. `bundle2`
+is outside the loop, after the feedback state has been defined.
 
 ### Slicing and multiple output ports
 

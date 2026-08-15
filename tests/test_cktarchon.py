@@ -34,6 +34,16 @@ from cktarchon.responses_chat_proxy import (
 )
 
 
+def test_skill_requires_outputs_outside_signal_loop():
+    skill = (Path(__file__).resolve().parents[1] / "agent" / "skill.txt").read_text(
+        encoding="utf-8"
+    )
+    prompt = build_system_prompt(skill, "prob_a", prompt_profile="cvdp-skill-fewshot")
+
+    assert "`Signal.loop` returns feedback state, not final interface outputs" in prompt
+    assert "Never return\n  a packed output bundle from the same loop body" in prompt
+
+
 def test_model_alias_sonnet_45():
     assert model_alias("claude-sonnet-4.5") == "claude-sonnet-4-5-20250929"
 
