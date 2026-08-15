@@ -97,3 +97,9 @@ def symbolicLetMaskXor {dom : DomainConfig} {W : Nat}
     (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
   let mask : BitVec W := BitVec.ofNat W 1
   x ^^^ mask
+
+/-- A retained parameter may be materialized at a clog2-derived width. -/
+def symbolicParameterLiteral {dom : DomainConfig} {D : Nat}
+    (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 D + 1)))
+    : Signal dom (BitVec (Sparkle.Library.RTL.clog2 D + 1)) :=
+  Signal.pure (BitVec.ofNat (Sparkle.Library.RTL.clog2 D + 1) D)

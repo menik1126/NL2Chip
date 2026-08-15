@@ -322,6 +322,25 @@ partial def extractDimExpr (expr : Lean.Expr) : CompilerM DimExpr := do
       else if name == ``Nat.pow then binary .pow
       else if name == ``Nat.min then binary .min
       else if name == ``Nat.max then binary .max
+      else if name == ``Decidable.rec && args.size >= 3 then
+        -- `Sparkle.Library.RTL.clog2` may be unfolded by elaboration when it
+        -- appears in a BitVec literal width. Recognize only its exact
+        -- `if value <= 1 then 0 else log2 (value - 1) + 1` decision shape.
+        let condition := args.back!
+        let conditionFn := condition.getAppFn
+        let conditionArgs := condition.getAppArgs
+        if let .const conditionName _ := conditionFn then
+          if conditionName == ``Nat.decLe && conditionArgs.size >= 2 then
+            let threshold ← try
+              some <$> extractDimExpr conditionArgs.back!
+            catch _ => pure none
+            let rendered ← CompilerM.liftMetaM (ppExpr expr)
+            if threshold == some (.literal 1) && rendered.pretty.contains "log2" then
+              return .clog2 (← extractDimExpr conditionArgs[conditionArgs.size - 2]!)
+        let rendered ← CompilerM.liftMetaM (ppExpr expr)
+        CompilerM.liftMetaM $ throwError
+          (s!"Unsupported symbolic hardware dimension '{rendered}'.\n" ++
+           "Supported operations: retained parameters, literals, +, -, *, /, %, ^, min, and max.")
       else if name == ``Nat.succ && !args.isEmpty then
         return DimExpr.mkAdd (← extractDimExpr args.back!) (.literal 1)
       else if name == ``OfNat.ofNat && args.size >= 2 then
