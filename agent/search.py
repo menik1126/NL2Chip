@@ -2867,9 +2867,16 @@ def build_compact_repair_prompt(
             f"Before editing, use `read_file` on `Generated/{prob_id}.lean`; that file is the authoritative current candidate.",
         ])
     if include_cvdp_verified_idioms:
-        constraints.append(
-            "Use the single retrieved repair idiom only as an expression-shape guide; preserve the target scaffold's names, signature, output packing, reset polarity, and latency."
-        )
+        if include_cvdp_scaffold:
+            constraints.extend([
+                "Directly adopt the single retrieved repair idiom body in the current typed scaffold, adapting only the authoritative task names, widths, output order, reset polarity, and latency.",
+                f"After the one required `read_file` of `Generated/{prob_id}.lean`, your next tool action must edit that target. Do not read or search anything else, and do not merely analyze the idiom.",
+                "Run the required compile check only after that edit, then iterate edit followed by check until generated Verilog is produced.",
+            ])
+        else:
+            constraints.append(
+                "Directly adopt the single retrieved repair idiom body in the current candidate, adapting names, signature, output packing, reset polarity, and latency; edit before running the required compile check."
+            )
     if extra_constraints:
         constraints.append(extra_constraints)
     interface_contract = format_benchmark_interface_contract(info)
@@ -2934,7 +2941,12 @@ def build_compact_repair_prompt(
         f"### Required Constraints\n\n"
         + "\n".join(f"- {c}" for c in constraints)
         + "\n\n"
-        f"Repair the current Lean candidate using the tools. End only after the final file is written."
+        + (
+            f"Read `Generated/{prob_id}.lean` once, then immediately edit it using the repair idiom body before any check or further read/search. "
+            "Reading or explaining without an edit is not a repair. End only after the edited final file is written and checked."
+            if include_cvdp_scaffold and include_cvdp_verified_idioms else
+            "Repair the current Lean candidate using the tools. End only after the final file is written."
+        )
     )
 
 

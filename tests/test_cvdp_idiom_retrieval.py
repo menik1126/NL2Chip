@@ -190,6 +190,11 @@ def test_reset_polarity_aliases_are_canonical_and_invalid_values_fail():
         ("unresolved outW metavariable after slice", "slice_resize"),
         ("unresolved dimension around clog2Nat", "derived_width"),
         ("unsupported array in tuple loop state", "memory_1r1w"),
+        (
+            # Exact root line from run2 hamming_tx repair iteration 2.
+            "Compile failed: don't know how to synthesize implicit argument `PW`",
+            "derived_width",
+        ),
     ],
 )
 def test_repair_classifier_selects_one_precise_root_card(
@@ -225,6 +230,60 @@ def test_repair_classifier_avoids_old_broad_false_positive_terms():
 
     assert classify_cvdp_idiom_feedback(query, feedback) is None
     assert select_cvdp_idioms(query, feedback=feedback) == ()
+
+
+@pytest.mark.parametrize(
+    "feedback",
+    [
+        # Exact diagnostic emitted by all run2 typed-scaffold fallbacks.
+        "Compile-checked typed scaffold fallback; behavioral TODOs remain.",
+        "failure_category: scaffold_incomplete",
+        "CKTARCHON_IMPLEMENTATION_REQUIRED: remove after implementation.",
+        "TODO: implement `data_out`; behavioral logic remains.",
+        "The required behavior is not implemented.",
+        # Exact terminal line from run2 restoring_division repair iteration 3.
+        "Cannot instantiate sorryAx: not a hardware module definition",
+        "当前行为未实现。",
+    ],
+)
+def test_scaffold_incomplete_feedback_uses_highest_ranked_initial_card(
+    feedback: str,
+):
+    query = CVDPIdiomQuery(
+        has_parameters=True,
+        has_derived_widths=True,
+        is_sequential=True,
+        has_reset=True,
+        reset_polarity="active-high",
+        has_multiple_outputs=True,
+        uses_memory=True,
+        uses_bit_network=True,
+        uses_width_transform=True,
+    )
+    initial = select_cvdp_idioms(query)
+    repair = select_cvdp_idioms(query, feedback=feedback)
+
+    assert _ids(initial)[0] == "memory_1r1w"
+    assert classify_cvdp_idiom_feedback(query, feedback) == _ids(initial)[0]
+    assert _ids(repair) == (_ids(initial)[0],)
+    assert len(render_cvdp_idiom_context(repair, repair=True)) <= 1400
+
+
+def test_precise_root_diagnostic_wins_over_scaffold_fallback_marker():
+    query = CVDPIdiomQuery(
+        has_parameters=True,
+        uses_memory=True,
+        uses_bit_network=True,
+    )
+    feedback = (
+        "Compile-checked typed scaffold fallback; behavioral TODOs remain.\n"
+        "First frontend error: List.foldl recursion is unsupported."
+    )
+
+    assert classify_cvdp_idiom_feedback(query, feedback) == "bounded_stages"
+    assert _ids(select_cvdp_idioms(query, feedback=feedback)) == (
+        "bounded_stages",
+    )
 
 
 def test_repair_renderer_never_contains_definition_shell():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import fnmatch
 import json
 import os
@@ -244,6 +245,13 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+_CVDP_CADENCE_BROWSE_TOOLS = frozenset(
+    {"read_file", "grep", "glob", "list_directory"}
+)
+_CVDP_CADENCE_EDIT_TOOLS = frozenset({"edit_file", "write_file"})
+_CVDP_CADENCE_FORCE_EDIT_TURN = 2
+_CVDP_CADENCE_MAX_BROWSE_CALLS = 2
+
 
 @dataclass
 class PathGuard:
@@ -316,11 +324,19 @@ class AnthropicHarnessRunner:
     api_timeout: float | None = 300.0
     extra_write_globs: tuple[str, ...] = ()
     local_guardrails: bool = False
+    verified_idioms: bool = False
     tool_counts: dict[str, int] = field(default_factory=dict)
     compile_checks: int = 0
     _tool_sequence: int = field(default=0, init=False, repr=False)
     _last_complete_code: str | None = field(default=None, init=False, repr=False)
     _last_complete_sequence: int = field(default=-1, init=False, repr=False)
+    _cadence_turn: int = field(default=0, init=False, repr=False)
+    _cadence_browse_calls: int = field(default=0, init=False, repr=False)
+    _cadence_browse_signatures: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
+    _cadence_target_changed: bool = field(default=False, init=False, repr=False)
+    _cadence_check_due: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         ensure_runtime_env()
@@ -346,6 +362,218 @@ class AnthropicHarnessRunner:
     def log_path(self) -> Path:
         return Path(str(self.log_base) + ".jsonl")
 
+    @property
+    def _cadence_enabled(self) -> bool:
+        return self.local_guardrails and self.verified_idioms
+
+    @property
+    def _generated_target_rel(self) -> str:
+        return f"Generated/{self.prob_id}.lean"
+
+    def _cadence_phase(self, turn: int) -> str:
+        if self._cadence_check_due:
+            return "check"
+        if not self._cadence_target_changed and (
+            turn >= _CVDP_CADENCE_FORCE_EDIT_TURN
+            or self._cadence_browse_calls >= _CVDP_CADENCE_MAX_BROWSE_CALLS
+        ):
+            return "edit"
+        return "explore"
+
+    def _tool_with_target_path(self, tool: dict[str, Any]) -> dict[str, Any]:
+        narrowed = copy.deepcopy(tool)
+        path_schema = narrowed["input_schema"]["properties"].setdefault(
+            "path", {"type": "string"}
+        )
+        path_schema["enum"] = [self._generated_target_rel]
+        return narrowed
+
+    def _cadence_request_tools(
+        self,
+        request_tools: list[dict[str, Any]],
+        phase: str,
+    ) -> list[dict[str, Any]]:
+        if phase == "edit":
+            return [
+                self._tool_with_target_path(tool)
+                for tool in request_tools
+                if tool["name"] in _CVDP_CADENCE_EDIT_TOOLS
+            ]
+        if phase == "check":
+            lean_tool = next(
+                tool for tool in request_tools if tool["name"] == "lean_check"
+            )
+            narrowed = self._tool_with_target_path(lean_tool)
+            narrowed["description"] = (
+                "Compile-check the just-edited generated target before any other action."
+            )
+            narrowed["input_schema"] = {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "enum": [self._generated_target_rel],
+                    }
+                },
+                "required": ["path"],
+            }
+            return [narrowed]
+        if self._cadence_browse_calls >= _CVDP_CADENCE_MAX_BROWSE_CALLS:
+            return [
+                tool
+                for tool in request_tools
+                if tool["name"] not in _CVDP_CADENCE_BROWSE_TOOLS
+            ]
+        return request_tools
+
+    def _cadence_directive(self, phase: str, turn: int, max_turns: int) -> str:
+        prefix = (
+            "\n\n## Verified-idiom tool cadence (mandatory)\n"
+            f"This is harness turn {turn + 1} of {max_turns}. "
+        )
+        if phase == "check":
+            return (
+                prefix
+                + "The target was successfully changed. Your next effective action must be "
+                + f"lean_check with path exactly {self._generated_target_rel}; "
+                + "do not browse, edit again, or answer with prose first."
+            )
+        if phase == "edit":
+            return (
+                prefix
+                + f"Exploration is over. Change {self._generated_target_rel} now with "
+                + "edit_file or write_file; browsing and prose-only responses are "
+                + "not progress."
+            )
+        remaining = max(
+            0, _CVDP_CADENCE_MAX_BROWSE_CALLS - self._cadence_browse_calls
+        )
+        return (
+            prefix
+            + f"At most {remaining} repository browsing call(s) remain. Read only what is "
+            + f"essential and change {self._generated_target_rel} no later than harness "
+            + f"turn {_CVDP_CADENCE_FORCE_EDIT_TURN + 1}."
+        )
+
+    def _cadence_tool_choice(self, phase: str) -> dict[str, str] | None:
+        if phase == "edit":
+            return {"type": "any"}
+        if phase == "check":
+            return {"type": "tool", "name": "lean_check"}
+        return None
+
+    def _cadence_browse_signature(
+        self, name: str, inputs: dict[str, Any]
+    ) -> str:
+        return json.dumps(
+            {"name": name, "input": inputs},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _cadence_block_reason(
+        self, name: str, inputs: dict[str, Any]
+    ) -> str | None:
+        if not self._cadence_enabled:
+            return None
+        if self._cadence_check_due:
+            if name != "lean_check":
+                return (
+                    "the generated target changed successfully; the next effective action "
+                    f"must be lean_check on {self._generated_target_rel}"
+                )
+            if inputs.get("code") is not None or not self._is_generated_target(
+                str(inputs.get("path") or self._generated_target_rel)
+            ):
+                return (
+                    "the required post-edit lean_check must use path exactly "
+                    f"{self._generated_target_rel}, not inline code or another file"
+                )
+            return None
+        if name in _CVDP_CADENCE_EDIT_TOOLS and not self._is_generated_target(
+            str(inputs.get("path") or "")
+        ):
+            return (
+                "verified-idiom cadence permits edit_file/write_file only on "
+                f"{self._generated_target_rel}"
+            )
+        if not self._cadence_target_changed and (
+            self._cadence_turn >= _CVDP_CADENCE_FORCE_EDIT_TURN
+            or self._cadence_browse_calls >= _CVDP_CADENCE_MAX_BROWSE_CALLS
+        ):
+            if name not in _CVDP_CADENCE_EDIT_TOOLS:
+                return (
+                    "exploration is over; change the generated target now with "
+                    f"edit_file or write_file on {self._generated_target_rel}"
+                )
+        if name in _CVDP_CADENCE_BROWSE_TOOLS:
+            signature = self._cadence_browse_signature(name, inputs)
+            if signature in self._cadence_browse_signatures:
+                return (
+                    f"duplicate {name} call blocked; use the information already returned "
+                    f"and edit {self._generated_target_rel}"
+                )
+            if self._cadence_browse_calls >= _CVDP_CADENCE_MAX_BROWSE_CALLS:
+                return (
+                    "repository browsing quota exhausted; edit the generated target and "
+                    "run lean_check"
+                )
+        return None
+
+    def _cadence_target_source(self) -> str | None:
+        try:
+            path = self.guard.resolve(self._generated_target_rel)
+            if path.exists() and path.is_file():
+                return path.read_text(errors="replace")
+        except OSError:
+            pass
+        return None
+
+    def _record_cadence_result(
+        self,
+        name: str,
+        inputs: dict[str, Any],
+        result: str,
+        target_before: str | None,
+    ) -> str:
+        if not self._cadence_enabled:
+            return result
+        if name in _CVDP_CADENCE_BROWSE_TOOLS:
+            self._cadence_browse_calls += 1
+            self._cadence_browse_signatures.add(
+                self._cadence_browse_signature(name, inputs)
+            )
+        if name in _CVDP_CADENCE_EDIT_TOOLS and self._is_generated_target(
+            str(inputs.get("path") or "")
+        ):
+            target_after = self._cadence_target_source()
+            if not result.startswith("Error:") and target_after != target_before:
+                self._cadence_target_changed = True
+                self._cadence_check_due = True
+            elif not result.startswith("Error:"):
+                result += (
+                    "\nCadence guard: the target content did not change; make a real edit "
+                    "before continuing."
+                )
+        elif name == "lean_check" and self._cadence_check_due:
+            if not result.startswith(
+                ("Error:", "REPL failed")
+            ):
+                self._cadence_check_due = False
+                certified_target = bool(
+                    self._last_complete_code is not None
+                    and self._last_complete_sequence == self._tool_sequence
+                    and self._last_complete_code == self._cadence_target_source()
+                )
+                if not certified_target:
+                    # A check without a current compile-safe hardware checkpoint
+                    # supplies diagnostics but is not permission to resume
+                    # browsing or repeat the same check.
+                    self._cadence_target_changed = False
+                    self._cadence_browse_calls = _CVDP_CADENCE_MAX_BROWSE_CALLS
+        return result
+
     def run(self, prompt: str, *, max_turns: int) -> AgentStats:
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         stats = AgentStats()
@@ -367,14 +595,36 @@ class AnthropicHarnessRunner:
         )
 
         for turn in range(max_turns):
-            try:
-                response = self._create_message_with_retries(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=self.system_prompt,
-                    tools=request_tools,
-                    messages=messages,
+            request_kwargs: dict[str, Any] = {
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "system": self.system_prompt,
+                "tools": request_tools,
+                "messages": messages,
+            }
+            if self._cadence_enabled:
+                self._cadence_turn = turn
+                cadence_phase = self._cadence_phase(turn)
+                cadence_tools = self._cadence_request_tools(
+                    request_tools, cadence_phase
                 )
+                request_kwargs["system"] = (
+                    self.system_prompt
+                    + self._cadence_directive(cadence_phase, turn, max_turns)
+                )
+                request_kwargs["tools"] = cadence_tools
+                tool_choice = self._cadence_tool_choice(cadence_phase)
+                if tool_choice is not None:
+                    request_kwargs["tool_choice"] = tool_choice
+                append_jsonl(self.log_path, {
+                    "event": "cvdp_tool_cadence",
+                    "turn": turn,
+                    "phase": cadence_phase,
+                    "browse_calls": self._cadence_browse_calls,
+                    "tool_names": [tool["name"] for tool in cadence_tools],
+                })
+            try:
+                response = self._create_message_with_retries(**request_kwargs)
             except Exception:
                 self._autosave_last_complete_candidate()
                 raise
@@ -498,6 +748,20 @@ class AnthropicHarnessRunner:
                 signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
 
     def _execute_tool(self, name: str, inputs: dict[str, Any]) -> str:
+        block_reason = self._cadence_block_reason(name, inputs)
+        if block_reason is not None:
+            return f"Error: cadence guard: {block_reason}."
+        target_before = (
+            self._cadence_target_source()
+            if self._cadence_enabled
+            and name in _CVDP_CADENCE_EDIT_TOOLS
+            and self._is_generated_target(str(inputs.get("path") or ""))
+            else None
+        )
+        result = self._execute_tool_unchecked(name, inputs)
+        return self._record_cadence_result(name, inputs, result, target_before)
+
+    def _execute_tool_unchecked(self, name: str, inputs: dict[str, Any]) -> str:
         try:
             if name == "bash":
                 return self._bash(str(inputs.get("command", "")))

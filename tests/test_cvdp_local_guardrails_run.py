@@ -50,7 +50,11 @@ def _result(*, compile_pass: bool, sim_status: str, detail: str):
     }
 
 
-def _fake_search(feedback_seen: list[str], repair_prompts: list[dict]):
+def _fake_search(
+    feedback_seen: list[str],
+    repair_prompts: list[dict],
+    idiom_feedback_seen: list[str] | None = None,
+):
     module = ModuleType("search")
     module.build_cvdp_typed_scaffold = lambda info: SCAFFOLD
     module.build_user_message = lambda *args, **kwargs: "initial"
@@ -74,7 +78,13 @@ def _fake_search(feedback_seen: list[str], repair_prompts: list[dict]):
         is_sequential=True, reset_polarity="active-high"
     )
     module.cvdp_verified_idiom_catalog_sha256 = lambda: "a" * 64
-    module.cvdp_verified_idiom_ids = lambda *args, **kwargs: ("packed_state_high",)
+    def verified_idiom_ids(*args, **kwargs):
+        feedback = kwargs.get("feedback", "")
+        if kwargs.get("repair") and idiom_feedback_seen is not None:
+            idiom_feedback_seen.append(feedback)
+        return ("packed_state_high",)
+
+    module.cvdp_verified_idiom_ids = verified_idiom_ids
     module.format_cvdp_verified_idioms = lambda *args, **kwargs: "VERIFIED_BODY"
     return module
 
@@ -175,7 +185,133 @@ def test_standard_loop_rolls_back_broken_edits_and_keeps_latest_diagnostics(
     assert record["sim_status"] == "sim_pass"
     assert record["sim_feedback_iterations"] == 2
     assert record["sim_feedback_history"][0]["accepted_candidate"] is False
+    assert record["sim_feedback_history"][0]["candidate_changed"] is True
+    assert record["sim_feedback_history"][0]["scaffold_unchanged"] is False
+    assert record["sim_feedback_history"][0]["patience_consumed"] is False
+    assert record["no_write_repairs"] == 0
     assert target.read_text(encoding="utf-8") == "GOOD"
+
+
+def test_scaffold_no_write_does_not_consume_patience_and_keeps_idiom_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    feedback_seen: list[str] = []
+    repair_prompts: list[dict] = []
+    idiom_feedback_seen: list[str] = []
+    fake_search = _fake_search(
+        feedback_seen, repair_prompts, idiom_feedback_seen
+    )
+    monkeypatch.setitem(sys.modules, "search", fake_search)
+    monkeypatch.setattr(run_module, "PROJECT_ROOT", tmp_path)
+
+    target = tmp_path / "Generated" / "prob_a.lean"
+
+    class NoWriteRunner:
+        def run(self, prompt: str, *, max_turns: int):
+            return AgentStats(turns=1)
+
+    class GoodRepairRunner:
+        def run(self, prompt: str, *, max_turns: int):
+            target.write_text("GOOD", encoding="utf-8")
+            return AgentStats(turns=1)
+
+    runners = iter([NoWriteRunner(), NoWriteRunner(), GoodRepairRunner()])
+    monkeypatch.setattr(
+        run_module, "make_runner", lambda **kwargs: next(runners)
+    )
+
+    evaluated_sources: list[str] = []
+
+    def evaluate(prob_id: str, run_dir: Path):
+        source = target.read_text(encoding="utf-8")
+        evaluated_sources.append(source)
+        return _result(
+            compile_pass=True,
+            sim_status="sim_pass" if source == "GOOD" else "sim_fail",
+            detail="good pass" if source == "GOOD" else "unexpected",
+        )
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    record = run_module._process_problem_standard(
+        "prob_a",
+        args=_args(
+            cvdp_verified_idioms=True,
+            prompt_profile="cvdp-skill-fewshot",
+            sim_feedback_patience=1,
+        ),
+        ds=SimpleNamespace(load_problem=lambda prob_id: SimpleNamespace()),
+        evaluator=SimpleNamespace(dataset_name="cvdp", evaluate=evaluate),
+        run_dir=run_dir,
+        skill="",
+        repl=_PassingRepl(),
+        candidate_transaction=None,
+    )
+
+    assert evaluated_sources == ["GOOD"]
+    assert record["sim_status"] == "sim_pass"
+    assert record["sim_feedback_iterations"] == 2
+    assert record["no_write_repairs"] == 1
+    first_attempt = record["sim_feedback_history"][0]
+    assert first_attempt["candidate_changed"] is False
+    assert first_attempt["scaffold_unchanged"] is True
+    assert first_attempt["patience_consumed"] is False
+    assert first_attempt["accepted_candidate"] is False
+    assert len(idiom_feedback_seen) == 2
+    assert '"scaffold_incomplete":true' in idiom_feedback_seen[0]
+    assert (
+        '"cvdp_verified_idiom_initial_selected_ids":["packed_state_high"]'
+        in idiom_feedback_seen[0]
+    )
+    assert '"is_sequential":true' in idiom_feedback_seen[0]
+    assert repair_prompts[0]["latest_feedback"] == idiom_feedback_seen[0]
+
+
+def test_no_write_still_consumes_patience_when_verified_idioms_are_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feedback_seen: list[str] = []
+    repair_prompts: list[dict] = []
+    monkeypatch.setitem(
+        sys.modules, "search", _fake_search(feedback_seen, repair_prompts)
+    )
+    monkeypatch.setattr(run_module, "PROJECT_ROOT", tmp_path)
+    target = tmp_path / "Generated" / "prob_a.lean"
+
+    class NoWriteRunner:
+        def run(self, prompt: str, *, max_turns: int):
+            return AgentStats(turns=1)
+
+    runners = iter([NoWriteRunner(), NoWriteRunner()])
+    monkeypatch.setattr(
+        run_module, "make_runner", lambda **kwargs: next(runners)
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    record = run_module._process_problem_standard(
+        "prob_a",
+        args=_args(cvdp_verified_idioms=False, sim_feedback_patience=1),
+        ds=SimpleNamespace(load_problem=lambda prob_id: SimpleNamespace()),
+        evaluator=SimpleNamespace(
+            dataset_name="cvdp",
+            evaluate=lambda *_args, **_kwargs: pytest.fail(
+                "unchanged scaffold must short-circuit evaluator"
+            ),
+        ),
+        run_dir=run_dir,
+        skill="",
+        repl=_PassingRepl(),
+        candidate_transaction=None,
+    )
+
+    assert record["sim_feedback_iterations"] == 1
+    first_attempt = record["sim_feedback_history"][0]
+    assert first_attempt["candidate_changed"] is False
+    assert first_attempt["accepted_candidate"] is True
+    assert first_attempt["patience_consumed"] is True
+    assert target.read_text(encoding="utf-8") == SCAFFOLD
 
 
 def test_main_rejects_non_anthropic_guardrail_harness(monkeypatch):

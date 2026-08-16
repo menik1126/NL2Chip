@@ -349,6 +349,7 @@ _FEEDBACK_RULES = (
             r"\bclog2(?:Nat)?\b",
             r"\bomega[^\n]{0,80}(?:width|dimension|arithmetic|prove)\b",
             r"\bdeclaration-only (?:symbol|parameter)\b",
+            r"\bdon't know how to synthesize implicit argument\b",
         ),
         5,
     ),
@@ -363,6 +364,39 @@ _FEEDBACK_RULES = (
         6,
     ),
 )
+
+
+# Backend evaluation deliberately rejects the compile-safe typed scaffold before
+# simulation. That rejection has no frontend diagnostic to classify, so reuse
+# the task's strongest initial structural signal instead of emitting no repair
+# card. Keep these markers specific to an explicitly unfinished implementation;
+# ordinary diagnostic prose must still fail closed.
+_SCAFFOLD_INCOMPLETE_PATTERNS = _patterns(
+    r"\bscaffold[_ -]?incomplete\b",
+    r"\bscaffold(?:-only)?\s+fallback\b",
+    r"\btyped scaffold fallback\b",
+    r"\bbehavioral TODOs? remain\b",
+    r"\bCKTARCHON_IMPLEMENTATION_REQUIRED\b",
+    r"\bimplementation required\b",
+    r"\b(?:not implemented|unimplemented)\b",
+    r"TODO[^\n]{0,100}\b(?:remain|implement|behavior|zero)\b",
+    r"\bsorryAx\b",
+    r"未实现",
+)
+
+
+def _ranked_initial_ids(query: CVDPIdiomQuery) -> list[str]:
+    """Return the initial-card ranking shared by initial and fallback repair."""
+
+    scores = _base_scores(query)
+    return sorted(
+        (idiom_id for idiom_id, score in scores.items() if score > 0),
+        key=lambda idiom_id: (
+            -scores[idiom_id],
+            _IDIOM_SPECS[idiom_id].order,
+            idiom_id,
+        ),
+    )
 
 
 def classify_cvdp_idiom_feedback(
@@ -382,12 +416,16 @@ def classify_cvdp_idiom_feedback(
         ]
         if positions:
             matches.append((min(positions), rule.priority, rule.tag))
-    if not matches:
-        return None
-    tag = min(matches)[2]
-    if tag == "packed_state":
-        return _packed_state_id(query)
-    return tag
+    if matches:
+        tag = min(matches)[2]
+        if tag == "packed_state":
+            return _packed_state_id(query)
+        return tag
+
+    if any(pattern.search(feedback) for pattern in _SCAFFOLD_INCOMPLETE_PATTERNS):
+        ranked = _ranked_initial_ids(query)
+        return ranked[0] if ranked else None
+    return None
 
 
 def _make_card(idiom_id: str, regions: dict[str, str]) -> VerifiedSparkleIdiom:
@@ -406,7 +444,7 @@ def _render_repair_context(card: VerifiedSparkleIdiom) -> str:
         [
             f"### Verified repair idiom `{card.idiom_id}`",
             "",
-            "Legal shape only; scaffold controls names, widths, order, reset, timing.",
+            "Required: adapt this body into the typed scaffold; edit first, then check. Do not only read.",
             "",
             "```lean",
             card.source,
@@ -473,15 +511,7 @@ def select_cvdp_idioms(
         repair_id = classify_cvdp_idiom_feedback(query, feedback)
         candidate_ids = [repair_id] if repair_id is not None else []
     else:
-        scores = _base_scores(query)
-        candidate_ids = sorted(
-            (idiom_id for idiom_id, score in scores.items() if score > 0),
-            key=lambda idiom_id: (
-                -scores[idiom_id],
-                _IDIOM_SPECS[idiom_id].order,
-                idiom_id,
-            ),
-        )
+        candidate_ids = _ranked_initial_ids(query)
 
     selected: list[VerifiedSparkleIdiom] = []
     selected_groups: set[str] = set()

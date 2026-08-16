@@ -296,6 +296,27 @@ def reject_incomplete_cvdp_scaffold(
     return result
 
 
+def _format_cvdp_guardrail_feedback_state(
+    *,
+    scaffold_incomplete: bool,
+    initial_selected_ids: list[str] | None,
+    initial_features: dict[str, Any] | None,
+) -> str:
+    """Keep scaffold fallback retrieval facts machine-readable across repairs."""
+
+    state = {
+        "scaffold_incomplete": scaffold_incomplete,
+        "cvdp_verified_idiom_initial_selected_ids": initial_selected_ids or [],
+        "cvdp_verified_idiom_initial_features": initial_features or {},
+    }
+    return (
+        "### CVDP Guardrail State\n"
+        "```json\n"
+        + json.dumps(state, sort_keys=True, separators=(",", ":"))
+        + "\n```"
+    )
+
+
 class GeneratedCandidateTransaction:
     """Serialize and protect one problem's ``Generated`` candidate lifecycle.
 
@@ -710,6 +731,7 @@ def make_runner(
         lean_repl=repl,
         api_timeout=args.api_timeout,
         local_guardrails=getattr(args, "cvdp_local_guardrails", False),
+        verified_idioms=cvdp_verified_idioms,
     )
 
 
@@ -1445,6 +1467,7 @@ def _process_problem_standard(
     sim_feedback_turns_remaining = 0
     sim_feedback_success = False
     sim_feedback_iterations = 0
+    no_write_repairs = 0
     scaffold_code: str | None = None
     scaffold_result: dict[str, Any] | None = None
     scaffold_sha256: str | None = None
@@ -1667,6 +1690,14 @@ def _process_problem_standard(
                 run_dir=run_dir,
                 info=info,
             )
+            if verified_idioms:
+                feedback += "\n\n" + _format_cvdp_guardrail_feedback_state(
+                    scaffold_incomplete=(
+                        CVDP_SCAFFOLD_MARKER in current_code
+                    ),
+                    initial_selected_ids=idiom_initial_selected_ids,
+                    initial_features=idiom_initial_features,
+                )
             repair_idiom_fields: dict[str, Any] = {}
             if verified_idioms:
                 repair_idiom_ids = list(
@@ -1776,6 +1807,19 @@ def _process_problem_standard(
                 if candidate_transaction is not None
                 else generated_candidate_available(generated_target)
             )
+            repair_code = (
+                generated_target.read_text(errors="replace")
+                if repair_candidate_available
+                else ""
+            )
+            candidate_changed = repair_code != current_code
+            scaffold_unchanged = bool(
+                local_guardrails
+                and scaffold_code is not None
+                and repair_code == scaffold_code
+            )
+            if repair_candidate_available and not candidate_changed:
+                no_write_repairs += 1
             if not repair_candidate_available:
                 if local_guardrails and best_code is not None:
                     generated_target.write_text(best_code, encoding="utf-8")
@@ -1795,6 +1839,9 @@ def _process_problem_standard(
                             "phase": "sim_feedback",
                             "iteration": sim_iter,
                             "note": "Repair agent emptied the target; restored the compile-safe best.",
+                            "candidate_changed": candidate_changed,
+                            "scaffold_unchanged": scaffold_unchanged,
+                            "patience_consumed": False,
                             **repair_idiom_fields,
                         })
                     continue
@@ -1803,6 +1850,9 @@ def _process_problem_standard(
                     "iteration": sim_iter,
                     "note": "Agent returned without a non-empty repair candidate; restored the prior best without evaluating the empty artifact.",
                     "remaining_turns": sim_feedback_turns_remaining,
+                    "candidate_changed": candidate_changed,
+                    "scaffold_unchanged": scaffold_unchanged,
+                    "patience_consumed": False,
                     **repair_idiom_fields,
                 })
                 if best_code is not None:
@@ -1818,12 +1868,33 @@ def _process_problem_standard(
             best_key = search.eval_progress_key(best_result)
             candidate_exists = repair_candidate_available
             improved = new_key > best_key
+            semantic_attempt = candidate_changed and not scaffold_unchanged
             generation_incomplete = not bool(best_result.get("compile_pass"))
-            if local_guardrails:
+            if verified_idioms and not semantic_attempt:
+                accepted = False
+            elif local_guardrails:
                 accepted = candidate_exists and new_key >= best_key
             else:
                 accepted = candidate_exists and (
                     generation_incomplete or new_key >= best_key
+                )
+            if verified_idioms:
+                patience_consumed = bool(
+                    semantic_attempt
+                    and not improved
+                    and not (
+                        local_guardrails and not new_result.get("compile_pass")
+                    )
+                )
+            else:
+                patience_consumed = bool(
+                    not improved
+                    and (
+                        accepted
+                        or not (
+                            local_guardrails and not new_result.get("compile_pass")
+                        )
+                    )
                 )
             sim_feedback_history.append({
                 "phase": "sim_feedback",
@@ -1833,6 +1904,9 @@ def _process_problem_standard(
                 "improved_best": improved,
                 "accepted_candidate": accepted,
                 "rolled_back_to_best": not accepted,
+                "candidate_changed": candidate_changed,
+                "scaffold_unchanged": scaffold_unchanged,
+                "patience_consumed": patience_consumed,
                 "repair_turns": repair_stats.turns,
                 "repair_turn_limit": repair_turn_limit,
                 "remaining_turns": sim_feedback_turns_remaining,
@@ -1851,6 +1925,9 @@ def _process_problem_standard(
                 "remaining_turns": sim_feedback_turns_remaining,
                 "improved_best": improved,
                 "accepted_candidate": accepted,
+                "candidate_changed": candidate_changed,
+                "scaffold_unchanged": scaffold_unchanged,
+                "patience_consumed": patience_consumed,
             })
 
             if accepted:
@@ -1858,17 +1935,17 @@ def _process_problem_standard(
                 best_code = generated_target.read_text(errors="replace") if candidate_exists else None
                 result = new_result
                 feedback_from_rolled_back_candidate = False
-                non_improving_repairs = 0 if improved else non_improving_repairs + 1
             else:
                 if best_code is not None:
                     generated_target.write_text(best_code, encoding="utf-8")
                 result = best_result
-                feedback_from_rolled_back_candidate = True
-                if local_guardrails and not new_result.get("compile_pass"):
-                    # Existing max-iteration and turn budgets still bound compile repair.
-                    pass
-                else:
-                    non_improving_repairs += 1
+                feedback_from_rolled_back_candidate = (
+                    semantic_attempt if verified_idioms else True
+                )
+            if improved and (semantic_attempt or not verified_idioms):
+                non_improving_repairs = 0
+            elif patience_consumed:
+                non_improving_repairs += 1
 
             if result.get("sim_status") == "sim_pass":
                 sim_feedback_success = True
@@ -1909,6 +1986,7 @@ def _process_problem_standard(
         "sim_feedback_enabled": bool(args.sim_feedback),
         "sim_feedback_iterations": sim_feedback_iterations,
         "sim_feedback_success": sim_feedback_success,
+        "no_write_repairs": no_write_repairs,
         "sim_feedback_turn_budget": sim_feedback_turn_budget,
         "sim_feedback_turns_remaining": sim_feedback_turns_remaining,
         "sim_feedback_history": sim_feedback_history,

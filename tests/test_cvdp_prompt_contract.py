@@ -849,6 +849,61 @@ def test_verified_idiom_compact_repair_adds_exactly_one_bounded_card():
     assert len(heading) + len(card) <= 1402
 
 
+def test_run2_scaffold_fallback_repair_selects_card_and_requires_edit_before_check():
+    info = _hamming_guardrail_info()
+    prompt = build_compact_repair_prompt(
+        prob_id="guardrail_problem",
+        info=info,
+        dataset_name="cvdp",
+        has_repl=True,
+        phase="simulation",
+        iteration=2,
+        current_lean="-- CURRENT_LEAN_SENTINEL\n" * 100,
+        # Exact feedback produced by the run2 rollback-selected scaffolds.
+        latest_feedback=(
+            "Compile-checked typed scaffold fallback; behavioral TODOs remain."
+        ),
+        recent_attempts=[],
+        include_cvdp_scaffold=True,
+        include_cvdp_verified_idioms=True,
+    )
+
+    heading = "### Verified repair idiom `derived_width`"
+    assert prompt.count("### Verified repair idiom") == 1
+    assert heading in prompt
+    assert "Directly adopt the single retrieved repair idiom body" in prompt
+    assert "your next tool action must edit that target" in prompt
+    assert "Run the required compile check only after that edit" in prompt
+    assert "Reading or explaining without an edit is not a repair" in prompt
+    assert prompt.index(heading) < prompt.index("### Latest Feedback To Fix")
+    card = prompt.split(heading, 1)[1].split(
+        "### Additional Input Context Files", 1
+    )[0]
+    assert len(heading) + len(card) <= 1402
+
+
+def test_run2_scaffold_fallback_directives_remain_flag_gated():
+    prompt = build_compact_repair_prompt(
+        prob_id="guardrail_problem",
+        info=_hamming_guardrail_info(),
+        dataset_name="cvdp",
+        has_repl=True,
+        phase="simulation",
+        iteration=2,
+        current_lean="-- CURRENT_LEAN_SENTINEL",
+        latest_feedback=(
+            "Compile-checked typed scaffold fallback; behavioral TODOs remain."
+        ),
+        recent_attempts=[],
+        include_cvdp_scaffold=True,
+        include_cvdp_verified_idioms=False,
+    )
+
+    assert "### Verified repair idiom" not in prompt
+    assert "Directly adopt the single retrieved repair idiom body" not in prompt
+    assert "Reading or explaining without an edit is not a repair" not in prompt
+
+
 def test_idiom_query_does_not_match_ram_inside_parameter():
     query = build_cvdp_idiom_query(_hamming_guardrail_info())
 

@@ -34,6 +34,7 @@ def _runner(
     monkeypatch: pytest.MonkeyPatch,
     *,
     lean_repl: object | None = None,
+    verified_idioms: bool = False,
 ) -> AnthropicHarnessRunner:
     monkeypatch.setattr(harness, "ensure_runtime_env", lambda: None)
     monkeypatch.setattr(harness.anthropic, "Anthropic", lambda **_: object())
@@ -46,6 +47,7 @@ def _runner(
         system_prompt="test",
         lean_repl=lean_repl,
         local_guardrails=True,
+        verified_idioms=verified_idioms,
     )
 
 
@@ -53,6 +55,21 @@ def _text_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[SimpleNamespace(type="text", text="done")],
         stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+
+
+def _tool_response(
+    *calls: tuple[str, dict[str, object]],
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="tool_use", id=f"tool-{index}", name=name, input=inputs
+            )
+            for index, (name, inputs) in enumerate(calls)
+        ],
+        stop_reason="tool_use",
         usage=SimpleNamespace(input_tokens=1, output_tokens=1),
     )
 
@@ -345,3 +362,183 @@ def test_anthropic_request_tool_schema_filters_bash_only_in_local_mode(
     tool_names = {tool["name"] for tool in requests[0]["tools"]}  # type: ignore[index]
     assert ("bash" in tool_names) is bash_expected
     assert {"read_file", "edit_file", "lean_check"} <= tool_names
+
+
+def test_verified_idiom_cadence_blocks_duplicate_browse_and_forces_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "Generated" / "prob_a.lean"
+    target.parent.mkdir()
+    target.write_text("def prob_a := 0\n", encoding="utf-8")
+    runner = _runner(tmp_path, monkeypatch, verified_idioms=True)
+    responses = iter([
+        _tool_response(
+            ("read_file", {"path": "Generated/prob_a.lean"}),
+            ("read_file", {"path": "Generated/prob_a.lean"}),
+        ),
+        _tool_response(("grep", {"pattern": "def", "path": "."})),
+        _text_response(),
+    ])
+    requests: list[dict[str, object]] = []
+
+    def create_message(**kwargs: object) -> SimpleNamespace:
+        requests.append({**kwargs, "messages": list(kwargs["messages"])})  # type: ignore[arg-type]
+        return next(responses)
+
+    monkeypatch.setattr(runner, "_create_message_with_retries", create_message)
+
+    stats = runner.run("implement it", max_turns=3)
+
+    assert stats.turns == 3
+    assert len(requests) == 3
+    duplicate_result = requests[1]["messages"][-1]["content"][1]["content"]  # type: ignore[index]
+    assert "duplicate read_file call blocked" in duplicate_result
+    assert requests[2]["tool_choice"] == {"type": "any"}
+    forced_tools = requests[2]["tools"]  # type: ignore[assignment]
+    assert {tool["name"] for tool in forced_tools} == {"edit_file", "write_file"}
+    for tool in forced_tools:
+        path_schema = tool["input_schema"]["properties"]["path"]
+        assert path_schema["enum"] == ["Generated/prob_a.lean"]
+    assert "Exploration is over" in str(requests[2]["system"])
+
+
+def test_verified_idiom_cadence_requires_target_check_after_real_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "Generated" / "prob_a.lean"
+    target.parent.mkdir()
+    marker = "-- CKTARCHON_IMPLEMENTATION_REQUIRED\n"
+    target.write_text(
+        marker + "def prob_a := 1\n#synthesizeVerilog prob_a\n",
+        encoding="utf-8",
+    )
+    repl = _RecordingLeanRepl()
+    runner = _runner(
+        tmp_path, monkeypatch, lean_repl=repl, verified_idioms=True
+    )
+    responses = iter([
+        _tool_response(
+            (
+                "edit_file",
+                {
+                    "path": "Generated/prob_a.lean",
+                    "old_string": marker,
+                    "new_string": "",
+                },
+            ),
+            ("read_file", {"path": "Generated/prob_a.lean"}),
+        ),
+        _tool_response(
+            ("lean_check", {"path": "Generated/prob_a.lean"})
+        ),
+        _text_response(),
+    ])
+    requests: list[dict[str, object]] = []
+
+    def create_message(**kwargs: object) -> SimpleNamespace:
+        requests.append({**kwargs, "messages": list(kwargs["messages"])})  # type: ignore[arg-type]
+        return next(responses)
+
+    monkeypatch.setattr(runner, "_create_message_with_retries", create_message)
+
+    stats = runner.run("implement it", max_turns=3)
+
+    assert stats.turns == 3
+    blocked_read = requests[1]["messages"][-1]["content"][1]["content"]  # type: ignore[index]
+    assert "next effective action must be lean_check" in blocked_read
+    assert requests[1]["tool_choice"] == {
+        "type": "tool",
+        "name": "lean_check",
+    }
+    check_tools = requests[1]["tools"]  # type: ignore[assignment]
+    assert [tool["name"] for tool in check_tools] == ["lean_check"]
+    assert check_tools[0]["input_schema"] == {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "enum": ["Generated/prob_a.lean"],
+            }
+        },
+        "required": ["path"],
+    }
+    assert runner._cadence_check_due is False
+    assert runner._last_complete_code is not None
+    assert repl.checked_paths == [target.resolve(), target.resolve()]
+
+
+def test_local_guardrails_without_verified_idioms_preserve_tool_behavior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "Generated" / "prob_a.lean"
+    target.parent.mkdir()
+    target.write_text("def prob_a := 0\n", encoding="utf-8")
+    runner = _runner(tmp_path, monkeypatch, verified_idioms=False)
+    responses = iter([
+        _tool_response(("read_file", {"path": "Generated/prob_a.lean"})),
+        _tool_response(("read_file", {"path": "Generated/prob_a.lean"})),
+        _tool_response(("read_file", {"path": "Generated/prob_a.lean"})),
+    ])
+    requests: list[dict[str, object]] = []
+
+    def create_message(**kwargs: object) -> SimpleNamespace:
+        requests.append({**kwargs, "messages": list(kwargs["messages"])})  # type: ignore[arg-type]
+        return next(responses)
+
+    monkeypatch.setattr(runner, "_create_message_with_retries", create_message)
+
+    stats = runner.run("implement it", max_turns=3)
+
+    assert stats.turns == 3
+    assert len(requests) == 3
+    assert all(request["system"] == "test" for request in requests)
+    assert all("tool_choice" not in request for request in requests)
+    assert all(
+        {"read_file", "grep", "glob", "edit_file", "lean_check"}
+        <= {tool["name"] for tool in request["tools"]}  # type: ignore[index]
+        for request in requests
+    )
+    second_read = requests[2]["messages"][-1]["content"][0]["content"]  # type: ignore[index]
+    assert second_read == "def prob_a := 0\n"
+
+
+@pytest.mark.parametrize("summary", ["✓ COMPLETE", "✗ FAILED"])
+def test_post_edit_check_accepts_real_repl_summary_prefixes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    summary: str,
+) -> None:
+    target = tmp_path / "Generated" / "prob_a.lean"
+    target.parent.mkdir()
+    target.write_text("def prob_a := 0\n", encoding="utf-8")
+    lean_result = SimpleNamespace(
+        summary=summary,
+        passed=summary.startswith("✓"),
+        complete=summary.startswith("✓"),
+        error_text="",
+        errors=[],
+        warnings=[],
+        verilog="",
+    )
+    repl = SimpleNamespace(check_file=lambda _: lean_result)
+    runner = _runner(
+        tmp_path, monkeypatch, lean_repl=repl, verified_idioms=True
+    )
+    runner._cadence_target_changed = True
+    runner._cadence_check_due = True
+
+    result = runner._execute_tool(
+        "lean_check", {"path": "Generated/prob_a.lean"}
+    )
+
+    assert result.startswith(summary)
+    assert runner._cadence_check_due is False
+    assert runner._cadence_target_changed is False
+    assert (
+        runner._cadence_browse_calls
+        == harness._CVDP_CADENCE_MAX_BROWSE_CALLS
+    )
+    assert runner._cadence_phase(1) == "edit"
