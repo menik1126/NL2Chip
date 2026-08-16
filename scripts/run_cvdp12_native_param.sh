@@ -6,6 +6,8 @@ set -euo pipefail
 #
 #   KEY_ENV=/path/to/key.env WORKERS=16 ./scripts/run_cvdp12_native_param.sh
 #   MODEL=gpt-5.6-sol HARNESS=codex-agent ./scripts/run_cvdp12_native_param.sh
+#   CVDP_LOCAL_GUARDRAILS=1 CVDP_VERIFIED_IDIOMS=1 \
+#     MODEL=claude-opus-4-6 HARNESS=anthropic-api ./scripts/run_cvdp12_native_param.sh
 #   ARCHON_SRC=/path/to/science-mango/src NO_CODEX_CHAT_PROXY=1 \
 #     MODEL=gpt-5.6-sol HARNESS=codex-agent ./scripts/run_cvdp12_native_param.sh
 #
@@ -31,6 +33,8 @@ SIM_FEEDBACK_TURN_BUDGET="${SIM_FEEDBACK_TURN_BUDGET:-90}"
 SIM_FEEDBACK_TURNS_PER_ITER="${SIM_FEEDBACK_TURNS_PER_ITER:-10}"
 SIM_FEEDBACK_PATIENCE="${SIM_FEEDBACK_PATIENCE:-2}"
 PROMPT_PROFILE="${PROMPT_PROFILE:-cvdp-skill-fewshot}"
+CVDP_LOCAL_GUARDRAILS="${CVDP_LOCAL_GUARDRAILS:-0}"
+CVDP_VERIFIED_IDIOMS="${CVDP_VERIFIED_IDIOMS:-0}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -57,6 +61,28 @@ case "$NO_CODEX_CHAT_PROXY" in
     exit 2
     ;;
 esac
+case "$CVDP_LOCAL_GUARDRAILS" in
+  0|false|FALSE|no|NO|"")
+    ;;
+  1|true|TRUE|yes|YES)
+    extra_args+=(--cvdp-local-guardrails)
+    ;;
+  *)
+    echo "[cvdp12-native-param] error: CVDP_LOCAL_GUARDRAILS must be 0/1 or false/true" >&2
+    exit 2
+    ;;
+esac
+case "$CVDP_VERIFIED_IDIOMS" in
+  0|false|FALSE|no|NO|"")
+    ;;
+  1|true|TRUE|yes|YES)
+    extra_args+=(--cvdp-verified-idioms)
+    ;;
+  *)
+    echo "[cvdp12-native-param] error: CVDP_VERIFIED_IDIOMS must be 0/1 or false/true" >&2
+    exit 2
+    ;;
+esac
 if [[ "${NO_REPL:-0}" == "1" ]]; then
   extra_args+=(--no-repl)
 fi
@@ -72,6 +98,7 @@ if [[ -n "$ARCHON_SRC" ]]; then
   echo "[cvdp12-native-param] archon_src=$ARCHON_SRC"
 fi
 echo "[cvdp12-native-param] no_codex_chat_proxy=$NO_CODEX_CHAT_PROXY"
+echo "[cvdp12-native-param] cvdp_local_guardrails=$CVDP_LOCAL_GUARDRAILS cvdp_verified_idioms=$CVDP_VERIFIED_IDIOMS"
 
 "$PYTHON_BIN" -m cktarchon.run \
   --dataset cvdp \

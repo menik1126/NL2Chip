@@ -56,6 +56,12 @@ from evaluator import (
     _strip_sv_comments,
     parse_module_ports,
 )
+from cvdp_idioms import (
+    CVDPIdiomQuery,
+    idiom_catalog_sha256,
+    render_cvdp_idiom_context,
+    select_cvdp_idioms,
+)
 try:
     from universal_theorem import is_valid_universal_theorem_evidence
 except ModuleNotFoundError:  # package-style ``import agent.search``
@@ -1256,6 +1262,7 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
     }
     prompt_interface = _parse_prompt_interface(info.prompt_text or "")
     derived_symbols: set[str] = set()
+    adapter_observable_metadata: set[str] = set()
 
     if metadata.get("dataset") == "cvdp":
         harness_files = metadata.get("harness_files", {}) or {}
@@ -1281,6 +1288,12 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
             | reference_derived_parameters
             | (raw_harness_usage.get("direct_ports", set()) & ref_constants)
         ) - harness_parameters
+        if (
+            design_name == "hamming_rx"
+            and "ENCODED_DATA" in derived_symbols
+            and "ENCODED_DATA" in raw_harness_usage.get("outputs", set())
+        ):
+            adapter_observable_metadata.add("ENCODED_DATA")
         overrideable_parameters = (
             harness_parameters
             | ref_parameters
@@ -1350,6 +1363,13 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
             "- Derived-symbol requirement: compute these symbols from the active benchmark parameters for every "
             "configuration; do not expose them as unrelated output ports or freeze them to a default-width constant."
         )
+    if adapter_observable_metadata:
+        lines.append(
+            "- Adapter-observable derived metadata exception: `ENCODED_DATA` is not an independent sweep "
+            "parameter or functional data output, but the hamming_rx harness reads it as a DUT metadata handle. "
+            "Preserve the scaffold's 32-bit metadata leaf and drive it with "
+            "`DATA_WIDTH + PARITY_BIT + 1` for every parameter combination."
+        )
 
     inputs = [p for p in expected_ports if p[0] == "input"]
     outputs = [p for p in expected_ports if p[0] == "output"]
@@ -1389,12 +1409,471 @@ def benchmark_expected_port_names(info: ProblemInfo | None) -> tuple[set[str], s
     )
 
 
+_CVDP_SCAFFOLD_DERIVED_WIDTHS = {
+    "COUNT_WIDTH": "Sparkle.IR.Type.DimExpr.clog2Nat (BIT_WIDTH + 1)",
+    "ENCODED_DATA": "DATA_WIDTH + PARITY_BIT + 1",
+    "ENCODED_DATA_BIT": "DATA_WIDTH + PARITY_BIT + 1",
+    "BIT_WIDTH": "Sparkle.IR.Type.DimExpr.clog2Nat DICE_MAX + 1",
+}
+
+
+_CVDP_SCAFFOLD_DEFAULTS = {
+    "ADDR_WIDTH": 3,
+    "BIT_WIDTH": 3,
+    "C_S_AXI_ADDR_WIDTH": 8,
+    "C_S_AXI_DATA_WIDTH": 32,
+    "DATA_WIDTH": 8,
+    "DICE_MAX": 6,
+    "FILO_DEPTH": 16,
+    "NUM_DICE": 2,
+    "PARITY_BIT": 3,
+    "TOTAL_SPACES": 12,
+    "WIDTH": 8,
+}
+_CVDP_SCAFFOLD_DESIGN_DEFAULTS = {
+    "Bit_Difference_Counter": {"BIT_WIDTH": 3},
+    "nbit_swizzling": {"DATA_WIDTH": 64},
+    "sync_lifo": {"ADDR_WIDTH": 3, "DATA_WIDTH": 8},
+    "gf_mac": {"WIDTH": 32},
+    "car_parking_system": {"TOTAL_SPACES": 12},
+    "hamming_rx": {"DATA_WIDTH": 4, "PARITY_BIT": 3},
+    "square_root_seq": {"WIDTH": 16},
+    "FILO_RTL": {"DATA_WIDTH": 8, "FILO_DEPTH": 16},
+    "digital_dice_roller": {"DICE_MAX": 6, "NUM_DICE": 2},
+    "restoring_division": {"WIDTH": 6},
+    "hamming_tx": {"DATA_WIDTH": 4, "PARITY_BIT": 3},
+    "precision_counter_axi": {"C_S_AXI_ADDR_WIDTH": 8, "C_S_AXI_DATA_WIDTH": 32},
+}
+
+
+def _cvdp_scaffold_parameters(
+    info: ProblemInfo,
+) -> tuple[
+    list[str],
+    dict[str, str],
+    dict[str, list[str]],
+    list[dict[str, str]],
+]:
+    """Return authoritative CVDP parameters, widths, and parameter sweeps."""
+
+    metadata = info.metadata or {}
+    harness_files = metadata.get("harness_files", {}) or {}
+    prompt_interface = _parse_prompt_interface(info.prompt_text or "")
+    raw_usage = _parse_cvdp_harness_usage(harness_files)
+    harness_parameters = set(raw_usage.get("params", set()))
+    reference_parameters = {
+        parameter.name
+        for parameter in _module_parameters(info.ref_code or "", info.design_name)
+    }
+    reference_derived = _cvdp_derived_reference_parameter_names(
+        info.ref_code or "", info.design_name
+    )
+    derived_names = (
+        prompt_interface.derived_parameters | reference_derived
+    ) - harness_parameters
+    parameters = sorted(
+        (
+            harness_parameters
+            | reference_parameters
+            | (prompt_interface.parameters - prompt_interface.derived_parameters)
+        )
+        - derived_names
+    )
+    sweep_values, sweep_combinations = _cvdp_parse_parameter_sweeps(
+        harness_files, set(parameters)
+    )
+    derived_widths = {
+        name: expression
+        for name, expression in _CVDP_SCAFFOLD_DERIVED_WIDTHS.items()
+        if name in derived_names
+    }
+    return parameters, derived_widths, sweep_values, sweep_combinations
+
+
+def _cvdp_scaffold_default(
+    name: str,
+    design_name: str,
+    sweep_values: dict[str, list[str]],
+) -> int:
+    preferred = _CVDP_SCAFFOLD_DESIGN_DEFAULTS.get(
+        design_name, {}
+    ).get(name, _CVDP_SCAFFOLD_DEFAULTS.get(name))
+    numeric_values = [
+        int(value)
+        for value in sweep_values.get(name, [])
+        if re.fullmatch(r"[0-9]+", str(value).strip())
+        and int(value) > 0
+    ]
+    if preferred is not None and (not numeric_values or preferred in numeric_values):
+        return preferred
+    if numeric_values:
+        return min(numeric_values)
+    return preferred or 1
+
+
+def _cvdp_scaffold_defaults(
+    parameters: list[str],
+    design_name: str,
+    sweep_values: dict[str, list[str]],
+    sweep_combinations: list[dict[str, str]],
+) -> dict[str, int]:
+    """Choose defaults without inventing an untested cross-parameter tuple."""
+
+    defaults = {
+        name: _cvdp_scaffold_default(name, design_name, sweep_values)
+        for name in parameters
+    }
+    complete_combinations: list[dict[str, int]] = []
+    for combination in sweep_combinations:
+        parsed: dict[str, int] = {}
+        for name in parameters:
+            value = str(combination.get(name, "")).strip()
+            if not re.fullmatch(r"[0-9]+", value) or int(value) <= 0:
+                break
+            parsed[name] = int(value)
+        else:
+            complete_combinations.append(parsed)
+
+    if complete_combinations and defaults not in complete_combinations:
+        return complete_combinations[0]
+    return defaults
+
+
+_CVDP_IDIOM_MEMORY_TERMS = (
+    "memory", "memories", "ram", "fifo", "lifo", "stack", "stacks",
+    "queue", "queues", "buffer", "buffers", "storage", "register file",
+    "register files",
+)
+_CVDP_IDIOM_BIT_NETWORK_TERMS = (
+    "bit", "bits", "xor", "parity", "encode", "decode", "mask", "shift",
+    "swizzle", "multiply", "hamming", "popcount", "reduction",
+)
+_CVDP_IDIOM_WIDTH_TERMS = (
+    "slice", "slices", "concat", "concatenate", "concatenation", "extend",
+    "extension", "zero-extend", "truncate", "truncation", "packed",
+    "bit position", "bit positions", "variable width", "parameterized width",
+)
+
+
+def _cvdp_idiom_text_has_any(text: str, terms: tuple[str, ...]) -> bool:
+    """Match complete public-spec terms, never substrings such as ram in parameter."""
+
+    return any(
+        re.search(
+            rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])",
+            text,
+        ) is not None
+        for term in terms
+    )
+
+
+def build_cvdp_idiom_query(info: ProblemInfo | None) -> CVDPIdiomQuery:
+    """Derive retrieval features from the already-resolved public contract."""
+
+    if info is None or (info.metadata or {}).get("dataset") != "cvdp":
+        return CVDPIdiomQuery()
+    ports = _benchmark_expected_ports(info)
+    parameters, derived_widths, _, _ = _cvdp_scaffold_parameters(info)
+    inputs = [port for port in ports if port[0] == "input"]
+    outputs = [port for port in ports if port[0] == "output"]
+    text = " ".join((info.prompt_text or "").lower().split())
+    has_clock = any(_port_kind(name) == "clock" for _, _, name in inputs)
+    reset_names = [
+        name for _, _, name in inputs if _port_kind(name) == "reset"
+    ]
+    harness_files = (info.metadata or {}).get("harness_files", {}) or {}
+    inferred_polarities = _infer_cvdp_reset_polarities(
+        harness_files, reset_names
+    )
+    reset_polarities = {
+        inferred_polarities.get(name, _reset_polarity(name))
+        for name in reset_names
+    }
+    if not reset_polarities:
+        reset_polarity = "none"
+    elif len(reset_polarities) == 1:
+        reset_polarity = next(iter(reset_polarities))
+    else:
+        reset_polarity = "mixed"
+    return CVDPIdiomQuery(
+        has_parameters=bool(parameters),
+        has_derived_widths=bool(derived_widths),
+        is_sequential=has_clock,
+        has_reset=bool(reset_names),
+        reset_polarity=reset_polarity,
+        has_multiple_outputs=len(outputs) > 1,
+        uses_memory=_cvdp_idiom_text_has_any(text, _CVDP_IDIOM_MEMORY_TERMS),
+        uses_bit_network=_cvdp_idiom_text_has_any(
+            text, _CVDP_IDIOM_BIT_NETWORK_TERMS
+        ),
+        uses_width_transform=bool(derived_widths) or _cvdp_idiom_text_has_any(
+            text, _CVDP_IDIOM_WIDTH_TERMS
+        ),
+    )
+
+
+def cvdp_verified_idiom_cards(
+    info: ProblemInfo | None,
+    *,
+    feedback: str = "",
+    repair: bool = False,
+):
+    return select_cvdp_idioms(
+        build_cvdp_idiom_query(info),
+        feedback=feedback,
+        max_cards=1 if repair else 3,
+        max_chars=1400 if repair else 3800,
+    )
+
+
+def cvdp_verified_idiom_ids(
+    info: ProblemInfo | None,
+    *,
+    feedback: str = "",
+    repair: bool = False,
+) -> tuple[str, ...]:
+    return tuple(
+        card.idiom_id
+        for card in cvdp_verified_idiom_cards(
+            info, feedback=feedback, repair=repair
+        )
+    )
+
+
+def format_cvdp_verified_idioms(
+    info: ProblemInfo | None,
+    *,
+    feedback: str = "",
+    repair: bool = False,
+) -> str:
+    return render_cvdp_idiom_context(
+        cvdp_verified_idiom_cards(info, feedback=feedback, repair=repair),
+        repair=repair,
+    )
+
+
+def cvdp_verified_idiom_catalog_sha256() -> str:
+    return idiom_catalog_sha256()
+
+
+def _cvdp_scaffold_lean_expr(
+    expression: str,
+    derived_widths: dict[str, str],
+) -> str:
+    """Translate the small public CVDP packed-width expression subset to Lean."""
+
+    text = re.sub(r"\s+", " ", str(expression or "").strip())
+    text = re.sub(
+        r"\$?clog2\s*\(\s*([^()]+?)\s*\)",
+        r"Sparkle.IR.Type.DimExpr.clog2Nat (\1)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\blog2\s*\(\s*([^()]+?)\s*\)",
+        r"Nat.max 1 (Sparkle.IR.Type.DimExpr.clog2Nat \1)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    for _ in range(len(derived_widths) + 1):
+        old = text
+        for name, replacement in derived_widths.items():
+            text = re.sub(
+                rf"\b{re.escape(name)}\b", f"({replacement})", text
+            )
+        if text == old:
+            break
+    return text
+
+
+def _cvdp_scaffold_port_width(
+    sv_type: str,
+    derived_widths: dict[str, str],
+) -> str:
+    packed = re.search(r"\[\s*(.+?)\s*:\s*(.+?)\s*\]", str(sv_type or ""))
+    if packed is None:
+        return "1"
+    msb = packed.group(1).strip()
+    lsb = packed.group(2).strip()
+    if lsb == "0":
+        minus_one = re.fullmatch(r"(.+?)\s*-\s*1", msb)
+        width = minus_one.group(1).strip() if minus_one else f"({msb}) + 1"
+    else:
+        width = f"({msb}) - ({lsb}) + 1"
+    return _cvdp_scaffold_lean_expr(width, derived_widths)
+
+
+def build_cvdp_typed_scaffold(info: ProblemInfo | None) -> str:
+    """Build a compile-safe, behavior-neutral Sparkle starter for CVDP.
+
+    Only public interface facts are fixed: module/parameter names, Signal
+    binders, packed widths, output order, clock/reset roles, and the synthesis
+    command.  The model must replace the explicitly marked zero logic.
+    """
+
+    if info is None or (info.metadata or {}).get("dataset") != "cvdp":
+        return ""
+    ports = _benchmark_expected_ports(info)
+    if not ports or not info.design_name:
+        return ""
+    (
+        parameters,
+        derived_widths,
+        sweep_values,
+        sweep_combinations,
+    ) = _cvdp_scaffold_parameters(info)
+    inputs = [port for port in ports if port[0] == "input"]
+    outputs = [port for port in ports if port[0] == "output"]
+    raw_usage = _parse_cvdp_harness_usage(
+        (info.metadata or {}).get("harness_files", {}) or {}
+    )
+    adapter_metadata_outputs: set[str] = set()
+    if (
+        info.design_name == "hamming_rx"
+        and "ENCODED_DATA" in raw_usage.get("outputs", set())
+        and all(name != "ENCODED_DATA" for _, _, name in outputs)
+    ):
+        outputs.insert(0, ("output", "logic [31:0]", "ENCODED_DATA"))
+        adapter_metadata_outputs.add("ENCODED_DATA")
+    if not outputs:
+        return ""
+
+    function_name = lean_identifier(info.design_name)
+    lines = [
+        "import Sparkle",
+        "import Sparkle.Compiler.Elab",
+        "",
+        "open Sparkle.Core.Domain",
+        "open Sparkle.Core.Signal",
+        "open Sparkle.Library.RTL",
+        "",
+        "/-- Compile-safe public-interface scaffold. Replace every TODO zero with real logic. -/",
+        "-- CKTARCHON_IMPLEMENTATION_REQUIRED: remove only after every named output is implemented.",
+        f"def {function_name} {{dom : DomainConfig}}",
+    ]
+    if parameters:
+        lines.append("    {" + " ".join(parameters) + " : Nat}")
+    omitted_clocks = [
+        name for _, _, name in inputs if _port_kind(name) == "clock"
+    ]
+    input_widths: list[tuple[str, str, str]] = []
+    for _, sv_type, name in inputs:
+        if _port_kind(name) == "clock":
+            continue
+        width = _cvdp_scaffold_port_width(sv_type, derived_widths)
+        input_widths.append((sv_type, name, width))
+        lean_type = "Bool" if width == "1" else f"BitVec ({width})"
+        lines.append(f"    ({name} : Signal dom ({lean_type}))")
+
+    output_widths = [
+        (name, _cvdp_scaffold_port_width(sv_type, derived_widths))
+        for _, sv_type, name in outputs
+    ]
+    total_width = " + ".join(f"({width})" for _, width in output_widths)
+    lines.append(f"    : Signal dom (BitVec ({total_width})) :=")
+    if omitted_clocks:
+        lines.append(
+            "  -- Public clock " + ", ".join(omitted_clocks)
+            + " is wrapper-owned through Sparkle's implicit domain clk."
+        )
+    if not input_widths:
+        return ""
+    _, first_input, first_width = input_widths[0]
+    condition_name = "scaffold_condition"
+    if first_width == "1":
+        lines.append(
+            f"  let {condition_name} : Signal dom Bool := {first_input}"
+        )
+    else:
+        lines.append(
+            f"  let {condition_name} : Signal dom Bool := isZero {first_input}"
+        )
+    port_type_text = " ".join(width for _, _, width in input_widths) + " " + " ".join(width for _, width in output_widths)
+    unused_parameters = [
+        parameter for parameter in parameters
+        if not re.search(rf"\b{re.escape(parameter)}\b", port_type_text)
+    ]
+    for index, parameter in enumerate(unused_parameters):
+        witness = f"scaffold_{parameter.lower()}_state"
+        next_condition = f"scaffold_condition_{index + 1}"
+        lines.extend([
+            f"  -- TODO scaffold-only live witness for benchmark parameter {parameter}; replace with real state.",
+            f"  let {witness} : Signal dom (BitVec ({parameter})) :=",
+            f"    Signal.loop fun q => dff (BitVec.ofNat ({parameter}) 0) q",
+            f"  let {next_condition} : Signal dom Bool :=",
+            f"    Signal.mux (isZero {witness}) {condition_name} {condition_name}",
+        ])
+        condition_name = next_condition
+    if omitted_clocks and not unused_parameters:
+        lines.extend([
+            "  -- TODO scaffold-only clock witness; replace with the benchmark state machine.",
+            "  let scaffold_clock_state : Signal dom Bool :=",
+            "    Signal.loop fun q => dff false q",
+            "  let scaffold_clock_condition : Signal dom Bool :=",
+            f"    Signal.mux scaffold_clock_state {condition_name} {condition_name}",
+        ])
+        condition_name = "scaffold_clock_condition"
+    for name, width in output_widths:
+        if name in adapter_metadata_outputs:
+            metadata_name = f"{name}_metadata"
+            lines.extend([
+                f"  -- Adapter-observable derived metadata; this leaf is already implemented, not a behavioral TODO.",
+                f"  let {metadata_name} : Signal dom (BitVec ({width})) :=",
+                f"    Signal.pure (BitVec.ofNat ({width}) (DATA_WIDTH + PARITY_BIT + 1))",
+                f"  let {name} : Signal dom (BitVec ({width})) :=",
+                f"    Signal.mux {condition_name} {metadata_name} {metadata_name}",
+            ])
+            continue
+        zero_name = f"{name}_zero"
+        lines.extend([
+            f"  let {zero_name} : Signal dom (BitVec ({width})) :=",
+            f"    Signal.pure (BitVec.ofNat ({width}) 0)",
+            f"  let {name} : Signal dom (BitVec ({width})) :=",
+            f"    Signal.mux {condition_name} {zero_name} {zero_name} -- TODO: implement `{name}`",
+        ])
+    lines.append("  " + " ++ ".join(name for name, _ in output_widths))
+    lines.append("")
+    selected_defaults = _cvdp_scaffold_defaults(
+        parameters,
+        info.design_name,
+        sweep_values,
+        sweep_combinations,
+    )
+    defaults = ", ".join(
+        f"{name} := {selected_defaults[name]}" for name in parameters
+    )
+    if defaults:
+        lines.extend([
+            f"#synthesizeVerilog {function_name} parameters",
+            f"  [{defaults}]",
+        ])
+    else:
+        lines.append(f"#synthesizeVerilog {function_name}")
+    return "\n".join(lines) + "\n"
+
+
+def format_cvdp_typed_scaffold(info: ProblemInfo | None) -> str:
+    source = build_cvdp_typed_scaffold(info)
+    if not source:
+        return ""
+    return (
+        "### Deterministic Typed Sparkle Scaffold\n\n"
+        "This scaffold was generated only from the public interface and is already "
+        "compile-checked by the local harness. Preserve its parameters, binders, "
+        "return width, named MSB-to-LSB packing, and synthesis command. Replace "
+        "the TODO zeros with real logic; do not restart from a guessed signature.\n\n"
+        f"```lean\n{source}```"
+    )
+
+
 def build_user_message(
     prob_id: str,
     has_repl: bool = False,
     info: ProblemInfo | None = None,
     dataset_name: str = "verilogeval",
     condition_sv: str | None = None,
+    include_cvdp_scaffold: bool = False,
+    include_cvdp_verified_idioms: bool = False,
 ) -> str:
     """Build the user message for the agent, including NL description and reference Verilog."""
     if info is not None:
@@ -1453,44 +1932,85 @@ def build_user_message(
 
     dataset_note = ""
     if dataset_name in ("resbench", "cvdp", "realbench"):
+        example_guidance = (
+            "- Use only the retrieved verified idiom bodies supplied below; migrate expression shapes into the authoritative scaffold, and do not inspect unrelated Benchmark or Generated candidates.\n"
+            if include_cvdp_verified_idioms else
+            "- Read `Benchmark/RTLIdioms.lean` if the task has memory, packed fields, priority logic, or generate-like bit operations.\n"
+        )
         dataset_note = (
             f"- The evaluator expects the generated SystemVerilog top module to be `{design_name}`.\n"
             f"- Use port names and widths exactly as specified by the problem statement.\n"
             f"- Preserve reset polarity and cycle latency exactly; these testbenches often check protocol timing.\n"
             f"- Prefer Sparkle.Library.RTL helpers for bit slices, reset muxes, registers, memories, and register files.\n"
-            f"- Read `Benchmark/RTLIdioms.lean` if the task has memory, packed fields, priority logic, or generate-like bit operations.\n"
+            f"{example_guidance}"
         )
     interface_contract = format_benchmark_interface_contract(info)
     interface_section = (
         f"### Benchmark Interface Contract\n\n{interface_contract}\n\n"
         if interface_contract else ""
     )
-
+    scaffold_section = (
+        format_cvdp_typed_scaffold(info) + "\n\n"
+        if include_cvdp_scaffold else ""
+    )
+    idiom_section = (
+        format_cvdp_verified_idioms(info) + "\n\n"
+        if include_cvdp_verified_idioms else ""
+    )
+    if scaffold_section:
+        guardrail_note = (
+            "The target file is already initialized with the typed scaffold above. Its current "
+            "contents are authoritative: preserve the typed shell and implement every TODO. "
+            "Remove `CKTARCHON_IMPLEMENTATION_REQUIRED` only after the completed design passes "
+            "the compile check and produces Verilog. A marked scaffold compiling is not completion.\n\n"
+        )
+        implementation_step = (
+            "2. Implement the specification in that file. Use only the retrieved verified idiom bodies below when a matching Sparkle expression shape is needed; never copy their outer definition shell\n"
+            if include_cvdp_verified_idioms else
+            "2. Implement the specification in that file. Consult at most one or two relevant Benchmark examples only if a specific Sparkle idiom is needed\n"
+        )
+        workflow_instructions = (
+            f"1. Read `Generated/{prob_id}.lean` first; do not replace its typed shell with a generic from-scratch template\n"
+            f"{implementation_step}"
+            f"{compile_instructions}\n\n"
+        )
+        structure_section = ""
+    else:
+        guardrail_note = ""
+        workflow_instructions = (
+            f"1. Start by reading a few Benchmark/*.lean examples to see working patterns\n"
+            f"2. Write your solution to `Generated/{prob_id}.lean`\n"
+            f"{compile_instructions}\n\n"
+        )
+        structure_section = (
+            f"The file must follow this exact structure:\n"
+            f"```lean\n"
+            f"import Sparkle\n"
+            f"import Sparkle.Compiler.Elab\n\n"
+            f"open Sparkle.Core.Domain\n"
+            f"open Sparkle.Core.Signal\n\n"
+            f"open Sparkle.Library.RTL\n\n"
+            f"/-- <description> -/\n"
+            f"def {func_name} {{dom : DomainConfig}}\n"
+            f"    (<inputs>) : <output_type> :=\n"
+            f"  <implementation>\n\n"
+            f"#synthesizeVerilog {func_name}\n"
+            f"```\n"
+        )
     return (
         f"## Problem: {prob_id}\n\n"
         f"### Target Module\n\n`{design_name}`\n\n"
         f"### Natural Language Description\n\n{nl_desc}\n\n"
         f"{interface_section}"
+        f"{scaffold_section}"
+        f"{idiom_section}"
         f"{ref_section}"
         f"### Your Task\n\n"
         f"Write a Sparkle HDL (Lean 4) implementation for this problem.\n\n"
-        f"1. Start by reading a few Benchmark/*.lean examples to see working patterns\n"
-        f"2. Write your solution to `Generated/{prob_id}.lean`\n"
-        f"{compile_instructions}\n\n"
+        f"{guardrail_note}"
+        f"{workflow_instructions}"
         f"{dataset_note}"
-        f"The file must follow this exact structure:\n"
-        f"```lean\n"
-        f"import Sparkle\n"
-        f"import Sparkle.Compiler.Elab\n\n"
-        f"open Sparkle.Core.Domain\n"
-        f"open Sparkle.Core.Signal\n\n"
-        f"open Sparkle.Library.RTL\n\n"
-        f"/-- <description> -/\n"
-        f"def {func_name} {{dom : DomainConfig}}\n"
-        f"    (<inputs>) : <output_type> :=\n"
-        f"  <implementation>\n\n"
-        f"#synthesizeVerilog {func_name}\n"
-        f"```\n"
+        f"{structure_section}"
     )
 
 
@@ -2319,6 +2839,8 @@ def build_compact_repair_prompt(
     latest_feedback: str,
     recent_attempts: list[dict],
     extra_constraints: str = "",
+    include_cvdp_scaffold: bool = False,
+    include_cvdp_verified_idioms: bool = False,
 ) -> str:
     design_name = info.design_name if info else "TopModule"
     prompt_text = info.prompt_text if info else "(no description available)"
@@ -2337,6 +2859,17 @@ def build_compact_repair_prompt(
         "Do not trade functional correctness for optimization.",
         check_instruction,
     ]
+    if include_cvdp_scaffold:
+        constraints.extend([
+            "Preserve the deterministic typed scaffold shell and named MSB-to-LSB output order.",
+            "A compile-successful marked scaffold is incomplete; implement all TODO behavior and remove CKTARCHON_IMPLEMENTATION_REQUIRED.",
+            "Read only this task's Generated target; other concurrent candidates are unverified and isolated.",
+            f"Before editing, use `read_file` on `Generated/{prob_id}.lean`; that file is the authoritative current candidate.",
+        ])
+    if include_cvdp_verified_idioms:
+        constraints.append(
+            "Use the single retrieved repair idiom only as an expression-shape guide; preserve the target scaffold's names, signature, output packing, reset polarity, and latency."
+        )
     if extra_constraints:
         constraints.append(extra_constraints)
     interface_contract = format_benchmark_interface_contract(info)
@@ -2344,24 +2877,56 @@ def build_compact_repair_prompt(
         f"### Benchmark Interface Contract\n\n{interface_contract}\n\n"
         if interface_contract else ""
     )
-
+    if include_cvdp_scaffold:
+        resume_note = (
+            "The full previous conversation is intentionally omitted to save tokens. "
+            f"First use `read_file` on `Generated/{prob_id}.lean`; repair that authoritative "
+            "rollback-selected candidate using the contract and latest diagnostics below."
+        )
+        reference_section = ""
+        scaffold_section = ""
+        current_candidate_section = (
+            "### Current Lean Candidate\n\n"
+            f"Read `Generated/{prob_id}.lean` with `read_file` before editing. The target file, "
+            "not a copied prompt snapshot, is the authoritative current candidate.\n\n"
+        )
+    else:
+        resume_note = (
+            "The full previous conversation is intentionally omitted to save tokens; "
+            "rely on the compact state below."
+        )
+        reference_section = (
+            "### Reference Verilog / Interface Context\n\n"
+            f"```systemverilog\n{truncate_text(ref_code, COMPACT_REF_CHARS, keep='middle')}\n```\n\n"
+        )
+        scaffold_section = ""
+        current_candidate_section = (
+            "### Current Lean Candidate\n\n"
+            f"```lean\n{truncate_text(current_lean, COMPACT_CODE_CHARS, keep='middle')}\n```\n\n"
+        )
+    idiom_section = (
+        format_cvdp_verified_idioms(
+            info, feedback=latest_feedback, repair=True
+        ) + "\n\n"
+        if include_cvdp_verified_idioms else ""
+    )
     return (
         f"## Compact Repair Context\n\n"
         f"You are resuming `{phase}` repair for `{prob_id}` at iteration {iteration}. "
-        f"The full previous conversation is intentionally omitted to save tokens; rely on the compact state below.\n\n"
+        f"{resume_note}\n\n"
         f"### Problem\n"
         f"- Dataset: {dataset_name}\n"
         f"- Target module: `{design_name}`\n"
         f"- Lean function: `{func_name}`\n\n"
         f"### Natural Language Specification\n\n"
         f"{truncate_text(prompt_text, COMPACT_SPEC_CHARS, keep='head')}\n\n"
-        f"### Reference Verilog / Interface Context\n\n"
-        f"```systemverilog\n{truncate_text(ref_code, COMPACT_REF_CHARS, keep='middle')}\n```\n\n"
+        f"{reference_section}"
         f"{interface_section}"
+        f"{scaffold_section}"
+        f"{idiom_section}"
         f"### Additional Input Context Files\n\n"
         f"{format_context_files(info)}\n\n"
-        f"### Current Lean Candidate\n\n"
-        f"```lean\n{truncate_text(current_lean, COMPACT_CODE_CHARS, keep='middle')}\n```\n\n"
+        f"{current_candidate_section}"
         f"### Latest Feedback To Fix\n\n"
         f"{compact_repair_feedback(latest_feedback)}\n\n"
         f"### Recent Attempts Summary\n\n"

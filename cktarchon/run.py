@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .env import ensure_runtime_env, load_env_file, model_alias
-from .harness import AnthropicHarnessRunner, AnthropicTextRunner
+from .harness import AnthropicHarnessRunner, AnthropicTextRunner, configure_anthropic_credentials_from_env
 from .logs import AgentStats, append_jsonl, parse_agent_log
 from .search_strategy import (
     CandidateTracker,
@@ -33,6 +33,7 @@ from .search_strategy import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CVDP_SCAFFOLD_MARKER = "CKTARCHON_IMPLEMENTATION_REQUIRED"
 
 COMPACT_SPARKLE_GENERATION_SKILL = """You are an expert hardware engineer translating natural-language RTL specifications into Sparkle HDL, a Lean 4 hardware DSL.
 
@@ -116,6 +117,20 @@ def parse_args() -> argparse.Namespace:
             "non-evaluation few-shot examples."
         ),
     )
+    p.add_argument(
+        "--cvdp-local-guardrails",
+        action="store_true",
+        help=(
+            "Use a compile-checked typed CVDP scaffold, local diagnostics, isolated candidates, and strict rollback."
+        ),
+    )
+    p.add_argument(
+        "--cvdp-verified-idioms",
+        action="store_true",
+        help=(
+            "Retrieve a small deterministic set of compile-verified Sparkle idioms for the guarded CVDP standard loop."
+        ),
+    )
     p.add_argument("--results-dir", type=str, required=True)
     p.add_argument("--harness", default="anthropic-api", choices=["anthropic-api", "codex-agent", "archon-native"])
     p.add_argument("--key-env", default=str(PROJECT_ROOT / "key.env"))
@@ -177,6 +192,37 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def validate_cvdp_verified_idiom_mode(
+    args: argparse.Namespace,
+    *,
+    active_repl: bool | None = None,
+) -> None:
+    """Reject every unsupported verified-idiom execution mode."""
+
+    if not bool(getattr(args, "cvdp_verified_idioms", False)):
+        return
+    requirements = (
+        (getattr(args, "dataset", None) == "cvdp", "--dataset cvdp"),
+        (bool(getattr(args, "cvdp_local_guardrails", False)), "--cvdp-local-guardrails"),
+        (getattr(args, "harness", None) == "anthropic-api", "--harness anthropic-api"),
+        (not bool(getattr(args, "guided_search", False)), "the standard (non-guided) loop"),
+        (not bool(getattr(args, "eval_only", False)), "generation mode (not --eval-only)"),
+        (not bool(getattr(args, "no_repl", False)), "the Lean REPL (remove --no-repl)"),
+        (
+            getattr(args, "prompt_profile", None) == "cvdp-skill-fewshot",
+            "--prompt-profile cvdp-skill-fewshot",
+        ),
+    )
+    missing = [description for satisfied, description in requirements if not satisfied]
+    if active_repl is False:
+        missing.append("an active Lean REPL")
+    if missing:
+        raise ValueError(
+            "--cvdp-verified-idioms is fail-closed and requires "
+            + ", ".join(missing)
+        )
+
+
 def discover_problems(args: argparse.Namespace, ds: Any) -> list[str]:
     if args.problem_file:
         path = Path(args.problem_file)
@@ -223,6 +269,31 @@ def generated_candidate_available(target: Path) -> bool:
         return bool(target.read_text(errors="replace").strip())
     except OSError:
         return False
+
+
+def reject_incomplete_cvdp_scaffold(
+    result: dict[str, Any], source: str
+) -> dict[str, Any]:
+    """Fail closed when the behavior-neutral starter marker remains."""
+
+    if CVDP_SCAFFOLD_MARKER not in source:
+        return result
+    result = dict(result)
+    result["scaffold_incomplete"] = True
+    marker_detail = (
+        "Typed scaffold is still marked CKTARCHON_IMPLEMENTATION_REQUIRED; "
+        "implement every TODO output and remove the marker before completion."
+    )
+    detail = str(result.get("detail", "") or "")
+    if marker_detail not in detail:
+        result["detail"] = marker_detail + (("\n" + detail) if detail else "")
+    if result.get("sim_status") == "sim_pass":
+        result["sim_status"] = "sim_fail"
+        mismatches = result.get("sim_mismatches")
+        result["sim_mismatches"] = (
+            max(1, mismatches) if isinstance(mismatches, int) else 1
+        )
+    return result
 
 
 class GeneratedCandidateTransaction:
@@ -462,6 +533,8 @@ def build_system_prompt(
     prob_id: str,
     info: Any | None = None,
     prompt_profile: str = "compact",
+    cvdp_local_guardrails: bool = False,
+    cvdp_verified_idioms: bool = False,
 ) -> str:
     design_name = getattr(info, "design_name", None) if info is not None else None
     design_rule = ""
@@ -471,7 +544,20 @@ def build_system_prompt(
             f"- Use `#synthesizeVerilog {design_name}`. Do not name the synthesized function `{prob_id}` unless the problem explicitly says that is the target module.\n"
         )
     skill_section = ""
-    if prompt_profile == "cvdp-skill-fewshot":
+    if cvdp_verified_idioms:
+        if prompt_profile != "cvdp-skill-fewshot":
+            raise ValueError(
+                "verified CVDP idioms require prompt_profile='cvdp-skill-fewshot'"
+            )
+        skill_section = (
+            "\n## Retrieved Verified Sparkle Idioms (authoritative)\n"
+            "The user prompt contains a small deterministic selection from the "
+            "compile-verified, specification-neutral idiom catalog. Use those "
+            "retrieved bodies only as expression-shape guides; the benchmark "
+            "contract and typed scaffold remain authoritative. The static "
+            "skill.txt reference is intentionally not appended in this mode.\n"
+        )
+    elif prompt_profile == "cvdp-skill-fewshot":
         skill_section = (
             "\n## Curated Sparkle Skill and Few-Shot Reference\n"
             "The following compact reference has been verified on non-evaluation "
@@ -479,6 +565,18 @@ def build_system_prompt(
             "rather than copying a mismatched interface.\n\n"
             + skill.strip()
             + "\n"
+        )
+    local_guardrail_section = ""
+    if cvdp_local_guardrails:
+        local_guardrail_section = (
+            "\n## Local CVDP guardrails (authoritative)\n"
+            f"- `Generated/{prob_id}.lean` already contains a compile-checked typed scaffold. Read and edit it instead of guessing a new signature.\n"
+            "- Preserve its Nat parameters, Signal binders, return width, named MSB-to-LSB packing, and synthesis command.\n"
+            "- The marker CKTARCHON_IMPLEMENTATION_REQUIRED means the implementation is incomplete even when it compiles. Implement every TODO and remove the marker only after real logic is Lean-checked.\n"
+            "- Use a read/edit/lean_check tool on every unfinished turn; a prose-only answer is not progress.\n"
+            "- Never inspect another Generated candidate. Concurrent candidates are unverified and isolated.\n"
+            "- Signal.loop is a fixed point: its body returns exactly the state Signal type (usually dff init next); derive visible outputs outside the loop.\n"
+            "- Compiler success is a checkpoint, not the finish condition; the outer evaluator still requires adapter, lint, and simulation success.\n"
         )
     return (
         COMPACT_SPARKLE_GENERATION_SKILL.rstrip()
@@ -510,6 +608,7 @@ def build_system_prompt(
         + "- Do not leave placeholders such as `sorry`, `admit`, or dummy zero outputs in the synthesized implementation.\n"
         + "- Do not modify benchmark sources, Sparkle library code, or other Generated files.\n"
         + "- Stop once the generated Lean file compiles; the CktArchon evaluator will run Verilog extraction, lint, and simulation.\n"
+        + local_guardrail_section
     )
 
 
@@ -554,7 +653,14 @@ def make_runner(
     skill: str,
     info: Any | None,
     repl: Any | None,
+    cvdp_verified_idioms: bool | None = None,
 ) -> Any:
+    if cvdp_verified_idioms is None:
+        cvdp_verified_idioms = bool(
+            getattr(args, "cvdp_verified_idioms", False)
+        )
+    if cvdp_verified_idioms:
+        validate_cvdp_verified_idiom_mode(args, active_repl=repl is not None)
     if args.harness == "archon-native":
         run_archon_native_unavailable(getattr(args, "archon_src", None))
     if args.harness == "codex-agent":
@@ -566,7 +672,14 @@ def make_runner(
             model=model_alias(args.model),
             role=role,
             log_base=log_base,
-            system_prompt=build_system_prompt(skill, prob_id, info, args.prompt_profile),
+            system_prompt=build_system_prompt(
+                skill,
+                prob_id,
+                info,
+                args.prompt_profile,
+                getattr(args, "cvdp_local_guardrails", False),
+                cvdp_verified_idioms,
+            ),
             archon_src=configured_archon_src(getattr(args, "archon_src", None)),
             codex_bin=args.codex_bin,
             effort=args.codex_effort,
@@ -585,10 +698,18 @@ def make_runner(
         model=model_alias(args.model),
         role=role,
         log_base=log_base,
-        system_prompt=build_system_prompt(skill, prob_id, info, args.prompt_profile),
+        system_prompt=build_system_prompt(
+            skill,
+            prob_id,
+            info,
+            args.prompt_profile,
+            getattr(args, "cvdp_local_guardrails", False),
+            cvdp_verified_idioms,
+        ),
         max_tokens=args.max_tokens,
         lean_repl=repl,
         api_timeout=args.api_timeout,
+        local_guardrails=getattr(args, "cvdp_local_guardrails", False),
     )
 
 
@@ -1272,23 +1393,43 @@ def _process_problem_standard(
 
     problem_t0 = time.monotonic()
     info = ds.load_problem(prob_id)
-    benchmark_port_resolver = getattr(search, "_benchmark_expected_ports", None)
-    benchmark_ports = (
-        benchmark_port_resolver(info) if benchmark_port_resolver is not None else None
-    )
-
-    def evaluate_candidate():
-        if benchmark_ports is None:
-            return evaluator.evaluate(prob_id, run_dir)
-        return evaluator.evaluate(
-            prob_id, run_dir, benchmark_ports=benchmark_ports
-        )
+    local_guardrails = bool(getattr(args, "cvdp_local_guardrails", False))
+    verified_idioms = bool(getattr(args, "cvdp_verified_idioms", False))
     has_repl = repl is not None
+    validate_cvdp_verified_idiom_mode(args, active_repl=has_repl)
     generated_target = (
         candidate_transaction.target
         if candidate_transaction is not None
         else PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
     )
+    benchmark_port_resolver = getattr(search, "_benchmark_expected_ports", None)
+    benchmark_ports = (
+        benchmark_port_resolver(info) if benchmark_port_resolver is not None else None
+    )
+
+    def evaluate_candidate() -> dict[str, Any]:
+        source = (
+            generated_target.read_text(errors="replace")
+            if generated_target.exists()
+            else ""
+        )
+        if (
+            local_guardrails
+            and scaffold_code is not None
+            and scaffold_result is not None
+            and source == scaffold_code
+        ):
+            return dict(scaffold_result)
+        if benchmark_ports is None:
+            evaluated = evaluator.evaluate(prob_id, run_dir)
+        else:
+            evaluated = evaluator.evaluate(
+                prob_id, run_dir, benchmark_ports=benchmark_ports
+            )
+        if not local_guardrails:
+            return evaluated
+        return reject_incomplete_cvdp_scaffold(evaluated, source)
+
     agent_stats = AgentStats()
     repair_stats_total = AgentStats()
     agent_elapsed = 0.0
@@ -1304,6 +1445,82 @@ def _process_problem_standard(
     sim_feedback_turns_remaining = 0
     sim_feedback_success = False
     sim_feedback_iterations = 0
+    scaffold_code: str | None = None
+    scaffold_result: dict[str, Any] | None = None
+    scaffold_sha256: str | None = None
+    scaffold_preflight_pass = False
+    idiom_catalog_sha256: str | None = None
+    idiom_initial_selected_ids: list[str] | None = None
+    idiom_initial_features: dict[str, Any] | None = None
+    idiom_initial_rendered_chars: int | None = None
+    idiom_repair_selections: list[dict[str, Any]] = []
+
+    if verified_idioms:
+        idiom_query = search.build_cvdp_idiom_query(info)
+        idiom_catalog_sha256 = search.cvdp_verified_idiom_catalog_sha256()
+        idiom_initial_selected_ids = list(
+            search.cvdp_verified_idiom_ids(info)
+        )
+        idiom_initial_features = dict(vars(idiom_query))
+        idiom_initial_rendered_chars = len(
+            search.format_cvdp_verified_idioms(info)
+        )
+        append_jsonl(run_dir / "events.jsonl", {
+            "prob_id": prob_id,
+            "event": "cvdp_verified_idioms_initial",
+            "cvdp_verified_idiom_catalog_sha256": idiom_catalog_sha256,
+            "cvdp_verified_idiom_initial_selected_ids": idiom_initial_selected_ids,
+            "cvdp_verified_idiom_initial_features": idiom_initial_features,
+            "cvdp_verified_idiom_initial_rendered_chars": idiom_initial_rendered_chars,
+        })
+
+    if local_guardrails and not args.eval_only:
+        if repl is None:
+            raise RuntimeError("--cvdp-local-guardrails requires an active Lean REPL")
+        scaffold_code = search.build_cvdp_typed_scaffold(info)
+        if not scaffold_code.strip():
+            raise RuntimeError(
+                f"Could not derive a typed CVDP scaffold for {prob_id} from the public interface"
+            )
+        scaffold_dir = run_dir / "scaffolds"
+        scaffold_dir.mkdir(parents=True, exist_ok=True)
+        scaffold_archive = scaffold_dir / f"{prob_id}.lean"
+        scaffold_archive.write_text(scaffold_code, encoding="utf-8")
+        scaffold_check = repl.check_file(scaffold_archive)
+        scaffold_verilog = str(getattr(scaffold_check, "verilog", "") or "")
+        if not (
+            bool(getattr(scaffold_check, "passed", False))
+            and bool(getattr(scaffold_check, "complete", False))
+            and scaffold_verilog.strip()
+        ):
+            error_text = str(getattr(scaffold_check, "error_text", "") or "")
+            raise RuntimeError(
+                f"Typed CVDP scaffold preflight failed for {prob_id}: "
+                + (error_text[:1000] or "no generated Verilog")
+            )
+        scaffold_preflight_pass = True
+        scaffold_sha256 = hashlib.sha256(scaffold_code.encode("utf-8")).hexdigest()
+        generated_target.parent.mkdir(parents=True, exist_ok=True)
+        generated_target.write_text(scaffold_code, encoding="utf-8")
+        scaffold_result = {
+            "prob_id": prob_id,
+            "compile_pass": True,
+            "sv_extracted": True,
+            "lint_pass": False,
+            "sim_status": "not_run",
+            "sim_mismatches": -1,
+            "has_sorry": False,
+            "lean_source_status": "complete",
+            "scaffold_incomplete": True,
+            "detail": "Compile-checked typed scaffold fallback; behavioral TODOs remain.",
+        }
+        append_jsonl(run_dir / "events.jsonl", {
+            "prob_id": prob_id,
+            "event": "cvdp_scaffold_preflight",
+            "compile_pass": True,
+            "sv_extracted": True,
+            "scaffold_sha256": scaffold_sha256,
+        })
 
     if not args.eval_only:
         log_base = run_dir / "logs" / prob_id / "generate"
@@ -1315,6 +1532,8 @@ def _process_problem_standard(
                 info=info,
                 dataset_name=evaluator.dataset_name,
                 condition_sv=None,
+                include_cvdp_scaffold=local_guardrails,
+                include_cvdp_verified_idioms=verified_idioms,
             )
             runner = make_runner(
                 args=args,
@@ -1324,6 +1543,7 @@ def _process_problem_standard(
                 skill=skill,
                 info=info,
                 repl=repl,
+                cvdp_verified_idioms=verified_idioms,
             )
             agent_stats = runner.run(user_message, max_turns=args.max_turns)
         except Exception as exc:
@@ -1345,6 +1565,15 @@ def _process_problem_standard(
             if candidate_transaction is not None
             else generated_candidate_available(generated_target)
         )
+        if not generated_candidate_from_agent:
+            if local_guardrails and scaffold_code is not None:
+                generated_target.write_text(scaffold_code, encoding="utf-8")
+                generated_candidate_from_agent = True
+                sim_feedback_history.append({
+                    "phase": "generation",
+                    "iteration": 0,
+                    "note": "Initial agent emptied the target; restored the compile-checked scaffold.",
+                })
         if not generated_candidate_from_agent:
             if agent_error is None:
                 agent_error = (
@@ -1386,6 +1615,25 @@ def _process_problem_standard(
         result = evaluate_candidate()
     eval_elapsed = time.monotonic() - eval_t0
 
+    feedback_result = result
+    feedback_from_rolled_back_candidate = False
+    if (
+        local_guardrails
+        and scaffold_code is not None
+        and scaffold_result is not None
+        and result.get("sim_status") != "sim_pass"
+        and search.eval_progress_key(scaffold_result) > search.eval_progress_key(result)
+    ):
+        generated_target.write_text(scaffold_code, encoding="utf-8")
+        result = scaffold_result
+        feedback_from_rolled_back_candidate = True
+        append_jsonl(run_dir / "events.jsonl", {
+            "prob_id": prob_id,
+            "event": "cvdp_scaffold_rollback",
+            "reason": "initial candidate ranked below compile-checked scaffold",
+            "rejected_result_summary": search.summarize_eval_result(feedback_result),
+        })
+
     if (
         args.sim_feedback
         and not args.eval_only
@@ -1413,16 +1661,53 @@ def _process_problem_standard(
             current_code = generated_target.read_text(errors="replace") if generated_target.exists() else ""
             feedback = search.build_sim_feedback(
                 prob_id=prob_id,
-                result=result,
+                result=feedback_result,
                 iteration=sim_iter - 1,
                 history=sim_feedback_history,
                 run_dir=run_dir,
                 info=info,
             )
-            continuing_generation = not bool(result.get("compile_pass"))
+            repair_idiom_fields: dict[str, Any] = {}
+            if verified_idioms:
+                repair_idiom_ids = list(
+                    search.cvdp_verified_idiom_ids(
+                        info, feedback=feedback, repair=True
+                    )
+                )
+                repair_idiom_rendered_chars = len(
+                    search.format_cvdp_verified_idioms(
+                        info, feedback=feedback, repair=True
+                    )
+                )
+                repair_idiom_fields = {
+                    "cvdp_verified_idiom_selected_id": (
+                        repair_idiom_ids[0] if repair_idiom_ids else None
+                    ),
+                    "cvdp_verified_idiom_selected_ids": repair_idiom_ids,
+                    "cvdp_verified_idiom_rendered_chars": repair_idiom_rendered_chars,
+                }
+                repair_idiom_selection = {
+                    "iteration": sim_iter,
+                    **repair_idiom_fields,
+                }
+                idiom_repair_selections.append(repair_idiom_selection)
+                append_jsonl(run_dir / "events.jsonl", {
+                    "prob_id": prob_id,
+                    "event": "cvdp_verified_idioms_repair_selection",
+                    **repair_idiom_selection,
+                })
+            scaffold_incomplete = bool(feedback_result.get("scaffold_incomplete"))
+            continuing_generation = (
+                not bool(feedback_result.get("compile_pass"))
+                or scaffold_incomplete
+            )
             if not current_code.strip():
                 repair_instruction = (
                     "No Lean candidate exists yet. Create the complete Lean source before checking it. "
+                )
+            elif scaffold_incomplete:
+                repair_instruction = (
+                    "Implement the typed scaffold TODO behavior; compilation of the marked zero scaffold is not completion. "
                 )
             elif continuing_generation:
                 repair_instruction = (
@@ -1430,6 +1715,12 @@ def _process_problem_standard(
                 )
             else:
                 repair_instruction = "Use the Verilog simulation diagnostics to repair the Lean source. "
+            if feedback_from_rolled_back_candidate:
+                repair_instruction += (
+                    "The current file has been rolled back to the compile-safe best candidate. "
+                    "The latest diagnostics below came from the rejected edit; reapply only "
+                    "its corrected changes to the current file. "
+                )
             compact_prompt = search.build_compact_repair_prompt(
                 prob_id=prob_id,
                 info=info,
@@ -1444,6 +1735,8 @@ def _process_problem_standard(
                     "Before ending, ensure the final Lean file compiles; "
                     "the outer evaluator will rerun RTL simulation."
                 ),
+                include_cvdp_scaffold=local_guardrails,
+                include_cvdp_verified_idioms=verified_idioms,
             )
             repair_log_base = run_dir / "logs" / prob_id / f"sim_feedback_iter_{sim_iter}"
             repair_runner = make_runner(
@@ -1452,6 +1745,7 @@ def _process_problem_standard(
                 role="ckt-sim-repair",
                 log_base=repair_log_base,
                 skill=skill,
+                cvdp_verified_idioms=verified_idioms,
                 info=info,
                 repl=repl,
             )
@@ -1471,6 +1765,7 @@ def _process_problem_standard(
                     "iteration": sim_iter,
                     "note": f"Agent error during simulation repair: {type(exc).__name__}: {exc}",
                     "remaining_turns": sim_feedback_turns_remaining,
+                    **repair_idiom_fields,
                 })
                 break
             finally:
@@ -1482,11 +1777,33 @@ def _process_problem_standard(
                 else generated_candidate_available(generated_target)
             )
             if not repair_candidate_available:
+                if local_guardrails and best_code is not None:
+                    generated_target.write_text(best_code, encoding="utf-8")
+                    feedback_result = {
+                        "prob_id": prob_id,
+                        "compile_pass": False,
+                        "sv_extracted": False,
+                        "lint_pass": False,
+                        "sim_status": "not_run",
+                        "sim_mismatches": -1,
+                        "detail": "Repair agent emptied the target; the compile-safe best was restored.",
+                    }
+                    feedback_from_rolled_back_candidate = True
+                    result = best_result
+                    if verified_idioms:
+                        sim_feedback_history.append({
+                            "phase": "sim_feedback",
+                            "iteration": sim_iter,
+                            "note": "Repair agent emptied the target; restored the compile-safe best.",
+                            **repair_idiom_fields,
+                        })
+                    continue
                 sim_feedback_history.append({
                     "phase": "sim_feedback",
                     "iteration": sim_iter,
                     "note": "Agent returned without a non-empty repair candidate; restored the prior best without evaluating the empty artifact.",
                     "remaining_turns": sim_feedback_turns_remaining,
+                    **repair_idiom_fields,
                 })
                 if best_code is not None:
                     generated_target.write_text(best_code, encoding="utf-8")
@@ -1495,13 +1812,19 @@ def _process_problem_standard(
 
             repair_eval_t0 = time.monotonic()
             new_result = evaluate_candidate()
+            feedback_result = new_result
             eval_elapsed += time.monotonic() - repair_eval_t0
             new_key = search.eval_progress_key(new_result)
             best_key = search.eval_progress_key(best_result)
             candidate_exists = repair_candidate_available
             improved = new_key > best_key
             generation_incomplete = not bool(best_result.get("compile_pass"))
-            accepted = candidate_exists and (generation_incomplete or new_key >= best_key)
+            if local_guardrails:
+                accepted = candidate_exists and new_key >= best_key
+            else:
+                accepted = candidate_exists and (
+                    generation_incomplete or new_key >= best_key
+                )
             sim_feedback_history.append({
                 "phase": "sim_feedback",
                 "iteration": sim_iter,
@@ -1509,12 +1832,14 @@ def _process_problem_standard(
                 "result_summary": search.summarize_eval_result(new_result),
                 "improved_best": improved,
                 "accepted_candidate": accepted,
+                "rolled_back_to_best": not accepted,
                 "repair_turns": repair_stats.turns,
                 "repair_turn_limit": repair_turn_limit,
                 "remaining_turns": sim_feedback_turns_remaining,
                 "repair_input_tokens": repair_stats.input_tokens,
                 "repair_output_tokens": repair_stats.output_tokens,
                 "repair_compile_checks": repair_stats.compile_checks,
+                **repair_idiom_fields,
             })
             append_jsonl(run_dir / "events.jsonl", {
                 "prob_id": prob_id,
@@ -1532,12 +1857,18 @@ def _process_problem_standard(
                 best_result = new_result
                 best_code = generated_target.read_text(errors="replace") if candidate_exists else None
                 result = new_result
+                feedback_from_rolled_back_candidate = False
                 non_improving_repairs = 0 if improved else non_improving_repairs + 1
             else:
                 if best_code is not None:
                     generated_target.write_text(best_code, encoding="utf-8")
                 result = best_result
-                non_improving_repairs += 1
+                feedback_from_rolled_back_candidate = True
+                if local_guardrails and not new_result.get("compile_pass"):
+                    # Existing max-iteration and turn budgets still bound compile repair.
+                    pass
+                else:
+                    non_improving_repairs += 1
 
             if result.get("sim_status") == "sim_pass":
                 sim_feedback_success = True
@@ -1570,6 +1901,9 @@ def _process_problem_standard(
         "agent_usage_accounting_notes": all_stats.usage_accounting_notes,
         "agent_turn_budget": args.max_turns,
         "prompt_profile": args.prompt_profile,
+        "cvdp_local_guardrails": local_guardrails,
+        "scaffold_preflight_pass": scaffold_preflight_pass,
+        "scaffold_sha256": scaffold_sha256,
         "agent_generation_turns": agent_stats.turns,
         "agent_turns_total": all_stats.turns,
         "sim_feedback_enabled": bool(args.sim_feedback),
@@ -1585,6 +1919,15 @@ def _process_problem_standard(
         "model": model_alias(args.model),
         "timestamp": datetime.now().isoformat(),
     }
+    if verified_idioms:
+        record.update({
+            "cvdp_verified_idioms": True,
+            "cvdp_verified_idiom_catalog_sha256": idiom_catalog_sha256,
+            "cvdp_verified_idiom_initial_selected_ids": idiom_initial_selected_ids,
+            "cvdp_verified_idiom_initial_features": idiom_initial_features,
+            "cvdp_verified_idiom_initial_rendered_chars": idiom_initial_rendered_chars,
+            "cvdp_verified_idiom_repair_selections": idiom_repair_selections,
+        })
     if preexisting_generated_backup:
         record["preexisting_generated_backup"] = preexisting_generated_backup
     if preexisting_generated_restored:
@@ -1654,7 +1997,32 @@ def process_problem(
 def main() -> None:
     args = parse_args()
     load_env_file(Path(args.key_env))
+    # harness.py is imported before CLI env loading. Capture credentials into
+    # its private client configuration, then remove them from subprocess envs.
+    configure_anthropic_credentials_from_env()
     ensure_runtime_env()
+    local_guardrails = bool(getattr(args, "cvdp_local_guardrails", False))
+    verified_idioms = bool(getattr(args, "cvdp_verified_idioms", False))
+    if verified_idioms:
+        try:
+            validate_cvdp_verified_idiom_mode(args)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+    if local_guardrails:
+        if args.dataset != "cvdp":
+            raise SystemExit("--cvdp-local-guardrails is supported only for --dataset cvdp")
+        if args.harness != "anthropic-api":
+            raise SystemExit(
+                "--cvdp-local-guardrails currently requires --harness anthropic-api"
+            )
+        if args.eval_only:
+            raise SystemExit("--cvdp-local-guardrails cannot be combined with --eval-only")
+        if getattr(args, "guided_search", False):
+            raise SystemExit(
+                "--cvdp-local-guardrails currently supports the standard feedback loop, not --guided-search"
+            )
+        if args.no_repl:
+            raise SystemExit("--cvdp-local-guardrails requires the Lean REPL; remove --no-repl")
     _add_legacy_agent_path()
     from dataset import Dataset
     from evaluator import Evaluator
@@ -1682,6 +2050,16 @@ def main() -> None:
             pool = None
     else:
         pool = None
+
+    if verified_idioms:
+        try:
+            validate_cvdp_verified_idiom_mode(args, active_repl=pool is not None)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+    if local_guardrails and pool is None:
+        raise SystemExit(
+            "--cvdp-local-guardrails failed closed because the Lean REPL is unavailable"
+        )
 
     skill = search.load_skill()
     summary = {"total": len(problems), "skipped": 0, "compile_pass": 0, "sim_pass": 0, "sim_fail": 0, "sim_error": 0, "agent_error": 0, "sim_feedback_attempts": 0, "sim_feedback_success": 0}

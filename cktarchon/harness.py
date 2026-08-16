@@ -17,6 +17,22 @@ import anthropic
 from .env import ensure_runtime_env
 from .logs import AgentStats, append_jsonl
 
+_ANTHROPIC_API_KEY: str | None = None
+_ANTHROPIC_BASE_URL: str | None = None
+
+def configure_anthropic_credentials_from_env() -> None:
+    global _ANTHROPIC_API_KEY, _ANTHROPIC_BASE_URL
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    if api_key:
+        _ANTHROPIC_API_KEY = api_key
+    if base_url:
+        _ANTHROPIC_BASE_URL = base_url
+    for secret_name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        os.environ.pop(secret_name, None)
+
+configure_anthropic_credentials_from_env()
+
 BASH_TIMEOUT = 180
 MAX_BASH_OUTPUT = 12000
 MAX_FILE_SIZE = 120000
@@ -69,6 +85,65 @@ def _is_retriable_api_error(exc: Exception) -> bool:
 
 def _retry_delay_seconds(attempt: int) -> int:
     return min(API_BASE_DELAY * (2**attempt), API_MAX_DELAY)
+
+
+def _strip_lean_comments(source: str) -> str:
+    text = re.sub(r"/\-.*?\-/", " ", str(source or ""), flags=re.DOTALL)
+    return re.sub(r"--[^\n]*", " ", text)
+
+
+def sparkle_candidate_hints(source: str) -> list[str]:
+    """Return short deterministic recipes for common Sparkle frontend traps."""
+
+    text = _strip_lean_comments(source)
+    issues: list[str] = []
+
+    def add(message: str) -> None:
+        if message not in issues:
+            issues.append(message)
+
+    if "CKTARCHON_IMPLEMENTATION_REQUIRED" in source:
+        add("The compile-safe scaffold is not a solution; implement every named output, then remove CKTARCHON_IMPLEMENTATION_REQUIRED.")
+    if re.search(r"\bNat\.(?:clog2|ceilLog2)\b", text):
+        add("Replace Nat.clog2/Nat.ceilLog2 with Sparkle.IR.Type.DimExpr.clog2Nat.")
+    if re.search(r"\bNat\.log2\b", text):
+        add("Do not use floor Nat.log2 for a hardware width; use Nat.max 1 (Sparkle.IR.Type.DimExpr.clog2Nat n).")
+    if re.search(r"\bSignal\.(?:mapBV|uge|ule|ugt|sgt|sge|sle)\b", text):
+        add("Use only checked Sparkle APIs: Signal.ult/Signal.slt plus Signal.mux; mapBV/uge/ule/ugt/sge/sle are unavailable.")
+    if re.search(r"\bList\.enum\b", text):
+        add("List.enum is unavailable here; use a fixed checked expression or List.range only outside synthesized signal logic.")
+    if re.search(r"\b(?:True|False)\b", text):
+        add("Lean Bool literals are lowercase true/false; uppercase True/False are propositions and break Signal types.")
+    if re.search(r"\blet\s+\w+\s*:=\s*[^\n]+\s:\s*Signal\b", text):
+        add("Typed lets must be `let x : Signal dom T := expr`, never `let x := expr : Signal dom T`.")
+    if re.search(r"\b(?:sorry|admit)\b", text):
+        add("Remove sorry/admit; synthesis rejects sorryAx even if Lean accepts the declaration.")
+
+    nat_names: set[str] = set()
+    for match in re.finditer(r"[\{(]\s*([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\s*:\s*Nat\b", text):
+        nat_names.update(match.group(1).split())
+    if nat_names:
+        param_pattern = "|".join(re.escape(name) for name in sorted(nat_names))
+        if re.search(rf"\bif\b[^\n]*(?:{param_pattern})\b", text):
+            add("A top-level Nat parameter controls a Lean host `if`; replace it with a closed dimension expression or hardware Signal.mux.")
+    if "Signal.loop" in text:
+        add("Signal.loop is a fixed point `Signal A -> Signal A`: return exactly the same state type (usually `dff init next`) and derive visible outputs outside the loop.")
+    if re.search(r"\b(?:dff|resetHigh|resetLow)\s*\(\s*(?:Signal\.|bundle)", text):
+        add("dff/resetHigh/resetLow initial/reset values are bare BitVec/Bool values, not Signal or bundle2 results.")
+    if re.search(r"\b(?:zext|trunc)\s+\(?\s*[0-9]+#", text):
+        add("zext/trunc operate on Signal values; wrap a literal with an explicitly typed Signal.pure or use BitVec.ofNat at a typed boundary.")
+    return issues[:6]
+
+
+def format_sparkle_candidate_hints(source: str) -> str:
+    issues = sparkle_candidate_hints(source)
+    if not issues:
+        return ""
+    return (
+        "\n\nLocal deterministic Sparkle preflight:\n"
+        + "\n".join(f"{index}. {issue}" for index, issue in enumerate(issues, 1))
+        + "\nRun lean_check immediately after the smallest edit."
+    )
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -175,30 +250,57 @@ class PathGuard:
     project_root: Path
     prob_id: str
     extra_write_globs: tuple[str, ...] = ()
+    strict_exact_generated: bool = False
 
-    def resolve(self, rel_path: str) -> Path:
+    def resolve(self, rel_path: str | Path) -> Path:
         path = (self.project_root / rel_path).resolve()
         root = self.project_root.resolve()
         if path != root and root not in path.parents:
             raise ValueError(f"Path escapes project root: {rel_path}")
         return path
 
-    def is_write_allowed(self, rel_path: str) -> bool:
-        normalized = rel_path.strip().lstrip("./")
+    def _resolved_write_target(self, rel_path: str | Path) -> Path | None:
+        try:
+            path = self.resolve(rel_path)
+            normalized = path.relative_to(self.project_root.resolve()).as_posix()
+        except (OSError, TypeError, ValueError):
+            return None
+        exact_generated = f"Generated/{self.prob_id}.lean"
+        if self.strict_exact_generated and normalized.startswith("Generated/"):
+            return path if normalized == exact_generated else None
+
         allowed = [
-            f"Generated/{self.prob_id}.lean",
+            exact_generated,
             f"Generated/{self.prob_id}_*.lean",
             f"cktarchon_work/{self.prob_id}/**",
             *self.extra_write_globs,
         ]
-        return any(fnmatch.fnmatch(normalized, pat) for pat in allowed)
+        if not any(fnmatch.fnmatch(normalized, pat) for pat in allowed):
+            return None
+        return path
 
-    def require_write_allowed(self, rel_path: str) -> Path:
-        if not self.is_write_allowed(rel_path):
+    def is_write_allowed(self, rel_path: str | Path) -> bool:
+        return self._resolved_write_target(rel_path) is not None
+
+    def is_parallel_generated_candidate(self, rel_path: str | Path) -> bool:
+        """Hide unverified candidates produced by other concurrent workers."""
+
+        try:
+            path = self.resolve(os.fspath(rel_path))
+            normalized = path.relative_to(self.project_root.resolve()).as_posix()
+        except (TypeError, ValueError):
+            return True
+        if not normalized.startswith("Generated/") or not normalized.endswith(".lean"):
+            return False
+        return normalized != f"Generated/{self.prob_id}.lean"
+
+    def require_write_allowed(self, rel_path: str | Path) -> Path:
+        path = self._resolved_write_target(rel_path)
+        if path is None:
             raise PermissionError(
                 f"Write denied for {rel_path}. Allowed outputs are Generated/{self.prob_id}.lean and cktarchon_work/{self.prob_id}/."
             )
-        return self.resolve(rel_path)
+        return path
 
 
 @dataclass
@@ -213,6 +315,7 @@ class AnthropicHarnessRunner:
     lean_repl: Any | None = None
     api_timeout: float | None = 300.0
     extra_write_globs: tuple[str, ...] = ()
+    local_guardrails: bool = False
     tool_counts: dict[str, int] = field(default_factory=dict)
     compile_checks: int = 0
     _tool_sequence: int = field(default=0, init=False, repr=False)
@@ -222,10 +325,15 @@ class AnthropicHarnessRunner:
     def __post_init__(self) -> None:
         ensure_runtime_env()
         self.project_root = self.project_root.resolve()
-        self.guard = PathGuard(self.project_root, self.prob_id, self.extra_write_globs)
+        self.guard = PathGuard(
+            self.project_root,
+            self.prob_id,
+            self.extra_write_globs,
+            strict_exact_generated=self.local_guardrails,
+        )
         kwargs: dict[str, Any] = {}
-        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        api_key = _ANTHROPIC_API_KEY
+        base_url = _ANTHROPIC_BASE_URL
         if api_key:
             kwargs["api_key"] = api_key
         if base_url:
@@ -252,6 +360,11 @@ class AnthropicHarnessRunner:
         })
         append_jsonl(self.log_path, {"event": "prompt", "prompt": prompt})
         self._seed_compile_safe_candidate()
+        request_tools = (
+            [tool for tool in TOOLS if tool["name"] != "bash"]
+            if self.local_guardrails
+            else TOOLS
+        )
 
         for turn in range(max_turns):
             try:
@@ -259,7 +372,7 @@ class AnthropicHarnessRunner:
                     model=self.model,
                     max_tokens=self.max_tokens,
                     system=self.system_prompt,
-                    tools=TOOLS,
+                    tools=request_tools,
                     messages=messages,
                 )
             except Exception:
@@ -310,6 +423,19 @@ class AnthropicHarnessRunner:
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
             if not tool_results:
+                if (
+                    self.local_guardrails
+                    and self._last_complete_code is None
+                    and turn + 1 < max_turns
+                ):
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "No tool was used, so the candidate is not verified. Read/edit the target "
+                            "and run lean_check now; a marked scaffold or prose-only answer is incomplete."
+                        ),
+                    })
+                    continue
                 break
             messages.append({"role": "user", "content": tool_results})
 
@@ -394,6 +520,11 @@ class AnthropicHarnessRunner:
             return f"Error: {type(exc).__name__}: {exc}"
 
     def _bash(self, command: str) -> str:
+        if self.local_guardrails:
+            return (
+                "Error: bash is disabled in local guardrails mode. "
+                "Use read_file, grep, glob, list_directory, edit_file, and lean_check instead."
+            )
         if not command.strip():
             return "Error: empty command"
         blocked = re.compile(r"\b(rm\s+-rf|git\s+reset|git\s+checkout|pkill|killall|sudo|scp|ssh)\b")
@@ -420,6 +551,11 @@ class AnthropicHarnessRunner:
         return output or "(no output)"
 
     def _read_file(self, rel_path: str, offset: Any = None, limit: Any = None) -> str:
+        if self.local_guardrails and self.guard.is_parallel_generated_candidate(rel_path):
+            return (
+                "Error: reading another worker's unverified Generated candidate is blocked; "
+                "use the typed scaffold and curated Benchmark examples."
+            )
         path = self.guard.resolve(rel_path)
         if path.exists() and path.is_dir():
             return self._list_directory(rel_path)
@@ -439,7 +575,11 @@ class AnthropicHarnessRunner:
         path = self.guard.require_write_allowed(rel_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
-        return f"Wrote {len(content)} chars to {rel_path}"
+        return (
+            f"Wrote {len(content)} chars to {rel_path}"
+            + (format_sparkle_candidate_hints(content)
+               if self.local_guardrails else "")
+        )
 
     def _edit_file(self, rel_path: str, old: str, new: str) -> str:
         path = self.guard.require_write_allowed(rel_path)
@@ -449,12 +589,21 @@ class AnthropicHarnessRunner:
         count = text.count(old)
         if count != 1:
             return f"Error: old_string matched {count} times; expected exactly 1"
-        path.write_text(text.replace(old, new, 1))
-        return f"Edited {rel_path}: replaced {len(old)} chars with {len(new)} chars"
+        updated = text.replace(old, new, 1)
+        path.write_text(updated)
+        return (
+            f"Edited {rel_path}: replaced {len(old)} chars with {len(new)} chars"
+            + (format_sparkle_candidate_hints(updated)
+               if self.local_guardrails else "")
+        )
 
-    def _is_generated_target(self, rel_path: str) -> bool:
-        normalized = rel_path.strip().lstrip("./")
-        return normalized == f"Generated/{self.prob_id}.lean"
+    def _is_generated_target(self, rel_path: str | Path) -> bool:
+        try:
+            path = self.guard.resolve(rel_path)
+            target = self.guard.resolve(f"Generated/{self.prob_id}.lean")
+        except (OSError, TypeError, ValueError):
+            return False
+        return path == target
 
     def _autosave_last_complete_candidate(self) -> None:
         if self._last_complete_code is None:
@@ -513,6 +662,8 @@ class AnthropicHarnessRunner:
             rel = path.relative_to(self.project_root)
             if any(part in {".git", ".lake", ".venv", "__pycache__"} for part in rel.parts):
                 continue
+            if self.local_guardrails and self.guard.is_parallel_generated_candidate(rel):
+                continue
             if include and not fnmatch.fnmatch(path.name, str(include)):
                 continue
             try:
@@ -536,6 +687,8 @@ class AnthropicHarnessRunner:
                 continue
             if any(part in {".git", ".lake", ".venv", "__pycache__"} for part in rel.parts):
                 continue
+            if self.local_guardrails and self.guard.is_parallel_generated_candidate(rel):
+                continue
             rows.append(str(rel))
             if len(rows) >= MAX_GLOB_RESULTS:
                 rows.append(f"... [truncated at {MAX_GLOB_RESULTS} matches]")
@@ -550,6 +703,12 @@ class AnthropicHarnessRunner:
         for entry in sorted(path.iterdir()):
             if entry.name.startswith(".") or entry.name == "__pycache__":
                 continue
+            try:
+                entry_rel = entry.relative_to(self.project_root)
+            except ValueError:
+                continue
+            if self.local_guardrails and self.guard.is_parallel_generated_candidate(entry_rel):
+                continue
             suffix = "/" if entry.is_dir() else ""
             rows.append(f"{entry.name}{suffix}")
         return "\n".join(rows) if rows else "(empty directory)"
@@ -558,6 +717,11 @@ class AnthropicHarnessRunner:
         if code is not None and str(code).strip():
             return self._lean_check_code(str(code))
         rel_path = str(path or f"Generated/{self.prob_id}.lean")
+        if self.local_guardrails and self.guard.is_parallel_generated_candidate(rel_path):
+            return (
+                "Error: lean_check cannot inspect another worker's unverified candidate; "
+                "check only the current target or inline code."
+            )
         path = self.guard.resolve(rel_path)
         if not path.exists():
             return f"Error: file not found: {rel_path}"
@@ -565,8 +729,14 @@ class AnthropicHarnessRunner:
             try:
                 result = self.lean_repl.check_file(path)
                 if self._is_generated_target(rel_path):
-                    self._remember_complete_candidate(path.read_text(errors="replace"), result)
-                return self._format_lean_result(result)
+                    source = path.read_text(errors="replace")
+                    self._remember_complete_candidate(source, result)
+                else:
+                    source = ""
+                return self._format_lean_result(result) + (
+                    format_sparkle_candidate_hints(source)
+                    if self.local_guardrails else ""
+                )
             except Exception as exc:
                 return f"REPL failed, falling back unavailable in-tool: {type(exc).__name__}: {exc}"
         module = rel_path.replace("/", ".").removesuffix(".lean")
@@ -577,7 +747,10 @@ class AnthropicHarnessRunner:
             try:
                 result = self.lean_repl.check_code(_with_repl_opens(code))
                 self._remember_complete_candidate(code, result)
-                return self._format_lean_result(result)
+                return self._format_lean_result(result) + (
+                    format_sparkle_candidate_hints(code)
+                    if self.local_guardrails else ""
+                )
             except Exception as exc:
                 return f"Error: REPL failed: {type(exc).__name__}: {exc}"
         temp_rel = f"cktarchon_work/{self.prob_id}/lean_check.lean"
@@ -593,14 +766,14 @@ class AnthropicHarnessRunner:
             and bool(getattr(result, "complete", False))
             and "#synthesizeVerilog" in code
             and generated_verilog.strip()
+            and "CKTARCHON_IMPLEMENTATION_REQUIRED" not in code
         ):
             return
         self._last_complete_code = code
         self._last_complete_sequence = self._tool_sequence
         self._autosave_last_complete_candidate()
 
-    @staticmethod
-    def _format_lean_result(result: Any) -> str:
+    def _format_lean_result(self, result: Any) -> str:
         summary = getattr(result, "summary", None)
         if summary:
             lines = [str(summary)]
@@ -615,22 +788,37 @@ class AnthropicHarnessRunner:
                 errors = getattr(result, "errors", []) or []
                 lines = [f"FAIL ({elapsed:.2f}s, {len(errors)} errors)"]
         error_text = getattr(result, "error_text", "")
-        if error_text:
+        errors = getattr(result, "errors", []) or []
+        if error_text and not (self.local_guardrails and errors):
             lines.append(str(error_text)[:4000])
-        for err in (getattr(result, "errors", []) or [])[:12]:
+        seen_errors: set[tuple[str, str]] = set()
+        error_limit = 4 if self.local_guardrails else 12
+        for err in errors:
             pos = err.get("pos", {}) if isinstance(err, dict) else {}
             loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
             data = err.get("data", err) if isinstance(err, dict) else err
+            key = (loc, re.sub(r"\s+", " ", str(data)).strip())
+            if key in seen_errors:
+                continue
+            seen_errors.add(key)
             lines.append(f"[error {loc}] {data}")
-        for warning in (getattr(result, "warnings", []) or [])[:8]:
+            if len(seen_errors) >= error_limit:
+                break
+        warning_limit = 3 if self.local_guardrails else 8
+        for warning in (getattr(result, "warnings", []) or [])[:warning_limit]:
             pos = warning.get("pos", {}) if isinstance(warning, dict) else {}
             loc = f"line {pos.get('line', '?')}:{pos.get('column', '?')}"
             data = warning.get("data", warning) if isinstance(warning, dict) else warning
             lines.append(f"[warning {loc}] {data}")
         verilog = getattr(result, "verilog", "")
         if verilog:
-            lines.append("=== Generated Verilog ===")
-            lines.append(str(verilog)[:5000])
+            if self.local_guardrails:
+                lines.append(
+                    f"PASS: generated Verilog is available ({len(str(verilog))} chars); inspect it only if needed."
+                )
+            else:
+                lines.append("=== Generated Verilog ===")
+                lines.append(str(verilog)[:5000])
         return "\n".join(lines)
 
 
@@ -648,8 +836,8 @@ class AnthropicTextRunner:
     def __post_init__(self) -> None:
         ensure_runtime_env()
         kwargs: dict[str, Any] = {}
-        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        api_key = _ANTHROPIC_API_KEY
+        base_url = _ANTHROPIC_BASE_URL
         if api_key:
             kwargs["api_key"] = api_key
         if base_url:

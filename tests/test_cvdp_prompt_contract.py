@@ -12,6 +12,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "agent"))
 from dataset import Dataset, ProblemInfo  # noqa: E402
 from search import (  # noqa: E402
     _parse_prompt_interface,
+    _cvdp_scaffold_defaults,
+    _cvdp_scaffold_parameters,
+    build_cvdp_idiom_query,
+    build_compact_repair_prompt,
+    build_cvdp_typed_scaffold,
+    build_user_message,
     format_benchmark_interface_contract,
 )
 
@@ -561,3 +567,290 @@ def test_installed_public_cvdp12_contracts(
         assert fragment in contract
     for fragment in forbidden:
         assert fragment not in contract
+
+
+def _hamming_guardrail_info() -> ProblemInfo:
+    return _info(
+        design_name="hamming_tx",
+        prompt="""
+        ## Interface
+        ### Parameters
+        - **DATA_WIDTH**: User-configurable data width.
+        - **PARITY_BIT**: User-configurable parity width.
+        - **ENCODED_DATA**: Calculated as `DATA_WIDTH + PARITY_BIT + 1`.
+        ### Inputs
+        - **data_in [DATA_WIDTH-1:0]**: Input word.
+        ### Outputs
+        - **data_out [ENCODED_DATA-1:0]**: Encoded word.
+        """,
+        ref_code="""
+        module hamming_tx #(
+          parameter DATA_WIDTH = 4,
+          parameter PARITY_BIT = 3,
+          localparam ENCODED_DATA = DATA_WIDTH + PARITY_BIT + 1
+        ) (
+          input logic [DATA_WIDTH-1:0] data_in,
+          output logic [ENCODED_DATA-1:0] data_out
+        );
+          // REFERENCE_SENTINEL
+        endmodule
+        """,
+        harness="""
+        parameter_combinations = [(4, 3), (8, 4), (16, 5)]
+        parameters = {
+            "DATA_WIDTH": DATA_WIDTH,
+            "PARITY_BIT": PARITY_BIT,
+        }
+
+        @pytest.mark.parametrize(
+            "DATA_WIDTH,PARITY_BIT", parameter_combinations
+        )
+        def test_hamming(dut, DATA_WIDTH, PARITY_BIT):
+            dut.data_in.value = 0
+            int(dut.data_out.value)
+        """,
+    )
+
+
+def _hamming_rx_guardrail_info() -> ProblemInfo:
+    return _info(
+        design_name="hamming_rx",
+        prompt="""
+        ## Interface
+        ### Parameters
+        - **DATA_WIDTH**: User-configurable data width.
+        - **PARITY_BIT**: User-configurable parity width.
+        - **ENCODED_DATA**: Calculated as `DATA_WIDTH + PARITY_BIT + 1`.
+        ### Inputs
+        - **data_in [ENCODED_DATA-1:0]**: Encoded input word.
+        ### Outputs
+        - **data_out [DATA_WIDTH-1:0]**: Corrected data word.
+        """,
+        ref_code="""
+        module hamming_rx #(
+          parameter DATA_WIDTH = 4,
+          parameter PARITY_BIT = 3,
+          localparam ENCODED_DATA = DATA_WIDTH + PARITY_BIT + 1
+        ) (
+          input logic [ENCODED_DATA-1:0] data_in,
+          output logic [DATA_WIDTH-1:0] data_out
+        );
+        endmodule
+        """,
+        harness="""
+        parameter_combinations = [(4, 3), (8, 4), (16, 5)]
+        parameters = {
+            "DATA_WIDTH": DATA_WIDTH,
+            "PARITY_BIT": PARITY_BIT,
+        }
+
+        @pytest.mark.parametrize(
+            "DATA_WIDTH,PARITY_BIT", parameter_combinations
+        )
+        def test_hamming(dut, DATA_WIDTH, PARITY_BIT):
+            dut.data_in.value = 0
+            int(dut.ENCODED_DATA.value)
+            int(dut.data_out.value)
+        """,
+    )
+
+
+def test_scaffold_defaults_select_a_complete_hamming_sweep_tuple():
+    info = _hamming_guardrail_info()
+    parameters, _, sweep_values, sweep_combinations = (
+        _cvdp_scaffold_parameters(info)
+    )
+
+    assert sweep_combinations == [
+        {"DATA_WIDTH": "4", "PARITY_BIT": "3"},
+        {"DATA_WIDTH": "8", "PARITY_BIT": "4"},
+        {"DATA_WIDTH": "16", "PARITY_BIT": "5"},
+    ]
+    assert _cvdp_scaffold_defaults(
+        parameters,
+        "unmapped_hamming_design",
+        sweep_values,
+        sweep_combinations,
+    ) == {"DATA_WIDTH": 4, "PARITY_BIT": 3}
+    assert (
+        "[DATA_WIDTH := 4, PARITY_BIT := 3]"
+        in build_cvdp_typed_scaffold(info)
+    )
+
+
+def test_hamming_rx_scaffold_implements_adapter_metadata_without_a_todo():
+    info = _hamming_rx_guardrail_info()
+    contract = format_benchmark_interface_contract(info)
+    scaffold = build_cvdp_typed_scaffold(info)
+    initial_prompt = build_user_message(
+        "guardrail_problem",
+        has_repl=True,
+        info=info,
+        dataset_name="cvdp",
+        include_cvdp_scaffold=True,
+    )
+
+    assert "Adapter-observable derived metadata exception" in contract
+    assert "not an independent sweep parameter or functional data output" in contract
+    assert "32-bit metadata leaf" in contract
+    assert "`DATA_WIDTH + PARITY_BIT + 1`" in contract
+    assert "let ENCODED_DATA_metadata : Signal dom (BitVec ((31) + 1))" in scaffold
+    assert (
+        "Signal.pure (BitVec.ofNat ((31) + 1) "
+        "(DATA_WIDTH + PARITY_BIT + 1))" in scaffold
+    )
+    assert (
+        "Signal.mux scaffold_condition ENCODED_DATA_metadata ENCODED_DATA_metadata"
+        in scaffold
+    )
+    assert "TODO: implement `ENCODED_DATA`" not in scaffold
+    assert "TODO: implement `data_out`" in scaffold
+    assert "Adapter-observable derived metadata exception" in initial_prompt
+
+
+def test_initial_scaffold_prompt_is_target_first_without_generic_template():
+    prompt = build_user_message(
+        "guardrail_problem",
+        has_repl=True,
+        info=_hamming_guardrail_info(),
+        dataset_name="cvdp",
+        include_cvdp_scaffold=True,
+    )
+
+    assert "### Deterministic Typed Sparkle Scaffold" in prompt
+    assert "1. Read `Generated/guardrail_problem.lean` first" in prompt
+    assert "Consult at most one or two relevant Benchmark examples" in prompt
+    assert "1. Start by reading a few Benchmark/*.lean examples" not in prompt
+    assert "The file must follow this exact structure:" not in prompt
+    assert "(<inputs>) : <output_type>" not in prompt
+
+
+def test_scaffold_prompt_features_remain_opt_in_by_default():
+    info = _hamming_guardrail_info()
+    implicit_initial = build_user_message(
+        "guardrail_problem",
+        has_repl=True,
+        info=info,
+        dataset_name="cvdp",
+    )
+    explicit_initial = build_user_message(
+        "guardrail_problem",
+        has_repl=True,
+        info=info,
+        dataset_name="cvdp",
+        include_cvdp_scaffold=False,
+        include_cvdp_verified_idioms=False,
+    )
+
+    assert implicit_initial == explicit_initial
+    assert "1. Start by reading a few Benchmark/*.lean examples" in implicit_initial
+    assert "The file must follow this exact structure:" in implicit_initial
+    assert "### Deterministic Typed Sparkle Scaffold" not in implicit_initial
+
+
+def test_compact_scaffold_repair_reads_target_without_repeating_code():
+    info = _hamming_guardrail_info()
+    current_lean = "-- CURRENT_LEAN_SENTINEL\n" * 500
+    arguments = {
+        "prob_id": "guardrail_problem",
+        "info": info,
+        "dataset_name": "cvdp",
+        "has_repl": True,
+        "phase": "simulation",
+        "iteration": 2,
+        "current_lean": current_lean,
+        "latest_feedback": "LATEST_DIAGNOSTIC_SENTINEL",
+        "recent_attempts": [],
+    }
+    implicit_default = build_compact_repair_prompt(**arguments)
+    explicit_default = build_compact_repair_prompt(
+        **arguments,
+        include_cvdp_scaffold=False,
+        include_cvdp_verified_idioms=False,
+    )
+    guarded = build_compact_repair_prompt(
+        **arguments,
+        include_cvdp_scaffold=True,
+    )
+
+    assert implicit_default == explicit_default
+    assert "REFERENCE_SENTINEL" in implicit_default
+    assert "CURRENT_LEAN_SENTINEL" in implicit_default
+
+    assert "REFERENCE_SENTINEL" not in guarded
+    assert "CURRENT_LEAN_SENTINEL" not in guarded
+    assert "### Reference Verilog / Interface Context" not in guarded
+    assert "### Deterministic Typed Sparkle Scaffold" not in guarded
+    assert "Signal.pure (BitVec.ofNat" not in guarded
+    assert "### Benchmark Interface Contract" in guarded
+    assert "LATEST_DIAGNOSTIC_SENTINEL" in guarded
+    assert "`read_file` on `Generated/guardrail_problem.lean`" in guarded
+    assert len(guarded) < len(implicit_default)
+
+
+def test_verified_idiom_initial_context_is_opt_in_body_only_and_scaffold_first():
+    info = _hamming_guardrail_info()
+    default_prompt = build_user_message(
+        "guardrail_problem",
+        has_repl=True,
+        info=info,
+        dataset_name="cvdp",
+        include_cvdp_scaffold=True,
+    )
+    treatment_prompt = build_user_message(
+        "guardrail_problem",
+        has_repl=True,
+        info=info,
+        dataset_name="cvdp",
+        include_cvdp_scaffold=True,
+        include_cvdp_verified_idioms=True,
+    )
+
+    heading = "### Retrieved Verified Sparkle Idioms"
+    assert heading not in default_prompt
+    assert heading in treatment_prompt
+    assert treatment_prompt.index("### Deterministic Typed Sparkle Scaffold") < treatment_prompt.index(heading)
+    assert treatment_prompt.index(heading) < treatment_prompt.index("### Reference Verilog")
+    assert "def promptIdiom" not in treatment_prompt
+    assert "#synthesizeVerilog promptIdiom" not in treatment_prompt
+    assert "Use only the retrieved verified idiom bodies" in treatment_prompt
+    assert "Read `Benchmark/RTLIdioms.lean`" not in treatment_prompt
+    assert "The file must follow this exact structure:" not in treatment_prompt
+
+
+def test_verified_idiom_compact_repair_adds_exactly_one_bounded_card():
+    info = _hamming_guardrail_info()
+    prompt = build_compact_repair_prompt(
+        prob_id="guardrail_problem",
+        info=info,
+        dataset_name="cvdp",
+        has_repl=True,
+        phase="simulation",
+        iteration=3,
+        current_lean="-- CURRENT_LEAN_SENTINEL\n" * 100,
+        latest_feedback=(
+            "CVDP_ADAPTER_ERROR: output has no unique exact-core mapping; "
+            "failure_category=adapter_contract_error"
+        ),
+        recent_attempts=[],
+        include_cvdp_scaffold=True,
+        include_cvdp_verified_idioms=True,
+    )
+
+    heading = "### Verified repair idiom `named_packed_outputs`"
+    assert prompt.count("### Verified repair idiom") == 1
+    assert heading in prompt
+    assert "### Retrieved Verified Sparkle Idioms" not in prompt
+    assert "def promptIdiom" not in prompt
+    assert "#synthesizeVerilog promptIdiom" not in prompt
+    assert "REFERENCE_SENTINEL" not in prompt
+    assert "CURRENT_LEAN_SENTINEL" not in prompt
+    card = prompt.split(heading, 1)[1].split("### Additional Input Context Files", 1)[0]
+    assert len(heading) + len(card) <= 1402
+
+
+def test_idiom_query_does_not_match_ram_inside_parameter():
+    query = build_cvdp_idiom_query(_hamming_guardrail_info())
+
+    assert query.has_parameters
+    assert not query.uses_memory
