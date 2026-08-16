@@ -164,6 +164,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim-feedback-turns-per-iter", type=int, default=None, help="Max agent turns for each individual simulation-feedback repair attempt.")
     p.add_argument("--sim-feedback-patience", type=int, default=2, help="Stop after this many non-improving feedback repairs; set 0 to disable.")
     p.add_argument(
+        "--cvdp-generated-dev-feedback",
+        action="store_true",
+        help=(
+            "Use deterministic tests generated only from the public CVDP specification "
+            "during repair, then run the hidden benchmark evaluator exactly once after "
+            "the candidate is frozen. Disabled by default."
+        ),
+    )
+    p.add_argument(
+        "--cvdp-generated-dev-seed",
+        type=lambda value: int(value, 0),
+        default=0xC0D3_2026,
+        help="Deterministic seed for --cvdp-generated-dev-feedback (decimal or 0x-prefixed).",
+    )
+    p.add_argument(
         "--guided-search",
         action="store_true",
         help=(
@@ -223,8 +238,95 @@ def validate_cvdp_verified_idiom_mode(
         )
 
 
+def validate_cvdp_generated_dev_feedback_mode(
+    args: argparse.Namespace,
+    *,
+    active_repl: bool | None = None,
+) -> None:
+    """Fail closed for the public-dev/hidden-holdout evaluation boundary."""
+
+    if not bool(getattr(args, "cvdp_generated_dev_feedback", False)):
+        return
+    requirements = (
+        (getattr(args, "dataset", None) == "cvdp", "--dataset cvdp"),
+        (bool(getattr(args, "sim_feedback", False)), "--sim-feedback"),
+        (bool(getattr(args, "cvdp_local_guardrails", False)), "--cvdp-local-guardrails"),
+        (bool(getattr(args, "problem_file", None)), "--problem-file"),
+        (getattr(args, "harness", None) == "anthropic-api", "--harness anthropic-api"),
+        (not bool(getattr(args, "guided_search", False)), "the standard (non-guided) loop"),
+        (not bool(getattr(args, "eval_only", False)), "generation mode (not --eval-only)"),
+        (not bool(getattr(args, "no_repl", False)), "the Lean REPL (remove --no-repl)"),
+    )
+    missing = [description for satisfied, description in requirements if not satisfied]
+    if active_repl is False:
+        missing.append("an active Lean REPL")
+    if missing:
+        raise ValueError(
+            "--cvdp-generated-dev-feedback is fail-closed and requires "
+            + ", ".join(missing)
+        )
+def _build_cvdp_public_dev_suite(
+    prob_id: str,
+    dataset_path: Path,
+    *,
+    seed: int,
+) -> Any:
+    """Build a suite through a loader that never materializes hidden fields."""
+
+    _add_legacy_agent_path()
+    from cvdp_devtests import (
+        PUBLIC_SPEC_SOURCE,
+        build_cvdp_public_dev_suite,
+        load_cvdp_public_input,
+    )
+
+    public_input = load_cvdp_public_input(dataset_path, prob_id)
+    suite = build_cvdp_public_dev_suite(
+        prob_id,
+        public_input.prompt_text,
+        input_context_files=public_input.input_context_files,
+        seed=seed,
+    )
+    suite.validate()
+    if suite.source != PUBLIC_SPEC_SOURCE:
+        raise RuntimeError(
+            "Generated CVDP dev suite does not carry canonical public-spec provenance"
+        )
+    if not suite.supported:
+        reason = str(suite.reason or "unsupported public specification")
+        raise RuntimeError(
+            f"Generated public dev tests are unavailable for {prob_id}: {reason}"
+        )
+    if suite.public_info is None:
+        raise RuntimeError("Generated CVDP dev suite did not return public_info")
+    return suite
+
+
+def _tag_public_dev_result(result: dict[str, Any], suite: Any) -> dict[str, Any]:
+    """Verify and attach public provenance before a result reaches a prompt."""
+
+    suite.validate()
+    tagged = dict(result)
+    canonical = {
+        "prob_id": str(suite.prob_id),
+        "source": str(suite.source),
+        "public_dev_seed": int(suite.seed),
+        "public_dev_suite_sha256": str(suite.sha256),
+        "public_dev_suite_version": str(suite.version),
+    }
+    for key, value in canonical.items():
+        existing = tagged.get(key)
+        if existing is not None and existing != value:
+            raise ValueError(
+                f"Public dev evaluator result has conflicting {key} provenance"
+            )
+    tagged.update(canonical)
+    return tagged
+
+
 def discover_problems(args: argparse.Namespace, ds: Any) -> list[str]:
     if args.problem_file:
+
         path = Path(args.problem_file)
         problems = [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
         if args.filter:
@@ -682,6 +784,11 @@ def make_runner(
         )
     if cvdp_verified_idioms:
         validate_cvdp_verified_idiom_mode(args, active_repl=repl is not None)
+    public_dev_feedback = bool(
+        getattr(args, "cvdp_generated_dev_feedback", False)
+    )
+    if public_dev_feedback:
+        validate_cvdp_generated_dev_feedback_mode(args, active_repl=repl is not None)
     if args.harness == "archon-native":
         run_archon_native_unavailable(getattr(args, "archon_src", None))
     if args.harness == "codex-agent":
@@ -713,6 +820,9 @@ def make_runner(
             auto_chat_proxy=not args.no_codex_chat_proxy,
             chat_proxy_timeout_s=args.api_timeout,
         )
+    public_runner_kwargs = (
+        {"public_dev_feedback": True} if public_dev_feedback else {}
+    )
     return AnthropicHarnessRunner(
         project_root=PROJECT_ROOT,
         prob_id=prob_id,
@@ -732,6 +842,7 @@ def make_runner(
         api_timeout=args.api_timeout,
         local_guardrails=getattr(args, "cvdp_local_guardrails", False),
         verified_idioms=cvdp_verified_idioms,
+        **public_runner_kwargs,
     )
 
 
@@ -1414,27 +1525,127 @@ def _process_problem_standard(
     import search
 
     problem_t0 = time.monotonic()
-    info = ds.load_problem(prob_id)
     local_guardrails = bool(getattr(args, "cvdp_local_guardrails", False))
     verified_idioms = bool(getattr(args, "cvdp_verified_idioms", False))
+    generated_dev_feedback = bool(
+        getattr(args, "cvdp_generated_dev_feedback", False)
+    )
     has_repl = repl is not None
     validate_cvdp_verified_idiom_mode(args, active_repl=has_repl)
+    validate_cvdp_generated_dev_feedback_mode(args, active_repl=has_repl)
+
+    hidden_info: Any | None = None
+    public_dev_suite: Any | None = None
+    public_dev_run_dir: Path | None = None
+    public_dev_provenance: dict[str, Any] = {}
+    public_history_provenance: dict[str, Any] = {}
+    if generated_dev_feedback:
+        dataset_path = Path(getattr(ds, "dataset_dir"))
+        from .harness import PathGuard
+        public_guard = PathGuard(PROJECT_ROOT, prob_id, public_dev_feedback=True)
+        for sealed_label, sealed_path in (
+            ("dataset", dataset_path),
+            ("run directory", run_dir),
+            ("public evaluator directory", run_dir / "public_dev"),
+        ):
+            if public_guard.is_public_dev_read_allowed(sealed_path):
+                raise ValueError(
+                    f"Generated public-dev {sealed_label} resolves inside a model-readable path: "
+                    f"{sealed_path.resolve()}"
+                )
+        public_dev_suite = _build_cvdp_public_dev_suite(
+            prob_id,
+            dataset_path,
+            seed=int(getattr(args, "cvdp_generated_dev_seed", 0xC0D3_2026)),
+        )
+        info = public_dev_suite.public_info
+        public_dev_run_dir = run_dir / "public_dev"
+        public_dev_provenance = {
+            "source": str(public_dev_suite.source),
+            "derivation": "public_spec",
+            "seed": int(public_dev_suite.seed),
+            "suite_sha256": str(public_dev_suite.sha256),
+            "suite_version": str(public_dev_suite.version),
+        }
+        public_history_provenance = {
+            "feedback_source": str(public_dev_suite.source),
+            "public_dev_seed": int(public_dev_suite.seed),
+            "public_dev_suite_sha256": str(public_dev_suite.sha256),
+            "public_dev_suite_version": str(public_dev_suite.version),
+        }
+        append_jsonl(run_dir / "events.jsonl", {
+            "prob_id": prob_id,
+            "event": "cvdp_generated_public_dev_suite",
+            **public_dev_provenance,
+        })
+    else:
+        hidden_info = ds.load_problem(prob_id)
+        info = hidden_info
+
     generated_target = (
         candidate_transaction.target
         if candidate_transaction is not None
         else PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
     )
     benchmark_port_resolver = getattr(search, "_benchmark_expected_ports", None)
-    benchmark_ports = (
-        benchmark_port_resolver(info) if benchmark_port_resolver is not None else None
-    )
+    iteration_benchmark_ports = None
+    if generated_dev_feedback:
+        iteration_benchmark_ports = list(public_dev_suite.benchmark_ports)
+    elif benchmark_port_resolver is not None:
+        iteration_benchmark_ports = benchmark_port_resolver(info)
+
+    def evaluate_hidden_candidate(final_hidden_info: Any) -> dict[str, Any]:
+        """The only hidden-capable call in generated-dev mode."""
+
+        hidden_benchmark_ports = (
+            benchmark_port_resolver(final_hidden_info)
+            if benchmark_port_resolver is not None
+            else None
+        )
+        if hidden_benchmark_ports is None:
+            return evaluator.evaluate(
+                prob_id,
+                run_dir,
+                problem_info=final_hidden_info,
+            )
+        return evaluator.evaluate(
+            prob_id,
+            run_dir,
+            benchmark_ports=hidden_benchmark_ports,
+            problem_info=final_hidden_info,
+        )
 
     def evaluate_candidate() -> dict[str, Any]:
+        """Evaluate a repairable candidate against public tests or legacy eval."""
+
         source = (
             generated_target.read_text(errors="replace")
             if generated_target.exists()
             else ""
         )
+        if generated_dev_feedback:
+            from .harness import public_dev_lean_source_violation
+
+            violation = public_dev_lean_source_violation(source)
+            if violation is not None:
+                if public_dev_suite is None:
+                    raise RuntimeError("Generated public dev suite was not initialized")
+                return _tag_public_dev_result(
+                    {
+                        "prob_id": prob_id,
+                        "compile_pass": False,
+                        "sv_extracted": False,
+                        "lint_pass": False,
+                        "sim_status": "not_run",
+                        "sim_mismatches": -1,
+                        "source_policy_rejected": True,
+                        "detail": (
+                            "Generated candidate rejected by public-dev Lean source policy "
+                            f"before evaluation ({violation})."
+                        ),
+                    },
+                    public_dev_suite,
+                )
         if (
             local_guardrails
             and scaffold_code is not None
@@ -1442,11 +1653,23 @@ def _process_problem_standard(
             and source == scaffold_code
         ):
             return dict(scaffold_result)
-        if benchmark_ports is None:
+        if generated_dev_feedback:
+            if public_dev_run_dir is None or public_dev_suite is None:
+                raise RuntimeError("Generated public dev evaluator was not initialized")
+            public_dev_suite.validate()
+            evaluated = evaluator.evaluate_public_dev(
+                prob_id,
+                public_dev_run_dir,
+                public_dev_suite,
+            )
+            evaluated = _tag_public_dev_result(evaluated, public_dev_suite)
+        elif iteration_benchmark_ports is None:
             evaluated = evaluator.evaluate(prob_id, run_dir)
         else:
             evaluated = evaluator.evaluate(
-                prob_id, run_dir, benchmark_ports=benchmark_ports
+                prob_id,
+                run_dir,
+                benchmark_ports=iteration_benchmark_ports,
             )
         if not local_guardrails:
             return evaluated
@@ -1468,6 +1691,11 @@ def _process_problem_standard(
     sim_feedback_success = False
     sim_feedback_iterations = 0
     no_write_repairs = 0
+    public_dev_best_result: dict[str, Any] | None = None
+    hidden_holdout_calls = 0
+    frozen_candidate_sha256: str | None = None
+    post_holdout_candidate_sha256: str | None = None
+    hidden_holdout_candidate_unchanged: bool | None = None
     scaffold_code: str | None = None
     scaffold_result: dict[str, Any] | None = None
     scaffold_sha256: str | None = None
@@ -1495,6 +1723,7 @@ def _process_problem_standard(
             "cvdp_verified_idiom_initial_selected_ids": idiom_initial_selected_ids,
             "cvdp_verified_idiom_initial_features": idiom_initial_features,
             "cvdp_verified_idiom_initial_rendered_chars": idiom_initial_rendered_chars,
+            **public_dev_provenance,
         })
 
     if local_guardrails and not args.eval_only:
@@ -1537,12 +1766,15 @@ def _process_problem_standard(
             "scaffold_incomplete": True,
             "detail": "Compile-checked typed scaffold fallback; behavioral TODOs remain.",
         }
+        if generated_dev_feedback:
+            scaffold_result = _tag_public_dev_result(scaffold_result, public_dev_suite)
         append_jsonl(run_dir / "events.jsonl", {
             "prob_id": prob_id,
             "event": "cvdp_scaffold_preflight",
             "compile_pass": True,
             "sv_extracted": True,
             "scaffold_sha256": scaffold_sha256,
+            **(public_dev_provenance if generated_dev_feedback else {}),
         })
 
     if not args.eval_only:
@@ -1596,6 +1828,7 @@ def _process_problem_standard(
                     "phase": "generation",
                     "iteration": 0,
                     "note": "Initial agent emptied the target; restored the compile-checked scaffold.",
+                    **public_history_provenance,
                 })
         if not generated_candidate_from_agent:
             if agent_error is None:
@@ -1655,6 +1888,7 @@ def _process_problem_standard(
             "event": "cvdp_scaffold_rollback",
             "reason": "initial candidate ranked below compile-checked scaffold",
             "rejected_result_summary": search.summarize_eval_result(feedback_result),
+            **(public_dev_provenance if generated_dev_feedback else {}),
         })
 
     if (
@@ -1682,14 +1916,24 @@ def _process_problem_standard(
             sim_iter += 1
             sim_feedback_iterations = sim_iter
             current_code = generated_target.read_text(errors="replace") if generated_target.exists() else ""
-            feedback = search.build_sim_feedback(
-                prob_id=prob_id,
-                result=feedback_result,
-                iteration=sim_iter - 1,
-                history=sim_feedback_history,
-                run_dir=run_dir,
-                info=info,
-            )
+            if generated_dev_feedback:
+                public_dev_suite.validate()
+                feedback = search.build_public_dev_feedback(
+                    prob_id=prob_id,
+                    result=feedback_result,
+                    iteration=sim_iter - 1,
+                    history=sim_feedback_history,
+                    provenance=public_dev_provenance,
+                )
+            else:
+                feedback = search.build_sim_feedback(
+                    prob_id=prob_id,
+                    result=feedback_result,
+                    iteration=sim_iter - 1,
+                    history=sim_feedback_history,
+                    run_dir=run_dir,
+                    info=info,
+                )
             if verified_idioms:
                 feedback += "\n\n" + _format_cvdp_guardrail_feedback_state(
                     scaffold_incomplete=(
@@ -1726,6 +1970,7 @@ def _process_problem_standard(
                     "prob_id": prob_id,
                     "event": "cvdp_verified_idioms_repair_selection",
                     **repair_idiom_selection,
+                    **public_dev_provenance,
                 })
             scaffold_incomplete = bool(feedback_result.get("scaffold_incomplete"))
             continuing_generation = (
@@ -1752,20 +1997,36 @@ def _process_problem_standard(
                     "The latest diagnostics below came from the rejected edit; reapply only "
                     "its corrected changes to the current file. "
                 )
+            repair_phase = (
+                "Lean generation/compile repair"
+                if continuing_generation
+                else (
+                    "public-spec generated dev-test feedback"
+                    if generated_dev_feedback
+                    else "RTL simulation feedback"
+                )
+            )
+            final_check_constraint = (
+                "Before ending, ensure the final Lean file compiles; the public-spec "
+                "dev evaluator will rerun generated tests. The hidden holdout remains "
+                "sealed until this repair loop has ended."
+                if generated_dev_feedback
+                else (
+                    "Before ending, ensure the final Lean file compiles; "
+                    "the outer evaluator will rerun RTL simulation."
+                )
+            )
             compact_prompt = search.build_compact_repair_prompt(
                 prob_id=prob_id,
                 info=info,
                 dataset_name=evaluator.dataset_name,
                 has_repl=has_repl,
-                phase=("Lean generation/compile repair" if continuing_generation else "RTL simulation feedback"),
+                phase=repair_phase,
                 iteration=sim_iter,
                 current_lean=current_code,
                 latest_feedback=feedback,
                 recent_attempts=sim_feedback_history,
-                extra_constraints=repair_instruction + (
-                    "Before ending, ensure the final Lean file compiles; "
-                    "the outer evaluator will rerun RTL simulation."
-                ),
+                extra_constraints=repair_instruction + final_check_constraint,
                 include_cvdp_scaffold=local_guardrails,
                 include_cvdp_verified_idioms=verified_idioms,
             )
@@ -1796,6 +2057,7 @@ def _process_problem_standard(
                     "iteration": sim_iter,
                     "note": f"Agent error during simulation repair: {type(exc).__name__}: {exc}",
                     "remaining_turns": sim_feedback_turns_remaining,
+                    **public_history_provenance,
                     **repair_idiom_fields,
                 })
                 break
@@ -1832,6 +2094,8 @@ def _process_problem_standard(
                         "sim_mismatches": -1,
                         "detail": "Repair agent emptied the target; the compile-safe best was restored.",
                     }
+                    if generated_dev_feedback:
+                        feedback_result = _tag_public_dev_result(feedback_result, public_dev_suite)
                     feedback_from_rolled_back_candidate = True
                     result = best_result
                     if verified_idioms:
@@ -1842,6 +2106,7 @@ def _process_problem_standard(
                             "candidate_changed": candidate_changed,
                             "scaffold_unchanged": scaffold_unchanged,
                             "patience_consumed": False,
+                            **public_history_provenance,
                             **repair_idiom_fields,
                         })
                     continue
@@ -1853,6 +2118,7 @@ def _process_problem_standard(
                     "candidate_changed": candidate_changed,
                     "scaffold_unchanged": scaffold_unchanged,
                     "patience_consumed": False,
+                    **public_history_provenance,
                     **repair_idiom_fields,
                 })
                 if best_code is not None:
@@ -1913,6 +2179,7 @@ def _process_problem_standard(
                 "repair_input_tokens": repair_stats.input_tokens,
                 "repair_output_tokens": repair_stats.output_tokens,
                 "repair_compile_checks": repair_stats.compile_checks,
+                **public_history_provenance,
                 **repair_idiom_fields,
             })
             append_jsonl(run_dir / "events.jsonl", {
@@ -1928,6 +2195,7 @@ def _process_problem_standard(
                 "candidate_changed": candidate_changed,
                 "scaffold_unchanged": scaffold_unchanged,
                 "patience_consumed": patience_consumed,
+                **public_dev_provenance,
             })
 
             if accepted:
@@ -1956,6 +2224,7 @@ def _process_problem_standard(
                     "iteration": sim_iter,
                     "note": f"Stopped: {args.sim_feedback_patience} consecutive simulation-feedback repairs did not improve the best candidate.",
                     "best_result_summary": search.summarize_eval_result(best_result),
+                    **public_history_provenance,
                 })
                 break
 
@@ -1963,6 +2232,53 @@ def _process_problem_standard(
             generated_target.write_text(best_code, encoding="utf-8")
             result = best_result
 
+
+    if generated_dev_feedback:
+        public_dev_suite.validate()
+        public_dev_best_result = dict(result)
+        if not generated_target.exists():
+            raise RuntimeError(
+                "Strict generated-dev mode reached holdout freeze without a candidate"
+            )
+        frozen_candidate = generated_target.read_bytes()
+        if not frozen_candidate.strip():
+            raise RuntimeError(
+                "Strict generated-dev mode reached holdout freeze with an empty candidate"
+            )
+        frozen_candidate_sha256 = hashlib.sha256(frozen_candidate).hexdigest()
+        append_jsonl(run_dir / "events.jsonl", {
+            "prob_id": prob_id,
+            "event": "cvdp_candidate_frozen_for_hidden_holdout",
+            "candidate_sha256": frozen_candidate_sha256,
+            **public_dev_provenance,
+        })
+
+        # This is the first point at which hidden ProblemInfo may be materialized.
+        # No formatter, ranking step, history append, or agent call occurs below.
+        hidden_info = ds.load_problem(prob_id)
+        holdout_t0 = time.monotonic()
+        hidden_holdout_calls = 1
+        try:
+            hidden_result = evaluate_hidden_candidate(hidden_info)
+        finally:
+            eval_elapsed += time.monotonic() - holdout_t0
+        post_holdout_candidate = generated_target.read_bytes()
+        post_holdout_candidate_sha256 = hashlib.sha256(
+            post_holdout_candidate
+        ).hexdigest()
+        hidden_holdout_candidate_unchanged = (
+            post_holdout_candidate_sha256 == frozen_candidate_sha256
+        )
+        if not hidden_holdout_candidate_unchanged:
+            raise RuntimeError("Hidden holdout mutated the frozen Lean candidate")
+        result = dict(hidden_result)
+        if agent_error:
+            result["agent_error"] = agent_error
+            hidden_detail = str(result.get("detail") or "")
+            result["detail"] = (
+                f"Agent ended with {agent_error}; evaluated frozen file anyway."
+                + (f"\n{hidden_detail}" if hidden_detail else "")
+            )
     all_stats = AgentStats()
     merge_agent_stats(all_stats, agent_stats)
     merge_agent_stats(all_stats, repair_stats_total)
@@ -1997,6 +2313,24 @@ def _process_problem_standard(
         "model": model_alias(args.model),
         "timestamp": datetime.now().isoformat(),
     }
+
+    generated_dev_audit: dict[str, Any] = {}
+    if generated_dev_feedback:
+        generated_dev_audit = {
+            "cvdp_generated_dev_feedback": True,
+            "public_dev_source": public_dev_provenance["source"],
+            "public_dev_derivation": public_dev_provenance["derivation"],
+            "public_dev_seed": public_dev_provenance["seed"],
+            "public_dev_suite_sha256": public_dev_provenance["suite_sha256"],
+            "public_dev_suite_version": public_dev_provenance["suite_version"],
+            "public_dev_best_result": public_dev_best_result,
+            "hidden_holdout_calls": hidden_holdout_calls,
+            "hidden_holdout_feedback_exposed": False,
+            "frozen_candidate_sha256": frozen_candidate_sha256,
+            "post_holdout_candidate_sha256": post_holdout_candidate_sha256,
+            "hidden_holdout_candidate_unchanged": hidden_holdout_candidate_unchanged,
+        }
+        record.update(generated_dev_audit)
     if verified_idioms:
         record.update({
             "cvdp_verified_idioms": True,
@@ -2016,7 +2350,21 @@ def _process_problem_standard(
         record.update(search.classify_failure_record(result))
     except Exception:
         pass
+    if generated_dev_feedback:
+        conflicting_audit_fields = [
+            key
+            for key, value in generated_dev_audit.items()
+            if key in result and result[key] != value
+        ]
+        if conflicting_audit_fields:
+            raise RuntimeError(
+                "Hidden evaluator returned conflicting generated-dev audit field(s): "
+                + ", ".join(sorted(conflicting_audit_fields))
+            )
     record.update(result)
+    # Reapply trusted controller-owned fields after merging evaluator output so
+    # the persisted audit record cannot be forged by a result dictionary.
+    record.update(generated_dev_audit)
     append_jsonl(run_dir / "results.jsonl", record)
     return record
 
@@ -2033,6 +2381,7 @@ def process_problem(
 ) -> dict[str, Any]:
     """Process one problem under a single Generated-candidate transaction."""
 
+    validate_cvdp_generated_dev_feedback_mode(args, active_repl=repl is not None)
     if args.eval_only:
         with GeneratedCandidateTransaction(
             PROJECT_ROOT, run_dir, prob_id, read_only=True
@@ -2081,9 +2430,15 @@ def main() -> None:
     ensure_runtime_env()
     local_guardrails = bool(getattr(args, "cvdp_local_guardrails", False))
     verified_idioms = bool(getattr(args, "cvdp_verified_idioms", False))
+    generated_dev_feedback = bool(getattr(args, "cvdp_generated_dev_feedback", False))
     if verified_idioms:
         try:
             validate_cvdp_verified_idiom_mode(args)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+    if generated_dev_feedback:
+        try:
+            validate_cvdp_generated_dev_feedback_mode(args)
         except ValueError as exc:
             raise SystemExit(str(exc)) from None
     if local_guardrails:
@@ -2132,6 +2487,13 @@ def main() -> None:
     if verified_idioms:
         try:
             validate_cvdp_verified_idiom_mode(args, active_repl=pool is not None)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+    if generated_dev_feedback:
+        try:
+            validate_cvdp_generated_dev_feedback_mode(
+                args, active_repl=pool is not None
+            )
         except ValueError as exc:
             raise SystemExit(str(exc)) from None
     if local_guardrails and pool is None:

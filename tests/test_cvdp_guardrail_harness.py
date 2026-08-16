@@ -29,12 +29,24 @@ class _RecordingLeanRepl:
         return _CompleteLeanResult()
 
 
+class _RecordingInlineLeanRepl(_RecordingLeanRepl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.checked_code: list[str] = []
+
+    def check_code(self, code: str) -> _CompleteLeanResult:
+        self.checked_code.append(code)
+        return _CompleteLeanResult()
+
+
 def _runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     lean_repl: object | None = None,
     verified_idioms: bool = False,
+    local_guardrails: bool = True,
+    public_dev_feedback: bool = False,
 ) -> AnthropicHarnessRunner:
     monkeypatch.setattr(harness, "ensure_runtime_env", lambda: None)
     monkeypatch.setattr(harness.anthropic, "Anthropic", lambda **_: object())
@@ -46,8 +58,9 @@ def _runner(
         log_base=tmp_path / "logs" / "guardrail",
         system_prompt="test",
         lean_repl=lean_repl,
-        local_guardrails=True,
+        local_guardrails=local_guardrails,
         verified_idioms=verified_idioms,
+        public_dev_feedback=public_dev_feedback,
     )
 
 

@@ -2807,8 +2807,10 @@ def compact_repair_feedback(feedback: str) -> str:
         selected.append(truncate_text(preamble, 900, keep="head"))
     for heading, limit in (
         ("First Failing Assertions", COMPACT_ASSERTION_CHARS),
+        ("First Public Dev-Test Failures", COMPACT_ASSERTION_CHARS),
         ("Waveform Context", COMPACT_ASSERTION_CHARS),
         ("Cleaned Simulator Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
+        ("Public Dev-Test Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
         ("Current Evaluation Summary", 900),
         ("Interface Diagnostics", COMPACT_INTERFACE_CHARS),
         ("Benchmark Interface Contract", COMPACT_INTERFACE_CHARS),
@@ -2977,7 +2979,93 @@ def eval_progress_key(result: dict | None) -> tuple:
     )
 
 
+def build_public_dev_feedback(
+    prob_id: str,
+    result: dict,
+    iteration: int,
+    history: list[dict],
+    provenance: dict,
+) -> str:
+    """Format only provenance-checked public dev-test output.
+
+    This path intentionally accepts neither a run directory nor ProblemInfo, so
+    it cannot read a hidden simulator artifact, harness, interface contract, or
+    expected-port description.
+    """
+
+    from cvdp_devtests import PUBLIC_SPEC_SOURCE
+
+    if provenance.get("source") != PUBLIC_SPEC_SOURCE:
+        raise ValueError("Public dev feedback has non-canonical suite provenance")
+    if provenance.get("derivation") != "public_spec":
+        raise ValueError("Public dev feedback is not marked as public-spec-derived")
+    if result.get("prob_id") != prob_id:
+        raise ValueError("Public dev result problem id does not match the repair target")
+    if result.get("source") != PUBLIC_SPEC_SOURCE:
+        raise ValueError("Refusing to format a non-public evaluator result")
+    expected_fields = {
+        "public_dev_seed": provenance.get("seed"),
+        "public_dev_suite_sha256": provenance.get("suite_sha256"),
+        "public_dev_suite_version": provenance.get("suite_version"),
+    }
+    if any(result.get(key) != value for key, value in expected_fields.items()):
+        raise ValueError("Public dev result provenance does not match its generated suite")
+    history_fields = {
+        "feedback_source": PUBLIC_SPEC_SOURCE,
+        **expected_fields,
+    }
+    for attempt in history:
+        if any(attempt.get(key) != value for key, value in history_fields.items()):
+            raise ValueError(
+                "Refusing to include mismatched, non-public, or untagged history "
+                "in public dev feedback"
+            )
+
+    evaluation_summary = summarize_eval_result(result)
+    detail = clean_diagnostic_text(result.get("detail"))
+    diagnostics = extract_sim_diagnostics(detail, SIM_DIAGNOSTIC_CHARS)
+    first_failures = extract_first_failure_diagnostics(detail)
+    lines = [
+        f"## Public-Spec Generated Dev-Test Feedback - Iteration {iteration + 1}",
+        "",
+        f"The current Lean implementation for `{prob_id}` did not pass the generated public development suite.",
+        "These tests and their oracle were derived only from the public prompt/input context. "
+        "The hidden holdout has not run and remains unavailable.",
+        "",
+        "### Current Evaluation Summary",
+        evaluation_summary,
+    ]
+    if diagnostics:
+        lines.extend([
+            "",
+            "### Public Dev-Test Diagnostics",
+            "```text",
+            diagnostics,
+            "```",
+        ])
+    if first_failures:
+        lines.extend([
+            "",
+            "### First Public Dev-Test Failures",
+            first_failures,
+        ])
+    if history:
+        lines.extend([
+            "",
+            "### Previous Public Dev-Test Repair Attempts",
+            summarize_recent_attempts(history),
+        ])
+    lines.extend([
+        "",
+        "### Repair Guidance",
+        "- Repair the Lean code, not generated SystemVerilog or any test file.",
+        "- Use the public counterexample to correct behavior, timing, widths, reset semantics, or parameterization.",
+        "- Preserve the public interface and run `lean_check` after editing.",
+        "- Stop after the corrected candidate compiles; the outer loop reruns only the generated public development suite.",
+    ])
+    return "\n".join(lines)
 def build_sim_feedback(
+
     prob_id: str,
     result: dict,
     iteration: int,

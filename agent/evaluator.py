@@ -6469,12 +6469,66 @@ class Evaluator:
             ),
         }
 
+    def evaluate_public_dev(
+        self,
+        prob_id: str,
+        run_dir: Path,
+        suite: Any,
+    ) -> dict:
+        """Evaluate only against an integrity-checked public CVDP dev suite.
+
+        This deliberately has no fallback to ``self.dataset_obj``. Callers
+        cannot accidentally omit the sanitized view and load a hidden harness
+        while the candidate is still repairable.
+        """
+
+        from cvdp_devtests import GeneratedDevSuite, PUBLIC_SPEC_SOURCE
+
+        if not isinstance(suite, GeneratedDevSuite):
+            raise TypeError("public dev evaluation requires GeneratedDevSuite")
+        suite.validate()
+        if not suite.supported or suite.public_info is None:
+            raise ValueError(
+                f"public dev suite is unsupported: {suite.reason or 'unknown reason'}"
+            )
+        if suite.source != PUBLIC_SPEC_SOURCE:
+            raise ValueError("public dev suite has non-canonical provenance")
+        if suite.prob_id != prob_id or suite.public_info.prob_id != prob_id:
+            raise ValueError("public dev suite problem id does not match candidate")
+        if self.dataset_name != "cvdp":
+            raise ValueError("public CVDP dev evaluation requires dataset_name='cvdp'")
+        evaluated = self.evaluate(
+            prob_id,
+            run_dir,
+            benchmark_ports=list(suite.benchmark_ports),
+            problem_info=suite.public_info,
+            functional_only=True,
+        )
+        tagged = dict(evaluated)
+        canonical = {
+            "prob_id": suite.prob_id,
+            "source": suite.source,
+            "public_dev_seed": suite.seed,
+            "public_dev_suite_sha256": suite.sha256,
+            "public_dev_suite_version": suite.version,
+        }
+        for key, value in canonical.items():
+            existing = tagged.get(key)
+            if existing is not None and existing != value:
+                raise ValueError(
+                    f"public dev evaluator returned conflicting {key} provenance"
+                )
+        tagged.update(canonical)
+        return tagged
+
     def evaluate(
         self,
         prob_id: str,
         run_dir: Path,
         *,
         benchmark_ports: list[tuple[str, str, str]] | None = None,
+        problem_info: Any | None = None,
+        functional_only: bool = False,
     ) -> dict:
         """Run full evaluation for a single problem.
 
@@ -6519,6 +6573,11 @@ class Evaluator:
             "unsupported_reason": None,
             "detail": "",
         }
+
+        # A caller-supplied ProblemInfo is the complete authority for this
+        # evaluation. Generated public development tests pass a sanitized view
+        # here so no hidden CVDP harness is loaded while a candidate is repairable.
+        effective_info = problem_info
 
         # 1. Compile
         lean_file = self.project_root / "Generated" / f"{prob_id}.lean"
@@ -6631,8 +6690,8 @@ class Evaluator:
         # so the root is the last module.  Prefer the benchmark's exact target
         # name when it is present, since externally supplied multi-module RTL
         # is not required to follow Sparkle's ordering convention.
-        preferred_top = None
-        if self.dataset_obj is not None:
+        preferred_top = getattr(effective_info, "design_name", None)
+        if preferred_top is None and self.dataset_obj is not None:
             try:
                 preferred_top = self.dataset_obj.load_problem(prob_id).design_name
             except (FileNotFoundError, KeyError, ValueError, AttributeError):
@@ -6641,8 +6700,20 @@ class Evaluator:
             sv_code, preferred_top
         )
 
-        # 4. Simulation
-        if benchmark_ports is None:
+        # 4. Simulation. Preserve the legacy call shape when there is
+        # no override so existing evaluator integrations remain byte-for-byte
+        # compatible; only the public-dev path supplies the new authority.
+        if effective_info is not None:
+            sim_status, mismatches, detail = self._run_sim(
+                prob_id,
+                sv_code,
+                sparkle_mod_name,
+                sparkle_ports,
+                run_dir,
+                benchmark_ports=benchmark_ports,
+                problem_info=effective_info,
+            )
+        elif benchmark_ports is None:
             sim_status, mismatches, detail = self._run_sim(
                 prob_id, sv_code, sparkle_mod_name, sparkle_ports, run_dir
             )
@@ -6668,8 +6739,14 @@ class Evaluator:
             result["unsupported_reason"] = detail
             return result
 
-        if self.dataset_name == "cvdp" and self.dataset_obj is not None:
-            info = self.dataset_obj.load_problem(prob_id)
+        if functional_only:
+            result["functional_only"] = True
+            return result
+
+        if self.dataset_name == "cvdp" and (
+            effective_info is not None or self.dataset_obj is not None
+        ):
+            info = effective_info or self.dataset_obj.load_problem(prob_id)
             harness_files = info.metadata.get("harness_files", {})
             parameter_analysis = _cvdp_parameter_override_analysis(
                 harness_files
@@ -6868,6 +6945,7 @@ class Evaluator:
         run_dir: Path,
         *,
         benchmark_ports: list[tuple[str, str, str]] | None = None,
+        problem_info: Any | None = None,
     ) -> tuple[str, int, str]:
         """Run simulation — dispatches to dataset-specific mode."""
         if self.dataset_name == "rtllm":
@@ -6880,6 +6958,7 @@ class Evaluator:
                 sparkle_ports,
                 run_dir,
                 benchmark_ports=benchmark_ports,
+                problem_info=problem_info,
             )
         if self.dataset_name == "resbench":
             return self._run_sim_resbench(prob_id, sv_code, sparkle_mod_name, run_dir)
@@ -7092,12 +7171,13 @@ class Evaluator:
         *,
         benchmark_ports: list[tuple[str, str, str]] | None = None,
         direct_top: bool = False,
+        problem_info: Any | None = None,
     ) -> tuple[str, int, str]:
         """Run a CVDP cocotb harness in its Docker simulation image."""
-        if self.dataset_obj is None:
+        if problem_info is None and self.dataset_obj is None:
             return "sim_error", -1, "CVDP dataset object not set on evaluator"
 
-        info = self.dataset_obj.load_problem(prob_id)
+        info = problem_info or self.dataset_obj.load_problem(prob_id)
         harness_files = info.metadata.get("harness_files", {})
         verilog_sources = info.metadata.get("verilog_sources", [])
         design_name = info.design_name
@@ -7236,8 +7316,20 @@ class Evaluator:
             context_code = str(context_files.get(rel_source, ""))
             out_path.write_text(sv_code if source == primary else context_code)
 
-        sim_mode = os.environ.get("CVDP_SIM_MODE", "local").lower()
+        # Generated public suites are self-contained and intentionally do not
+        # carry the benchmark's Docker compose bundle. Keep this choice local
+        # so a process-wide hidden-holdout setting cannot redirect dev tests.
+        public_dev_generated = info.metadata.get("public_dev_generated") is True
+        sim_mode = (
+            "local" if public_dev_generated
+            else os.environ.get("CVDP_SIM_MODE", "local").lower()
+        )
         if sim_mode != "docker":
+            if public_dev_generated:
+                return self._run_sim_cvdp_local(
+                    sim_dir,
+                    public_dev_generated=True,
+                )
             return self._run_sim_cvdp_local(sim_dir)
 
         compose = ["docker", "compose"]
@@ -7295,7 +7387,12 @@ class Evaluator:
             return "sim_fail", -1, f"CVDP harness failed:\n{tail[:1200]}"
         return "sim_error", -1, f"CVDP harness error:\n{tail[:1200]}"
 
-    def _run_sim_cvdp_local(self, sim_dir: Path) -> tuple[str, int, str]:
+    def _run_sim_cvdp_local(
+        self,
+        sim_dir: Path,
+        *,
+        public_dev_generated: bool = False,
+    ) -> tuple[str, int, str]:
         """Run a CVDP harness directly with local pytest/cocotb and Icarus."""
         env_file = sim_dir / "src" / ".env"
         test_runner = sim_dir / "src" / "test_runner.py"
@@ -7402,6 +7499,23 @@ class Evaluator:
         )
         if actual_timeout:
             return "sim_error", -1, f"CVDP local simulation timeout:\n{tail[-1200:]}"
+
+        if public_dev_generated:
+            # The generated public suite emits this marker only for an oracle
+            # mismatch. A generic pytest/cocotb failure may instead be a bug
+            # in the generated harness, simulator, or runtime and must not be
+            # presented to the repair model as a functional counterexample.
+            if "CVDP_PUBLIC_DEV_MISMATCH" in combined_output:
+                return (
+                    "sim_fail",
+                    -1,
+                    f"CVDP generated public dev-test mismatch:\n{tail[:1200]}",
+                )
+            return (
+                "sim_error",
+                -1,
+                f"CVDP generated public dev-test harness error:\n{tail[:1200]}",
+            )
 
         functional_failure = re.search(
             r"(?:AssertionError:|^\s*E\s+assert\b|\*\*[^\n]*\bFAIL\b|"

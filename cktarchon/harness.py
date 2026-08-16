@@ -93,6 +93,51 @@ def _strip_lean_comments(source: str) -> str:
     return re.sub(r"--[^\n]*", " ", text)
 
 
+_PUBLIC_DEV_INLINE_LEAN_DENIED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("evaluation command", re.compile(r"#\s*(?:eval|reduce)\b")),
+    ("tactic metaprogram", re.compile(r"\brun_tac\b")),
+    (
+        "syntax or elaborator extension",
+        re.compile(r"\b(?:elab|elab_rules|command_elab|term_elab|macro|macro_rules|syntax)\b"),
+    ),
+    ("unsafe declaration", re.compile(r"\bunsafe\b")),
+    (
+        "compile-time IO namespace",
+        re.compile(r"\b(?:IO|System|FilePath|Lean\.(?:Elab|Meta|Parser))\b"),
+    ),
+    (
+        "file, environment, or process access",
+        re.compile(
+            r"\b(?:readFile|writeFile|readBinFile|writeBinFile|getEnv|setEnv|Process|spawn)\b"
+        ),
+    ),
+    ("file inclusion", re.compile(r"\binclude_(?:str|bytes)\b")),
+    (
+        "environment-changing command",
+        re.compile(r"\b(?:initialize|builtin_initialize|extern)\b"),
+    ),
+)
+
+
+def _public_dev_inline_lean_violation(
+    source: str, *, allow_import: bool = False
+) -> str | None:
+    text = _strip_lean_comments(source)
+    text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+    if not allow_import and re.search(r"\bimport\b", text):
+        return "environment-changing import"
+    for label, pattern in _PUBLIC_DEV_INLINE_LEAN_DENIED_PATTERNS:
+        if pattern.search(text):
+            return label
+    return None
+
+
+def public_dev_lean_source_violation(source: str) -> str | None:
+    """Return a best-effort reason to reject a generated target before Lean runs."""
+
+    return _public_dev_inline_lean_violation(source, allow_import=True)
+
+
 def sparkle_candidate_hints(source: str) -> list[str]:
     """Return short deterministic recipes for common Sparkle frontend traps."""
 
@@ -252,6 +297,18 @@ _CVDP_CADENCE_EDIT_TOOLS = frozenset({"edit_file", "write_file"})
 _CVDP_CADENCE_FORCE_EDIT_TURN = 2
 _CVDP_CADENCE_MAX_BROWSE_CALLS = 2
 
+_PUBLIC_DEV_READ_DIRS = ("Sparkle", "Benchmark", "Examples", "Tests")
+_PUBLIC_DEV_ROOT_FILES = frozenset(
+    {
+        "lakefile.lean",
+        "lake-manifest.json",
+        "lean-toolchain",
+        "Sparkle.lean",
+        "Benchmark.lean",
+        "docs/Troubleshooting_Synthesis.md",
+    }
+)
+
 
 @dataclass
 class PathGuard:
@@ -259,6 +316,7 @@ class PathGuard:
     prob_id: str
     extra_write_globs: tuple[str, ...] = ()
     strict_exact_generated: bool = False
+    public_dev_feedback: bool = False
 
     def resolve(self, rel_path: str | Path) -> Path:
         path = (self.project_root / rel_path).resolve()
@@ -289,6 +347,38 @@ class PathGuard:
 
     def is_write_allowed(self, rel_path: str | Path) -> bool:
         return self._resolved_write_target(rel_path) is not None
+
+    def is_public_dev_read_allowed(self, rel_path: str | Path) -> bool:
+        """Allow only public implementation material and this worker's files."""
+
+        if not self.public_dev_feedback:
+            return True
+        try:
+            path = self.resolve(rel_path)
+            normalized = path.relative_to(self.project_root.resolve()).as_posix()
+        except (OSError, TypeError, ValueError):
+            return False
+        if normalized in {"", ".", "Generated", "cktarchon_work"}:
+            return True
+        if normalized == f"Generated/{self.prob_id}.lean":
+            return True
+        if normalized in _PUBLIC_DEV_ROOT_FILES:
+            return True
+        allowed_roots = (*_PUBLIC_DEV_READ_DIRS, f"cktarchon_work/{self.prob_id}")
+        return any(
+            normalized == root or normalized.startswith(root + "/")
+            for root in allowed_roots
+        )
+
+    def require_public_dev_read_allowed(self, rel_path: str | Path) -> Path:
+        path = self.resolve(rel_path)
+        if not self.is_public_dev_read_allowed(path):
+            raise PermissionError(
+                f"Public-dev read denied for {rel_path}; only the current Generated target, "
+                "public Sparkle/Benchmark/Examples/Tests sources, root build files, and "
+                f"cktarchon_work/{self.prob_id}/ are readable."
+            )
+        return path
 
     def is_parallel_generated_candidate(self, rel_path: str | Path) -> bool:
         """Hide unverified candidates produced by other concurrent workers."""
@@ -325,6 +415,7 @@ class AnthropicHarnessRunner:
     extra_write_globs: tuple[str, ...] = ()
     local_guardrails: bool = False
     verified_idioms: bool = False
+    public_dev_feedback: bool = False
     tool_counts: dict[str, int] = field(default_factory=dict)
     compile_checks: int = 0
     _tool_sequence: int = field(default=0, init=False, repr=False)
@@ -340,12 +431,17 @@ class AnthropicHarnessRunner:
 
     def __post_init__(self) -> None:
         ensure_runtime_env()
+        if self.public_dev_feedback and not self.local_guardrails:
+            raise ValueError(
+                "public-dev feedback requires local_guardrails so bash and broad writes stay disabled"
+            )
         self.project_root = self.project_root.resolve()
         self.guard = PathGuard(
             self.project_root,
             self.prob_id,
             self.extra_write_globs,
-            strict_exact_generated=self.local_guardrails,
+            strict_exact_generated=self.local_guardrails or self.public_dev_feedback,
+            public_dev_feedback=self.public_dev_feedback,
         )
         kwargs: dict[str, Any] = {}
         api_key = _ANTHROPIC_API_KEY
@@ -590,7 +686,7 @@ class AnthropicHarnessRunner:
         self._seed_compile_safe_candidate()
         request_tools = (
             [tool for tool in TOOLS if tool["name"] != "bash"]
-            if self.local_guardrails
+            if self.local_guardrails or self.public_dev_feedback
             else TOOLS
         )
 
@@ -784,7 +880,7 @@ class AnthropicHarnessRunner:
             return f"Error: {type(exc).__name__}: {exc}"
 
     def _bash(self, command: str) -> str:
-        if self.local_guardrails:
+        if self.local_guardrails or self.public_dev_feedback:
             return (
                 "Error: bash is disabled in local guardrails mode. "
                 "Use read_file, grep, glob, list_directory, edit_file, and lean_check instead."
@@ -815,12 +911,19 @@ class AnthropicHarnessRunner:
         return output or "(no output)"
 
     def _read_file(self, rel_path: str, offset: Any = None, limit: Any = None) -> str:
+        try:
+            path = (
+                self.guard.require_public_dev_read_allowed(rel_path)
+                if self.public_dev_feedback
+                else self.guard.resolve(rel_path)
+            )
+        except (OSError, TypeError, ValueError, PermissionError) as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
         if self.local_guardrails and self.guard.is_parallel_generated_candidate(rel_path):
             return (
                 "Error: reading another worker's unverified Generated candidate is blocked; "
                 "use the typed scaffold and curated Benchmark examples."
             )
-        path = self.guard.resolve(rel_path)
         if path.exists() and path.is_dir():
             return self._list_directory(rel_path)
         if not path.exists() or not path.is_file():
@@ -837,6 +940,15 @@ class AnthropicHarnessRunner:
 
     def _write_file(self, rel_path: str, content: str) -> str:
         path = self.guard.require_write_allowed(rel_path)
+        if self.public_dev_feedback and self._is_generated_target(path):
+            violation = _public_dev_inline_lean_violation(
+                content, allow_import=True
+            )
+            if violation is not None:
+                return (
+                    "Error: public-dev target write rejected obvious "
+                    f"metaprogramming or IO access ({violation})."
+                )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         return (
@@ -854,6 +966,15 @@ class AnthropicHarnessRunner:
         if count != 1:
             return f"Error: old_string matched {count} times; expected exactly 1"
         updated = text.replace(old, new, 1)
+        if self.public_dev_feedback and self._is_generated_target(path):
+            violation = _public_dev_inline_lean_violation(
+                updated, allow_import=True
+            )
+            if violation is not None:
+                return (
+                    "Error: public-dev target edit rejected obvious "
+                    f"metaprogramming or IO access ({violation})."
+                )
         path.write_text(updated)
         return (
             f"Edited {rel_path}: replaced {len(old)} chars with {len(new)} chars"
@@ -896,6 +1017,17 @@ class AnthropicHarnessRunner:
             return
         try:
             code = path.read_text(errors="replace")
+            if self.public_dev_feedback:
+                violation = _public_dev_inline_lean_violation(
+                    code, allow_import=True
+                )
+                if violation is not None:
+                    append_jsonl(self.log_path, {
+                        "event": "compile_safe_seed_rejected",
+                        "path": rel_path,
+                        "reason": violation,
+                    })
+                    return
             result = self.lean_repl.check_file(path)
         except Exception as exc:
             append_jsonl(self.log_path, {
@@ -913,7 +1045,14 @@ class AnthropicHarnessRunner:
             })
 
     def _grep(self, pattern: str, rel_path: str, include: Any = None) -> str:
-        root = self.guard.resolve(rel_path)
+        try:
+            root = (
+                self.guard.require_public_dev_read_allowed(rel_path)
+                if self.public_dev_feedback
+                else self.guard.resolve(rel_path)
+            )
+        except (OSError, TypeError, ValueError, PermissionError) as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
         if not root.exists():
             return f"Error: path not found: {rel_path}"
         try:
@@ -923,7 +1062,9 @@ class AnthropicHarnessRunner:
         files = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file()]
         rows: list[str] = []
         for path in sorted(files):
-            rel = path.relative_to(self.project_root)
+            if self.public_dev_feedback and not self.guard.is_public_dev_read_allowed(path):
+                continue
+            rel = path.resolve().relative_to(self.project_root)
             if any(part in {".git", ".lake", ".venv", "__pycache__"} for part in rel.parts):
                 continue
             if self.local_guardrails and self.guard.is_parallel_generated_candidate(rel):
@@ -943,11 +1084,25 @@ class AnthropicHarnessRunner:
         return "\n".join(rows) if rows else f"No matches for {pattern!r}"
 
     def _glob(self, pattern: str) -> str:
+        if self.public_dev_feedback:
+            prefix_parts: list[str] = []
+            for part in Path(pattern).parts:
+                if any(marker in part for marker in ("*", "?", "[")):
+                    break
+                prefix_parts.append(part)
+            prefix = Path(*prefix_parts) if prefix_parts else Path(".")
+            try:
+                self.guard.require_public_dev_read_allowed(prefix)
+            except (OSError, TypeError, ValueError, PermissionError) as exc:
+                return f"Error: {type(exc).__name__}: {exc}"
         rows = []
         for path in sorted(self.project_root.glob(pattern)):
             try:
-                rel = path.relative_to(self.project_root)
-            except ValueError:
+                resolved = path.resolve()
+                if self.public_dev_feedback and not self.guard.is_public_dev_read_allowed(resolved):
+                    continue
+                rel = resolved.relative_to(self.project_root)
+            except (OSError, ValueError):
                 continue
             if any(part in {".git", ".lake", ".venv", "__pycache__"} for part in rel.parts):
                 continue
@@ -960,7 +1115,14 @@ class AnthropicHarnessRunner:
         return "\n".join(rows) if rows else f"No files matching {pattern!r}"
 
     def _list_directory(self, rel_path: str) -> str:
-        path = self.guard.resolve(rel_path)
+        try:
+            path = (
+                self.guard.require_public_dev_read_allowed(rel_path)
+                if self.public_dev_feedback
+                else self.guard.resolve(rel_path)
+            )
+        except (OSError, TypeError, ValueError, PermissionError) as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
         if not path.exists() or not path.is_dir():
             return f"Error: directory not found: {rel_path}"
         rows = []
@@ -968,8 +1130,11 @@ class AnthropicHarnessRunner:
             if entry.name.startswith(".") or entry.name == "__pycache__":
                 continue
             try:
-                entry_rel = entry.relative_to(self.project_root)
-            except ValueError:
+                resolved = entry.resolve()
+                if self.public_dev_feedback and not self.guard.is_public_dev_read_allowed(resolved):
+                    continue
+                entry_rel = resolved.relative_to(self.project_root)
+            except (OSError, ValueError):
                 continue
             if self.local_guardrails and self.guard.is_parallel_generated_candidate(entry_rel):
                 continue
@@ -981,6 +1146,11 @@ class AnthropicHarnessRunner:
         if code is not None and str(code).strip():
             return self._lean_check_code(str(code))
         rel_path = str(path or f"Generated/{self.prob_id}.lean")
+        if self.public_dev_feedback and not self._is_generated_target(rel_path):
+            return (
+                "Error: public-dev lean_check path is restricted to the current "
+                f"target {self._generated_target_rel}."
+            )
         if self.local_guardrails and self.guard.is_parallel_generated_candidate(rel_path):
             return (
                 "Error: lean_check cannot inspect another worker's unverified candidate; "
@@ -989,6 +1159,19 @@ class AnthropicHarnessRunner:
         path = self.guard.resolve(rel_path)
         if not path.exists():
             return f"Error: file not found: {rel_path}"
+        if self.public_dev_feedback:
+            try:
+                target_source = path.read_text(errors="replace")
+            except OSError as exc:
+                return f"Error: {type(exc).__name__}: {exc}"
+            violation = _public_dev_inline_lean_violation(
+                target_source, allow_import=True
+            )
+            if violation is not None:
+                return (
+                    "Error: public-dev target lean_check rejected obvious "
+                    f"metaprogramming or IO access ({violation})."
+                )
         if self.lean_repl is not None:
             try:
                 result = self.lean_repl.check_file(path)
@@ -1007,6 +1190,13 @@ class AnthropicHarnessRunner:
         return self._bash(f"lake build {module}")
 
     def _lean_check_code(self, code: str) -> str:
+        if self.public_dev_feedback:
+            violation = _public_dev_inline_lean_violation(code)
+            if violation is not None:
+                return (
+                    "Error: public-dev inline lean_check rejected obvious "
+                    f"metaprogramming or IO access ({violation})."
+                )
         if self.lean_repl is not None:
             try:
                 result = self.lean_repl.check_code(_with_repl_opens(code))

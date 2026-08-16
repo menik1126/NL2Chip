@@ -35,6 +35,8 @@ SIM_FEEDBACK_PATIENCE="${SIM_FEEDBACK_PATIENCE:-2}"
 PROMPT_PROFILE="${PROMPT_PROFILE:-cvdp-skill-fewshot}"
 CVDP_LOCAL_GUARDRAILS="${CVDP_LOCAL_GUARDRAILS:-0}"
 CVDP_VERIFIED_IDIOMS="${CVDP_VERIFIED_IDIOMS:-0}"
+CVDP_GENERATED_DEV_FEEDBACK="${CVDP_GENERATED_DEV_FEEDBACK:-0}"
+CVDP_GENERATED_DEV_SEED="${CVDP_GENERATED_DEV_SEED:-0xC0D32026}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -83,6 +85,21 @@ case "$CVDP_VERIFIED_IDIOMS" in
     exit 2
     ;;
 esac
+case "$CVDP_GENERATED_DEV_FEEDBACK" in
+  0|false|FALSE|no|NO|"")
+    ;;
+  1|true|TRUE|yes|YES)
+    if [[ ! "$CVDP_GENERATED_DEV_SEED" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]]; then
+      echo "[cvdp12-native-param] error: CVDP_GENERATED_DEV_SEED must be decimal or 0x-prefixed hexadecimal" >&2
+      exit 2
+    fi
+    extra_args+=(--cvdp-generated-dev-feedback --cvdp-generated-dev-seed "$CVDP_GENERATED_DEV_SEED")
+    ;;
+  *)
+    echo "[cvdp12-native-param] error: CVDP_GENERATED_DEV_FEEDBACK must be 0/1 or false/true" >&2
+    exit 2
+    ;;
+esac
 if [[ "${NO_REPL:-0}" == "1" ]]; then
   extra_args+=(--no-repl)
 fi
@@ -99,6 +116,7 @@ if [[ -n "$ARCHON_SRC" ]]; then
 fi
 echo "[cvdp12-native-param] no_codex_chat_proxy=$NO_CODEX_CHAT_PROXY"
 echo "[cvdp12-native-param] cvdp_local_guardrails=$CVDP_LOCAL_GUARDRAILS cvdp_verified_idioms=$CVDP_VERIFIED_IDIOMS"
+echo "[cvdp12-native-param] cvdp_generated_dev_feedback=$CVDP_GENERATED_DEV_FEEDBACK cvdp_generated_dev_seed=$CVDP_GENERATED_DEV_SEED"
 
 "$PYTHON_BIN" -m cktarchon.run \
   --dataset cvdp \

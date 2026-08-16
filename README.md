@@ -405,6 +405,22 @@ sweep. For cache reuse across separate processes, set
 when only a mutable tag is known, reuse is deliberately limited to the current
 process so a tool-image update cannot return stale PPA.
 
+For public-feedback CVDP repair, `--cvdp-generated-dev-feedback` uses a
+versioned, deterministic development suite derived only from the audited public
+prompt and public input-context files. Repair ranking and feedback use that
+suite in a separate `public_dev` directory. After the repair budget ends, the
+controller records the Lean candidate's SHA-256, runs the hidden benchmark
+harness exactly once, and checks that the candidate hash did not change; the
+hidden result becomes the final score and is never sent back to the model. The
+mode fails closed unless a problem file, the Anthropic local guardrails, and an
+active Lean REPL are supplied. The CVDP12 launcher exposes it as
+`CVDP_GENERATED_DEV_FEEDBACK=1` with an optional deterministic
+`CVDP_GENERATED_DEV_SEED`. These generated tests are finite development
+evidence, not a proof or a replacement for the final hidden holdout. The
+controller and tool allowlist prevent ordinary hidden-artifact reads, but they
+are not an OS security boundary against adversarial Lean metaprogramming; use a
+sanitized per-problem container or user namespace for that threat model.
+
 Specialization selects a concrete native generate branch but preserves its SV
 scope, and native procedural loops remain structured SV items. CppSim and the
 automatic verification-model generator therefore reject designs that still
