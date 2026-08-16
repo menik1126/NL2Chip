@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import signal
 import shutil
 import threading
 import time
@@ -75,6 +77,13 @@ open Sparkle.Core.Signal
 
 # Default timeout for a single REPL command (seconds)
 DEFAULT_TIMEOUT = 120
+
+# A timed-out exchange is never safe to reuse: a late response would otherwise
+# be indistinguishable from the response to the next request. Keep process
+# retirement short because it runs on the caller's error path, but wait long
+# enough for killed pipes to wake the request's I/O thread.
+_PROCESS_SHUTDOWN_TIMEOUT = 1.0
+_IO_THREAD_JOIN_TIMEOUT = 1.0
 
 
 @dataclass
@@ -155,6 +164,75 @@ def _error_result(msg: str, elapsed: float) -> REPLResult:
     )
 
 
+@dataclass(frozen=True)
+class _ExchangeOutcome:
+    """Result produced by the process-bound I/O worker."""
+
+    kind: str
+    raw: dict | None = None
+    text: str = ""
+    error: BaseException | None = None
+
+
+def _exchange_with_process(
+    proc: subprocess.Popen,
+    msg: str,
+    outcomes: queue.Queue[_ExchangeOutcome],
+) -> None:
+    """Write one request and read one response using only ``proc``.
+
+    Both writing and reading can block indefinitely on a wedged REPL. They
+    therefore run in one process-bound worker while the caller enforces the
+    deadline. Crucially, the worker never dereferences ``self._proc``: after a
+    timeout it cannot accidentally attach to a replacement process or consume
+    that process's response.
+    """
+    try:
+        if proc.stdin is None:
+            raise BrokenPipeError("REPL stdin is unavailable")
+        proc.stdin.write(msg)
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError) as exc:
+        outcomes.put(_ExchangeOutcome(kind="write_error", error=exc))
+        return
+
+    buf: list[str] = []
+    try:
+        if proc.stdout is None:
+            raise OSError("REPL stdout is unavailable")
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                text = "".join(buf).strip()
+                outcomes.put(_ExchangeOutcome(kind="eof", text=text))
+                return
+            buf.append(line)
+            text = "".join(buf).strip()
+            if not text:
+                continue
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                outcomes.put(
+                    _ExchangeOutcome(
+                        kind="read_error",
+                        text=text,
+                        error=TypeError("REPL response is not a JSON object"),
+                    )
+                )
+                return
+            outcomes.put(_ExchangeOutcome(kind="response", raw=raw, text=text))
+            return
+    except (OSError, ValueError) as exc:
+        outcomes.put(
+            _ExchangeOutcome(
+                kind="read_error", text="".join(buf).strip(), error=exc
+            )
+        )
+
+
 class LeanREPL:
     """Manages a single persistent `lake exe repl` process.
 
@@ -179,6 +257,10 @@ class LeanREPL:
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()  # protects _proc access
         self._prelude_env: int | None = None
+        self._generation = 0
+        self._env_bindings: dict[int, tuple[int, int]] = {}
+        self._env_handles: dict[tuple[int, int], int] = {}
+        self._next_env_handle = 1 << 62
         self._start()
         self._load_prelude()
 
@@ -192,26 +274,128 @@ class LeanREPL:
             stderr=subprocess.PIPE,
             text=True,
             cwd=str(self.project_dir),
+            # Lake may launch the REPL as a child process. A private process
+            # group lets timeout recovery kill every process that still owns
+            # one of our pipes, so a blocked writer/reader is reliably woken.
+            start_new_session=(os.name == "posix"),
         )
+        self._generation += 1
         self._prelude_env = None
 
-    def _close_proc(self) -> None:
-        """Terminate the subprocess if alive."""
-        if self._proc and self._proc.poll() is None:
+    @staticmethod
+    def _signal_proc(proc: subprocess.Popen, sig: signal.Signals) -> None:
+        """Signal the REPL and any Lake child that inherited its pipes."""
+        if os.name == "posix":
             try:
-                self._proc.stdin.close()
-                self._proc.terminate()
-                self._proc.wait(timeout=5)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-        self._proc = None
+                os.killpg(proc.pid, sig)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                # Fall back to signalling the direct child below.
+                pass
+        if proc.poll() is not None:
+            return
+        try:
+            if sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _close_streams(proc: subprocess.Popen) -> None:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def _retire_proc(
+        self,
+        proc: subprocess.Popen,
+        io_thread: threading.Thread | None = None,
+        *,
+        force: bool,
+    ) -> bool:
+        """Permanently retire ``proc`` and wait for its I/O worker.
+
+        Returns whether the worker stopped. ``self._proc`` is cleared before
+        signalling so no later request can reuse a poisoned stream.
+        """
+        if self._proc is proc:
+            self._proc = None
+            self._prelude_env = None
+
+        first_signal = signal.SIGKILL if force else signal.SIGTERM
+        self._signal_proc(proc, first_signal)
+        try:
+            proc.wait(timeout=_PROCESS_SHUTDOWN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            self._signal_proc(proc, signal.SIGKILL)
+            try:
+                proc.wait(timeout=_PROCESS_SHUTDOWN_TIMEOUT)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        except OSError:
+            pass
+
+        if io_thread is not None:
+            io_thread.join(timeout=_IO_THREAD_JOIN_TIMEOUT)
+        self._close_streams(proc)
+        if io_thread is not None and io_thread.is_alive():
+            io_thread.join(timeout=_IO_THREAD_JOIN_TIMEOUT)
+        return io_thread is None or not io_thread.is_alive()
+
+    def _close_proc(self) -> None:
+        """Terminate the subprocess if alive and invalidate its environment."""
+        proc = self._proc
+        if proc is None:
+            self._prelude_env = None
+            return
+        self._retire_proc(proc, force=False)
+
+    def _register_env(self, raw_env: int) -> int:
+        """Return a process-generation-bound public handle for a raw env ID."""
+        raw_env = int(raw_env)
+        key = (self._generation, raw_env)
+        existing = self._env_handles.get(key)
+        if existing is not None:
+            return existing
+
+        handle = raw_env
+        if handle in self._env_bindings:
+            handle = self._next_env_handle
+            while handle in self._env_bindings:
+                handle += 1
+            self._next_env_handle = handle + 1
+
+        self._env_handles[key] = handle
+        self._env_bindings[handle] = key
+        return handle
+
+    def _resolve_env(self, handle: int) -> tuple[int | None, str | None]:
+        """Resolve an env handle only when it belongs to the current process."""
+        binding = self._env_bindings.get(int(handle))
+        if binding is None:
+            return None, (
+                f"Unknown REPL environment handle {handle}; restart from env=None"
+            )
+        generation, raw_env = binding
+        if generation != self._generation:
+            return None, (
+                f"Stale REPL environment handle {handle} belongs to process "
+                f"generation {generation}, not current generation "
+                f"{self._generation}; restart from env=None"
+            )
+        return raw_env, None
 
     def _load_prelude(self) -> None:
         """Load the Sparkle prelude and cache its env."""
-        result = self._send_raw(self.prelude, env=None)
+        result = self._send_raw(self.prelude, env=None, restart_if_needed=False)
         if result.passed and result.env is not None:
             self._prelude_env = result.env
         else:
@@ -219,12 +403,33 @@ class LeanREPL:
                 f"Failed to load Sparkle prelude:\n{result.error_text}"
             )
 
-    def _send_raw(self, code: str, env: int | None = None, all_tactics: bool = False) -> REPLResult:
+    def _send_raw(
+        self,
+        code: str,
+        env: int | None = None,
+        all_tactics: bool = False,
+        use_prelude: bool = False,
+        restart_if_needed: bool = True,
+    ) -> REPLResult:
         """Send a command to the REPL and read back the JSON response."""
         if self._proc is None or self._proc.poll() is not None:
+            if not restart_if_needed:
+                self._close_proc()
+                return _error_result(
+                    "REPL process exited while loading the prelude", 0.0
+                )
             self._start()
             self._load_prelude()
 
+        # Bind the whole exchange to one immutable process reference. Public
+        # callers hold self._lock; this additionally prevents a timed-out I/O
+        # worker from observing a subsequently started REPL.
+        proc = self._proc
+        if proc is None:  # Defensive: _start above either succeeds or raises.
+            return _error_result("REPL process failed to start", 0.0)
+
+        if use_prelude:
+            env = self._prelude_env
         command = {
             "cmd": code,
             "allTactics": all_tactics,
@@ -233,59 +438,61 @@ class LeanREPL:
             "premises": False,
         }
         if env is not None:
-            command["env"] = env
+            raw_env, env_error = self._resolve_env(env)
+            if env_error is not None:
+                return _error_result(env_error, 0.0)
+            command["env"] = raw_env
 
         msg = json.dumps(command, ensure_ascii=False) + "\r\n\r\n"
         start = time.time()
+        outcomes: queue.Queue[_ExchangeOutcome] = queue.Queue(maxsize=1)
+        io_thread = threading.Thread(
+            target=_exchange_with_process,
+            args=(proc, msg, outcomes),
+            daemon=True,
+            name=f"LeanREPL-io-{proc.pid}",
+        )
+        io_thread.start()
 
         try:
-            self._proc.stdin.write(msg)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            return _error_result(f"REPL process died: {e}", time.time() - start)
+            outcome = outcomes.get(timeout=max(0.0, float(self.timeout)))
+        except queue.Empty:
+            elapsed = time.time() - start
+            worker_stopped = self._retire_proc(proc, io_thread, force=True)
+            detail = f"Timeout after {self.timeout}s"
+            if not worker_stopped:
+                detail += " (REPL I/O worker did not stop cleanly)"
+            return _error_result(detail, elapsed)
+        except BaseException:
+            self._retire_proc(proc, io_thread, force=True)
+            raise
 
-        # Read response: accumulate lines until we get valid JSON
-        buf = []
-        deadline = start + self.timeout
-        while time.time() < deadline:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-
-            line_result = [None]
-
-            def read_line():
-                try:
-                    line_result[0] = self._proc.stdout.readline()
-                except Exception:
-                    pass
-
-            t = threading.Thread(target=read_line, daemon=True)
-            t.start()
-            t.join(timeout=remaining)
-            if line_result[0] is None:
-                break
-            line = line_result[0]
-            if not line:  # EOF
-                break
-            buf.append(line)
-            text = "".join(buf).strip()
-            if text:
-                try:
-                    raw = json.loads(text)
-                    return _parse_raw(raw, time.time() - start)
-                except json.JSONDecodeError:
-                    continue
-
+        io_thread.join()
         elapsed = time.time() - start
-        text = "".join(buf).strip()
-        if text:
-            try:
-                raw = json.loads(text)
-                return _parse_raw(raw, elapsed)
-            except json.JSONDecodeError:
-                return _error_result(f"Incomplete JSON: {text[:300]}", elapsed)
-        return _error_result(f"Timeout after {self.timeout}s", elapsed)
+        if outcome.kind == "response" and outcome.raw is not None:
+            result = _parse_raw(outcome.raw, elapsed)
+            if result.env is not None:
+                result.env = self._register_env(result.env)
+            return result
+
+        # EOF, malformed data, and write/read errors all leave stream framing
+        # uncertain. Retire the process just as aggressively as on timeout.
+        self._retire_proc(proc, io_thread, force=True)
+        if outcome.kind == "write_error":
+            return _error_result(
+                f"REPL process write failed: {outcome.error}", elapsed
+            )
+        if outcome.kind == "read_error":
+            return _error_result(
+                f"REPL process read failed: {outcome.error}", elapsed
+            )
+        if outcome.text:
+            return _error_result(
+                f"Incomplete JSON: {outcome.text[:300]}", elapsed
+            )
+        return _error_result(
+            "REPL process closed stdout before responding", elapsed
+        )
 
     def check_code(self, code: str) -> REPLResult:
         """Verify Lean code incrementally against the cached prelude env.
@@ -300,7 +507,7 @@ class LeanREPL:
             REPLResult with pass/fail, errors, and generated Verilog.
         """
         with self._lock:
-            return self._send_raw(code, env=self._prelude_env)
+            return self._send_raw(code, use_prelude=True)
 
     def check_code_incremental(self, code: str, env: int | None = None) -> REPLResult:
         """Verify Lean code incrementally with custom env and tactic info.
@@ -316,8 +523,12 @@ class LeanREPL:
             REPLResult with goal states in `sorries` and tactic trace in `tactics`.
         """
         with self._lock:
-            target_env = env if env is not None else self._prelude_env
-            return self._send_raw(code, env=target_env, all_tactics=True)
+            return self._send_raw(
+                code,
+                env=env,
+                all_tactics=True,
+                use_prelude=env is None,
+            )
 
     def check_file(self, filepath: str | Path) -> REPLResult:
         """Verify a .lean file, stripping prelude imports.
