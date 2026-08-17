@@ -15,7 +15,11 @@ from evaluator import (  # noqa: E402
     generate_cvdp_wrapper,
     parse_module_ports,
 )
-from search import format_benchmark_interface_contract  # noqa: E402
+from search import (  # noqa: E402
+    build_sim_feedback,
+    compact_repair_feedback,
+    format_benchmark_interface_contract,
+)
 
 
 def _cvdp_info(
@@ -42,7 +46,9 @@ def _cvdp_info(
     )
 
 
-def test_cvdp_timeout_after_test_start_is_repairable_progress_failure():
+def test_cvdp_timeout_after_test_start_is_repairable_progress_failure(
+    tmp_path: Path,
+):
     output = """
     0.00ns INFO cocotb Running tests
     0.00ns INFO cocotb.regression running test_divider.test_divider (1/1)
@@ -55,6 +61,27 @@ def test_cvdp_timeout_after_test_start_is_repairable_progress_failure():
     assert "functional progress failure" in detail
     assert "done/valid" in detail
     assert _simulation_diagnostic_stage(status, detail) == "simulation_mismatch"
+
+    feedback = build_sim_feedback(
+        prob_id="cvdp_test",
+        result={
+            "compile_pass": True,
+            "sv_extracted": True,
+            "lint_pass": True,
+            "sim_status": status,
+            "sim_mismatches": mismatches,
+            "synth_pass": False,
+            "detail": detail,
+        },
+        iteration=3,
+        history=[],
+        run_dir=tmp_path,
+    )
+    compact = compact_repair_feedback(feedback)
+
+    assert "### Cleaned Simulator Diagnostics" in compact
+    assert "simulation timed out after 180s" in compact
+    assert "done/valid" in compact
 
 
 def test_cvdp_timeout_before_test_start_remains_infrastructure_error():

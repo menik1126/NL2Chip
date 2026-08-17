@@ -174,8 +174,9 @@ def _classify_cvdp_local_timeout(
 
     tail = "\n".join(text.splitlines()[-24:])
     detail = (
-        f"CVDP DUT did not complete within {timeout_s}s after the cocotb test started. "
-        "Treat this as a functional progress failure: check whether done/valid was "
+        f"CVDP simulation timed out after {timeout_s}s because the DUT did not "
+        "complete after the cocotb test started. Treat this as a functional "
+        "progress failure: check whether done/valid was "
         "asserted too early and missed, never asserted, or held with the wrong pulse "
         "timing; also check state termination and zero-delay combinational loops."
     )
