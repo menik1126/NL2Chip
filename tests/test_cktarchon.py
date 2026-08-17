@@ -14,7 +14,9 @@ from cktarchon.harness import AnthropicHarnessRunner, PathGuard
 from cktarchon.logs import append_jsonl, parse_agent_log
 from cktarchon.run import (
     already_done,
+    build_fresh_candidate_prompt,
     build_system_prompt,
+    candidate_delivery_guard,
     clear_generated_target,
     evaluate_with_infrastructure_retries,
     parse_args,
@@ -50,6 +52,37 @@ def test_skill_requires_outputs_outside_signal_loop():
     assert "Signal.loop fun (q : Signal dom (BitVec W)) =>" in prompt
     assert "`Signal.const` and `Signal.not` are not Sparkle APIs" in prompt
     assert "Do not use Lean `if`/`match` to select hardware behavior" in prompt
+
+
+def test_fresh_candidate_prompt_requires_source_before_exploration():
+    guard = candidate_delivery_guard("prob_a", 10)
+
+    assert "at most 10 turns" in guard
+    assert "first tool call MUST be `write_file`" in guard
+    assert "Generated/prob_a.lean" in guard
+    assert "Do not call `glob`, `grep`, `read_file`" in guard
+
+    fake_search = SimpleNamespace(
+        build_user_message=lambda *args, **kwargs: "## Base Problem",
+        summarize_eval_result=lambda result: "prior result",
+        summarize_recent_attempts=lambda attempts: "prior attempts",
+    )
+    prompt = build_fresh_candidate_prompt(
+        search=fake_search,
+        prob_id="prob_a",
+        info=None,
+        dataset_name="cvdp",
+        has_repl=True,
+        candidate_id=2,
+        guide_text="guide",
+        prior_result={},
+        recent_attempts=[],
+        latest_self_test=None,
+        turn_limit=10,
+    )
+
+    assert prompt.startswith("## Mandatory Candidate Delivery")
+    assert prompt.index("first tool call MUST") < prompt.index("## Base Problem")
 
 
 def test_model_alias_sonnet_45():

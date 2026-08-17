@@ -654,6 +654,20 @@ def self_test_feedback(result: SelfTestResult | None) -> str:
     )
 
 
+def candidate_delivery_guard(prob_id: str, turn_limit: int) -> str:
+    """Front-load artifact delivery when a session starts without source code."""
+    return (
+        "## Mandatory Candidate Delivery\n\n"
+        f"You have at most {turn_limit} turns in this session. Your first tool call "
+        f"MUST be `write_file` for `Generated/{prob_id}.lean` with a complete draft, "
+        "including the synthesis command. Do not call `glob`, `grep`, `read_file`, "
+        "`list_directory`, or `bash` before that first write; the prompt already "
+        "contains the interface and supported Sparkle APIs. Use the remaining turns "
+        "for `lean_check`, focused inspection, and edits. A session that ends without "
+        "creating the target file is discarded."
+    )
+
+
 def build_fresh_candidate_prompt(
     *,
     search: Any,
@@ -666,6 +680,7 @@ def build_fresh_candidate_prompt(
     prior_result: dict | None,
     recent_attempts: list[dict[str, Any]],
     latest_self_test: SelfTestResult | None,
+    turn_limit: int,
 ) -> str:
     base = search.build_user_message(
         prob_id,
@@ -678,7 +693,9 @@ def build_fresh_candidate_prompt(
     attempts = search.summarize_recent_attempts(recent_attempts)
     advisory = self_test_feedback(latest_self_test)
     return (
-        base
+        candidate_delivery_guard(prob_id, turn_limit)
+        + "\n\n"
+        + base
         + "\n\n"
         + guide_text
         + "\n\n## Fresh Candidate Search\n\n"
@@ -927,6 +944,7 @@ def process_problem_guided(
                 prior_result=previous_result,
                 recent_attempts=search_history,
                 latest_self_test=latest_self_test,
+                turn_limit=turn_limit,
             )
             phase = "fresh_candidate"
             role = f"ckt-generator-candidate-{next_candidate}"
@@ -954,8 +972,10 @@ def process_problem_guided(
             if advisory:
                 feedback += "\n\n" + advisory
             continuing_generation = not bool(active_result.get("compile_pass"))
+            delivery_guard = ""
             if not current_code.strip():
                 repair_instruction = "Create the complete Lean source before checking it. "
+                delivery_guard = candidate_delivery_guard(prob_id, turn_limit)
             elif continuing_generation:
                 repair_instruction = "Continue the Lean implementation and fix its compile diagnostics. "
             else:
@@ -976,6 +996,8 @@ def process_problem_guided(
                     + "Before ending, Lean-check the complete candidate including `#synthesizeVerilog` and require generated Verilog; the outer evaluator will rerun simulation."
                 ),
             )
+            if delivery_guard:
+                prompt = delivery_guard + "\n\n" + prompt
             phase = "guided_repair"
             role = f"ckt-repair-candidate-{tracker.candidate_id}"
             log_name = f"candidate_{tracker.candidate_id}_repair_{sim_feedback_iterations}"
