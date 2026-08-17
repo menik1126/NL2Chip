@@ -24,6 +24,7 @@ require_command g++
 cd "$repo_root"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 
+lake build Sparkle
 "$python_bin" -m pytest -q --junitxml="$work_dir/pytest.xml"
 "$python_bin" - "$work_dir/pytest.xml" <<'PY'
 import sys
@@ -35,7 +36,11 @@ if skipped:
     raise SystemExit(f"P3 regression requires zero skipped tests, observed {skipped}")
 PY
 
-lake build Sparkle
+lake env lean Tests/SymbolicParameterSim.lean > "$work_dir/symbolic_parameter_lean.log"
+grep -q "SYMBOLIC_PARAMETER_LEAN_SIM_PASS" "$work_dir/symbolic_parameter_lean.log"
+lake env lean Tests/SignedHelpers.lean > "$work_dir/signed_helpers_lean.log"
+grep -q "SIGNED_HELPER_LEAN_SIM_PASS" "$work_dir/signed_helpers_lean.log"
+bash scripts/verify_signed_helpers.sh
 lake exe verilog-tests
 lake build Tests.SymbolicParameterEmit
 lake env lean p3_tests/CppSimSpecializations.lean

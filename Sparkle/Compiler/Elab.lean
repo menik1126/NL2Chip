@@ -235,6 +235,7 @@ def primitiveRegistry : List (Name × Sparkle.IR.AST.Operator) :=
     (``HSub.hSub, .sub),
     (``BitVec.mul, .mul),
     (``HMul.hMul, .mul),
+    (``HMod.hMod, .mod),
     -- Comparison operations (unsigned)
     (``BitVec.ult, .lt_u),
     (``BitVec.ule, .le_u),
@@ -430,10 +431,14 @@ def definitionParameterBindings (declName : Name) (args : Array Lean.Expr) :
     match constInfo with
     | .defnInfo info => return topLevelBinderInfo info.value
     | _ => throwError s!"Cannot inspect module boundary {declName}"
-  if args.size < binders.length then
+  if args.size > binders.length then
     CompilerM.liftMetaM $ throwError
-      s!"Module boundary {declName} has {binders.length} binders but only {args.size} arguments"
-  let actuals := args.toList.drop (args.size - binders.length)
+      s!"Module boundary {declName} has {binders.length} binders but got {args.size} arguments"
+  let missing := binders.drop args.size
+  if missing.any (fun (_, isNat) => isNat) then
+    CompilerM.liftMetaM $ throwError
+      s!"Module boundary {declName} is missing a retained Nat parameter argument"
+  let actuals := args.toList
   let compilerState ← CompilerM.getCompilerState
   let mut defaults : List (String × Nat) := []
   let mut bindings : List (String × DimExpr) := []
@@ -685,6 +690,7 @@ mutual
         | ``HAdd.hAdd => some .add
         | ``HSub.hSub => some .sub
         | ``HMul.hMul => some .mul
+        | ``HMod.hMod => some .mod
         | ``HAnd.hAnd => some .and
         | ``HOr.hOr   => some .or
         | ``HXor.hXor => some .xor
@@ -1480,6 +1486,18 @@ mutual
 
   /-- Handle BitVec.extractLsb', shifts, concat, isPrimitive dispatch -/
   partial def handleBitVecOps (e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    -- Signal.signExtend is opaque in Lean so simulation can use BitVec's
+    -- two's-complement operation without exposing host-level arithmetic to the
+    -- synthesis evaluator. Its result type carries the destination width.
+    if name == ``Sparkle.Core.Signal.Signal.signExtend && args.size >= 1 then
+      trace[sparkle.compiler] "-> signExtend"
+      let srcWire <- translateExprToWire args.back! "sext_src"
+      let exprType <- CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType <- inferHWTypeFromSignal exprType
+      let resultWire <- CompilerM.makeWire hint hwType (named := isNamed)
+      CompilerM.emitAssign resultWire (.op .sext [.ref srcWire])
+      return some resultWire
+
     -- BitVec.extractLsb': bit slice extraction
     if name == ``BitVec.extractLsb' && args.size >= 4 then
       trace[sparkle.compiler] "→ extractLsb'"
@@ -1817,6 +1835,20 @@ mutual
       return some resultWire
     return none
 
+  /-- Lower generic population-count without unfolding its List.range
+      simulation definition. -/
+  partial def handlePopCount (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.popCount && args.size >= 1 then
+      let input := args.back!
+      let inputWire ← translateExprToWire input "popcount_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      CompilerM.emitAssign resultWire (.op .popcount [.ref inputWire])
+      return some resultWire
+    return none
+
   /-- Handle definition unfolding (inline) or sub-module synthesis (fallback) -/
   partial def handleDefinitionUnfold (e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
     let isValidDef ← CompilerM.liftMetaM do
@@ -1893,6 +1925,367 @@ mutual
   -- Main dispatcher: routes expressions to the appropriate handler
   -- ===========================================================================
 
+  partial def handleReverseBits (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.reverseBits && args.size >= 1 then
+      let input := args.back!
+      let inputWire ← translateExprToWire input "reverse_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let reverseIndex : DimExpr := .sub (.sub hwType.bitWidthDim (.literal 1)) indexDimension
+      let inputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref inputWire) reverseIndex reverseIndex
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) indexDimension indexDimension
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0)
+        hwType.bitWidthDim [.assignExpr outputBit inputBit]
+      return some resultWire
+    return none
+
+  partial def handleReverseBlocks (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.reverseBlocks && args.size >= 2 then
+      let blockCount ← extractDimExpr args[args.size - 2]!
+      let input := args.back!
+      let inputWire ← translateExprToWire input "reverse_blocks_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let blockWidth := .div hwType.bitWidthDim blockCount
+      let blockBase := .mul (.div indexDimension blockWidth) blockWidth
+      let reverseOffset := .sub (.sub blockWidth (.literal 1))
+        (.mod indexDimension blockWidth)
+      let inputIndex := .add blockBase reverseOffset
+      let inputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref inputWire) inputIndex inputIndex
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) indexDimension indexDimension
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0)
+        hwType.bitWidthDim [.assignExpr outputBit inputBit]
+      return some resultWire
+    return none
+
+  /-- Lower a parameterized packed-vector repetition to a generate-for loop.
+      Each generated iteration fills one `W`-bit output slice with the input. -/
+  partial def handleRepeatVector (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.repeatVector && args.size >= 2 then
+      let repeats ← extractDimExpr args[args.size - 2]!
+      let input := args.back!
+      let inputWire ← translateExprToWire input "repeat_vector_input"
+      let inputWidth ← CompilerM.getWireWidthDim inputWire
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let low := .mul indexDimension inputWidth
+      let high := .sub (.add low inputWidth) (.literal 1)
+      let outputSlice : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) high low
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0)
+        repeats [.assignExpr outputSlice (.ref inputWire)]
+      return some resultWire
+    return none
+
+  /-- Lower packed one-based lane indices to a generate-for loop. Each lane is
+      assigned its zero-based generate index plus one. -/
+  partial def handleIotaVector1 (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.iotaVector1 && args.size >= 1 then
+      let laneCount ← extractDimExpr args.back!
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let laneWidth := .div hwType.bitWidthDim laneCount
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let laneStart := .mul indexDimension laneWidth
+      let outputSlice := makeSliceFromStartLength (.ref resultWire) laneStart laneWidth
+      let laneValue : Sparkle.IR.AST.Expr :=
+        .add (.ref indexName) (.const 1 32)
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0) laneCount
+        [.assignExpr outputSlice laneValue]
+      return some resultWire
+    return none
+
+  /-- Lower a named one-lane module across a symbolic packed-vector lane count. -/
+  partial def handleMapChunks (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.mapChunks && args.size >= 3 then
+      let laneCount ← extractDimExpr args[args.size - 3]!
+      let function := args[args.size - 2]!
+      let functionName ← match function.getAppFn with
+        | .const fnName _ => pure fnName
+        | _ => CompilerM.liftMetaM $ throwError
+          "Signal.mapChunks requires a named top-level single-lane Sparkle module"
+      let (childDefaults, parameterBindings) ← definitionParameterBindings functionName function.getAppArgs
+      let (childModule, childDesign) ← CompilerM.liftMetaM $
+        synthesizeCombinationalWithParameters functionName childDefaults
+      for module in childDesign.modules do CompilerM.addModuleToDesign module
+      CompilerM.addModuleToDesign childModule
+      let childInputs := childModule.inputs.filter (fun port => port.name != "clk" && port.name != "rst")
+      if childInputs.length != 1 || childModule.outputs.length != 1 then
+        CompilerM.liftMetaM $ throwError
+          "Signal.mapChunks requires a child module with exactly one data input and one output"
+      let input := args.back!
+      let inputWire ← translateExprToWire input "map_chunks_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let outputLaneWidth := .div hwType.bitWidthDim laneCount
+      let inputLaneWidth ← CompilerM.getWireWidthDim inputWire
+      let inputLaneWidth := .div inputLaneWidth laneCount
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let inputStart := .mul indexDimension inputLaneWidth
+      let inputSlice := makeSliceFromStartLength (.ref inputWire) inputStart inputLaneWidth
+      let outputStart := .mul indexDimension outputLaneWidth
+      let outputSlice := makeSliceFromStartLength (.ref resultWire) outputStart outputLaneWidth
+      let childInput := childInputs.head!
+      let childOutput := childModule.outputs.head!
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0) laneCount
+        [.inst childModule.name ("inst_" ++ childModule.name)
+          [(childInput.name, inputSlice), (childOutput.name, outputSlice)] parameterBindings]
+      return some resultWire
+    return none
+
+  /-- Lower a named two-input lane module across a symbolic packed-vector lane
+      count. The first lane input is the zero-based generate index; the second
+      receives the packed input chunk. -/
+  partial def handleMapChunksWithIndex (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.mapChunksWithIndex && args.size >= 3 then
+      let laneCount ← extractDimExpr args[args.size - 3]!
+      let function := args[args.size - 2]!
+      let functionName ← match function.getAppFn with
+        | .const fnName _ => pure fnName
+        | _ => CompilerM.liftMetaM $ throwError
+          "Signal.mapChunksWithIndex requires a named top-level two-input Sparkle module"
+      let (childDefaults, parameterBindings) ← definitionParameterBindings functionName function.getAppArgs
+      let (childModule, childDesign) ← CompilerM.liftMetaM $
+        synthesizeCombinationalWithParameters functionName childDefaults
+      for module in childDesign.modules do CompilerM.addModuleToDesign module
+      CompilerM.addModuleToDesign childModule
+      let childInputs := childModule.inputs.filter (fun port => port.name != "clk" && port.name != "rst")
+      if childInputs.length != 2 || childModule.outputs.length != 1 then
+        CompilerM.liftMetaM $ throwError
+          "Signal.mapChunksWithIndex requires a child module with exactly index, data, and output ports"
+      let input := args.back!
+      let inputWire ← translateExprToWire input "map_chunks_indexed_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let outputLaneWidth := .div hwType.bitWidthDim laneCount
+      let inputLaneWidth := .div (← CompilerM.getWireWidthDim inputWire) laneCount
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let inputStart := .mul indexDimension inputLaneWidth
+      let inputSlice := makeSliceFromStartLength (.ref inputWire) inputStart inputLaneWidth
+      let outputStart := .mul indexDimension outputLaneWidth
+      let outputSlice := makeSliceFromStartLength (.ref resultWire) outputStart outputLaneWidth
+      let childIndex := childInputs[0]!
+      let childData := childInputs[1]!
+      let childOutput := childModule.outputs.head!
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0) laneCount
+        [.inst childModule.name ("inst_" ++ childModule.name)
+          [(childIndex.name, .ref indexName), (childData.name, inputSlice),
+           (childOutput.name, outputSlice)] parameterBindings]
+      return some resultWire
+    return none
+
+  partial def generatedDimValue (dimension : DimExpr) : Sparkle.IR.AST.Expr :=
+    .dimension dimension
+
+  partial def generatedDimEq (lhs rhs : DimExpr) : Sparkle.IR.AST.Expr :=
+    .op .eq [generatedDimValue lhs, generatedDimValue rhs]
+
+  partial def generatedReservedPosition (position : DimExpr) : Sparkle.IR.AST.Expr :=
+    let zero := .literal 0
+    let one := .literal 1
+    let exponent := .max (.sub (.clog2 (.add position one)) one) zero
+    let power := .pow (.literal 2) exponent
+    .op .or [generatedDimEq position zero, generatedDimEq position power]
+
+  partial def generatedDataRank (position : DimExpr) : DimExpr :=
+    .sub (.sub position (.literal 1))
+      (.clog2 (.add position (.literal 1)))
+
+  /-- Lower a named index/data-to-bit module across every output position. -/
+  partial def handleGenerateBitsWithIndex (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.generateBitsWithIndex && args.size >= 3 then
+      let function := args[args.size - 2]!
+      let functionName ← match function.getAppFn with
+        | .const fnName _ => pure fnName
+        | _ => CompilerM.liftMetaM $ throwError
+          "Signal.generateBitsWithIndex requires a named top-level index/data-to-bit module"
+      let (childDefaults, parameterBindings) ←
+        definitionParameterBindings functionName function.getAppArgs
+      let (childModule, childDesign) ← CompilerM.liftMetaM $
+        synthesizeCombinationalWithParameters functionName childDefaults
+      for module in childDesign.modules do CompilerM.addModuleToDesign module
+      CompilerM.addModuleToDesign childModule
+      let childInputs := childModule.inputs.filter
+        (fun port => port.name != "clk" && port.name != "rst")
+      if childInputs.length != 2 || childModule.outputs.length != 1 ||
+          childModule.outputs.head!.ty.bitWidthDim != .literal 1 then
+        CompilerM.liftMetaM $ throwError
+          "Signal.generateBitsWithIndex requires exactly index, packed data, and one 1-bit output"
+      let inputWire ← translateExprToWire args.back! "generate_bits_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) indexDimension indexDimension
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0)
+        hwType.bitWidthDim
+        [.inst childModule.name ("inst_" ++ childModule.name)
+          [(childInputs[0]!.name, .ref indexName),
+           (childInputs[1]!.name, .ref inputWire),
+           (childModule.outputs.head!.name, outputBit)] parameterBindings]
+      return some resultWire
+    return none
+
+  /-- Lower payload scatter into non-power-of-two Hamming positions. -/
+  partial def handleScatterNonPowerOfTwoBits (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.scatterNonPowerOfTwoBits && args.size >= 1 then
+      let inputWire ← translateExprToWire args.back! "scatter_data_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let positionName := resultWire ++ "_position"
+      let position : DimExpr := .parameter positionName
+      let rank := .max (generatedDataRank position) (.literal 0)
+      let inputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref inputWire) rank rank
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) position position
+      let value : Sparkle.IR.AST.Expr := .op .mux
+        [generatedReservedPosition position, .const 0 1, inputBit]
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") positionName (.literal 0)
+        hwType.bitWidthDim [.assignExpr outputBit value]
+      return some resultWire
+    return none
+
+  /-- Lower indexed parity reduction as a generated selection matrix followed
+      by one population-count LSB per parity index. -/
+  partial def handleParityByIndexMask (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.parityByIndexMask && args.size >= 1 then
+      let inputWire ← translateExprToWire args.back! "parity_input"
+      let inputWidth ← CompilerM.getWireWidthDim inputWire
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let parityWidth := hwType.bitWidthDim
+      let matrixWidth := .mul parityWidth inputWidth
+      let matrixWire ← CompilerM.makeWire (hint ++ "_terms")
+        (hwTypeFromDim matrixWidth)
+      let flatName := matrixWire ++ "_index"
+      let flat : DimExpr := .parameter flatName
+      let parityIndex := .div flat inputWidth
+      let position := .mod flat inputWidth
+      let selected := .mod (.div position (.pow (.literal 2) parityIndex)) (.literal 2)
+      let term : Sparkle.IR.AST.Expr := .op .and
+        [.sliceDim (.ref inputWire) position position,
+         generatedDimEq selected (.literal 1)]
+      CompilerM.emitGenerateFor (matrixWire ++ "_generate") flatName (.literal 0)
+        matrixWidth
+        [.assignExpr (.sliceDim (.ref matrixWire) flat flat) term]
+
+      let parityName ← CompilerM.makeWire hint hwType (named := isNamed)
+      let parityIndexName := parityName ++ "_index"
+      let outputIndex : DimExpr := .parameter parityIndexName
+      let low := .mul outputIndex inputWidth
+      let high := .sub (.add low inputWidth) (.literal 1)
+      let terms : Sparkle.IR.AST.Expr := .sliceDim (.ref matrixWire) high low
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref parityName) outputIndex outputIndex
+      CompilerM.emitGenerateFor (parityName ++ "_generate") parityIndexName (.literal 0)
+        parityWidth [.assignExpr outputBit (.op .popcount [terms])]
+      return some parityName
+    return none
+
+  /-- Lower insertion of packed parity bits at positions 1, 2, 4, ... . -/
+  partial def handlePlaceParityBits (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.placeParityBits && args.size >= 2 then
+      let baseWire ← translateExprToWire args[args.size - 2]! "place_parity_base"
+      let parityWire ← translateExprToWire args.back! "place_parity_bits"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let positionName := resultWire ++ "_position"
+      let position : DimExpr := .parameter positionName
+      let isZero := generatedDimEq position (.literal 0)
+      let isParity : Sparkle.IR.AST.Expr := .op .and
+        [.op .not [isZero], generatedReservedPosition position]
+      let parityIndex := .max
+        (.sub (.clog2 (.add position (.literal 1))) (.literal 1)) (.literal 0)
+      let parityBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref parityWire) parityIndex parityIndex
+      let baseBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref baseWire) position position
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) position position
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") positionName (.literal 0)
+        hwType.bitWidthDim
+        [.assignExpr outputBit (.op .mux [isParity, parityBit, baseBit])]
+      return some resultWire
+    return none
+
+  /-- Lower gather of non-power-of-two Hamming positions through a generated
+      rank-selection matrix. -/
+  partial def handleGatherNonPowerOfTwoBits (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Library.RTL.gatherNonPowerOfTwoBits && args.size >= 1 then
+      let inputWire ← translateExprToWire args.back! "gather_encoded_input"
+      let inputWidth ← CompilerM.getWireWidthDim inputWire
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let dataWidth := hwType.bitWidthDim
+      let matrixWidth := .mul dataWidth inputWidth
+      let matrixWire ← CompilerM.makeWire (hint ++ "_terms")
+        (hwTypeFromDim matrixWidth)
+      let flatName := matrixWire ++ "_index"
+      let flat : DimExpr := .parameter flatName
+      let dataIndex := .div flat inputWidth
+      let position := .mod flat inputWidth
+      let rankMatches := generatedDimEq (generatedDataRank position) dataIndex
+      let selected : Sparkle.IR.AST.Expr := .op .and
+        [.op .not [generatedReservedPosition position], rankMatches]
+      let term : Sparkle.IR.AST.Expr := .op .and
+        [.sliceDim (.ref inputWire) position position, selected]
+      CompilerM.emitGenerateFor (matrixWire ++ "_generate") flatName (.literal 0)
+        matrixWidth
+        [.assignExpr (.sliceDim (.ref matrixWire) flat flat) term]
+
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let outputIndexName := resultWire ++ "_index"
+      let outputIndex : DimExpr := .parameter outputIndexName
+      let low := .mul outputIndex inputWidth
+      let high := .sub (.add low inputWidth) (.literal 1)
+      let terms : Sparkle.IR.AST.Expr := .sliceDim (.ref matrixWire) high low
+      let outputBit : Sparkle.IR.AST.Expr :=
+        .sliceDim (.ref resultWire) outputIndex outputIndex
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") outputIndexName (.literal 0)
+        dataWidth [.assignExpr outputBit (.op .popcount [terms])]
+      return some resultWire
+    return none
+
   partial def translateExprToWireApp (e : Lean.Expr) (hint : String) (isNamed : Bool := false) : CompilerM String := do
     let fn := e.getAppFn
     let args := e.getAppArgs
@@ -1910,6 +2303,18 @@ mutual
       if let some w ← handleTupleProjections e name args hint isNamed then return w
       if let some w ← handleApplicative e name args hint isNamed then return w
       if let some w ← handleBitVecOps e name args hint isNamed then return w
+      if let some w ← handlePopCount e name args hint isNamed then return w
+      if let some w ← handleReverseBits e name args hint isNamed then return w
+      if let some w ← handleReverseBlocks e name args hint isNamed then return w
+      if let some w ← handleRepeatVector e name args hint isNamed then return w
+      if let some w ← handleIotaVector1 e name args hint isNamed then return w
+      if let some w ← handleMapChunks e name args hint isNamed then return w
+      if let some w ← handleMapChunksWithIndex e name args hint isNamed then return w
+      if let some w ← handleGenerateBitsWithIndex e name args hint isNamed then return w
+      if let some w ← handleScatterNonPowerOfTwoBits e name args hint isNamed then return w
+      if let some w ← handleParityByIndexMask e name args hint isNamed then return w
+      if let some w ← handlePlaceParityBits e name args hint isNamed then return w
+      if let some w ← handleGatherNonPowerOfTwoBits e name args hint isNamed then return w
       if let some w ← handleGenerate e name args hint isNamed then return w
       if let some w ← handleRegister e name args hint isNamed then return w
       if let some w ← handleMux e name args hint isNamed then return w

@@ -29,6 +29,61 @@ CPP_CASES = {
         dut._gen_lhs = 0x12345; dut._gen_rhs = 0x05555; dut.eval();
         return dut.out == ((0x12345 ^ 0x05555) & 0x1ffff) ? 0 : 1;
     """,
+    "/tmp/p3_cppsim_cast_extend_w17.h": """
+        symbolicCastExtend dut;
+        dut._gen_x = 0x12345; dut.eval();
+        return dut.out == 0x12345 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_cast_trunc_w17.h": """
+        symbolicCastTrunc dut;
+        dut._gen_x = 0x212345; dut.eval();
+        return dut.out == 0x12345 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_modulo_w17.h": """
+        symbolicModulo dut;
+        dut._gen_lhs = 12345; dut._gen_rhs = 97; dut.eval();
+        return dut.out == 26 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_repeat_w3_n4.h": """
+        symbolicRepeatVector dut;
+        dut._gen_x = 0x5; dut.eval();
+        return dut.out == 0xb6d ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_repeat_w17_n3.h": """
+        symbolicRepeatVector dut;
+        dut._gen_x = 0x12345; dut.eval();
+        return dut.out == ((0x12345ULL << 34) | (0x12345ULL << 17) | 0x12345ULL) ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_iota_w4_n3.h": """
+        symbolicIotaVector1 dut;
+        dut.eval();
+        return dut.out == 0x321 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_iota_w3_n5.h": """
+        symbolicIotaVector1 dut;
+        dut.eval();
+        return dut.out == 0x58d1 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_map_chunks_w3_n4.h": """
+        symbolicMapChunks dut;
+        dut._gen_x = 0x2a6; dut.eval();
+        return dut.out == 0x88b ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_map_chunks_indexed_w3_n4.h": """
+        symbolicMapChunksWithIndex dut;
+        dut._gen_x = 0x2a6; dut.eval();
+        return dut.out == 0x42e ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_map_chunks_narrow_n3.h": """
+        symbolicMapChunksNarrow dut;
+        dut._gen_x = 0xd2b; dut.eval();
+        return dut.out == 0x1b ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_map_chunks_narrow_n5.h": """
+        symbolicMapChunksNarrow dut;
+        dut._gen_x = 0x6f583; dut.eval();
+        return dut.out == 0x2d3 ? 0 : 1;
+    """,
     "/tmp/p3_cppsim_hierarchy_w17.h": """
         symbolicXorHierarchy dut;
         dut._gen_lhs = 0x12345; dut._gen_rhs = 0x05555; dut.eval();
@@ -65,7 +120,9 @@ CPP_CASES = {
         dut.reset();
         dut._gen_writeAddr = 1; dut._gen_writeData = 0x5a;
         dut._gen_writeEnable = 1; dut._gen_readAddr = 1;
-        dut.eval(); dut.tick(); dut._gen_writeEnable = 0; dut.eval();
+        dut.eval(); dut.tick(); dut.eval();
+        if (dut.out != 0) return 1;
+        dut._gen_writeEnable = 0; dut.eval(); dut.tick(); dut.eval();
         return dut.out == 0x5a ? 0 : 1;
     """,
     "/tmp/p3_cppsim_memory_a4_d17.h": """
@@ -73,8 +130,40 @@ CPP_CASES = {
         dut.reset();
         dut._gen_writeAddr = 9; dut._gen_writeData = 0x12345;
         dut._gen_writeEnable = 1; dut._gen_readAddr = 9;
-        dut.eval(); dut.tick(); dut._gen_writeEnable = 0; dut.eval();
+        dut.eval(); dut.tick(); dut.eval();
+        if (dut.out != 0) return 1;
+        dut._gen_writeEnable = 0; dut.eval(); dut.tick(); dut.eval();
         return dut.out == 0x12345 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_popcount_w3.h": """
+        symbolicPopCount dut;
+        dut._gen_x = 0x5; dut.eval();
+        return dut.out == 2 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_popcount_w17.h": """
+        symbolicPopCount dut;
+        dut._gen_x = 0x12345; dut.eval();
+        return dut.out == 7 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_reverse_w3.h": """
+        symbolicReverseBits dut;
+        dut._gen_x = 0x6; dut.eval();
+        return dut.out == 0x3 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_reverse_w17.h": """
+        symbolicReverseBits dut;
+        dut._gen_x = 0x10002; dut.eval();
+        return dut.out == 0x08001 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_reverse_blocks_w16_b2.h": """
+        symbolicReverseBlocks dut;
+        dut._gen_x = 0x1234; dut.eval();
+        return dut.out == 0x482c ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_reverse_blocks_w16_b4.h": """
+        symbolicReverseBlocks dut;
+        dut._gen_x = 0x1234; dut.eval();
+        return dut.out == 0x84c2 ? 0 : 1;
     """,
 }
 

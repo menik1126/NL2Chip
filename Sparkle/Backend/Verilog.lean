@@ -58,6 +58,7 @@ def emitOperator (op : Operator) : String :=
   | .add => "+"
   | .sub => "-"
   | .mul => "*"
+  | .mod => "%"
   | .eq  => "=="
   | .lt_u => "<"
   | .lt_s => "<" -- Handled in emitExpr with $signed()
@@ -70,7 +71,9 @@ def emitOperator (op : Operator) : String :=
   | .shl => "<<"
   | .shr => ">>"
   | .asr => ">>>"
+  | .sext => "$signed"
   | .neg => "-"
+  | .popcount => "$countones"
   | .mux => "?"  -- Special case, handled in emitExpr
 
 /-- Convert IR expression to Verilog expression -/
@@ -88,6 +91,8 @@ partial def emitExpr (e : Expr) : String :=
 
   | .constDim value width =>
     s!"{emitDimExpr width}'({value})"
+  | .dimension value =>
+    emitDimExpr value
   | .ref name =>
     sanitizeName name
 
@@ -122,13 +127,25 @@ partial def emitExpr (e : Expr) : String :=
     | [arg] => s!"-{emitExpr arg}"
     | _ => "/* ERROR: neg requires 1 argument */"
 
+  | .op .popcount args =>
+    match args with
+    | [arg] => s!"$countones({emitExpr arg})"
+    | _ => "/* ERROR: popcount requires 1 argument */"
+
+  | .op .sext args =>
+    match args with
+    | [arg] => s!"$signed({emitExpr arg})"
+    | _ => "/* ERROR: sext requires 1 argument */"
+
   | .op operator args =>
     -- Binary operators
     match args with
     | [arg1, arg2] =>
       match operator with
-      | .lt_s | .le_s | .gt_s | .ge_s | .asr =>
+      | .lt_s | .le_s | .gt_s | .ge_s =>
         s!"($signed({emitExpr arg1}) {emitOperator operator} $signed({emitExpr arg2}))"
+      | .asr =>
+        s!"($signed({emitExpr arg1}) >>> {emitExpr arg2})"
       | _ =>
         s!"({emitExpr arg1} {emitOperator operator} {emitExpr arg2})"
     | _ => s!"/* ERROR: operator {operator} with wrong arity */"
@@ -185,14 +202,23 @@ partial def emitStmt (stmt : Stmt) (indent : String := "    ")
     let lastAddress := match addrWidth.toNat? with
       | some width => s!"{(2 ^ width) - 1}"
       | none => s!"((2 ** {emitDimExpr addrWidth}) - 1)"
+    let resetIndex := sanitizeName s!"{name}_reset_index"
     let memDecl :=
-      s!"{indent}{emitType (hwTypeFromDim dataWidth)} {sanitizeName name} [0:{lastAddress}];"
+      s!"{indent}{emitType (hwTypeFromDim dataWidth)} {sanitizeName name} [0:{lastAddress}];\n" ++
+      s!"{indent}integer {resetIndex};"
+    let resetMemory :=
+      s!"{indent}        for ({resetIndex} = 0; {resetIndex} <= {lastAddress}; " ++
+      s!"{resetIndex} = {resetIndex} + 1) begin\n" ++
+      s!"{indent}            {sanitizeName name}[{resetIndex}] <= '0;\n" ++
+      s!"{indent}        end"
     if comboRead then
       -- Combinational read: assign readData = mem[readAddr]
       let assignRead := s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
       let alwaysBlock :=
-        s!"{indent}always_ff @(posedge {sanitizeName clock}) begin\n" ++
-        s!"{indent}    if ({emitExpr writeEnable}) begin\n" ++
+        s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge rst) begin\n" ++
+        s!"{indent}    if (rst) begin\n" ++
+        resetMemory ++ "\n" ++
+        s!"{indent}    end else if ({emitExpr writeEnable}) begin\n" ++
         s!"{indent}        {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
         s!"{indent}    end\n" ++
         s!"{indent}end"
@@ -200,11 +226,16 @@ partial def emitStmt (stmt : Stmt) (indent : String := "    ")
     else
       -- Registered read: readData latched inside always_ff
       let alwaysBlock :=
-        s!"{indent}always_ff @(posedge {sanitizeName clock}) begin\n" ++
-        s!"{indent}    if ({emitExpr writeEnable}) begin\n" ++
-        s!"{indent}        {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
+        s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge rst) begin\n" ++
+        s!"{indent}    if (rst) begin\n" ++
+        resetMemory ++ "\n" ++
+        s!"{indent}        {sanitizeName readData} <= '0;\n" ++
+        s!"{indent}    end else begin\n" ++
+        s!"{indent}        if ({emitExpr writeEnable}) begin\n" ++
+        s!"{indent}            {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
+        s!"{indent}        end\n" ++
+        s!"{indent}        {sanitizeName readData} <= {sanitizeName name}[{emitExpr readAddr}];\n" ++
         s!"{indent}    end\n" ++
-        s!"{indent}    {sanitizeName readData} <= {sanitizeName name}[{emitExpr readAddr}];\n" ++
         s!"{indent}end"
       memDecl ++ "\n" ++ alwaysBlock
 

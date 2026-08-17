@@ -15,8 +15,14 @@ CVDP-style RTL translation under a small turn budget.
 - Use exact-width literals (`0#8`, `1#32`). For `x : Signal dom (BitVec W)`,
   shifts use a W-bit amount, e.g. `x >>> 1#W` after replacing W with a concrete
   width. Do not use an unsized natural shift amount.
+- Unsigned same-width remainder is supported as `lhs % rhs` for
+  `Signal dom (BitVec W)` operands. Bind a parameter-derived divisor to an
+  explicitly typed signal first and ensure it is nonzero.
 - Use `slice x lo` with an explicit type annotation when width inference is
-  ambiguous. Use `zext` and `trunc` explicitly at width boundaries.
+  ambiguous. Use `zext` and `trunc` explicitly at width boundaries. When the
+  direction is determined only by symbolic widths, `Signal.cast x` is an
+  unsigned packed-vector conversion: it zero-extends when wider and retains
+  low bits when narrower.
 - For multiple output ports, return a tuple signal with `bundle2` or
   `bundleAll!` in the exact contract order. For packed bits, build an explicit
   MSB-to-LSB `++` chain instead.
@@ -29,6 +35,12 @@ CVDP-style RTL translation under a small turn budget.
   several ports, first bind `let state := Signal.loop fun state => ... dff init
   nextState`, then derive and bundle all outputs outside the loop. Never return
   a packed output bundle from the same loop body that creates a register.
+- For several state registers, use a typed tuple state rather than manually
+  slicing one large state vector: `Signal.loop fun state => let next :=
+  bundle2 nextA nextB; Signal.register (initA, initB) next`. Read the current
+  components with `state.fst` and `state.snd`. This tuple-state form is
+  synthesized and parameter-width-regressed; keep any externally required
+  vector packing outside the loop.
 
 - When a `Signal.loop` body performs arithmetic, muxing, slicing, or uses a
   parameter-derived width, annotate the feedback argument before its value can
@@ -95,6 +107,66 @@ top-level-binder error and does not form a P3 generic module.
 - `sorry`, `admit`, and unfinished helper stubs are invalid generated hardware.
   If a generic task needs a helper, finish it and Lean-check the complete top
   before requesting synthesis.
+- Do not implement parameter-width hardware using partial def or recursive
+  helpers over a retained width: the recursion is Lean elaboration, not a
+  SystemVerilog generate loop. Use a native Sparkle primitive instead. In
+  particular, popCount x supports Signal dom (BitVec W) and returns
+  Signal dom (BitVec (clog2 (W + 1))) while preserving W as a parameter.
+- For a generic whole-vector bit reversal, use `reverseBits x`. It accepts
+  `Signal dom (BitVec W)`, retains `W`, and lowers to a SystemVerilog generate
+  loop. It reverses the entire vector only; parameterized block permutations
+  still require a structural primitive.
+- To reverse inside an equal number of blocks, write `reverseBlocks (BLOCKS := 2) x`
+  (or `4`/`8`). `W` must be divisible by `BLOCKS`; this is an explicit
+  structural precondition, not an arbitrary-width block-permutation primitive.
+- To replicate one `W`-bit packed value a symbolic number of times, use
+  `repeatVector (N := NUM_DICE) x`. Its result has type
+  `Signal dom (BitVec (NUM_DICE * W))` and lowers to a SystemVerilog
+  `generate for`, so it is appropriate for parameterized reset/output patterns.
+  It repeats one value only: it does not create independently indexed state,
+  distinct per-lane constants, or a general parameter-controlled map.
+- To initialize packed lanes to distinct one-based values, use
+  `iotaVector1 (W := 16) (N := NUM_DICE)`. It has type
+  `Signal dom (BitVec (NUM_DICE * 16))` and lowers to a generate-for whose
+  lane `i` receives `i + 1`. This is appropriate for generic LFSR seed
+  initialization; do not replace it with `repeatVector` or Lean branches over
+  public sweep values.
+- To apply the same combinational lane operation independently across a packed
+  parameterized vector, define a named one-input, one-output Sparkle module
+  (mark it `@[sparkle_module]`) and write `Signal.mapChunks laneStep packed`.
+  It emits one `laneStep` instance per input chunk in a SystemVerilog
+  generate-for. Input and output lane widths may differ: a
+  `BitVec INW -> BitVec OUTW` lane function maps `BitVec (N * INW)` to
+  `BitVec (N * OUTW)`. The lane module may retain its own top-level Nat
+  parameters, for example a 16-bit seed mapper producing
+  `BitVec (clog2 DICE_MAX + 1)`. Do not pass an anonymous lambda, use a
+  function with state, or expect the helper to create distinct per-lane reset
+  constants.
+- When a generic lane operation needs its zero-based lane number, define a
+  named two-input, one-output `@[sparkle_module]` whose first data input is
+  `index` and whose second is the lane value, then write
+  `Signal.mapChunksWithIndex laneStep packed`. The index is connected to the
+  SystemVerilog generate-loop index and is zero-extended/truncated to the
+  helper input width. This is the supported way to build parameterized
+  index-dependent structures; never use `List.range`, `List.foldl`, or
+  Lean recursion over a retained public parameter inside `Signal.map`.
+  Minimal form:
+  ```lean
+  @[sparkle_module]
+  def laneStep {dom : DomainConfig} {W : Nat}
+      (index x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+    index ^^^ x
+
+  def indexedLanes {dom : DomainConfig} {W N : Nat}
+      (x : Signal dom (BitVec (N * W))) : Signal dom (BitVec (N * W)) :=
+    Signal.mapChunksWithIndex laneStep x
+  ```
+- A design that uses `Signal.mapChunks` or any named `@[sparkle_module]`
+  helper is hierarchical. End it with
+  `#synthesizeParameterizedVerilogDesign top [PARAM := default]`, not
+  `#synthesizeParameterizedVerilog`: the latter emits only the top module and
+  leaves the child module undefined for the Verilog evaluator.
+
 ## Fixed Verified Examples (non-CVDP evaluation examples)
 
 ### Combinational logic and multiple output ports
@@ -140,6 +212,44 @@ def exampleStateWithFlag {dom : DomainConfig} {W : Nat}
 
 The final expression inside `Signal.loop` is the register for `q`. `bundle2`
 is outside the loop, after the feedback state has been defined.
+
+
+### Comparisons
+
+For unsigned vectors use `Signal.ult`, `Signal.ule`, `Signal.ugt`, and `Signal.uge`; for signed two's-complement vectors use `Signal.slt`, `Signal.sle`, `Signal.sgt`, and `Signal.sge`. These return `Signal dom Bool`. Do not invent comparison names or compare host-language values.
+
+### Signed and fixed-point arithmetic
+
+BitVec is unsigned by default. When a port represents a signed two's-complement
+quantity, use the RTL helpers rather than treating zext or >>> as signed
+operations:
+
+- Use signExtend before signed widening; zext always inserts zero bits.
+- Use arithShiftRight or arithShiftRightC for a signed right shift. Plain >>>
+  is logical and fills with zeros.
+- Use signedLT, signedLE, signedGT, and signedGE for signed comparisons.
+- Use signedMulWide for a full signed product, signedMulTrunc when only the
+  low result bits are required, and signedMulShiftTrunc for fixed-point
+  multiply/shift/truncate.
+- Use signedSaturate or signedSaturateC to clamp a signed value before a
+  narrowing truncation. Bounds must have the same width as the value and be
+  encoded in two's complement.
+
+~~~lean
+def exampleQ4Multiply {dom : DomainConfig}
+    (lhs rhs : Signal dom (BitVec 8)) : Signal dom (BitVec 8) :=
+  let product : Signal dom (BitVec 16) := signedMulWide lhs rhs
+  let scaled : Signal dom (BitVec 16) :=
+    arithShiftRightC product (BitVec.ofNat 16 4)
+  let clamped : Signal dom (BitVec 16) :=
+    signedSaturateC scaled (BitVec.ofNat 16 65408) (BitVec.ofNat 16 127)
+  trunc clamped
+~~~
+
+This example treats the inputs as signed Q4 values, preserves the sign through
+the 16-bit product and arithmetic shift, clamps to signed 8-bit range, then
+keeps the low 8 bits. Do not replace the helper calls with host-language Int
+conversion, direct BitVec.sshiftRight, or an unsigned comparison.
 
 ### Derived symbolic width alias
 

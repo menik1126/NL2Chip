@@ -69,6 +69,71 @@ def trunc {w outW : Nat} (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) 
 def zext {w outW : Nat} (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) :=
   Signal.map (fun v => v.zeroExtend outW) x
 
+/-- Sign-extend or truncate a two's-complement packed vector. Prefer this to
+    zext whenever the vector represents a signed quantity. -/
+def signExtend {w outW : Nat}
+    (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) :=
+  Signal.signExtend x
+
+/-- Arithmetic right shift for a two's-complement packed vector. -/
+def arithShiftRight {w : Nat}
+    (x amount : Signal dom (BitVec w)) : Signal dom (BitVec w) :=
+  Signal.ashr x amount
+
+/-- Arithmetic right shift by a concrete, exact-width packed amount. -/
+def arithShiftRightC {w : Nat}
+    (x : Signal dom (BitVec w)) (amount : BitVec w) : Signal dom (BitVec w) :=
+  Signal.ashr x (Signal.pure amount)
+
+/-- Signed two's-complement comparisons. -/
+def signedLT {w : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.slt lhs rhs
+
+def signedLE {w : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.sle lhs rhs
+
+def signedGT {w : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.sgt lhs rhs
+
+def signedGE {w : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.sge lhs rhs
+
+/-- Full-width signed product of two W-bit two's-complement values. -/
+def signedMulWide {w : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom (BitVec (w + w)) :=
+  let lhsExt : Signal dom (BitVec (w + w)) := signExtend lhs
+  let rhsExt : Signal dom (BitVec (w + w)) := signExtend rhs
+  lhsExt * rhsExt
+
+/-- Signed product retaining the low OUTW bits. -/
+def signedMulTrunc {w outW : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom (BitVec outW) :=
+  trunc (signedMulWide lhs rhs)
+
+/-- Fixed-point signed product: widen, arithmetic-shift, then retain low OUTW
+    bits. The shift amount must use the widened product width. -/
+def signedMulShiftTrunc {w outW : Nat}
+    (lhs rhs : Signal dom (BitVec w))
+    (amount : Signal dom (BitVec (w + w))) : Signal dom (BitVec outW) :=
+  trunc (arithShiftRight (signedMulWide lhs rhs) amount)
+
+/-- Clamp a two's-complement value to explicit signed lower and upper bounds.
+    Callers must supply bounds such that lower <= upper in signed order. -/
+def signedSaturate {w : Nat}
+    (value lower upper : Signal dom (BitVec w)) : Signal dom (BitVec w) :=
+  Signal.mux (signedLT value lower) lower
+    (Signal.mux (signedGT value upper) upper value)
+
+/-- Constant-bound signed saturation. -/
+def signedSaturateC {w : Nat}
+    (value : Signal dom (BitVec w)) (lower upper : BitVec w)
+    : Signal dom (BitVec w) :=
+  signedSaturate value (Signal.pure lower) (Signal.pure upper)
+
 /-- D flip-flop alias. Prefer this when mirroring Verilog `q <= d`. -/
 def dff {α : Type} (init : α) (d : Signal dom α) : Signal dom α :=
   Signal.register init d
@@ -105,6 +170,16 @@ def regFile1R1W {addrWidth dataWidth : Nat}
     (readAddr : Signal dom (BitVec addrWidth))
     : Signal dom (BitVec dataWidth) :=
   Signal.memoryComboRead writeAddr writeData writeEnable readAddr
+
+/-- Count asserted bits in a packed vector. The result width is preserved as
+    clog2 (W + 1), so the Verilog backend can retain W as a parameter. -/
+def popCount {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec (clog2 (W + 1))) :=
+  Signal.map (fun value =>
+    BitVec.ofNat (clog2 (W + 1)) <|
+      (List.range W).foldl (fun count index =>
+        count + if value.getLsbD index then 1 else 0) 0
+  ) x
 
 /-
   Fixed-width helpers below avoid generic `List.range` code in the synthesized
@@ -325,5 +400,121 @@ def priorityEncodeLsb32 (x : Signal dom (BitVec 32)) : Signal dom (BitVec 5) :=
     | bitBool x 29 => Signal.pure 29#5
     | bitBool x 30 => Signal.pure 30#5
     | bitBool x 31 => Signal.pure 31#5
+
+/-- Reverse the bit order of a packed vector while retaining its symbolic width. -/
+def reverseBits {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  Signal.map BitVec.reverse x
+
+/-- Reverse bits independently within a fixed number of equal-sized blocks.
+    `W` must be divisible by `BLOCKS` for the generated structural mapping. -/
+def reverseBlocks {W BLOCKS : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  Signal.map (fun value =>
+    BitVec.ofNat W <|
+      (List.range W).foldl (fun result outputIndex =>
+        let blockWidth := W / BLOCKS
+        let blockBase := (outputIndex / blockWidth) * blockWidth
+        let sourceIndex := blockBase + (blockWidth - 1 - (outputIndex % blockWidth))
+        if value.getLsbD sourceIndex then result + 2 ^ outputIndex else result
+      ) 0
+  ) x
+
+/-- Repeat a packed `W`-bit value `N` times into a `N * W`-bit vector.
+    The compiler lowers this to a SystemVerilog generate-for loop, so `N`
+    remains a retained hardware parameter rather than a Lean elaboration-time
+    specialization. -/
+def repeatVector {W N : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec (N * W)) :=
+  Signal.map (fun value =>
+    BitVec.ofNat (N * W) <|
+      (List.range N).foldl (fun acc _ => acc * 2 ^ W + value.toNat) 0
+  ) x
+
+/-- Build packed lanes with the one-based sequence `[1, 2, ..., N]`.
+    Lane zero occupies the least-significant `W` bits. The compiler lowers
+    this to a SystemVerilog generate-for, retaining both `W` and `N`. -/
+def iotaVector1 {W N : Nat} : Signal dom (BitVec (N * W)) :=
+  Signal.pure <| BitVec.ofNat (N * W) <|
+    (List.range N).foldl (fun acc index =>
+      acc + (index + 1) * 2 ^ (index * W)
+    ) 0
+
+private def isReservedHammingPosition (position : Nat) : Bool :=
+  position == 0 || (position &&& (position - 1)) == 0
+
+/-- Scatter payload bits into the non-power-of-two positions of an extended
+    Hamming word. Position zero and positions 1, 2, 4, ... are initialized to
+    zero for the overall and indexed parity bits. -/
+def scatterNonPowerOfTwoBits {DATAW PARITYW : Nat}
+    (data : Signal dom (BitVec DATAW))
+    : Signal dom (BitVec (DATAW + PARITYW + 1)) :=
+  let encodedWidth := DATAW + PARITYW + 1
+  Signal.map (fun value =>
+    let final := (List.range encodedWidth).foldl (fun state position =>
+      let dataIndex := state.1
+      let result := state.2
+      if isReservedHammingPosition position then state
+      else
+        let result := if value.getLsbD dataIndex
+          then result + 2 ^ position else result
+        (dataIndex + 1, result)
+    ) (0, 0)
+    BitVec.ofNat encodedWidth final.2
+  ) data
+
+/-- Compute one parity bit for each binary position-index mask. Output bit `p`
+    is the XOR of input positions whose index has bit `p` set. -/
+def parityByIndexMask {W PARITYW : Nat}
+    (value : Signal dom (BitVec W)) : Signal dom (BitVec PARITYW) :=
+  Signal.map (fun input =>
+    BitVec.ofNat PARITYW <|
+      (List.range PARITYW).foldl (fun result parityIndex =>
+        let parity := (List.range W).foldl (fun acc position =>
+          if ((position / (2 ^ parityIndex)) % 2 == 1) && input.getLsbD position
+          then !acc else acc
+        ) false
+        if parity then result + 2 ^ parityIndex else result
+      ) 0
+  ) value
+
+/-- Replace the power-of-two positions 1, 2, 4, ... of an encoded word with
+    the corresponding bits of a packed parity vector. Position zero and all
+    data positions are preserved. -/
+def placeParityBits {DATAW PARITYW : Nat}
+    (base : Signal dom (BitVec (DATAW + PARITYW + 1)))
+    (parity : Signal dom (BitVec PARITYW))
+    : Signal dom (BitVec (DATAW + PARITYW + 1)) :=
+  let encodedWidth := DATAW + PARITYW + 1
+  (fun baseValue parityValue =>
+    BitVec.ofNat encodedWidth <|
+      (List.range encodedWidth).foldl (fun result position =>
+        let bitValue :=
+          if position != 0 && isReservedHammingPosition position then
+            parityValue.getLsbD (Nat.log2 position)
+          else baseValue.getLsbD position
+        if bitValue then result + 2 ^ position else result
+      ) 0
+  ) <$> base <*> parity
+
+/-- Gather the non-power-of-two positions of an extended Hamming word into a
+    densely packed payload vector. This is the inverse layout operation of
+    `scatterNonPowerOfTwoBits`. -/
+def gatherNonPowerOfTwoBits {DATAW PARITYW : Nat}
+    (encoded : Signal dom (BitVec (DATAW + PARITYW + 1)))
+    : Signal dom (BitVec DATAW) :=
+  let encodedWidth := DATAW + PARITYW + 1
+  Signal.map (fun value =>
+    let final := (List.range encodedWidth).foldl (fun state position =>
+      let dataIndex := state.1
+      let result := state.2
+      if isReservedHammingPosition position then state
+      else
+        let result := if value.getLsbD position
+          then result + 2 ^ dataIndex else result
+        (dataIndex + 1, result)
+    ) (0, 0)
+    BitVec.ofNat DATAW final.2
+  ) encoded
 
 end Sparkle.Library.RTL

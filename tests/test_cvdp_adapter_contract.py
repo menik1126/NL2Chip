@@ -448,6 +448,64 @@ def test_cvdp_wrapper_bridges_observed_internal_memory_without_making_it_a_port(
     ) in wrapper
 
 
+def test_cvdp_wrapper_selects_unique_output_backed_memory_when_names_are_ambiguous():
+    wrapper = generate_cvdp_wrapper(
+        design_name="fifo_policy",
+        sparkle_mod_name="fifo_policy_sparkle_inner",
+        sparkle_ports=[
+            ("input", "logic [4:0]", "_gen_index"),
+            ("input", "logic", "clk"),
+            ("input", "logic", "rst"),
+            ("output", "logic [1:0]", "out"),
+        ],
+        ref_code="""
+        module fifo_policy #(
+            parameter NWAYS = 4,
+            parameter NINDEXES = 32
+        ) (
+            input logic clock,
+            input logic reset,
+            input logic [$clog2(NINDEXES)-1:0] index,
+            output logic [$clog2(NWAYS)-1:0] way_replace
+        );
+            logic [$clog2(NWAYS)-1:0] fifo_array [NINDEXES-1:0];
+        endmodule
+        """,
+        harness_files={
+            "src/test.py": """
+            int(dut.way_replace.value)
+            int(dut.fifo_array[0].value)
+            """,
+        },
+        sv_code="""
+        module fifo_policy_sparkle_inner(
+            input logic [4:0] _gen_index,
+            input logic clk,
+            input logic rst,
+            output logic [1:0] out
+        );
+            logic [1:0] _gen_shadow [0:31];
+            logic [1:0] _gen_policy_state [0:31];
+            logic [1:0] _gen_shadow_rdata;
+            logic [1:0] _gen_policy_rdata;
+            logic [1:0] _gen_unused_next;
+            assign _gen_shadow_rdata = _gen_shadow[_gen_index];
+            assign _gen_unused_next = _gen_shadow_rdata + 2'd1;
+            assign _gen_policy_rdata = _gen_policy_state[_gen_index];
+            assign out = _gen_policy_rdata;
+        endmodule
+        """,
+    )
+
+    assert wrapper is not None
+    assert "could not be mapped uniquely" not in wrapper
+    assert (
+        "assign fifo_array[_cvdp_bridge_fifo_array_i] = "
+        "sparkle_dut._gen_policy_state[_cvdp_bridge_fifo_array_i];"
+    ) in wrapper
+    assert "sparkle_dut._gen_shadow[_cvdp_bridge_fifo_array_i]" not in wrapper
+
+
 def test_cvdp_direct_top_is_evaluated_without_sparkle_wrapper(tmp_path, monkeypatch):
     code = """
     module dut #(

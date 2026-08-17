@@ -95,7 +95,6 @@ structure VerilogOutputs where
   symbolicMemoryVerilog : String
   symbolicHierarchyVerilog : String
   symbolicGenerateVerilog : String
-  symbolicLoopVerilog : String
   rejectsUnretainedWidth : Bool
   rejectsMissingBinder : Bool
   rejectsDuplicateParameter : Bool
@@ -126,8 +125,6 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     synthesizeParameterizedDesignToString `symbolicXorHierarchy [("W", 8)]
   let symbolicGenerateVerilog ←
     synthesizeParameterizedToString `symbolicGenerateNot [("W", 8)]
-  let symbolicLoopVerilog ←
-    synthesizeParameterizedToString `symbolicLoopXor [("W", 8)]
   let rejectsUnretainedWidth ←
     parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
   let rejectsMissingBinder ←
@@ -144,7 +141,6 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
     symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
     symbolicSliceLowVerilog, symbolicZeroExtendVerilog, symbolicRegisterVerilog,
     symbolicMemoryVerilog, symbolicHierarchyVerilog, symbolicGenerateVerilog,
-    symbolicLoopVerilog,
     rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
     rejectsZeroWidthDefault
   }
@@ -219,7 +215,11 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
         test "memory data storage retains DATA_W"
           (outputs.symbolicMemoryVerilog.containsSubstr "logic [DATA_W-1:0]") $
         test "memory depth retains ADDR_W"
-          (outputs.symbolicMemoryVerilog.containsSubstr "[0:((2 ** ADDR_W) - 1)]")
+          (outputs.symbolicMemoryVerilog.containsSubstr "[0:((2 ** ADDR_W) - 1)]") $
+        test "memory reset clears every entry"
+          (outputs.symbolicMemoryVerilog.containsSubstr "always_ff @(posedge clk or posedge rst)" &&
+           outputs.symbolicMemoryVerilog.containsSubstr "for (" &&
+           outputs.symbolicMemoryVerilog.containsSubstr " <= '0;")
       ) ++
       group "parameterized hierarchy" (
         test "design emits the child module"

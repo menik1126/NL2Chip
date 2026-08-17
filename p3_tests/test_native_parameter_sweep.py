@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "agent"))
 
 from cvdp_native_parameters import (  # noqa: E402
+    format_native_parameter_contract,
     native_plan_from_dict,
     native_plan_to_dict,
     parse_native_modules,
@@ -169,6 +170,13 @@ def test_native_plan_round_trip_keeps_sweep_cases_without_p0_modules():
     ]
 
 
+def test_native_contract_requires_design_emission_for_hierarchical_helpers():
+    contract = format_native_parameter_contract(_plan())
+    assert "#synthesizeParameterizedVerilogDesign" in contract
+    assert "named `@[sparkle_module]` helper" in contract
+    assert "unknown module types" in contract
+
+
 def test_iverilog_runtime_failures_are_not_reported_as_rtl_errors():
     assert _iverilog_failure_stage(
         "sh: /toolcache/usr/x86_64-linux-gnu/ivl/ivlpp: not found"
@@ -251,8 +259,213 @@ endmodule
     )
     assert design is not None, manifest
     assert manifest["contract_pass"] is True
-    assert "assign done = sparkle_dut._gen_done;" in design
-    assert "assign final_root = sparkle_dut._gen_regRoot;" in design
+    assert "assign {done, final_root} = out_wire;" in design
+
+
+def test_native_wrapper_maps_renamed_symbolic_fields_by_sweep_width_and_order(
+    tmp_path: Path,
+):
+    plan = FiniteParameterPlan(
+        design_name="parking",
+        parameter_names=("TOTAL_SPACES",),
+        cases=tuple(
+            SpecializationCase(
+                parameters=(("TOTAL_SPACES", spaces),),
+                module_name=f"unused_{spaces}",
+            )
+            for spaces in (9, 12, 14)
+        ),
+    )
+    sv_code = """
+module parking #(parameter integer TOTAL_SPACES = 9) (
+    input logic _gen_reset,
+    output logic [($clog2(TOTAL_SPACES) + ($clog2(TOTAL_SPACES) + 1))-1:0] out
+);
+    logic [$clog2(TOTAL_SPACES)-1:0] _gen_available;
+    logic [$clog2(TOTAL_SPACES)-1:0] _tmp_loop_body;
+    logic _gen_status;
+    assign out = {_gen_available, {_tmp_loop_body, _gen_status}};
+endmodule
+"""
+    expected_ports = [
+        ("input", "logic", "reset"),
+        ("output", "logic [log2(TOTAL_SPACES)-1:0]", "available_spaces"),
+        ("output", "logic [log2(TOTAL_SPACES)-1:0]", "count_car"),
+        ("output", "logic", "led_status"),
+    ]
+    design, manifest = prepare_cvdp_native_parameter_design(
+        sv_code=sv_code,
+        design_name="parking",
+        plan=plan,
+        expected_ports=expected_ports,
+        ref_code="""
+module parking #(parameter integer TOTAL_SPACES = 9) (
+    input logic reset,
+    output logic [log2(TOTAL_SPACES)-1:0] available_spaces,
+    output logic [log2(TOTAL_SPACES)-1:0] count_car,
+    output logic led_status
+); endmodule
+""",
+        harness_files={
+            "src/test_runner.py": (
+                "runner.build(parameters={'TOTAL_SPACES': TOTAL_SPACES}); "
+                "dut.available_spaces.value; dut.count_car.value; dut.led_status.value"
+            ),
+        },
+    )
+    assert design is not None, manifest
+    assert manifest["contract_pass"] is True
+    assert (
+        "assign {available_spaces, count_car, led_status} = out_wire;"
+        in design
+    )
+    assert "logic [$clog2(TOTAL_SPACES)-1:0] available_spaces" in design
+    assert "logic [$clog2(TOTAL_SPACES)-1:0] count_car" in design
+
+    if shutil.which("iverilog") is not None:
+        sv_file = tmp_path / "parking.sv"
+        sv_file.write_text(design, encoding="utf-8")
+        passed, rows, detail, stage = Evaluator._run_native_parameter_elaboration(
+            sv_file=sv_file,
+            top_module="parking",
+            plan=plan,
+        )
+        assert passed, detail
+        assert stage == "verilog_elaboration"
+        assert {row["verilog_elaboration"] for row in rows} == {"passed"}
+
+
+def test_native_wrapper_maps_real_car_parking_seven_output_bundle():
+    plan = FiniteParameterPlan(
+        design_name="car_parking_system",
+        parameter_names=("TOTAL_SPACES",),
+        cases=tuple(
+            SpecializationCase(
+                parameters=(("TOTAL_SPACES", spaces),),
+                module_name=f"unused_{spaces}",
+            )
+            for spaces in (9, 12, 14)
+        ),
+    )
+    sv_code = """
+module car_parking_system #(parameter integer TOTAL_SPACES = 9) (
+    input logic _gen_reset,
+    input logic _gen_vehicle_entry_sensor,
+    input logic _gen_vehicle_exit_sensor,
+    input logic clk,
+    input logic rst,
+    output logic [($clog2(TOTAL_SPACES) + ($clog2(TOTAL_SPACES) + 29))-1:0] out
+);
+    logic [$clog2(TOTAL_SPACES)-1:0] _gen_available;
+    logic [$clog2(TOTAL_SPACES)-1:0] _tmp_loop_body_8;
+    logic _gen_led;
+    logic [6:0] _gen_availableTensDisplay;
+    logic [6:0] _gen_availableUnitsDisplay;
+    logic [6:0] _gen_countTensDisplay;
+    logic [6:0] _gen_countUnitsDisplay;
+    logic [13:0] _tmp_b_893;
+    logic [20:0] _tmp_b_894;
+    logic [27:0] _tmp_b_895;
+    logic [28:0] _tmp_b_896;
+    logic [($clog2(TOTAL_SPACES) + 29)-1:0] _tmp_b_897;
+    logic [($clog2(TOTAL_SPACES) + ($clog2(TOTAL_SPACES) + 29))-1:0] _tmp_result_898;
+    assign _tmp_b_893 = {_gen_countTensDisplay, _gen_countUnitsDisplay};
+    assign _tmp_b_894 = {_gen_availableUnitsDisplay, _tmp_b_893};
+    assign _tmp_b_895 = {_gen_availableTensDisplay, _tmp_b_894};
+    assign _tmp_b_896 = {_gen_led, _tmp_b_895};
+    assign _tmp_b_897 = {_tmp_loop_body_8, _tmp_b_896};
+    assign _tmp_result_898 = {_gen_available, _tmp_b_897};
+    assign out = _tmp_result_898;
+endmodule
+"""
+    expected_outputs = [
+        ("output", "logic [$clog2(TOTAL_SPACES+1)-1:0]", "available_spaces"),
+        ("output", "logic [$clog2(TOTAL_SPACES+1)-1:0]", "count_car"),
+        ("output", "logic", "led_status"),
+        ("output", "logic [6:0]", "seven_seg_display_available_tens"),
+        ("output", "logic [6:0]", "seven_seg_display_available_units"),
+        ("output", "logic [6:0]", "seven_seg_display_count_tens"),
+        ("output", "logic [6:0]", "seven_seg_display_count_units"),
+    ]
+    expected_ports = [
+        expected_outputs[0],
+        ("input", "logic", "clk"),
+        expected_outputs[1],
+        expected_outputs[2],
+        ("input", "logic", "reset"),
+        *expected_outputs[3:],
+        ("input", "logic", "vehicle_entry_sensor"),
+        ("input", "logic", "vehicle_exit_sensor"),
+    ]
+    design, manifest = prepare_cvdp_native_parameter_design(
+        sv_code=sv_code,
+        design_name="car_parking_system",
+        plan=plan,
+        expected_ports=expected_ports,
+        ref_code="(no public reference Verilog available)",
+        harness_files={
+            "src/test_runner.py": (
+                "parameter_defines = {'TOTAL_SPACES': TOTAL_SPACES}; "
+                "runner.build(parameters=parameter_defines); "
+                "dut.available_spaces.value; dut.count_car.value; dut.led_status.value"
+            ),
+        },
+    )
+    assert design is not None, manifest
+    assert manifest["contract_pass"] is True
+    assert (
+        "assign {available_spaces, count_car, led_status, "
+        "seven_seg_display_available_tens, seven_seg_display_available_units, "
+        "seven_seg_display_count_tens, seven_seg_display_count_units} = out_wire;"
+        in design
+    )
+
+
+def test_native_wrapper_rejects_positional_bundle_when_any_sweep_width_differs():
+    plan = FiniteParameterPlan(
+        design_name="bad_bundle",
+        parameter_names=("WIDTH",),
+        cases=tuple(
+            SpecializationCase(
+                parameters=(("WIDTH", width),),
+                module_name=f"unused_{width}",
+            )
+            for width in (3, 17)
+        ),
+    )
+    sv_code = """
+module bad_bundle #(parameter integer WIDTH = 3) (
+    output logic [(WIDTH + WIDTH)-1:0] out
+);
+    logic [WIDTH-1:0] _tmp_first;
+    logic [WIDTH-1:0] _tmp_second;
+    assign out = {_tmp_first, _tmp_second};
+endmodule
+"""
+    design, manifest = prepare_cvdp_native_parameter_design(
+        sv_code=sv_code,
+        design_name="bad_bundle",
+        plan=plan,
+        expected_ports=[
+            ("output", "logic [WIDTH-1:0]", "first"),
+            ("output", "logic [WIDTH:0]", "second"),
+        ],
+        ref_code="""
+module bad_bundle #(parameter integer WIDTH = 3) (
+    output logic [WIDTH-1:0] first,
+    output logic [WIDTH:0] second
+); endmodule
+""",
+        harness_files={
+            "src/test_runner.py": (
+                "runner.build(parameters={'WIDTH': WIDTH}); "
+                "dut.first.value; dut.second.value"
+            ),
+        },
+    )
+    assert design is None
+    assert manifest["contract_pass"] is False
+    assert "could not validate derived width" in manifest["error"]
 
 @pytest.mark.skipif(shutil.which("iverilog") is None, reason="iverilog unavailable")
 def test_same_sv_elaborates_at_unseen_widths_3_17_and_65(tmp_path: Path):
@@ -638,6 +851,8 @@ def test_runner_configures_native_metadata_and_prompt_without_p0_aliases():
     assert "direct implicit top-level Nat binder" in prompt
     assert "def native_xor {dom : DomainConfig} {WIDTH : Nat}" in prompt
     assert "Keep every {NAME : Nat} binder in the exact def header" in prompt
+    assert "#synthesizeParameterizedVerilogDesign" in prompt
+    assert "named `@[sparkle_module]` helper" in prompt
     assert "Repeat the eta-expanded alias" not in prompt
 
 

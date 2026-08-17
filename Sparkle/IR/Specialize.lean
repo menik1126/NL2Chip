@@ -60,6 +60,10 @@ partial def specializeExpr (bindings : Bindings) (indices : Bindings) : Expr →
   | .constDim value width => do
     let concreteWidth ← requireDimension bindings "constant width" width
     return .const value concreteWidth
+  | .dimension value => do
+    let concreteValue ← requireDimension (indices ++ bindings)
+      "generate-time value" value
+    return .const (Int.ofNat concreteValue) 32
   | .ref name =>
     match indices.lookup name with
     | some value => return .const (Int.ofNat value) 32
@@ -126,7 +130,10 @@ partial def specializeStmt
       let _ ← requireDimension bindings s!"instance '{instName}' parameter '{name}'" dimension
     let concreteConnections ← connections.mapM fun (name, expression) => do
       return (name, ← specializeExpr bindings indices expression)
-    return [.inst moduleName instName concreteConnections []]
+    let suffix := indices.foldl (fun acc (index, value) =>
+      acc ++ "_" ++ index ++ "_" ++ toString value
+    ) ""
+    return [.inst moduleName (instName ++ suffix) concreteConnections []]
 
 
 def collectInstanceBindings (design : Design) (initial : Bindings) : Except String Bindings := do

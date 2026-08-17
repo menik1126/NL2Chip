@@ -14,9 +14,16 @@ from cktarchon.diagnostics import (  # noqa: E402
     lean_diagnostic_signature,
     parse_lean_error_text,
 )
+from dataset import ProblemInfo  # noqa: E402
 from cktarchon.harness import AnthropicHarnessRunner  # noqa: E402
 from evaluator import _record_lean_compile_failure  # noqa: E402
-from search import build_sim_feedback, compact_repair_feedback, lean_repair_playbook  # noqa: E402
+from search import (  # noqa: E402
+    build_sim_feedback,
+    build_compact_repair_prompt,
+    compact_repair_feedback,
+    lean_repair_playbook,
+    native_parameter_repair_capabilities,
+)
 
 
 OPAQUE_LOWERING_ERROR = """Cannot instantiate List.foldl.match_1: not a hardware module definition
@@ -91,6 +98,14 @@ def test_hardware_type_diagnostic_rejects_bundleall_top_level_output():
 
     assert "bundleAll!" in hint
     assert "bundle2" in hint
+
+
+def test_unsupported_hardware_definition_gets_parameterized_popcount_guidance():
+    hint = lean_repair_playbook([{"code": "unsupported_hardware_definition"}])
+
+    assert "partial def" in hint
+    assert "popCount x" in hint
+    assert "clog2 (W + 1)" in hint
 
 
 def test_raw_error_parser_deduplicates_repl_location_aliases():
@@ -218,3 +233,90 @@ def test_hardware_type_feedback_marks_generated_lean_source(tmp_path: Path):
     compact = compact_repair_feedback(feedback)
     assert "### Lean Source Context" in compact
     assert ">    4 | state expression" in compact
+
+
+def test_signal_generate_diagnostic_marks_symbolic_structural_boundary():
+    errors = [{
+        "pos": {"line": 29, "column": 4},
+        "data": "Unknown constant Signal.generate",
+    }]
+    records = build_lean_diagnostics(errors)
+    hint = lean_repair_playbook(records)
+
+    assert records[0]["code"] == "unsupported_symbolic_generate"
+    assert "symbolic index" in hint
+    assert "Signal.mapBits" in hint
+
+
+def test_compile_time_parameter_branch_gets_native_p3_guidance():
+    errors = [{
+        "pos": {"line": 44, "column": 0},
+        "data": "if-then-else expressions cannot be synthesized to hardware",
+    }]
+    records = build_lean_diagnostics(errors)
+    hint = lean_repair_playbook(records)
+
+    assert records[0]["code"] == "unsupported_compile_time_branch"
+    assert "retained Nat parameter" in hint
+    assert "Signal dom Bool" in hint
+
+
+def test_retained_parameter_diagnostic_offers_native_repeat_vector_rule():
+    hint = lean_repair_playbook([{"code": "retained_parameter_not_top_level"}])
+
+    assert "NUM_DICE = 2" in hint
+    assert "repeatVector (N := NUM_DICE)" in hint
+    assert "distinct indexed per-lane state" in hint
+
+
+def test_native_parameter_repair_sessions_receive_native_primitive_summary():
+    info = SimpleNamespace(metadata={
+        "native_parameter_sweep_plan": {
+            "mode": "native_parameter_sweep",
+            "design_name": "demo",
+            "parameter_names": ["WIDTH", "COUNT"],
+            "cases": [{"parameters": {"WIDTH": 3, "COUNT": 4}}],
+        },
+    })
+
+    section = native_parameter_repair_capabilities(info)
+
+    assert "WIDTH, COUNT" in section
+    assert "repeatVector (N := COUNT) x" in section
+    assert "Signal.mapChunks laneStep packed" in section
+    assert "Signal.cast" in section
+
+
+def test_compact_repair_prompt_keeps_native_primitive_summary():
+    info = ProblemInfo(
+        prob_id="native_demo",
+        design_name="native_demo",
+        prompt_text="repeat packed lanes",
+        ref_code="module native_demo; endmodule",
+        testbench_path=Path("native_demo_tb.py"),
+        ref_path=None,
+        metadata={
+            "native_parameter_sweep_plan": {
+                "mode": "native_parameter_sweep",
+                "design_name": "native_demo",
+                "parameter_names": ["WIDTH", "COUNT"],
+                "cases": [{"parameters": {"WIDTH": 3, "COUNT": 4}}],
+            },
+        },
+    )
+
+    prompt = build_compact_repair_prompt(
+        prob_id="native_demo",
+        info=info,
+        dataset_name="cvdp",
+        has_repl=True,
+        phase="Lean compile",
+        iteration=1,
+        current_lean="def native_demo := by sorry",
+        latest_feedback="compile failed",
+        recent_attempts=[],
+    )
+
+    assert "### Native P3 Repair Primitives" in prompt
+    assert "repeatVector (N := COUNT) x" in prompt
+    assert prompt.index("Native P3 Repair Primitives") < prompt.index("Current Lean Candidate")

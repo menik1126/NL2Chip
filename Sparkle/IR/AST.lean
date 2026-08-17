@@ -37,6 +37,7 @@ inductive Operator where
   | add  : Operator  -- Addition
   | sub  : Operator  -- Subtraction
   | mul  : Operator  -- Multiplication
+  | mod  : Operator  -- Unsigned remainder
   | eq   : Operator  -- Equality comparison
   | lt_u : Operator  -- Less than comparison (unsigned)
   | lt_s : Operator  -- Less than comparison (signed)
@@ -50,7 +51,9 @@ inductive Operator where
   | shl  : Operator  -- Shift left
   | shr  : Operator  -- Shift right (logical)
   | asr  : Operator  -- Arithmetic shift right (signed)
+  | sext : Operator  -- Signed width conversion
   | neg  : Operator  -- Arithmetic negation
+  | popcount : Operator  -- Population count
   deriving Repr, BEq, DecidableEq
 
 namespace Operator
@@ -64,6 +67,7 @@ def toString : Operator → String
   | add  => "add"
   | sub  => "sub"
   | mul  => "mul"
+  | mod  => "mod"
   | eq   => "eq"
   | lt_u => "lt_u"
   | lt_s => "lt_s"
@@ -77,7 +81,9 @@ def toString : Operator → String
   | shl  => "shl"
   | shr  => "shr"
   | asr  => "asr"
+  | sext => "sext"
   | neg  => "neg"
+  | popcount => "popcount"
 
 instance : ToString Operator where
   toString := Operator.toString
@@ -94,6 +100,7 @@ end Operator
 inductive Expr where
   | const (value : Int) (width : Nat) : Expr
   | constDim (value : Int) (width : DimExpr) : Expr
+  | dimension (value : DimExpr) : Expr
   | ref (name : String) : Expr
   | op (operator : Operator) (args : List Expr) : Expr
   | concat (args : List Expr) : Expr
@@ -119,6 +126,7 @@ def not (a : Expr) : Expr := .op .not [a]
 def add (a b : Expr) : Expr := .op .add [a, b]
 def sub (a b : Expr) : Expr := .op .sub [a, b]
 def mul (a b : Expr) : Expr := .op .mul [a, b]
+def mod (a b : Expr) : Expr := .op .mod [a, b]
 def eq (a b : Expr) : Expr := .op .eq [a, b]
 def lt_u (a b : Expr) : Expr := .op .lt_u [a, b]
 def lt_s (a b : Expr) : Expr := .op .lt_s [a, b]
@@ -128,6 +136,7 @@ def mux (cond then_ else_ : Expr) : Expr := .op .mux [cond, then_, else_]
 partial def toString : Expr → String
   | constDim v w => s!"{v}#{w}"
   | const v w => s!"{v}#{w}"
+  | dimension value => s!"dim({value})"
   | ref name => name
   | op operator args =>
       let argStr := String.intercalate ", " (args.map toString)

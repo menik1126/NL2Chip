@@ -61,6 +61,8 @@ def classify_lean_diagnostic(message: str) -> str:
         return "lean_typeclass_stuck"
     if "type mismatch" in lowered or "application type mismatch" in lowered:
         return "lean_type_mismatch"
+    if "signal.generate" in lowered and ("unknown constant" in lowered or "unknown identifier" in lowered):
+        return "unsupported_symbolic_generate"
     if "unknown constant" in lowered or "unknown identifier" in lowered:
         return "unknown_lean_api"
     if "unbound variable" in lowered and "_uniq." in text:

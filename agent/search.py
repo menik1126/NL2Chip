@@ -2103,10 +2103,25 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "header as `{WIDTH : Nat}`. Derived expressions such as `let PTR_W := clog2 DEPTH` "
             "are allowed only after that top-level binder is present."
         )
+        hints.append(
+            "Do not recover by writing separate `NUM_DICE = 2`/`3` branches or by hard-coding "
+            "a two- or three-lane concat: that freezes the default elaboration case. For one "
+            "value replicated across parameter-controlled packed lanes, import "
+            "`Sparkle.Library.RTL` and use `repeatVector (N := NUM_DICE) value`; it lowers "
+            "to a native SystemVerilog generate-for loop. It cannot create distinct indexed "
+            "per-lane state, so do not pretend it implements a parameter-indexed map."
+        )
     if "zero_width_parameter_default" in codes:
         hints.append(
             "Use positive default bindings for every P3 parameter in "
             "`#synthesizeParameterizedVerilog`; zero-width defaults cannot form a valid RTL type."
+        )
+    if "unsupported_compile_time_branch" in codes:
+        hints.append(
+            "A Lean `if`/`match` over a retained Nat parameter cannot be repaired with "
+            "`Signal.mux`: only a `Signal dom Bool` condition may drive a hardware mux. "
+            "Keep one parameter-generic datapath, do not enumerate public sweep values, "
+            "and do not select a body with `WIDTH % k` or `match WIDTH`."
         )
     if "unsupported_symbolic_clog2" in codes:
         hints.append(
@@ -2132,6 +2147,23 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "`Signal.register` receive a plain payload whose tuple shape exactly matches the state. "
             "Do not use `bundleAll!` for a synthesized top-level tuple; build the declared output "
             "shape with explicit nested `bundle2` calls or sized `++` concatenation."
+        )
+    if "unsupported_symbolic_generate" in codes:
+        hints.append(
+            "`Signal.generate` is not a Sparkle API and native P3 currently cannot lower "
+            "a retained-width structural generator with a symbolic index, dynamic bit-select, "
+            "or nested reduction. Do not keep retrying that shape. Re-express a per-bit transform "
+            "of an existing vector with `Signal.mapBits`; use `popCount` for population count. "
+            "Otherwise this task requires a future symbolic-index/generate IR extension, not a "
+            "local Lean syntax repair."
+        )
+    if "unsupported_hardware_definition" in codes:
+        hints.append(
+            "Do not call a partial def, recursive helper, or ordinary Lean function whose "
+            "result contains Signal: Sparkle cannot instantiate it as RTL. Inline a supported "
+            "Signal expression or use a library primitive. For a parameter-width population count, "
+            "replace a recursive helper with popCount x; it returns "
+            "Signal dom (BitVec (clog2 (W + 1))) while retaining W in Verilog."
         )
     return "\n".join(f"- {hint}" for hint in hints)
 
@@ -2245,6 +2277,38 @@ def compact_repair_feedback(feedback: str) -> str:
     return truncate_text("\n\n".join(selected), COMPACT_FEEDBACK_CHARS, keep="head")
 
 
+def native_parameter_repair_capabilities(info: ProblemInfo | None) -> str:
+    """Give compact repair sessions the P3 primitives absent from their fresh prompt."""
+    payload = (info.metadata or {}).get("native_parameter_sweep_plan") if info else None
+    plan = native_plan_from_dict(payload)
+    if plan is None:
+        return ""
+    parameters = ", ".join(plan.parameter_names)
+    return (
+        "### Native P3 Repair Primitives\n\n"
+        f"- Retained parameters for this task: {parameters}. Keep every one symbolic; "
+        "never write Lean branches for public sweep values.\n"
+        "- `repeatVector (N := COUNT) x` repeats one packed `W`-bit signal into "
+        "`BitVec (COUNT * W)` using a native SystemVerilog generate-for. Use it "
+        "for repeated reset/output values, not to fake independently indexed lanes.\n"
+        "- `iotaVector1 (W := 16) (N := COUNT)` returns packed lanes `[1, 2, ..., COUNT]` "
+        "as `Signal dom (BitVec (COUNT * 16))` using a native generate-for. Use it for "
+        "distinct generic LFSR/reset seeds; do not emulate it with Lean branches.\n"
+        "- `Signal.mapChunks laneStep packed` applies a named top-level, one-input, "
+        "one-output combinational Sparkle module independently to every packed lane. "
+        "Mark `laneStep` with `@[sparkle_module]`; it supports different lane widths, so a "
+        "`BitVec INW -> BitVec OUTW` helper maps `BitVec (N * INW)` to `BitVec (N * OUTW)`. "
+        "A helper may retain top-level Nat parameters such as `DICE_MAX`; this is the native "
+        "P3 operation for an LFSR/update transform and width-changing lane map. Because "
+        "`mapChunks` creates a named child module, end the file with "
+        "`#synthesizeParameterizedVerilogDesign top [..]`, not the leaf-only "
+        "`#synthesizeParameterizedVerilog` command.\n"
+        "- `popCount x`, `reverseBits x`, and `reverseBlocks (BLOCKS := k) x` preserve "
+        "symbolic widths. `Signal.cast` only converts Signals; do not apply it to a "
+        "raw `BitVec` or use it to prove non-definitional arithmetic width equalities.\n"
+    )
+
+
 def build_compact_repair_prompt(
     *,
     prob_id: str,
@@ -2306,6 +2370,9 @@ def build_compact_repair_prompt(
     specialization_section = (
         f"{specialization_contract}\n\n" if specialization_contract else ""
     )
+    native_repair_section = native_parameter_repair_capabilities(info)
+    if native_repair_section:
+        native_repair_section += "\n"
     lean_target_line = (
         f"- Lean target: generic core plus {len(plan.cases)} concrete modules\n\n"
         if plan else f"- Lean function: `{func_name}`\n\n"
@@ -2325,6 +2392,7 @@ def build_compact_repair_prompt(
         f"```systemverilog\n{truncate_text(ref_code, COMPACT_REF_CHARS, keep='middle')}\n```\n\n"
         f"{interface_section}"
         f"{specialization_section}"
+        f"{native_repair_section}"
         f"### Additional Input Context Files\n\n"
         f"{format_context_files(info)}\n\n"
         f"### Current Lean Candidate\n\n"

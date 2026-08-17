@@ -786,6 +786,12 @@ def _cvdp_normalize_type(width_or_type: str) -> str:
     text = (width_or_type or "").strip()
     if not text:
         return "logic"
+    text = re.sub(
+        r"(?<![$A-Za-z0-9_])(?:clog2|log2)\s*\(",
+        "$clog2(",
+        text,
+        flags=re.IGNORECASE,
+    )
     if re.match(r"^(?:logic|wire|reg)\b", text):
         return text
     return f"logic {text}"
@@ -805,7 +811,36 @@ def _cvdp_numeric_width(typ: str) -> int | None:
 def _cvdp_symbolic_type_key(typ: str) -> str:
     """Normalize simple symbolic packed types for strict field mapping."""
     normalized = _cvdp_normalize_type(typ).lower()
+    normalized = re.sub(
+        r"(?<![$a-z0-9_])(?:clog2|log2)\s*\(",
+        "$clog2(",
+        normalized,
+    )
     return re.sub(r"[\s()]", "", normalized)
+
+
+def _cvdp_types_match_across_cases(
+    expected_type: str,
+    field_type: str,
+    parameter_cases: list[dict[str, int]] | None,
+) -> bool:
+    """Prove two packed field types have equal width for every public case."""
+    if _cvdp_symbolic_type_key(expected_type) == _cvdp_symbolic_type_key(field_type):
+        return True
+    if not parameter_cases:
+        expected_width = _cvdp_numeric_width(expected_type)
+        field_width = _cvdp_numeric_width(field_type)
+        return expected_width is not None and expected_width == field_width
+    for values in parameter_cases:
+        expected_width = _concrete_sv_width(
+            _specialize_sv_type(expected_type, values)
+        )
+        field_width = _concrete_sv_width(
+            _specialize_sv_type(field_type, values)
+        )
+        if expected_width is None or field_width is None or expected_width != field_width:
+            return False
+    return True
 def _cvdp_expr_numeric_width(expr: str, type_lookup: dict[str, str]) -> int | None:
     """Return a concrete width for a simple field expression, honoring slices."""
     text = expr.strip()
@@ -897,16 +932,55 @@ def _cvdp_internal_unpacked_arrays(
     return arrays
 
 
+def _cvdp_output_fanin_signals(
+    sv_code: str,
+    module_name: str | None = None,
+) -> set[str]:
+    """Return signals in the continuous-assignment fan-in of module outputs."""
+    _, ports = parse_module_ports(sv_code, module_name=module_name)
+    _, _, body = _first_module_record(sv_code, module_name)
+    dependencies: dict[str, set[str]] = {}
+    for match in re.finditer(
+        r"\bassign\s+(?P<lhs>[A-Za-z_]\w*)"
+        r"(?:\s*\[[^\]]+\])?\s*=\s*(?P<rhs>[^;]+);",
+        _strip_sv_comments(body),
+        re.DOTALL,
+    ):
+        dependencies.setdefault(match.group("lhs"), set()).update(
+            re.findall(r"\b[A-Za-z_]\w*\b", match.group("rhs"))
+        )
+
+    reachable = {name for direction, _, name in ports if direction == "output"}
+    worklist = list(reachable)
+    while worklist:
+        signal = worklist.pop()
+        for dependency in dependencies.get(signal, ()):
+            if dependency not in reachable:
+                reachable.add(dependency)
+                worklist.append(dependency)
+    return reachable
+
+
 def _cvdp_match_internal_array(
     name: str,
     generated_arrays: dict[str, tuple[str, str]],
     used: set[str],
+    *,
+    sv_code: str = "",
+    module_name: str | None = None,
 ) -> str | None:
     """Conservatively match a benchmark-visible internal array to Sparkle RTL."""
     candidates = [candidate for candidate in generated_arrays if candidate not in used]
     exact = [candidate for candidate in candidates if _ports_equivalent(candidate, name)]
     if len(exact) == 1:
         return exact[0]
+    if len(candidates) > 1 and sv_code:
+        output_fanin = _cvdp_output_fanin_signals(sv_code, module_name)
+        output_backed = [
+            candidate for candidate in candidates if candidate in output_fanin
+        ]
+        if len(output_backed) == 1:
+            return output_backed[0]
     # Generated Sparkle names often describe the memory's read value rather
     # than the reference array. A unique memory is still unambiguous.
     if len(candidates) == 1:
@@ -1023,13 +1097,21 @@ def _cvdp_infer_concat_fields(sv_code: str, sp_out_name: str) -> list[str] | Non
         return None
 
     def expand(expr: str, seen: set[str]) -> list[str]:
-        name = _cvdp_expr_signal_name(expr)
+        text = expr.strip()
+        if text.startswith("{") and text.endswith("}"):
+            children = _cvdp_split_commas(text[1:-1])
+            if len(children) > 1:
+                out: list[str] = []
+                for child in children:
+                    out.extend(expand(child, seen))
+                return out
+        name = _cvdp_expr_signal_name(text)
         if name and name.startswith("_tmp") and name in assigns and name not in seen:
             out: list[str] = []
             for child in assigns[name]:
                 out.extend(expand(child, seen | {name}))
             return out
-        return [expr.strip()]
+        return [text]
 
     fields: list[str] = []
     for item in direct:
@@ -1042,15 +1124,25 @@ def _cvdp_infer_bundled_output_mapping(
     sp_out_name: str,
     expected_outputs: list[tuple[str, str, str]],
     sparkle_ports: list[tuple[str, str, str]],
+    parameter_cases: list[dict[str, int]] | None = None,
 ) -> list[tuple[tuple[str, str, str], str, str | None]]:
-    """Return MSB-first mapping from expected output ports to packed fields."""
+    """Return a width-proved, MSB-first mapping to packed output fields.
+
+    Semantic names remain the first choice. For fields whose generated name no
+    longer resembles the public port (for example ``readData`` vs
+    ``axi_rdata``), declaration order is accepted only when every unresolved
+    field has the same width as its corresponding public output at every
+    parameter-sweep case.
+    """
     fields = _cvdp_infer_concat_fields(sv_code, sp_out_name) or []
     if not fields:
         return []
     type_lookup = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
     used: set[str] = set()
-    mapping: list[tuple[tuple[str, str, str], str, str | None]] = []
-    for field in fields:
+    mapping_by_index: dict[
+        int, tuple[tuple[str, str, str], str, str | None]
+    ] = {}
+    for index, field in enumerate(fields):
         matched = _cvdp_match_output_for_field(field, expected_outputs, used)
         if not matched:
             continue
@@ -1058,9 +1150,39 @@ def _cvdp_infer_bundled_output_mapping(
         field_type = type_lookup.get(field_name)
         if field_name.startswith("_gen_"):
             field_type = field_type or type_lookup.get(field_name[5:])
-        mapping.append((matched, field, field_type))
+        if field_type is None or not _cvdp_types_match_across_cases(
+            matched[1], field_type, parameter_cases
+        ):
+            continue
+        mapping_by_index[index] = (matched, field, field_type)
         used.add(matched[2])
-    return mapping
+
+    unresolved_indices = [
+        index for index in range(len(fields)) if index not in mapping_by_index
+    ]
+    unresolved_outputs = [
+        output for output in expected_outputs if output[2] not in used
+    ]
+    if len(unresolved_indices) == len(unresolved_outputs):
+        positional: list[
+            tuple[int, tuple[tuple[str, str, str], str, str | None]]
+        ] = []
+        for index, output in zip(unresolved_indices, unresolved_outputs):
+            field = fields[index]
+            field_name = _cvdp_expr_signal_name(field) or ""
+            field_type = type_lookup.get(field_name)
+            if field_name.startswith("_gen_"):
+                field_type = field_type or type_lookup.get(field_name[5:])
+            if field_type is None or not _cvdp_types_match_across_cases(
+                output[1], field_type, parameter_cases
+            ):
+                positional = []
+                break
+            positional.append((index, (output, field, field_type)))
+        for index, entry in positional:
+            mapping_by_index[index] = entry
+
+    return [mapping_by_index[index] for index in sorted(mapping_by_index)]
 
 
 def _cvdp_assign_bundled_output_slices(
@@ -1190,7 +1312,10 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
     clocked = set(re.findall(r"\bClock\s*\(\s*dut\.([A-Za-z_]\w*)\b", port_py_text))
 
     params: set[str] = set()
-    for body in re.findall(r"\b(?:parameter|parameters)\s*=\s*\{([^}]+)\}", param_py_text):
+    for body in re.findall(
+        r"\b[A-Za-z_]*parameters?[A-Za-z_]*\s*=\s*\{([^}]+)\}",
+        param_py_text,
+    ):
         params.update(re.findall(r"[\"']([A-Za-z_]\w*)[\"']\s*:", body))
     params.update(
         name for name in all_names
@@ -1325,6 +1450,7 @@ def generate_cvdp_wrapper(
     strict_mapping: bool = False,
     required_parameter_names: set[str] | None = None,
     derived_parameter_expressions: dict[str, str] | None = None,
+    parameter_cases: list[dict[str, int]] | None = None,
 ) -> str | None:
     """Generate a CVDP top wrapper matching cocotb's expected DUT interface."""
     usage = _cvdp_parse_harness_usage(harness_files)
@@ -1361,6 +1487,7 @@ def generate_cvdp_wrapper(
                 sp_outputs[0][2],
                 pseudo_outputs,
                 sparkle_ports,
+                parameter_cases,
             ):
                 if field_type:
                     bundled_type_by_output[out_port[2]] = field_type
@@ -1600,6 +1727,8 @@ def generate_cvdp_wrapper(
             ref_name,
             generated_arrays,
             used_generated_arrays,
+            sv_code=sv_code,
+            module_name=sparkle_mod_name,
         )
         loop_bounds = _cvdp_unpacked_loop_bounds(unpacked_range)
         if generated_name is None or loop_bounds is None:
@@ -1637,10 +1766,28 @@ def generate_cvdp_wrapper(
 
     if len(sp_outputs) == 1:
         sp_out_d, sp_out_t, sp_out_n = sp_outputs[0]
+        packed_fields = _cvdp_infer_concat_fields(sv_code, sp_out_n) or []
+        packed_mapping = _cvdp_infer_bundled_output_mapping(
+            sv_code,
+            sp_out_n,
+            expected_outputs,
+            sparkle_ports,
+            parameter_cases,
+        )
+        if (
+            strict_mapping
+            and not assigned_outputs
+            and len(packed_mapping) == len(expected_outputs) == len(packed_fields)
+        ):
+            ordered_outputs = [entry[0][2] for entry in packed_mapping]
+            lines.append(
+                f"    assign {{{', '.join(ordered_outputs)}}} = {sp_out_n}_wire;"
+            )
+            assigned_outputs.update(ordered_outputs)
         remaining = [(d, t, n) for d, t, n in expected_outputs if n not in assigned_outputs]
         for expected, field_expr, field_type in (
             _cvdp_infer_bundled_output_mapping(
-                sv_code, sp_out_n, remaining, sparkle_ports
+                sv_code, sp_out_n, remaining, sparkle_ports, parameter_cases
             )
             if strict_mapping and any(
                 _cvdp_numeric_width(port_type) is None
@@ -1887,18 +2034,38 @@ def prepare_cvdp_native_parameter_design(
     )
     core_outputs = [port for port in core_ports if port[0] == "output"]
     expected_outputs = [port for port in expected_ports if port[0] == "output"]
+    manifest["expected_ports"] = [list(port) for port in expected_ports]
+    packed_fields: list[str] = []
+    packed_mapping_rows: list[
+        tuple[tuple[str, str, str], str, str | None]
+    ] = []
     packed_mapping = {}
     if len(core_outputs) == 1 and len(expected_outputs) > 1:
+        packed_fields = (
+            _cvdp_infer_concat_fields(sv_code, core_outputs[0][2]) or []
+        )
+        packed_mapping_rows = _cvdp_infer_bundled_output_mapping(
+            sv_code,
+            core_outputs[0][2],
+            expected_outputs,
+            core_ports,
+            [dict(case.values) for case in plan.cases],
+        )
         packed_mapping = {
             expected[2]: field_type
-            for expected, _field, field_type in _cvdp_infer_bundled_output_mapping(
-                sv_code,
-                core_outputs[0][2],
-                expected_outputs,
-                core_ports,
-            )
+            for expected, _field, field_type in packed_mapping_rows
             if field_type is not None
         }
+    manifest["packed_output_fields"] = packed_fields
+    manifest["packed_output_mapping"] = [
+        {
+            "public_port": expected[2],
+            "public_type": expected[1],
+            "generated_field": field,
+            "generated_type": field_type,
+        }
+        for expected, field, field_type in packed_mapping_rows
+    ]
     for case in plan.cases:
         values = dict(case.values)
         for name in derived_names:
@@ -1966,6 +2133,13 @@ def prepare_cvdp_native_parameter_design(
         )
 
     inner_ports = parse_module_ports(wrapped_core_sv, module_name=inner_name)[1]
+    wrapper_usage = _cvdp_parse_harness_usage(harness_files)
+    manifest["wrapped_core_module"] = inner_name
+    manifest["wrapped_core_ports"] = [list(port) for port in inner_ports]
+    manifest["wrapper_usage_parameters"] = sorted(wrapper_usage["params"])
+    manifest["wrapper_parameter_declarations"] = _cvdp_parse_module_parameters(
+        ref_code, wrapper_usage["params"]
+    )
     wrapper = generate_cvdp_wrapper(
         design_name=design_name,
         sparkle_mod_name=inner_name,
@@ -1978,6 +2152,7 @@ def prepare_cvdp_native_parameter_design(
         strict_mapping=True,
         required_parameter_names=set(required_parameters),
         derived_parameter_expressions=derived_expressions,
+        parameter_cases=[dict(case.values) for case in plan.cases],
     )
     if not wrapper:
         manifest["diagnostics"] = [
@@ -2046,19 +2221,33 @@ def _specialize_sv_type(typ: str, values: dict[str, int]) -> str:
 def _safe_sv_int_expr(expr: str) -> int | None:
     text = str(expr or "").strip()
     while "$clog2" in text:
-        matches = list(re.finditer(r"\$clog2\s*\(([^()]*)\)", text))
-        if not matches:
+        # Find the innermost explicit $clog2 call and match its parenthesis
+        # depth rather than stopping at the first nested arithmetic group.
+        start = text.rfind("$clog2")
+        opener = re.match(r"\$clog2\s*\(", text[start:])
+        if opener is None:
             return None
-        changed = False
-        for match in reversed(matches):
-            argument = _safe_sv_int_expr(match.group(1))
-            if argument is None or argument < 0:
-                continue
-            value = math.ceil(math.log2(max(1, argument)))
-            text = text[:match.start()] + str(value) + text[match.end():]
-            changed = True
-        if not changed:
+        open_index = start + opener.end() - 1
+        depth = 0
+        close_index = None
+        for index in range(open_index, len(text)):
+            char = text[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    close_index = index
+                    break
+            if depth < 0:
+                return None
+        if close_index is None:
             return None
+        argument = _safe_sv_int_expr(text[open_index + 1:close_index])
+        if argument is None or argument < 0:
+            return None
+        value = math.ceil(math.log2(max(1, argument)))
+        text = text[:start] + str(value) + text[close_index + 1:]
     if not re.fullmatch(r"[0-9\s()+*/%<>&|^~-]+", text):
         return None
     try:

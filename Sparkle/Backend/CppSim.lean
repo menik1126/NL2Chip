@@ -80,7 +80,7 @@ def applyMask (expr : String) (w : Nat) : String :=
 /-- Check if an IR expression produces a result that is already correctly masked.
     Invariant: every assignment applies a mask, so .ref reads yield masked values. -/
 partial def exprIsMasked (w : Nat) : Expr → Bool
-  | .const _ _ | .constDim _ _ => true  -- constants are always exact
+  | .const _ _ | .constDim _ _ | .dimension _ => true
   | .ref _ => true  -- all wires are masked at their assignment site
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
   | .op .le_s _ | .op .gt_u _ | .op .gt_s _ | .op .ge_u _
@@ -92,7 +92,7 @@ partial def exprIsMasked (w : Nat) : Expr → Bool
   | .op .or [a, b] => exprIsMasked w a && exprIsMasked w b  -- OR of masked stays in width
   | .op .xor [a, b] => exprIsMasked w a && exprIsMasked w b  -- XOR of masked stays in width
   | .op .shr _ => true  -- right-shift moves bits toward LSB, no new upper bits
-  | .op .asr _ => true  -- cast to unsigned in emitExpr handles width
+  | .op .asr _ => false  -- narrow results need an explicit low-bit mask
   | _ => !needsMask w  -- native widths don't need masking
 
 /-- Convert Operator to C++ operator symbol -/
@@ -105,6 +105,7 @@ def emitCppOperator (op : Operator) : String :=
   | .add => "+"
   | .sub => "-"
   | .mul => "*"
+  | .mod => "%"
   | .eq  => "=="
   | .lt_u => "<"
   | .lt_s => "<"
@@ -117,7 +118,9 @@ def emitCppOperator (op : Operator) : String :=
   | .shl => "<<"
   | .shr => ">>"
   | .asr => ">>"
+  | .sext => "/* signed width conversion */"
   | .neg => "-"
+  | .popcount => "__builtin_popcountll"
   | .mux => "?"
 
 /-- Get signed cast type for a given width -/
@@ -127,11 +130,23 @@ def signedCastType (w : Nat) : String :=
   else if w ≤ 32 then "int32_t"
   else "int64_t"
 
+/-- Interpret a packed C++ value as a two's-complement integer with exactly
+    width meaningful bits. A direct cast to int8_t is wrong for e.g. 4'hd:
+    the sign bit is bit 3, not bit 7. -/
+def emitSignedValue (value : String) (width : Nat) : String :=
+  if width == 0 then "0"
+  else if width >= 64 then
+    s!"((int64_t)(uint64_t)({value}))"
+  else
+    s!"((int64_t)(((uint64_t)({value}) ^ (1ULL << {width - 1})) - (1ULL << {width - 1})))"
+
 /-- Best-effort width inference for an expression -/
 partial def inferExprWidth (typeMap : List (String × HWType)) : Expr → Nat
   | .const _ w => w
   | .constDim _ width =>
     panic! s!"CppSim requires a concrete constant width, found {width}"
+  | .dimension value =>
+    panic! s!"CppSim requires specialization of generate-time value {value}"
   | .ref name => lookupWidth typeMap name
   | .slice _ hi lo => hi - lo + 1
   | .sliceDim _ hi lo =>
@@ -171,6 +186,8 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
       s!"({cppType}){value}ULL"
   | .constDim _ width =>
     panic! s!"CppSim requires a concrete constant width, found {width}"
+  | .dimension value =>
+    panic! s!"CppSim requires specialization of generate-time value {value}"
 
   | .ref name =>
     sanitizeName name
@@ -235,21 +252,28 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
     | [arg] => s!"(-{emitExpr typeMap arg})"
     | _ => "/* ERROR: neg requires 1 argument */"
 
+  | .op .popcount args =>
+    match args with
+    | [arg] => s!"__builtin_popcountll((unsigned long long){emitExpr typeMap arg})"
+    | _ => "/* ERROR: popcount requires 1 argument */"
+
+  | .op .sext args =>
+    match args with
+    | [arg] =>
+      let width := inferExprWidth typeMap arg
+      emitSignedValue (emitExpr typeMap arg) width
+    | _ => "/* ERROR: sext requires 1 argument */"
+
   | .op operator args =>
     match args with
     | [arg1, arg2] =>
       match operator with
       | .lt_s | .le_s | .gt_s | .ge_s =>
         let w := inferExprWidth typeMap arg1
-        let stype := signedCastType w
-        s!"(({stype}){emitExpr typeMap arg1} {emitCppOperator operator} ({stype}){emitExpr typeMap arg2} ? 1 : 0)"
+        s!"({emitSignedValue (emitExpr typeMap arg1) w} {emitCppOperator operator} {emitSignedValue (emitExpr typeMap arg2) w} ? 1 : 0)"
       | .asr =>
-        -- Always use at least 32-bit types for ASR to avoid overflow in
-        -- sign-extension patterns like (val << N) >> N where N can be large
-        let w := max (inferExprWidth typeMap arg1) 32
-        let stype := signedCastType w
-        let utype := emitCppType (.bitVector w)
-        s!"(({utype})(({stype}){emitExpr typeMap arg1} >> {emitExpr typeMap arg2}))"
+        let w := inferExprWidth typeMap arg1
+        s!"({emitSignedValue (emitExpr typeMap arg1) w} >> {emitExpr typeMap arg2})"
       | .eq | .lt_u | .le_u | .gt_u | .ge_u =>
         s!"({emitExpr typeMap arg1} {emitCppOperator operator} {emitExpr typeMap arg2} ? 1 : 0)"
       | _ =>
@@ -292,6 +316,31 @@ def emitGeneratedBitAssignment (typeMap : List (String × HWType))
   , resetBody := []
   , evalTickLocals := [] }
 
+/-- Emit a concrete packed-slice update produced by an unrolled generate loop.
+    CppSim specializes all dimensions first, so this only needs the scalar
+    (up to 64-bit) path supported by the existing backend. -/
+def emitGeneratedSliceAssignment (typeMap : List (String × HWType))
+    (target : String) (hi lo : Nat) (rhs : Expr) : StmtParts :=
+  let width := lookupWidth typeMap target
+  let sliceWidth := hi - lo + 1
+  if width > 64 then
+    panic! s!"CppSim generated slice assignment exceeds 64-bit scalar support: {target}"
+  else if sliceWidth > 64 then
+    panic! s!"CppSim generated slice assignment selects more than 64 bits: {target}"
+  else
+    let targetName := sanitizeName target
+    let valueExpr := emitExpr typeMap rhs
+    let sliceMask := if sliceWidth == 64 then "~0ULL" else s!"((1ULL << {sliceWidth}) - 1)"
+    let positionedMask := if lo == 0 then sliceMask else s!"({sliceMask} << {lo})"
+    let updated :=
+      s!"(({targetName} & ~({positionedMask})) | ((({valueExpr}) & {sliceMask}) << {lo}))"
+    let masked := applyMask updated width
+    { declarations := []
+    , evalBody := [s!"        {targetName} = {masked};"]
+    , tickBody := []
+    , resetBody := []
+    , evalTickLocals := [] }
+
 /-- Split a statement into declaration/eval/tick/reset parts -/
 def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
     (design : Option Design := none) : StmtParts :=
@@ -307,7 +356,13 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       , evalTickLocals := [] }
     else
       let expr := emitExpr typeMap rhs
-      let masked := if exprIsMasked width rhs then expr else applyMask expr width
+      let rhsWidth := inferExprWidth typeMap rhs
+      -- A reference is already masked to *its own* width, but an assignment to
+      -- a narrower destination still needs an explicit low-bit mask. This is
+      -- the C++ equivalent of unsigned SystemVerilog assignment truncation.
+      let masked := if rhsWidth <= width && exprIsMasked width rhs
+        then expr
+        else applyMask expr width
       { declarations := []
       , evalBody := [s!"        {sanitizeName lhs} = {masked};"]
       , tickBody := []
@@ -322,9 +377,9 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       if hi == lo then
         emitGeneratedBitAssignment typeMap target (toString lo) rhs
       else
-        panic! "CppSim generated lvalue slice must select exactly one bit"
+        emitGeneratedSliceAssignment typeMap target hi lo rhs
     | _ =>
-      panic! "CppSim supports only specialized per-bit generated lvalue assignments"
+      panic! "CppSim supports only specialized generated assignments to a named packed vector"
 
   | .generateFor label .. =>
     panic! s!"CppSim requires specialization of generate loop '{label}'"
@@ -368,9 +423,12 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       { declarations := [memDecl, s!"    {addrType} {addrLatch};"] ++ rdDecl
       , evalBody := [s!"        {addrLatch} = {emitExpr typeMap readAddr};"]
       , tickBody :=
-          [ s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};"
-          , s!"        {rdName} = {memName}[{addrLatch}];" ]
-      , resetBody := [s!"        {memName}.fill(0);"]
+          [ s!"        {rdName} = {memName}[{addrLatch}];"
+          , s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};" ]
+      , resetBody :=
+          [ s!"        {memName}.fill(0);"
+          , s!"        {rdName} = 0;"
+          , s!"        {addrLatch} = 0;" ]
       , evalTickLocals := [] }
 
   | .inst moduleName instName connections parameterBindings =>
@@ -392,6 +450,14 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
         if outputPortNames.contains portName then
           match expr with
           | .ref wireName => some s!"        {sanitizeName wireName} = {iName}.{sanitizeName portName};"
+          | .slice (.ref wireName) hi lo =>
+            let width := lookupWidth typeMap wireName
+            let sliceWidth := hi - lo + 1
+            let sliceMask := if sliceWidth == 64 then "~0ULL" else s!"((1ULL << {sliceWidth}) - 1)"
+            let positionedMask := if lo == 0 then sliceMask else s!"({sliceMask} << {lo})"
+            let updated := s!"(({sanitizeName wireName} & ~({positionedMask})) | " ++
+              s!"(((uint64_t){iName}.{sanitizeName portName} & {sliceMask}) << {lo}))"
+            some s!"        {sanitizeName wireName} = {applyMask updated width};"
           | _ => none
         else none
       { declarations := [s!"    {className} {iName};"]
@@ -403,7 +469,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
 /-- Collect all wire name references from an IR expression -/
 partial def collectExprRefs : Expr → List String
   | .ref name => [name]
-  | .const _ _ | .constDim _ _ => []
+  | .const _ _ | .constDim _ _ | .dimension _ => []
   | .slice inner _ _ => collectExprRefs inner
   | .sliceDim inner _ _ => collectExprRefs inner
   | .concat args => args.foldl (fun acc a => acc ++ collectExprRefs a) []
@@ -477,7 +543,7 @@ def emitModule (m : Module) (design : Option Design := none)
 
     -- Local variable declarations (emitted inside eval())
     let localDecls := localWires.map fun (p : Port) =>
-      s!"        {emitCppType p.ty} {sanitizeName p.name};"
+      s!"        {emitCppType p.ty} {sanitizeName p.name}" ++ " {};"
 
     -- Extra declarations from statements (registers, memories, sub-instances)
     let stmtDecls := allParts.foldl (fun acc p => acc ++ p.declarations) []

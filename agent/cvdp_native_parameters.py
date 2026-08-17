@@ -272,9 +272,10 @@ def format_native_parameter_contract(plan: FiniteParameterPlan) -> str:
         + ", ".join(f"{name}={defaults.get(name)}" for name in plan.parameter_names),
         f"- Public sweep configurations: {len(plan.cases)}",
         "",
-        "Critical Lean syntax: every retained parameter must be a direct implicit top-level Nat binder "
-        "of the synthesized definition, e.g. def <top> {dom : DomainConfig} {WIDTH : Nat}. "
-        "Do not place it in a local let, structure, or runtime Signal argument.",
+        "Critical Lean syntax: every retained parameter must be a direct implicit "
+        "top-level Nat binder of the synthesized definition, e.g. "
+        "`def top {dom : DomainConfig} {WIDTH : Nat}`. Do not place it in a "
+        "local let, structure, or runtime Signal argument.",
     ]
     for case in plan.cases:
         lines.append(
@@ -282,10 +283,14 @@ def format_native_parameter_contract(plan: FiniteParameterPlan) -> str:
         )
     lines.extend([
         "",
-        "Use `#synthesizeParameterizedVerilog` (or the design variant for hierarchy) with "
-        "one default binding per retained Nat binder. The evaluator will elaborate and run "
-        "this same emitted DUT at every public configuration and will reject fixed-width "
-        "inner cores or wrapper-only parameters.",
+        "Use `#synthesizeParameterizedVerilog` only for a leaf design. If the top calls "
+        "any named `@[sparkle_module]` helper (including through `Signal.mapChunks`), you "
+        "must use `#synthesizeParameterizedVerilogDesign` instead, with one default binding "
+        "per retained Nat binder. The Design command emits the helper module definitions; "
+        "the leaf command emits only the top and will fail downstream Verilog elaboration "
+        "with unknown module types. The evaluator will elaborate and run this same emitted "
+        "DUT at every public configuration and will reject fixed-width inner cores or "
+        "wrapper-only parameters.",
     ])
     return "\n".join(lines)
 
