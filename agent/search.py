@@ -2089,6 +2089,10 @@ def summarize_eval_result(result: dict | None) -> str:
 def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
     """Return short, diagnosis-specific Lean repair guidance."""
     codes = {str(item.get("code", "")) for item in (diagnostics or [])}
+    diagnostic_text = "\n".join(
+        str(item.get("message") or item.get("summary") or "")
+        for item in (diagnostics or [])
+    ).lower()
     hints: list[str] = []
     if "invalid_signal_loop" in codes:
         hints.append(
@@ -2150,12 +2154,11 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
         )
     if "unsupported_symbolic_generate" in codes:
         hints.append(
-            "`Signal.generate` is not a Sparkle API and native P3 currently cannot lower "
-            "a retained-width structural generator with a symbolic index, dynamic bit-select, "
-            "or nested reduction. Do not keep retrying that shape. Re-express a per-bit transform "
-            "of an existing vector with `Signal.mapBits`; use `popCount` for population count. "
-            "Otherwise this task requires a future symbolic-index/generate IR extension, not a "
-            "local Lean syntax repair."
+            "`Signal.generate` is not a Sparkle API. For an index-dependent output bit, define "
+            "a named `@[sparkle_module]` helper `(index, fullInput) -> BitVec 1` and call "
+            "`Signal.generateBitsWithIndex helper fullInput`; finish hierarchical output with "
+            "`#synthesizeParameterizedVerilogDesign`. For a uniform Boolean transform use "
+            "`Signal.mapBits`; for population count use `popCount`."
         )
     if "unsupported_hardware_definition" in codes:
         hints.append(
@@ -2165,6 +2168,15 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "replace a recursive helper with popCount x; it returns "
             "Signal dom (BitVec (clog2 (W + 1))) while retaining W in Verilog."
         )
+        if "list.foldl" in diagnostic_text or "list.range" in diagnostic_text:
+            hints.append(
+                "A `List.range`/`List.foldl` over a retained parameter was unfolded as a Lean "
+                "definition instead of hardware. Choose the structural primitive that matches "
+                "the operation: `Signal.mapBits`, `Signal.mapChunksWithIndex`, or "
+                "`Signal.generateBitsWithIndex`; use `popCount` for a reduction. For the standard "
+                "extended-Hamming position layout, compose `scatterNonPowerOfTwoBits`, "
+                "`parityByIndexMask`, `placeParityBits`, and `gatherNonPowerOfTwoBits`."
+            )
     return "\n".join(f"- {hint}" for hint in hints)
 
 
@@ -2303,9 +2315,22 @@ def native_parameter_repair_capabilities(info: ProblemInfo | None) -> str:
         "`mapChunks` creates a named child module, end the file with "
         "`#synthesizeParameterizedVerilogDesign top [..]`, not the leaf-only "
         "`#synthesizeParameterizedVerilog` command.\n"
+        "- Use `Signal.mapChunksWithIndex laneStep packed` when each lane also needs its "
+        "zero-based lane index. Use `Signal.generateBitsWithIndex bitStep packed` when each "
+        "output bit depends on its index and the complete input. Both require a named "
+        "`@[sparkle_module]` helper and design-level synthesis; do not use `List.foldl` over a "
+        "retained parameter.\n"
+        "- For the standard extended-Hamming layout, compose "
+        "`scatterNonPowerOfTwoBits`, `parityByIndexMask`, `placeParityBits`, and "
+        "`gatherNonPowerOfTwoBits`; keep `DATAW` and `PARITYW` symbolic.\n"
+        "- Symbolic-width memory is supported: `syncRam1R1W` has one-cycle read latency and "
+        "`regFile1R1W` has current-address combinational read semantics. Keep FIFO pointers, "
+        "count, full, and empty in explicit resettable `Signal.loop` state.\n"
         "- `popCount x`, `reverseBits x`, and `reverseBlocks (BLOCKS := k) x` preserve "
         "symbolic widths. `Signal.cast` only converts Signals; do not apply it to a "
-        "raw `BitVec` or use it to prove non-definitional arithmetic width equalities.\n"
+        "raw `BitVec` or use it to prove non-definitional arithmetic width equalities. For "
+        "two's-complement datapaths, use `signExtend`, `arithShiftRight`, signed comparisons, "
+        "and signed multiply/shift/truncate helpers instead of unsigned `zext` or `>>>`.\n"
     )
 
 

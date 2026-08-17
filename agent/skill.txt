@@ -161,7 +161,38 @@ top-level-binder error and does not form a P3 generic module.
       (x : Signal dom (BitVec (N * W))) : Signal dom (BitVec (N * W)) :=
     Signal.mapChunksWithIndex laneStep x
   ```
-- A design that uses `Signal.mapChunks` or any named `@[sparkle_module]`
+- When each output bit depends on its output index and the complete packed
+  input, use `Signal.generateBitsWithIndex`. Its named helper receives the
+  zero-based output index, the full input, and returns one bit. This is the
+  supported primitive for dynamic select, index masks, and scatter/gather
+  structures at retained widths. Do not rebuild it with `List.range`,
+  `List.foldl`, or Lean recursion. Verified minimal form:
+  ```lean
+  @[sparkle_module]
+  def indexedSelectBit {dom : DomainConfig} {W : Nat}
+      (index data : Signal dom (BitVec W)) : Signal dom (BitVec 1) :=
+    let shifted : Signal dom (BitVec W) := data >>> index
+    Signal.cast shifted
+
+  def indexedIdentity {dom : DomainConfig} {W : Nat}
+      (data : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+    Signal.generateBitsWithIndex indexedSelectBit data
+  ```
+- Extended-Hamming layouts with overall parity at position zero, indexed
+  parity at positions 1, 2, 4, ..., and payload in all other positions have
+  verified generic helpers in `Sparkle.Library.RTL`:
+  `scatterNonPowerOfTwoBits`, `parityByIndexMask`, `placeParityBits`, and
+  `gatherNonPowerOfTwoBits`. Keep `DATAW` and `PARITYW` symbolic and compose
+  these helpers; do not hard-code the 4-bit/default layout. Use them only when
+  the benchmark contract uses this exact position convention.
+- Parameterized memories accept symbolic address and data widths. Use
+  `syncRam1R1W`/`Signal.memory` for a one-cycle registered read, or
+  `regFile1R1W`/`Signal.memoryComboRead` for a current-address combinational
+  read of writes from prior cycles. Memory does not implement FIFO control:
+  keep count, read/write pointers, `full`, and `empty` as explicit resettable
+  feedback state and match the contract's read latency.
+- A design that uses `Signal.mapChunks`, `Signal.mapChunksWithIndex`,
+  `Signal.generateBitsWithIndex`, or any named `@[sparkle_module]`
   helper is hierarchical. End it with
   `#synthesizeParameterizedVerilogDesign top [PARAM := default]`, not
   `#synthesizeParameterizedVerilog`: the latter emits only the top module and

@@ -101,11 +101,16 @@ def test_hardware_type_diagnostic_rejects_bundleall_top_level_output():
 
 
 def test_unsupported_hardware_definition_gets_parameterized_popcount_guidance():
-    hint = lean_repair_playbook([{"code": "unsupported_hardware_definition"}])
+    hint = lean_repair_playbook([{
+        "code": "unsupported_hardware_definition",
+        "message": OPAQUE_LOWERING_ERROR,
+    }])
 
     assert "partial def" in hint
     assert "popCount x" in hint
     assert "clog2 (W + 1)" in hint
+    assert "Signal.generateBitsWithIndex" in hint
+    assert "parityByIndexMask" in hint
 
 
 def test_raw_error_parser_deduplicates_repl_location_aliases():
@@ -244,7 +249,8 @@ def test_signal_generate_diagnostic_marks_symbolic_structural_boundary():
     hint = lean_repair_playbook(records)
 
     assert records[0]["code"] == "unsupported_symbolic_generate"
-    assert "symbolic index" in hint
+    assert "Signal.generateBitsWithIndex" in hint
+    assert "#synthesizeParameterizedVerilogDesign" in hint
     assert "Signal.mapBits" in hint
 
 
@@ -284,7 +290,31 @@ def test_native_parameter_repair_sessions_receive_native_primitive_summary():
     assert "WIDTH, COUNT" in section
     assert "repeatVector (N := COUNT) x" in section
     assert "Signal.mapChunks laneStep packed" in section
+    assert "Signal.mapChunksWithIndex laneStep packed" in section
+    assert "Signal.generateBitsWithIndex bitStep packed" in section
+    assert "scatterNonPowerOfTwoBits" in section
+    assert "regFile1R1W" in section
+    assert "arithShiftRight" in section
     assert "Signal.cast" in section
+
+
+def test_skill_documents_verified_stage4_parameterized_apis():
+    skill = (PROJECT_ROOT / "agent" / "skill.txt").read_text(encoding="utf-8")
+
+    for api in (
+        "Signal.generateBitsWithIndex",
+        "scatterNonPowerOfTwoBits",
+        "parityByIndexMask",
+        "placeParityBits",
+        "gatherNonPowerOfTwoBits",
+        "syncRam1R1W",
+        "regFile1R1W",
+        "signExtend",
+        "arithShiftRight",
+    ):
+        assert api in skill
+
+    assert "future symbolic-index/generate IR extension" not in skill
 
 
 def test_compact_repair_prompt_keeps_native_primitive_summary():
