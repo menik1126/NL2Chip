@@ -158,6 +158,32 @@ def _simulation_diagnostic_stage(status: str, detail: str) -> str | None:
     return "infrastructure"
 
 
+def _classify_cvdp_local_timeout(
+    output: str,
+    timeout_s: int,
+) -> tuple[str, int, str]:
+    """Separate harness startup failures from a DUT that never completes."""
+    text = str(output or "")
+    test_started = bool(re.search(
+        r"cocotb\.regression.*\brunning\s+\S+|\bRunning tests\b",
+        text,
+        re.IGNORECASE,
+    ))
+    if not test_started:
+        return "sim_error", -1, f"CVDP local simulation timeout after {timeout_s}s"
+
+    tail = "\n".join(text.splitlines()[-24:])
+    detail = (
+        f"CVDP DUT did not complete within {timeout_s}s after the cocotb test started. "
+        "Treat this as a functional progress failure: check whether done/valid was "
+        "asserted too early and missed, never asserted, or held with the wrong pulse "
+        "timing; also check state termination and zero-delay combinational loops."
+    )
+    if tail:
+        detail += f"\nPartial simulator output:\n{tail[:1800]}"
+    return "sim_fail", -1, detail
+
+
 def _iverilog_failure_stage(output: str) -> str:
     text = str(output or "").lower()
     infrastructure_markers = (
@@ -3860,7 +3886,7 @@ class Evaluator:
             stdout, stderr = proc.communicate()
             output = stdout + stderr
             (sim_dir / "cvdp_local_output.txt").write_text(output)
-            return "sim_error", -1, f"CVDP local simulation timeout after {timeout_s}s"
+            return _classify_cvdp_local_timeout(output, timeout_s)
 
         output = stdout + stderr
         (sim_dir / "cvdp_local_output.txt").write_text(output)

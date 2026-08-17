@@ -8,7 +8,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "agent"))
 
 from dataset import ProblemInfo  # noqa: E402
-from evaluator import Evaluator, generate_cvdp_wrapper, parse_module_ports  # noqa: E402
+from evaluator import (  # noqa: E402
+    Evaluator,
+    _classify_cvdp_local_timeout,
+    _simulation_diagnostic_stage,
+    generate_cvdp_wrapper,
+    parse_module_ports,
+)
 from search import format_benchmark_interface_contract  # noqa: E402
 
 
@@ -34,6 +40,33 @@ def _cvdp_info(
             "verilog_sources": [f"/code/rtl/{design_name}.sv"],
         },
     )
+
+
+def test_cvdp_timeout_after_test_start_is_repairable_progress_failure():
+    output = """
+    0.00ns INFO cocotb Running tests
+    0.00ns INFO cocotb.regression running test_divider.test_divider (1/1)
+    """
+
+    status, mismatches, detail = _classify_cvdp_local_timeout(output, 180)
+
+    assert status == "sim_fail"
+    assert mismatches == -1
+    assert "functional progress failure" in detail
+    assert "done/valid" in detail
+    assert _simulation_diagnostic_stage(status, detail) == "simulation_mismatch"
+
+
+def test_cvdp_timeout_before_test_start_remains_infrastructure_error():
+    status, mismatches, detail = _classify_cvdp_local_timeout(
+        "pytest session started but simulator never initialized",
+        180,
+    )
+
+    assert status == "sim_error"
+    assert mismatches == -1
+    assert detail == "CVDP local simulation timeout after 180s"
+    assert _simulation_diagnostic_stage(status, detail) == "infrastructure"
 
 
 def test_cvdp_contract_lists_parameter_sweep_values():
