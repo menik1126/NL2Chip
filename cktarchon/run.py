@@ -509,6 +509,9 @@ def make_runner(
 
 def merge_agent_stats(total: AgentStats, extra: AgentStats) -> None:
     total.input_tokens += extra.input_tokens
+    total.uncached_input_tokens += extra.uncached_input_tokens
+    total.cache_creation_input_tokens += extra.cache_creation_input_tokens
+    total.cache_read_input_tokens += extra.cache_read_input_tokens
     total.output_tokens += extra.output_tokens
     total.turns += extra.turns
     total.compile_checks += extra.compile_checks
@@ -1097,6 +1100,9 @@ def process_problem_guided(
             "repair_turn_limit": turn_limit,
             "remaining_turns": budget.remaining,
             "repair_input_tokens": attempt_stats.input_tokens,
+            "repair_uncached_input_tokens": attempt_stats.uncached_input_tokens,
+            "repair_cache_creation_input_tokens": attempt_stats.cache_creation_input_tokens,
+            "repair_cache_read_input_tokens": attempt_stats.cache_read_input_tokens,
             "repair_output_tokens": attempt_stats.output_tokens,
             "repair_compile_checks": attempt_stats.compile_checks,
             "self_test_status": recorded_self_test_status,
@@ -1134,6 +1140,9 @@ def process_problem_guided(
         "prob_id": prob_id,
         "agent_turns": generation_stats.turns,
         "agent_input_tokens": all_stats.input_tokens,
+        "agent_uncached_input_tokens": all_stats.uncached_input_tokens,
+        "agent_cache_creation_input_tokens": all_stats.cache_creation_input_tokens,
+        "agent_cache_read_input_tokens": all_stats.cache_read_input_tokens,
         "agent_output_tokens": all_stats.output_tokens,
         "agent_compile_checks": all_stats.compile_checks,
         "agent_tool_counts": all_stats.tool_counts,
@@ -1148,6 +1157,9 @@ def process_problem_guided(
         "guided_self_test_enabled": self_test_enabled,
         "self_test_planner_turns": planner_stats.turns,
         "self_test_planner_input_tokens": planner_stats.input_tokens,
+        "self_test_planner_uncached_input_tokens": planner_stats.uncached_input_tokens,
+        "self_test_planner_cache_creation_input_tokens": planner_stats.cache_creation_input_tokens,
+        "self_test_planner_cache_read_input_tokens": planner_stats.cache_read_input_tokens,
         "self_test_planner_output_tokens": planner_stats.output_tokens,
         "self_test_planner_error": planner_error,
         "self_test_validation_error": self_test_validation_error,
@@ -1391,6 +1403,9 @@ def process_problem(
                 "repair_turn_limit": repair_turn_limit,
                 "remaining_turns": sim_feedback_turns_remaining,
                 "repair_input_tokens": repair_stats.input_tokens,
+                "repair_uncached_input_tokens": repair_stats.uncached_input_tokens,
+                "repair_cache_creation_input_tokens": repair_stats.cache_creation_input_tokens,
+                "repair_cache_read_input_tokens": repair_stats.cache_read_input_tokens,
                 "repair_output_tokens": repair_stats.output_tokens,
                 "repair_compile_checks": repair_stats.compile_checks,
             })
@@ -1437,6 +1452,15 @@ def process_problem(
         "prob_id": prob_id,
         "agent_turns": agent_stats.turns,
         "agent_input_tokens": agent_stats.input_tokens + repair_stats_total.input_tokens,
+        "agent_uncached_input_tokens": (
+            agent_stats.uncached_input_tokens + repair_stats_total.uncached_input_tokens
+        ),
+        "agent_cache_creation_input_tokens": (
+            agent_stats.cache_creation_input_tokens + repair_stats_total.cache_creation_input_tokens
+        ),
+        "agent_cache_read_input_tokens": (
+            agent_stats.cache_read_input_tokens + repair_stats_total.cache_read_input_tokens
+        ),
         "agent_output_tokens": agent_stats.output_tokens + repair_stats_total.output_tokens,
         "agent_compile_checks": agent_stats.compile_checks + repair_stats_total.compile_checks,
         "agent_tool_counts": {
@@ -1507,7 +1531,23 @@ def main() -> None:
         pool = None
 
     skill = search.load_skill()
-    summary = {"total": len(problems), "skipped": 0, "compile_pass": 0, "sim_pass": 0, "sim_fail": 0, "sim_error": 0, "agent_error": 0, "sim_feedback_attempts": 0, "sim_feedback_success": 0}
+    summary = {
+        "total": len(problems),
+        "skipped": 0,
+        "compile_pass": 0,
+        "sim_pass": 0,
+        "sim_fail": 0,
+        "sim_error": 0,
+        "agent_error": 0,
+        "sim_feedback_attempts": 0,
+        "sim_feedback_success": 0,
+        "tokens_in": 0,
+        "tokens_in_uncached": 0,
+        "tokens_in_cache_creation": 0,
+        "tokens_in_cache_read": 0,
+        "tokens_out": 0,
+        "turns": 0,
+    }
     summary_lock = Lock()
 
     indexed_problems: list[tuple[int, str]] = []
@@ -1568,6 +1608,12 @@ def main() -> None:
                     summary["sim_feedback_attempts"] += int(record.get("sim_feedback_iterations") or 0)
                     if record.get("sim_feedback_success"):
                         summary["sim_feedback_success"] += 1
+                    summary["tokens_in"] += int(record.get("agent_input_tokens") or 0)
+                    summary["tokens_in_uncached"] += int(record.get("agent_uncached_input_tokens") or 0)
+                    summary["tokens_in_cache_creation"] += int(record.get("agent_cache_creation_input_tokens") or 0)
+                    summary["tokens_in_cache_read"] += int(record.get("agent_cache_read_input_tokens") or 0)
+                    summary["tokens_out"] += int(record.get("agent_output_tokens") or 0)
+                    summary["turns"] += int(record.get("agent_turns_total") or 0)
                     status = record.get("sim_status")
                     if status == "sim_pass":
                         summary["sim_pass"] += 1
@@ -1582,6 +1628,12 @@ def main() -> None:
         if pool is not None:
             pool.close_all()
 
+    attempted = max(1, len(indexed_problems))
+    summary["avg_total_tokens"] = round(
+        (summary["tokens_in"] + summary["tokens_out"]) / attempted,
+        2,
+    )
+    summary["avg_turns"] = round(summary["turns"] / attempted, 2)
     summary.update({"dataset": args.dataset, "model": model_alias(args.model), "harness": args.harness, "run_dir": str(run_dir)})
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

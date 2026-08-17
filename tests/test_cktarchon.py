@@ -11,7 +11,7 @@ import pytest
 from cktarchon.codex_runner import CodexAgentHarnessRunner
 from cktarchon.env import ensure_runtime_env, model_alias
 from cktarchon.harness import AnthropicHarnessRunner, PathGuard
-from cktarchon.logs import append_jsonl, parse_agent_log
+from cktarchon.logs import append_jsonl, normalize_token_usage, parse_agent_log
 from cktarchon.run import (
     already_done,
     build_fresh_candidate_prompt,
@@ -255,6 +255,37 @@ def _anthropic_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Anthro
     )
 
 
+def test_harness_logs_anthropic_cache_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = _anthropic_runner(tmp_path, monkeypatch)
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=3,
+            cache_creation_input_tokens=1634,
+            cache_read_input_tokens=0,
+            output_tokens=16,
+        ),
+        content=[],
+        stop_reason="end_turn",
+    )
+    monkeypatch.setattr(runner, "_create_message_with_retries", lambda **_: response)
+
+    stats = runner.run("test prompt", max_turns=1)
+
+    assert stats.input_tokens == 1637
+    assert stats.uncached_input_tokens == 3
+    assert stats.cache_creation_input_tokens == 1634
+    assert stats.cache_read_input_tokens == 0
+    rows = [json.loads(line) for line in runner.log_path.read_text().splitlines()]
+    assistant = next(row for row in rows if row["event"] == "assistant")
+    session_end = next(row for row in rows if row["event"] == "session_end")
+    assert assistant["usage"]["input_tokens_total"] == 1637
+    assert session_end["input_tokens_total"] == 1637
+    assert session_end["cache_creation_input_tokens"] == 1634
+
+
 def test_harness_read_tools_expose_only_current_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -457,6 +488,9 @@ def test_parse_agent_log(tmp_path: Path):
     stats = parse_agent_log(log)
     assert stats.turns == 1
     assert stats.input_tokens == 10
+    assert stats.uncached_input_tokens == 10
+    assert stats.cache_creation_input_tokens == 0
+    assert stats.cache_read_input_tokens == 0
     assert stats.output_tokens == 2
     assert stats.compile_checks == 1
     assert stats.tool_counts == {"lean_check": 1}
@@ -472,9 +506,79 @@ def test_parse_codex_archon_log(tmp_path: Path):
     assert stats.session_id == "thread-1"
     assert stats.turns == 4
     assert stats.input_tokens == 10
+    assert stats.uncached_input_tokens == 7
+    assert stats.cache_creation_input_tokens == 0
+    assert stats.cache_read_input_tokens == 3
     assert stats.output_tokens == 2
     assert stats.compile_checks == 1
     assert stats.tool_counts == {"Bash": 1}
+
+
+def test_anthropic_cache_usage_is_counted_once(tmp_path: Path):
+    first = normalize_token_usage(
+        SimpleNamespace(
+            input_tokens=3,
+            cache_creation_input_tokens=1634,
+            cache_read_input_tokens=0,
+            output_tokens=16,
+        )
+    )
+    assert first == {
+        "input_tokens": 3,
+        "uncached_input_tokens": 3,
+        "cache_creation_input_tokens": 1634,
+        "cache_read_input_tokens": 0,
+        "input_tokens_total": 1637,
+        "output_tokens": 16,
+    }
+
+    log = tmp_path / "anthropic-cache.jsonl"
+    append_jsonl(log, {"event": "assistant", "turn": 0, "usage": first})
+    append_jsonl(
+        log,
+        {
+            "event": "assistant",
+            "turn": 1,
+            "usage": {
+                "input_tokens": 3,
+                "uncached_input_tokens": 3,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 2000,
+                "input_tokens_total": 2003,
+                "output_tokens": 8,
+            },
+        },
+    )
+    aggregate = {
+        "input_tokens": 6,
+        "uncached_input_tokens": 6,
+        "cache_creation_input_tokens": 1634,
+        "cache_read_input_tokens": 2000,
+        "input_tokens_total": 3640,
+        "output_tokens": 24,
+    }
+    append_jsonl(
+        log,
+        {
+            "event": "session_end",
+            "turns": 2,
+            "usage": aggregate,
+            **aggregate,
+        },
+    )
+
+    stats = parse_agent_log(log)
+    assert stats.turns == 2
+    assert stats.input_tokens == 3640
+    assert stats.uncached_input_tokens == 6
+    assert stats.cache_creation_input_tokens == 1634
+    assert stats.cache_read_input_tokens == 2000
+    assert stats.output_tokens == 24
+    assert stats.input_tokens == (
+        stats.uncached_input_tokens
+        + stats.cache_creation_input_tokens
+        + stats.cache_read_input_tokens
+    )
 
 
 def test_codex_runner_fails_loud_without_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

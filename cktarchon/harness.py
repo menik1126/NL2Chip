@@ -16,7 +16,7 @@ import anthropic
 
 from .env import ensure_runtime_env
 from .diagnostics import build_lean_diagnostics, format_lean_diagnostics
-from .logs import AgentStats, append_jsonl
+from .logs import AgentStats, append_jsonl, normalize_token_usage
 
 BASH_TIMEOUT = 180
 MAX_BASH_OUTPUT = 12000
@@ -376,12 +376,8 @@ class AnthropicHarnessRunner:
             except Exception:
                 self._autosave_last_complete_candidate()
                 raise
-            usage = {
-                "input_tokens": getattr(response.usage, "input_tokens", 0),
-                "output_tokens": getattr(response.usage, "output_tokens", 0),
-            }
-            stats.input_tokens += int(usage["input_tokens"] or 0)
-            stats.output_tokens += int(usage["output_tokens"] or 0)
+            usage = normalize_token_usage(response.usage)
+            stats.add_usage(usage)
             stats.turns = turn + 1
             append_jsonl(self.log_path, {
                 "event": "assistant",
@@ -432,7 +428,8 @@ class AnthropicHarnessRunner:
             "role": self.role,
             "prob_id": self.prob_id,
             "turns": stats.turns,
-            "usage": {"input_tokens": stats.input_tokens, "output_tokens": stats.output_tokens},
+            "usage": stats.usage_dict(),
+            **stats.usage_dict(),
             "tool_counts": stats.tool_counts,
             "compile_checks": stats.compile_checks,
             "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -838,15 +835,9 @@ class AnthropicTextRunner:
             for block in response.content
             if getattr(block, "type", None) == "text"
         ).strip()
-        usage = {
-            "input_tokens": getattr(response.usage, "input_tokens", 0),
-            "output_tokens": getattr(response.usage, "output_tokens", 0),
-        }
-        stats = AgentStats(
-            input_tokens=int(usage["input_tokens"] or 0),
-            output_tokens=int(usage["output_tokens"] or 0),
-            turns=1,
-        )
+        usage = normalize_token_usage(response.usage)
+        stats = AgentStats(turns=1)
+        stats.add_usage(usage)
         append_jsonl(self.log_path, {
             "event": "assistant",
             "turn": 0,
@@ -858,7 +849,8 @@ class AnthropicTextRunner:
             "event": "session_end",
             "role": self.role,
             "turns": 1,
-            "usage": usage,
+            "usage": stats.usage_dict(),
+            **stats.usage_dict(),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         })
         return text, stats

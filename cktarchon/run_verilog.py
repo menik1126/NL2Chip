@@ -278,6 +278,9 @@ def load_candidate(prob_id: str, info: Any, dataset_name: str, log_path: Path) -
 
 def merge_stats(total: AgentStats, extra: AgentStats) -> None:
     total.input_tokens += extra.input_tokens
+    total.uncached_input_tokens += extra.uncached_input_tokens
+    total.cache_creation_input_tokens += extra.cache_creation_input_tokens
+    total.cache_read_input_tokens += extra.cache_read_input_tokens
     total.output_tokens += extra.output_tokens
     total.turns += extra.turns
     total.compile_checks += extra.compile_checks
@@ -464,6 +467,9 @@ def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir:
         "agent_error": agent_error,
         "agent_turns_total": agent_stats.turns,
         "agent_input_tokens": agent_stats.input_tokens,
+        "agent_uncached_input_tokens": agent_stats.uncached_input_tokens,
+        "agent_cache_creation_input_tokens": agent_stats.cache_creation_input_tokens,
+        "agent_cache_read_input_tokens": agent_stats.cache_read_input_tokens,
         "agent_output_tokens": agent_stats.output_tokens,
         "agent_tool_counts": agent_stats.tool_counts,
         "agent_compile_checks": agent_stats.compile_checks,
@@ -496,6 +502,9 @@ def update_summary(run_dir: Path, total: int, records: list[dict[str, Any]], ski
         "sim_feedback_attempts": 0,
         "sim_feedback_success": 0,
         "tokens_in": 0,
+        "tokens_in_uncached": 0,
+        "tokens_in_cache_creation": 0,
+        "tokens_in_cache_read": 0,
         "tokens_out": 0,
         "turns": 0,
     }
@@ -515,6 +524,9 @@ def update_summary(run_dir: Path, total: int, records: list[dict[str, Any]], ski
         if row.get("sim_feedback_success"):
             summary["sim_feedback_success"] += 1
         summary["tokens_in"] += int(row.get("agent_input_tokens") or 0)
+        summary["tokens_in_uncached"] += int(row.get("agent_uncached_input_tokens") or 0)
+        summary["tokens_in_cache_creation"] += int(row.get("agent_cache_creation_input_tokens") or 0)
+        summary["tokens_in_cache_read"] += int(row.get("agent_cache_read_input_tokens") or 0)
         summary["tokens_out"] += int(row.get("agent_output_tokens") or 0)
         summary["turns"] += int(row.get("agent_turns_total") or 0)
     attempted = max(1, len(records))
