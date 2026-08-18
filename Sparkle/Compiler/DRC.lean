@@ -18,6 +18,7 @@ def findDriver (body : List Stmt) (wireName : String) : Option Stmt :=
     | .assignExpr (.ref lhs) _ => lhs == wireName
     | .assignExpr _ _ => false
     | .generateFor .. => false
+    | .signedDot output .. => output == wireName
     | .register output .. => output == wireName
     | .memory (readData := rd) .. => rd == wireName
     | .inst _ instName _ _ => instName == wireName

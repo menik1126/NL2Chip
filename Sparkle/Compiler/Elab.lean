@@ -123,6 +123,13 @@ def emitGenerateFor (label index : String) (start stop : DimExpr)
   let ((), cs') := CircuitM.emitGenerateFor label index start stop body cs
   set cs'
 
+def emitSignedDot (output : String) (lhs rhs : Sparkle.IR.AST.Expr)
+    (laneCount lhsWidth rhsWidth resultWidth : DimExpr) : CompilerM Unit := do
+  let cs ← get
+  let ((), cs') := CircuitM.emitSignedDot output lhs rhs
+    laneCount lhsWidth rhsWidth resultWidth cs
+  set cs'
+
 def addInput (name : String) (ty : HWType) : CompilerM Unit := do
   let cs ← get
   let ((), cs') := CircuitM.addInput name ty cs
@@ -235,6 +242,8 @@ def primitiveRegistry : List (Name × Sparkle.IR.AST.Operator) :=
     (``HSub.hSub, .sub),
     (``BitVec.mul, .mul),
     (``HMul.hMul, .mul),
+    (``Sparkle.Core.Signal.Signal.udiv, .udiv),
+    (``Sparkle.Core.Signal.Signal.sdiv, .sdiv),
     (``HMod.hMod, .mod),
     -- Comparison operations (unsigned)
     (``BitVec.ult, .lt_u),
@@ -483,6 +492,30 @@ def makeSliceFromStartLength (source : Sparkle.IR.AST.Expr)
     (start length : DimExpr) : Sparkle.IR.AST.Expr :=
   let hi := DimExpr.mkSub (DimExpr.mkAdd start length) (.literal 1)
   makeSliceExpr source hi start
+
+/-- Rewrite a child-module dimension into the parent module's parameter
+    namespace using the bindings attached to the child instance. -/
+partial def bindChildDimension
+    (bindings : List (String × DimExpr)) : DimExpr → DimExpr
+  | .literal value => .literal value
+  | .parameter name => bindings.lookup name |>.getD (.parameter name)
+  | .add lhs rhs => DimExpr.mkAdd
+      (bindChildDimension bindings lhs) (bindChildDimension bindings rhs)
+  | .sub lhs rhs => DimExpr.mkSub
+      (bindChildDimension bindings lhs) (bindChildDimension bindings rhs)
+  | .mul lhs rhs => DimExpr.mkMul
+      (bindChildDimension bindings lhs) (bindChildDimension bindings rhs)
+  | .div lhs rhs => .div
+      (bindChildDimension bindings lhs) (bindChildDimension bindings rhs)
+  | .mod lhs rhs => .mod
+      (bindChildDimension bindings lhs) (bindChildDimension bindings rhs)
+  | .pow base exponent => .pow
+      (bindChildDimension bindings base) (bindChildDimension bindings exponent)
+  | .clog2 value => .clog2 (bindChildDimension bindings value)
+  | .min lhs rhs => .min
+      (bindChildDimension bindings lhs) (bindChildDimension bindings rhs)
+  | .max lhs rhs => .max
+      (bindChildDimension bindings lhs) (bindChildDimension bindings rhs)
 
 /-- Helper to extract a Nat literal or OfNat.ofNat wrap. -/
 partial def extractNat (e : Lean.Expr) : CompilerM Nat := do
@@ -2105,6 +2138,14 @@ mutual
       let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
       let indexName := resultWire ++ "_index"
       let indexDimension : DimExpr := .parameter indexName
+      let childIndexWidth := bindChildDimension parameterBindings
+        childInputs[0]!.ty.bitWidthDim
+      let indexValuesWidth := .mul laneCount childIndexWidth
+      let indexValuesWire ← CompilerM.makeWire (resultWire ++ "_indices")
+        (hwTypeFromDim indexValuesWidth)
+      let indexValueStart := .mul indexDimension childIndexWidth
+      let indexValue := makeSliceFromStartLength
+        (.ref indexValuesWire) indexValueStart childIndexWidth
       let inputStart := .mul indexDimension inputLaneWidth
       let inputSlice := makeSliceFromStartLength (.ref inputWire) inputStart inputLaneWidth
       let outputStart := .mul indexDimension outputLaneWidth
@@ -2113,9 +2154,28 @@ mutual
       let childData := childInputs[1]!
       let childOutput := childModule.outputs.head!
       CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0) laneCount
-        [.inst childModule.name ("inst_" ++ childModule.name)
-          [(childIndex.name, .ref indexName), (childData.name, inputSlice),
+        [.assignExpr indexValue (.dimension indexDimension),
+         .inst childModule.name ("inst_" ++ childModule.name)
+          [(childIndex.name, indexValue), (childData.name, inputSlice),
            (childOutput.name, outputSlice)] parameterBindings]
+      return some resultWire
+    return none
+
+  /-- Lower a signed dot product over two parameterized packed lane vectors. -/
+  partial def handleSignedDotChunks (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.signedDotChunks && args.size >= 6 then
+      let lhsWidth ← extractDimExpr args[args.size - 6]!
+      let rhsWidth ← extractDimExpr args[args.size - 5]!
+      let laneCount ← extractDimExpr args[args.size - 3]!
+      let lhsWire ← translateExprToWire args[args.size - 2]! "signed_dot_lhs"
+      let rhsWire ← translateExprToWire args.back! "signed_dot_rhs"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      CompilerM.emitSignedDot resultWire (.ref lhsWire) (.ref rhsWire)
+        laneCount lhsWidth rhsWidth hwType.bitWidthDim
       return some resultWire
     return none
 
@@ -2164,14 +2224,73 @@ mutual
       let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
       let indexName := resultWire ++ "_index"
       let indexDimension : DimExpr := .parameter indexName
+      let childIndexWidth := bindChildDimension parameterBindings
+        childInputs[0]!.ty.bitWidthDim
+      let indexValuesWidth := .mul hwType.bitWidthDim childIndexWidth
+      let indexValuesWire ← CompilerM.makeWire (resultWire ++ "_indices")
+        (hwTypeFromDim indexValuesWidth)
+      let indexValueStart := .mul indexDimension childIndexWidth
+      let indexValue := makeSliceFromStartLength
+        (.ref indexValuesWire) indexValueStart childIndexWidth
       let outputBit : Sparkle.IR.AST.Expr :=
         .sliceDim (.ref resultWire) indexDimension indexDimension
       CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0)
         hwType.bitWidthDim
-        [.inst childModule.name ("inst_" ++ childModule.name)
-          [(childInputs[0]!.name, .ref indexName),
+        [.assignExpr indexValue (.dimension indexDimension),
+         .inst childModule.name ("inst_" ++ childModule.name)
+          [(childInputs[0]!.name, indexValue),
            (childInputs[1]!.name, .ref inputWire),
            (childModule.outputs.head!.name, outputBit)] parameterBindings]
+      return some resultWire
+    return none
+
+  /-- Lower a named index/full-input-to-chunk module across every output lane. -/
+  partial def handleGenerateChunksWithIndex (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.generateChunksWithIndex && args.size >= 3 then
+      let laneCount ← extractDimExpr args[args.size - 3]!
+      let function := args[args.size - 2]!
+      let functionName ← match function.getAppFn with
+        | .const fnName _ => pure fnName
+        | _ => CompilerM.liftMetaM $ throwError
+          "Signal.generateChunksWithIndex requires a named top-level index/data-to-chunk module"
+      let (childDefaults, parameterBindings) ←
+        definitionParameterBindings functionName function.getAppArgs
+      let (childModule, childDesign) ← CompilerM.liftMetaM $
+        synthesizeCombinationalWithParameters functionName childDefaults
+      for module in childDesign.modules do CompilerM.addModuleToDesign module
+      CompilerM.addModuleToDesign childModule
+      let childInputs := childModule.inputs.filter
+        (fun port => port.name != "clk" && port.name != "rst")
+      if childInputs.length != 2 || childModule.outputs.length != 1 then
+        CompilerM.liftMetaM $ throwError
+          "Signal.generateChunksWithIndex requires exactly index, packed data, and one chunk output"
+      let inputWire ← translateExprToWire args.back! "generate_chunks_input"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let outputLaneWidth := .div hwType.bitWidthDim laneCount
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      let indexName := resultWire ++ "_index"
+      let indexDimension : DimExpr := .parameter indexName
+      let childIndexWidth := bindChildDimension parameterBindings
+        childInputs[0]!.ty.bitWidthDim
+      let indexValuesWidth := .mul laneCount childIndexWidth
+      let indexValuesWire ← CompilerM.makeWire (resultWire ++ "_indices")
+        (hwTypeFromDim indexValuesWidth)
+      let indexValueStart := .mul indexDimension childIndexWidth
+      let indexValue := makeSliceFromStartLength
+        (.ref indexValuesWire) indexValueStart childIndexWidth
+      let outputStart := .mul indexDimension outputLaneWidth
+      let outputSlice := makeSliceFromStartLength
+        (.ref resultWire) outputStart outputLaneWidth
+      CompilerM.emitGenerateFor (resultWire ++ "_generate") indexName (.literal 0)
+        laneCount
+        [.assignExpr indexValue (.dimension indexDimension),
+         .inst childModule.name ("inst_" ++ childModule.name)
+          [(childInputs[0]!.name, indexValue),
+           (childInputs[1]!.name, .ref inputWire),
+           (childModule.outputs.head!.name, outputSlice)] parameterBindings]
       return some resultWire
     return none
 
@@ -2330,6 +2449,8 @@ mutual
       if let some w ← handleIotaVector1 e name args hint isNamed then return w
       if let some w ← handleMapChunks e name args hint isNamed then return w
       if let some w ← handleMapChunksWithIndex e name args hint isNamed then return w
+      if let some w ← handleSignedDotChunks e name args hint isNamed then return w
+      if let some w ← handleGenerateChunksWithIndex e name args hint isNamed then return w
       if let some w ← handleGenerateBitsWithIndex e name args hint isNamed then return w
       if let some w ← handleScatterNonPowerOfTwoBits e name args hint isNamed then return w
       if let some w ← handleParityByIndexMask e name args hint isNamed then return w

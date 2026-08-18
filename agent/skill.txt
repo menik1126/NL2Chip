@@ -176,8 +176,16 @@ top-level-binder error and does not form a P3 generic module.
 
   def indexedIdentity {dom : DomainConfig} {W : Nat}
       (data : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
-    Signal.generateBitsWithIndex indexedSelectBit data
+  Signal.generateBitsWithIndex indexedSelectBit data
   ```
+- When each output *lane* depends on its output-lane index and the complete
+  packed input, use `Signal.generateChunksWithIndex`. The named helper returns
+  one `OUTW`-bit lane, and the result contains a separately chosen symbolic
+  number of lanes. This is the general primitive for lane-count-changing
+  layouts, indexed rearrangement, interpolation, and table lookup. Lane zero
+  occupies the least-significant output chunk. Unlike `mapChunksWithIndex`, it
+  does not split the input into the same number of lanes. Do not emulate this
+  with a packed multiply or Lean recursion.
 - Extended-Hamming layouts with overall parity at position zero, indexed
   parity at positions 1, 2, 4, ..., and payload in all other positions have
   verified generic helpers in `Sparkle.Library.RTL`:
@@ -217,6 +225,25 @@ top-level-binder error and does not form a P3 generic module.
   that counts after a running countdown reaches zero must also require the
   running/completed state, because `value == 0` is already true in the reset
   state.
+- For a multi-cycle datapath, write an edge table before choosing registers:
+  current state, next state, newly computed result, internal result buffer,
+  externally visible result, and done/valid. All registers sample old values at
+  the same edge. If the public result is specified one cycle after an internal
+  computation, model an internal buffer and a separate visible-output register;
+  one tuple field cannot represent both timing levels. Likewise, derive
+  done/valid from the contract's visible cycle instead of assuming that entering
+  the DONE state, updating results, and asserting done all occur together.
+  This pattern is generic for buffered FSMs and pipelines: keep state/control,
+  internal datapath storage, and public output storage as distinct feedback
+  fields, reset each explicitly, and update each from the pre-edge state.
+- When translating a clocked software reference that first publishes an old
+  buffer and then mutates that buffer, preserve that ordering literally:
+  `nextVisible := oldBuffer`, while `nextBuffer := f oldState currentInputs`.
+  Do this on every edge, including IDLE and DONE; do not gate publication only
+  on the state that originally computed the value. A common symptom of the
+  wrong translation is correct data one cycle before `done`, followed by zero
+  data in the `done` cycle. Count latency from the accepting edge: values
+  observed immediately after that edge are at latency 1, not latency 0.
 - Sparkle can emit the implicit domain `rst` together with an explicit
   `_gen_rst` when reset is also a function argument. The CVDP wrapper connects
   both by name and applies the inferred polarity; two inner reset ports alone
@@ -294,9 +321,67 @@ operations:
 - Use signedMulWide for a full signed product, signedMulTrunc when only the
   low result bits are required, and signedMulShiftTrunc for fixed-point
   multiply/shift/truncate.
+- When a symbolic result width is written differently from the natural helper
+  type, use `signedAddTo`, `signedSubTo`, or `signedMulTo` and let the expected
+  result type choose the width. This avoids dependent-type failures such as
+  `W + W` versus `2 * W`; do not add casts or proofs for those equalities.
+- Use `signedDivOr`/`unsignedDivOr` for same-width division with explicit
+  divide-by-zero behavior. Use `signedDivOrTo`/`unsignedDivOrTo` when operands,
+  work width, and result width differ.
+- Rounding policy is part of the circuit contract. `signedMeanTowardZeroTo`
+  matches signed SystemVerilog `/ 2`; `signedMeanFloorTo` matches arithmetic
+  right shift. They differ for a negative odd sum. For a general power-of-two
+  rescale toward zero, use `signedDivPow2TowardZeroTo`.
+- Use `signedAbsTo` for two's-complement magnitude at an explicit output width.
+  The output must be one bit wider when the most-negative input magnitude must
+  be representable.
+- For packed DSP lanes, use `signedDotPacked` for a signed dot product and
+  `signedSumPacked` for a signed reduction. Lane zero is the least-significant
+  chunk. Supply `lanes`, lane widths, and accumulator width explicitly when
+  Lean cannot infer how a symbolic packed width is factorized.
+- When the contract pairs one packed operand with the other operand in reverse
+  lane order (common in FIR/convolution windows), use `reversePackedLanes`
+  before `signedDotPacked`. It reverses lane order while preserving the bits
+  inside every lane and retains both symbolic lane count and lane width:
+  ```lean
+  let coeffsReversed : Signal dom (BitVec (TAPS * COEFFW)) :=
+    reversePackedLanes (LANES := TAPS) coeffs
+  let sum : Signal dom (BitVec ACCW) :=
+    signedDotPacked (lanes := TAPS) (lhsW := DATAW)
+      (rhsW := COEFFW) samples coeffsReversed
+  ```
+  Do not use whole-vector `reverseBits` alone for lane reversal: that also
+  reverses every coefficient's internal bit order.
 - Use signedSaturate or signedSaturateC to clamp a signed value before a
   narrowing truncation. Bounds must have the same width as the value and be
   encoded in two's complement.
+
+Before coding a fixed-point datapath, write a short width ledger in comments:
+for every input, product, accumulator, scaled value, and output, record its
+signedness, total width, fractional-bit count, rounding rule, and narrowing
+point. Build the Lean types from that ledger. Do not silently use `zext`, a
+logical shift, or low-bit truncation where the ledger requires signed widening,
+toward-zero division, saturation, or a wider accumulator.
+
+For registered symbolic-width DSP, keep the derived widths in every state
+field; never replace them with the default parameter value. A stable pattern
+is:
+```lean
+let product : Signal dom (BitVec (2 * W)) := signedMulTo lhs rhs
+let lhsWide : Signal dom (BitVec (W + 1)) := signExtend lhs
+let biasWide : Signal dom (BitVec (W + 1)) := signExtend bias
+let shifted := arithShiftRightC lhsWide (BitVec.ofNat (W + 1) 2)
+let sum : Signal dom (BitVec (W + 1)) := biasWide + shifted
+Signal.loop fun state =>
+  let heldProduct := Signal.mux enable product state.fst
+  let heldSum := Signal.mux enable sum state.snd.fst
+  Signal.register
+    (BitVec.ofNat (2 * W) 0, BitVec.ofNat (W + 1) 0)
+    (bundle2 heldProduct heldSum)
+```
+If `W` or a lane count comes from the public contract, retain it with the
+parameterized synthesis command; a fixed `BitVec 16` core behind a wrapper
+parameter is not parameterized hardware.
 
 ~~~lean
 def exampleQ4Multiply {dom : DomainConfig}

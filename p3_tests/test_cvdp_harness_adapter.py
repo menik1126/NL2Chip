@@ -90,7 +90,10 @@ async def test_divider(dut):
     ) in source
     assert manifest["harness_profile"] == CVDP_HARNESS_PROFILE_RACE_SAFE
     assert manifest["harness_profile_overrides"] == {}
-    assert manifest["effective_options"] == options
+    assert manifest["effective_options"] == {
+        **options,
+        "emit_assertion_trace": False,
+    }
 
 
 def test_reset_inference_evaluates_active_false_at_call_site():

@@ -14,6 +14,19 @@ def indexedGenerateIdentity {dom : DomainConfig} {W : Nat}
     (data : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
   Signal.generateBitsWithIndex indexedSelectBit data
 
+@[sparkle_module]
+def indexedLaneValue {dom : DomainConfig} {INDEXW INW OUTW : Nat}
+    (index : Signal dom (BitVec INDEXW))
+    (data : Signal dom (BitVec INW)) : Signal dom (BitVec OUTW) :=
+  let dataBit : Signal dom (BitVec 1) := Signal.cast data
+  let dataWide : Signal dom (BitVec OUTW) := zext dataBit
+  let indexWide : Signal dom (BitVec OUTW) := Signal.cast index
+  indexWide ^^^ dataWide
+
+def indexedGenerateChunks {dom : DomainConfig} {N : Nat}
+    (data : Signal dom (BitVec 8)) : Signal dom (BitVec (N * 4)) :=
+  Signal.generateChunksWithIndex (INDEXW := 8) indexedLaneValue data
+
 def indexedScatter {dom : DomainConfig} {DATAW PARITYW : Nat}
     (data : Signal dom (BitVec DATAW))
     : Signal dom (BitVec (DATAW + PARITYW + 1)) :=

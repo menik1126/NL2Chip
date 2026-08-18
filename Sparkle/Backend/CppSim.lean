@@ -105,6 +105,8 @@ def emitCppOperator (op : Operator) : String :=
   | .add => "+"
   | .sub => "-"
   | .mul => "*"
+  | .udiv => "/"
+  | .sdiv => "/"
   | .mod => "%"
   | .eq  => "=="
   | .lt_u => "<"
@@ -271,6 +273,19 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
       | .lt_s | .le_s | .gt_s | .ge_s =>
         let w := inferExprWidth typeMap arg1
         s!"({emitSignedValue (emitExpr typeMap arg1) w} {emitCppOperator operator} {emitSignedValue (emitExpr typeMap arg2) w} ? 1 : 0)"
+      | .udiv =>
+        let lhs := emitExpr typeMap arg1
+        let rhs := emitExpr typeMap arg2
+        s!"(({rhs} == 0) ? 0 : ({lhs} / {rhs}))"
+      | .sdiv =>
+        let w := inferExprWidth typeMap arg1
+        let lhs := emitSignedValue (emitExpr typeMap arg1) w
+        let rhs := emitSignedValue (emitExpr typeMap arg2) w
+        let minValue := if w == 0 then "0"
+          else if w == 64 then "((int64_t)(1ULL << 63))"
+          else s!"(-((int64_t)(1ULL << {w - 1})))"
+        s!"(({rhs} == 0) ? 0 : (({lhs} == {minValue} && {rhs} == -1) ? " ++
+          s!"{lhs} : ({lhs} / {rhs})))"
       | .asr =>
         let w := inferExprWidth typeMap arg1
         s!"({emitSignedValue (emitExpr typeMap arg1) w} >> {emitExpr typeMap arg2})"
@@ -383,6 +398,41 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
 
   | .generateFor label .. =>
     panic! s!"CppSim requires specialization of generate loop '{label}'"
+
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    let lanes := requireConcreteDim "signed dot-product lane count" laneCount
+    let lhsW := requireConcreteDim "signed dot-product lhs lane width" lhsWidth
+    let rhsW := requireConcreteDim "signed dot-product rhs lane width" rhsWidth
+    let accW := requireConcreteDim "signed dot-product result width" resultWidth
+    let lhsTotalW := inferExprWidth typeMap lhs
+    let rhsTotalW := inferExprWidth typeMap rhs
+    if lhsW == 0 || rhsW == 0 || accW == 0 then
+      panic! "CppSim signed dot product requires positive lane and result widths"
+    else if lhsTotalW > 64 || rhsTotalW > 64 || accW > 64 then
+      panic! "CppSim signed dot product currently supports packed inputs and results up to 64 bits"
+    else
+      let outputName := sanitizeName output
+      let indexName := sanitizeName (output ++ "_dot_index")
+      let laneExpr (packed : Expr) (width : Nat) : String :=
+        let shifted := s!"((uint64_t)({emitExpr typeMap packed}) >> ({indexName} * {width}))"
+        if width == 64 then shifted
+        else s!"({shifted} & ((1ULL << {width}) - 1))"
+      let lhsSigned := emitSignedValue (laneExpr lhs lhsW) lhsW
+      let rhsSigned := emitSignedValue (laneExpr rhs rhsW) rhsW
+      let rawUpdate :=
+        s!"((int64_t){emitSignedValue outputName accW} + " ++
+          s!"((int64_t){lhsSigned} * (int64_t){rhsSigned}))"
+      let updated := applyMask rawUpdate accW
+      let body :=
+        s!"        {outputName} = 0;\n" ++
+        s!"        for (size_t {indexName} = 0; {indexName} < {lanes}; ++{indexName}) {ob}\n" ++
+        s!"            {outputName} = {updated};\n" ++
+        s!"        {cb}"
+      { declarations := []
+      , evalBody := [body]
+      , tickBody := []
+      , resetBody := []
+      , evalTickLocals := [] }
 
   | .register output _clock _reset input initValue =>
     let width := lookupWidth typeMap output

@@ -196,6 +196,27 @@ opaque mapChunksWithIndex {INDEXW INW OUTW N : Nat}
     (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
     (s : Signal dom (BitVec (N * INW))) : Signal dom (BitVec (N * OUTW))
 
+/-- Simulation implementation for a signed packed-lane dot product. Lane zero
+    occupies the least-significant chunk in each packed input. -/
+private def signedDotChunksImpl {LHSW RHSW ACCW N : Nat}
+    (lhs : Signal dom (BitVec (N * LHSW)))
+    (rhs : Signal dom (BitVec (N * RHSW))) : Signal dom (BitVec ACCW) :=
+  ⟨fun t =>
+    let total := (List.range N).foldl (fun acc index =>
+      let lhsLane := BitVec.extractLsb' (index * LHSW) LHSW (lhs.val t)
+      let rhsLane := BitVec.extractLsb' (index * RHSW) RHSW (rhs.val t)
+      acc + lhsLane.toInt * rhsLane.toInt
+    ) (0 : Int)
+    BitVec.ofInt ACCW total⟩
+
+/-- Signed dot product over two packed lane vectors. Products and the running
+    sum use two's-complement semantics, and the final sum wraps at `ACCW` bits.
+    Synthesis lowers this intrinsic to a parameterized SystemVerilog loop. -/
+@[implemented_by signedDotChunksImpl]
+opaque signedDotChunks {LHSW RHSW ACCW N : Nat}
+    (lhs : Signal dom (BitVec (N * LHSW)))
+    (rhs : Signal dom (BitVec (N * RHSW))) : Signal dom (BitVec ACCW)
+
 /-- Simulation implementation for index-driven bit generation. -/
 private def generateBitsWithIndexImpl {INDEXW INW OUTW : Nat}
     (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec 1))
@@ -219,6 +240,27 @@ private def generateBitsWithIndexImpl {INDEXW INW OUTW : Nat}
 opaque generateBitsWithIndex {INDEXW INW OUTW : Nat}
     (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec 1))
     (s : Signal dom (BitVec INW)) : Signal dom (BitVec OUTW)
+
+/-- Simulation implementation for index-driven packed-lane generation. -/
+private def generateChunksWithIndexImpl {INDEXW INW OUTW N : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec INW)) : Signal dom (BitVec (N * OUTW)) :=
+  let lanes := (List.range N).map fun index =>
+    f ⟨fun _ => BitVec.ofNat INDEXW index⟩ s
+  ⟨fun time => BitVec.ofNat (N * OUTW) <|
+    (List.range N).zip lanes |>.foldl (fun result (index, lane) =>
+      result + (lane.val time).toNat * 2 ^ (index * OUTW)
+    ) 0⟩
+
+/-- Generate every packed output lane with a named Sparkle module that receives
+    the zero-based output-lane index and the complete packed input. Unlike
+    `mapChunksWithIndex`, the input is not split and the number of output lanes
+    is independent of the input layout. Lane zero occupies the least-significant
+    output chunk. -/
+@[implemented_by generateChunksWithIndexImpl]
+opaque generateChunksWithIndex {INDEXW INW OUTW N : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec INW)) : Signal dom (BitVec (N * OUTW))
 
 /-- Apply a signal of functions to a signal of values -/
 def ap (sf : Signal dom (α → β)) (s : Signal dom α) : Signal dom β :=
@@ -478,6 +520,25 @@ def Signal.uge (a b : Signal dom (BitVec n)) : Signal dom Bool :=
 /-- Arithmetic shift right on BitVec signals. -/
 def Signal.ashr (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
   (fun x y => BitVec.sshiftRight x y.toNat) <$> a <*> b
+
+/-- Simulation implementation for unsigned packed-vector division. -/
+private def udivImpl (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
+  (BitVec.udiv · ·) <$> a <*> b
+
+/-- Unsigned packed-vector division. Division by zero follows Lean's BitVec
+    convention and returns zero. Prefer a `*DivOr` library helper when the
+    zero-denominator behavior is part of the circuit contract. -/
+@[implemented_by udivImpl]
+opaque Signal.udiv (a b : Signal dom (BitVec n)) : Signal dom (BitVec n)
+
+/-- Simulation implementation for signed two's-complement division. -/
+private def sdivImpl (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
+  (BitVec.sdiv · ·) <$> a <*> b
+
+/-- Signed two's-complement division with truncation toward zero. Division by
+    zero follows Lean's BitVec convention and returns zero. -/
+@[implemented_by sdivImpl]
+opaque Signal.sdiv (a b : Signal dom (BitVec n)) : Signal dom (BitVec n)
 
 -- Mixed constant variants for slt/ult/ashr
 def Signal.sltC (a : Signal dom (BitVec n)) (b : BitVec n) : Signal dom Bool :=

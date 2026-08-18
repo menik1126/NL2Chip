@@ -187,6 +187,8 @@ partial def countAllUses (stmts : List Stmt)
     | .assign _ rhs => countExprUses rhs counts
     | .assignExpr lhs rhs => countExprUses rhs (countExprUses lhs counts)
     | .generateFor _ _ _ _ body => countAllUses body counts
+    | .signedDot _ lhs rhs _ _ _ _ =>
+      countExprUses rhs (countExprUses lhs counts)
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
@@ -200,6 +202,9 @@ partial def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
   | .assignExpr lhs rhs => .assignExpr (optimizeExpr dm wm lhs) (optimizeExpr dm wm rhs)
   | .generateFor label index start stop body =>
     .generateFor label index start stop (body.map (optimizeStmt dm wm))
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    .signedDot output (optimizeExpr dm wm lhs) (optimizeExpr dm wm rhs)
+      laneCount lhsWidth rhsWidth resultWidth
   | .register output clock reset input initValue =>
     .register output clock reset (optimizeExpr dm wm input) (optimizeExpr dm wm initValue)
   | .memory name aw dw clk wa wd we ra rd cr =>
@@ -237,6 +242,11 @@ partial def substituteStmt (dm : DefMap) (inlinable : HashMap String Bool) : Stm
       (substituteExpr dm inlinable 100 rhs)
   | .generateFor label index start stop body =>
     .generateFor label index start stop (body.map (substituteStmt dm inlinable))
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    .signedDot output
+      (substituteExpr dm inlinable 100 lhs)
+      (substituteExpr dm inlinable 100 rhs)
+      laneCount lhsWidth rhsWidth resultWidth
   | .register output clock reset input initValue =>
     .register output clock reset (substituteExpr dm inlinable 100 input)
       (substituteExpr dm inlinable 100 initValue)

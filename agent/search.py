@@ -22,6 +22,7 @@ import sys
 import time
 import threading
 import textwrap
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -428,7 +429,8 @@ def _infer_cvdp_reset_polarities(harness_files: dict, reset_names: list[str]) ->
 
 
 def _format_port(direction: str, typ: str, name: str, reset_polarities: dict[str, str] | None = None) -> str:
-    width = _port_width_bits(typ)
+    type_text = str(typ or "").strip()
+    width = _port_width_bits(type_text)
     kind = _port_kind(name)
     suffix = []
     if width != 1:
@@ -438,7 +440,11 @@ def _format_port(direction: str, typ: str, name: str, reset_polarities: dict[str
     elif kind:
         suffix.append(kind)
     tail = f" ({', '.join(suffix)})" if suffix else ""
-    return f"{direction} {name}: {typ or 'logic'}{tail}"
+    rendered_type = type_text or (
+        "width unspecified by the public interface; infer it from the "
+        "behavioral specification instead of assuming 1 bit"
+    )
+    return f"{direction} {name}: {rendered_type}{tail}"
 
 
 def _clean_prompt_cell(text: str) -> str:
@@ -452,10 +458,11 @@ def _prompt_size_to_type(size_text: str) -> str:
     size = _clean_prompt_cell(size_text)
     if not size:
         return "logic"
-    lower = size.lower()
-    if re.search(r"\b1\s*-?\s*(?:bit|bits?)?\b", lower) and not re.search(r"[\w$]\s*[*+:-]", size):
-        return "logic"
-    m = re.search(r"\b(\d+)\s*-?\s*(?:bit|bits?)\b", lower)
+    lower = size.lower().strip()
+    # A trailing constant in a symbolic expression is not a fixed width.  In
+    # particular, DATA_WIDTH+1 bits must not be mistaken for the substring
+    # "1 bit" and collapsed to a scalar port.
+    m = re.fullmatch(r"(\d+)\s*-?\s*(?:bit|bits?)?", lower)
     if m:
         width = int(m.group(1))
         return "logic" if width <= 1 else f"logic [{width - 1}:0]"
@@ -922,12 +929,14 @@ def _benchmark_expected_ports(info: ProblemInfo | None) -> list[tuple[str, str, 
         seen = {name for _, _, name in expected_ports}
         for name in sorted(harness_usage["ports"] - seen):
             direction = "input" if name in harness_usage["inputs"] or _port_kind(name) in {"clock", "reset"} else "output"
-            expected_ports.append((direction, "logic", name))
+            typ = "logic" if _port_kind(name) in {"clock", "reset"} else ""
+            expected_ports.append((direction, typ, name))
         return expected_ports
 
     for name in sorted(harness_usage["ports"]):
         direction = "input" if name in harness_usage["inputs"] or _port_kind(name) in {"clock", "reset"} else "output"
-        expected_ports.append((direction, "logic", name))
+        typ = "logic" if _port_kind(name) in {"clock", "reset"} else ""
+        expected_ports.append((direction, typ, name))
     return expected_ports
 
 
@@ -1252,6 +1261,20 @@ def build_user_message(
     native_plan = native_plan_from_dict(
         (info.metadata or {}).get("native_parameter_sweep_plan") if info else None
     )
+    inferred_native_plan = False
+    if (
+        native_plan is None
+        and plan is None
+        and info is not None
+        and (info.metadata or {}).get("dataset") == "cvdp"
+    ):
+        discovered = discover_finite_parameter_plan(
+            design_name=design_name,
+            harness_files=(info.metadata or {}).get("harness_files", {}) or {},
+        )
+        if discovered.supported:
+            native_plan = discovered
+            inferred_native_plan = True
 
     # VerilogEval uses TopModule via wrapper; other datasets instantiate the named DUT.
     if dataset_name == "verilogeval":
@@ -1346,6 +1369,8 @@ def build_user_message(
         if interface_contract else ""
     )
     specialization_contract = finite_parameter_specialization_contract(info)
+    if not specialization_contract and inferred_native_plan and native_plan is not None:
+        specialization_contract = format_native_parameter_contract(native_plan)
     specialization_section = (
         f"{specialization_contract}\n\n" if specialization_contract else ""
     )
@@ -1736,6 +1761,30 @@ def extract_cvdp_progress_snapshots(
     return truncate_text("\n".join(snapshots), max_chars, keep="head")
 
 
+def extract_cvdp_assertion_traces(
+    detail: str | None,
+    *,
+    max_traces: int = 12,
+    max_chars: int = 4200,
+) -> str:
+    """Return bounded actual/expected traces from a non-scoring replay."""
+
+    text = clean_diagnostic_text(detail)
+    if not text:
+        return ""
+    traces: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("[CVDP_ASSERTION_TRACE ") or line in seen:
+            continue
+        seen.add(line)
+        traces.append(line)
+        if len(traces) >= max_traces:
+            break
+    return truncate_text("\n".join(traces), max_chars, keep="head")
+
+
 def semantic_repair_hints(
     result: dict,
     info: ProblemInfo | None,
@@ -1788,6 +1837,39 @@ def semantic_repair_hints(
             "start advancing immediately after reset."
         )
 
+    result_outputs = {
+        name for name in expected_outputs
+        if re.search(r"(?:result|output|data_out|sum|product)", name, re.IGNORECASE)
+    }
+    completion_outputs = {
+        name for name in expected_outputs
+        if re.search(r"(?:done|valid|ready)", name, re.IGNORECASE)
+    }
+    state_outputs = {
+        name for name in expected_outputs
+        if re.search(r"(?:current|next)?_?state", name, re.IGNORECASE)
+    }
+    if (
+        result.get("sim_status") == "sim_fail"
+        and result_outputs
+        and completion_outputs
+        and state_outputs
+    ):
+        hints.append(
+            "Build an edge-by-edge timing table for state, internal result, visible "
+            "result, and done/valid before changing arithmetic. In synchronous RTL, "
+            "every register observes the old right-hand-side value at an edge. If "
+            "the contract delays visible outputs relative to computation, keep an "
+            "internal result buffer and a separate visible-output register; do not "
+            "collapse them into one state field. Derive current_state, next_state, "
+            "results, and done from the contract's specified cycle, not merely from "
+            "the same encoded state. If a clocked reference publishes a buffer before "
+            "updating it, implement `nextVisible := oldBuffer` on every edge and "
+            "compute `nextBuffer` separately from the old state and current inputs; "
+            "do not clear or publish visible data solely because the current state is "
+            "IDLE/DONE. Count the accepting edge as latency 1."
+        )
+
     stack_ports = {"data_in", "data_out", "read_en", "write_en", "empty", "full"}
     if stack_ports <= ports and re.search(
         r"Expected\s+\d+\s*,\s*got\s+\d+", detail, re.IGNORECASE
@@ -1838,7 +1920,7 @@ def _compact_signal_value(expr: str) -> str:
     return truncate_text(expr, 80, keep="head")
 
 
-def extract_first_failure_diagnostics(detail: str | None, max_failures: int = 4, max_chars: int = 3000) -> str:
+def extract_first_failure_diagnostics(detail: str | None, max_failures: int = 6, max_chars: int = 3600) -> str:
     """Extract first failing test/signal/expected-actual snippets from simulator output."""
     text = clean_diagnostic_text(detail)
     if not text:
@@ -1847,9 +1929,17 @@ def extract_first_failure_diagnostics(detail: str | None, max_failures: int = 4,
     failures: list[str] = []
     seen: set[str] = set()
     current_test = ""
+    current_case = ""
+    current_parameters = ""
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
+        case_m = re.search(r"\[CVDP CASE\s+(.+?)\s+STATUS=", stripped)
+        if case_m:
+            current_case = case_m.group(1).strip()
+        parameters_m = re.search(r"\[DEBUG\]\s+Parameters:\s*(\{.*\})", stripped)
+        if parameters_m:
+            current_parameters = parameters_m.group(1).strip()
         run_m = re.search(r"\brunning\s+([A-Za-z0-9_.]+)\s*\(\d+/\d+\)", stripped)
         if run_m:
             current_test = run_m.group(1)
@@ -1892,6 +1982,7 @@ def extract_first_failure_diagnostics(detail: str | None, max_failures: int = 4,
 
         expr = ""
         actual = expected = ""
+        assertion_signal = ""
         for item in block:
             item = item.strip()
             if "dut." in item and "Logic(" not in item and "BinaryValue" not in item:
@@ -1904,13 +1995,28 @@ def extract_first_failure_diagnostics(detail: str | None, max_failures: int = 4,
                 actual = _compact_signal_value(lhs)
                 expected = _compact_signal_value(rhs)
                 break
+        for item in block:
+            item = item.strip()
+            source_m = re.search(
+                r"\bassert\s+([A-Za-z_][A-Za-z0-9_.]*)\s*==\s*",
+                item,
+            )
+            if source_m and not source_m.group(1).isdigit():
+                assertion_signal = source_m.group(1)
+                break
 
         parts = []
+        if current_case:
+            parts.append("case=" + current_case.rsplit("::", 1)[-1])
+        if current_parameters:
+            parts.append("parameters=" + current_parameters)
         if test:
             parts.append(test)
         if time_s:
             parts.append(time_s.strip())
-        if signals:
+        if assertion_signal:
+            parts.append("signal=" + assertion_signal)
+        elif signals:
             parts.append("signals=" + ",".join(signals))
         if actual or expected:
             parts.append(f"got={actual or '?'} expected={expected or '?'}")
@@ -1920,8 +2026,9 @@ def extract_first_failure_diagnostics(detail: str | None, max_failures: int = 4,
             parts.append("expr=" + truncate_text(expr, 160, keep="head"))
         summary = "; ".join(parts)
         key = re.sub(r"\s+", " ", "|".join([
-            ",".join(signals),
-            assertion_msg,
+            current_case,
+            current_parameters,
+            assertion_signal or ",".join(signals),
             actual,
             expected,
         ]))
@@ -2147,10 +2254,43 @@ def read_simulator_output(prob_id: str, run_dir: Path) -> str:
     candidates = [
         run_dir / "cvdp_sim" / prob_id / "cvdp_local_output.txt",
     ]
+    parts: list[str] = []
     for path in candidates:
         if path.exists():
-            return path.read_text(errors="replace")
-    return ""
+            parts.append(path.read_text(errors="replace"))
+            break
+
+    sim_root = run_dir / "cvdp_sim" / prob_id
+    xml_failures: list[str] = []
+    if sim_root.exists():
+        for path in sorted(sim_root.rglob("*.result.xml")):
+            try:
+                root = ET.parse(path).getroot()
+            except (ET.ParseError, OSError):
+                continue
+            for testcase in root.iter("testcase"):
+                failure = testcase.find("failure")
+                if failure is None:
+                    failure = testcase.find("error")
+                if failure is None:
+                    continue
+                name = testcase.attrib.get("name", "unknown")
+                sim_time = testcase.attrib.get("sim_time_ns")
+                error_type = failure.attrib.get("error_type", failure.tag)
+                message = failure.attrib.get("error_msg") or (failure.text or "").strip()
+                summary = f"[COCOTB_RESULT test={name} type={error_type}"
+                if sim_time:
+                    summary += f" time={sim_time}ns"
+                summary += f"] {message}"
+                if summary not in xml_failures:
+                    xml_failures.append(summary)
+                if len(xml_failures) >= 8:
+                    break
+            if len(xml_failures) >= 8:
+                break
+    if xml_failures:
+        parts.append("\n".join(xml_failures))
+    return "\n".join(part for part in parts if part.strip())
 
 
 def bool_status(value) -> str:
@@ -2269,6 +2409,11 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "has width `A + B + C`, not `3 * A`. Keep concat field widths in explicit `+` "
             "form, or use a checked `zext`/truncation boundary before assigning to a differently "
             "written symbolic width."
+        )
+        hints.append(
+            "For signed arithmetic, do not fight equal symbolic spellings such as `W + W` and "
+            "`2 * W`. Use caller-width helpers: `signedAddTo`, `signedSubTo`, or `signedMulTo`; "
+            "the expected `Signal dom (BitVec RESULT_W)` type selects the hardware result width."
         )
     if "lean_hardware_type_inference" in codes:
         hints.append(
@@ -2393,6 +2538,7 @@ def compact_repair_feedback(feedback: str) -> str:
         selected.append(truncate_text(preamble, 900, keep="head"))
     for heading, limit in (
         ("First Failing Assertions", COMPACT_ASSERTION_CHARS),
+        ("Sequential Assertion Trace", 4200),
         ("Protocol Progress Snapshots", 3600),
         ("Waveform Context", COMPACT_ASSERTION_CHARS),
         ("Cleaned Simulator Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
@@ -2466,8 +2612,20 @@ def native_parameter_repair_capabilities(info: ProblemInfo | None) -> str:
         "- `popCount x`, `reverseBits x`, and `reverseBlocks (BLOCKS := k) x` preserve "
         "symbolic widths. `Signal.cast` only converts Signals; do not apply it to a "
         "raw `BitVec` or use it to prove non-definitional arithmetic width equalities. For "
-        "two's-complement datapaths, use `signExtend`, `arithShiftRight`, signed comparisons, "
-        "and signed multiply/shift/truncate helpers instead of unsigned `zext` or `>>>`.\n"
+        "two's-complement datapaths, use `signExtend`, signed comparisons, and caller-width "
+        "`signedAddTo`/`signedSubTo`/`signedMulTo` helpers instead of unsigned `zext`. "
+        "Choose rounding explicitly: `signedMeanTowardZeroTo` matches signed `/ 2`, while "
+        "`signedMeanFloorTo` or `arithShiftRight` matches floor behavior for negative odd "
+        "values. Use `signedDivOr` "
+        "for explicit divide-by-zero behavior.\n"
+        "- For packed FIR/MAC or convolution arithmetic, use `signedDotPacked` with explicit "
+        "lane widths/count and accumulator width; use `signedSumPacked` for a signed lane "
+        "reduction. Lane zero is the least-significant packed chunk. Do not multiply entire "
+        "packed vectors or unfold `List.range` to emulate a dot product.\n"
+        "- When the output lane count/layout differs from the packed input, use "
+        "`Signal.generateChunksWithIndex laneStep packed`. Each generated output lane receives "
+        "its zero-based index and the complete packed input, so it can implement indexed "
+        "selection, rearrangement, interpolation, or lookup without Lean recursion.\n"
     )
 
 
@@ -2490,13 +2648,59 @@ def build_compact_repair_prompt(
     plan = plan_from_dict(
         (info.metadata or {}).get("finite_parameter_plan") if info else None
     )
+    native_plan = native_plan_from_dict(
+        (info.metadata or {}).get("native_parameter_sweep_plan") if info else None
+    )
     func_name = prob_id.lower() if dataset_name == "verilogeval" else lean_identifier(design_name)
+    parameterized_command = re.search(
+        r"#synthesizeParameterizedVerilog(?:Design)?\s+\S+(?:\s*\[([^\]]+)\])?",
+        current_lean,
+        flags=re.S,
+    )
+    synthesized_def = re.search(
+        rf"\bdef\s+{re.escape(func_name)}\b(.*?)(?::=|\bwhere\b)",
+        current_lean,
+        flags=re.S,
+    )
+    has_symbolic_nat_binder = bool(
+        synthesized_def
+        and re.search(
+            r"\{\s*[A-Za-z_][A-Za-z0-9_]*\s*:\s*Nat\s*\}",
+            synthesized_def.group(1),
+        )
+    )
+    parameterized_candidate = bool(
+        native_plan is not None or parameterized_command or has_symbolic_nat_binder
+    )
     if plan is not None:
         check_instruction = (
             "Use `lean_check` on the complete family and require generated Verilog for all "
             f"{len(plan.cases)} concrete modules; the harness rejects incomplete families."
             if has_repl else
             f"Run `lake build Generated.{prob_id}` before ending the repair."
+        )
+    elif parameterized_candidate:
+        defaults = native_plan.cases[0].values if native_plan and native_plan.cases else {}
+        bindings = (
+            ", ".join(
+                f"{name} := {defaults[name]}" for name in native_plan.parameter_names
+            )
+            if native_plan else str(parameterized_command.group(1) or "").strip()
+            if parameterized_command else ""
+        )
+        binding_instruction = (
+            f"default bindings `[{bindings}]`"
+            if bindings else
+            "positive default bindings for every retained top-level Nat parameter"
+        )
+        check_instruction = (
+            "Use `lean_check` on the complete body with exactly one parameter-retaining "
+            f"synthesis command and {binding_instruction}; use "
+            "`#synthesizeParameterizedVerilogDesign` when the top instantiates named "
+            "Sparkle helper modules, otherwise use `#synthesizeParameterizedVerilog`. "
+            "Require generated Verilog that retains all public parameters."
+            if has_repl else
+            f"Run `lake build Generated.{prob_id}` and require one parameter-retaining module."
         )
     else:
         check_instruction = (
@@ -2510,6 +2714,13 @@ def build_compact_repair_prompt(
             f"Reserve `{design_name}` for the evaluator-generated selector; do not synthesize it in Lean.",
             "Keep one shared generic Lean core and every eta-expanded concrete alias listed in the P0 contract.",
             "Every required concrete alias must have its own `#synthesizeVerilog` command.",
+        ])
+    elif parameterized_candidate:
+        constraints.extend([
+            f"The generated SystemVerilog top module must remain `{design_name}`.",
+            f"The parameter-retaining synthesis command must reference `{func_name}`.",
+            "Never replace retained public parameters with fixed-width aliases or a concrete module family.",
+            "Use the Design form only when named hierarchical helpers must also be emitted.",
         ])
     else:
         constraints.extend([
@@ -2535,9 +2746,21 @@ def build_compact_repair_prompt(
     native_repair_section = native_parameter_repair_capabilities(info)
     if native_repair_section:
         native_repair_section += "\n"
+    retained_parameter_names = (
+        ", ".join(native_plan.parameter_names)
+        if native_plan else
+        ", ".join(re.findall(
+            r"\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*Nat\s*\}",
+            synthesized_def.group(1) if synthesized_def else "",
+        ))
+    )
     lean_target_line = (
         f"- Lean target: generic core plus {len(plan.cases)} concrete modules\n\n"
-        if plan else f"- Lean function: `{func_name}`\n\n"
+        if plan else (
+            f"- Lean function: `{func_name}` with retained parameters "
+            f"{retained_parameter_names or '(infer from the current top-level Nat binders)'}\n\n"
+            if parameterized_candidate else f"- Lean function: `{func_name}`\n\n"
+        )
     )
 
     return (
@@ -2669,6 +2892,7 @@ def build_sim_feedback(
     )
     sim_diagnostics = extract_sim_diagnostics(combined_detail, SIM_DIAGNOSTIC_CHARS)
     progress_snapshots = extract_cvdp_progress_snapshots(combined_detail)
+    assertion_traces = extract_cvdp_assertion_traces(combined_detail)
     benchmark_contract = format_benchmark_interface_contract(info)
     if benchmark_contract:
         lines.extend([
@@ -2695,7 +2919,18 @@ def build_sim_feedback(
             progress_snapshots,
             "```",
         ])
-    semantic_hints = semantic_repair_hints(result, info, progress_snapshots)
+    if assertion_traces:
+        lines.extend([
+            "",
+            "### Sequential Assertion Trace",
+            "Bounded actual/expected mismatches from one deterministic, non-scoring replay; only public DUT port values are included, not benchmark source.",
+            "```text",
+            assertion_traces,
+            "```",
+        ])
+    semantic_hints = semantic_repair_hints(
+        {**result, "detail": combined_detail}, info, progress_snapshots
+    )
     if semantic_hints:
         lines.extend([
             "",

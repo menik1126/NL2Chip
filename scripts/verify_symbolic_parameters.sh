@@ -11,5 +11,10 @@ iverilog -g2012 \
     -s symbolic_parameter_behavior_tb \
     -o "$work_dir/symbolic_parameter_behavior" \
     "$work_dir/symbolic_parameters.sv" \
-    Tests/SymbolicParameterBehavior.v
+    Tests/SymbolicParameterBehavior.v \
+    2> "$work_dir/iverilog.log"
+if grep -q "expects .* bits, got" "$work_dir/iverilog.log"; then
+    cat "$work_dir/iverilog.log" >&2
+    exit 1
+fi
 vvp "$work_dir/symbolic_parameter_behavior"

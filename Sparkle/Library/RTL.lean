@@ -105,6 +105,117 @@ def signedGE {w : Nat}
     (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
   Signal.sge lhs rhs
 
+/-- Signed addition with a caller-selected result width. Both operands are
+    converted to `outW` before the modular addition, avoiding proof obligations
+    between propositionally equal symbolic widths such as `W + W` and `2 * W`.
+    Choose `outW` large enough when mathematical overflow must be preserved. -/
+def signedAddTo {lhsW rhsW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let lhsOut : Signal dom (BitVec outW) := signExtend lhs
+  let rhsOut : Signal dom (BitVec outW) := signExtend rhs
+  lhsOut + rhsOut
+
+/-- Signed subtraction with a caller-selected result width. -/
+def signedSubTo {lhsW rhsW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let lhsOut : Signal dom (BitVec outW) := signExtend lhs
+  let rhsOut : Signal dom (BitVec outW) := signExtend rhs
+  lhsOut - rhsOut
+
+/-- Signed multiplication with a caller-selected result width. The result is
+    the low `outW` bits of the exact two's-complement product. -/
+def signedMulTo {lhsW rhsW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let lhsOut : Signal dom (BitVec outW) := signExtend lhs
+  let rhsOut : Signal dom (BitVec outW) := signExtend rhs
+  lhsOut * rhsOut
+
+/-- Dot product of two packed signed lane vectors. Lane zero occupies the
+    least-significant chunk. The final sum wraps at the caller-selected `accW`.
+    Specify all symbolic lane dimensions explicitly at call sites when Lean
+    cannot infer a factorization of the packed widths. -/
+def signedDotPacked {lhsW rhsW accW lanes : Nat}
+    (lhs : Signal dom (BitVec (lanes * lhsW)))
+    (rhs : Signal dom (BitVec (lanes * rhsW))) : Signal dom (BitVec accW) :=
+  Signal.signedDotChunks lhs rhs
+
+/-- Unsigned division with explicit zero-denominator behavior. -/
+def unsignedDivOr {w : Nat}
+    (numerator denominator fallback : Signal dom (BitVec w))
+    : Signal dom (BitVec w) :=
+  Signal.mux (isZero denominator) fallback (Signal.udiv numerator denominator)
+
+/-- Signed division with truncation toward zero and explicit zero-denominator
+    behavior. -/
+def signedDivOr {w : Nat}
+    (numerator denominator fallback : Signal dom (BitVec w))
+    : Signal dom (BitVec w) :=
+  Signal.mux (isZero denominator) fallback (Signal.sdiv numerator denominator)
+
+/-- Unsigned division with caller-selected work and result widths. -/
+def unsignedDivOrTo {numW denW workW outW : Nat}
+    (numerator : Signal dom (BitVec numW))
+    (denominator : Signal dom (BitVec denW))
+    (fallback : Signal dom (BitVec outW)) : Signal dom (BitVec outW) :=
+  let numeratorWork : Signal dom (BitVec workW) := zext numerator
+  let denominatorWork : Signal dom (BitVec workW) := zext denominator
+  let fallbackWork : Signal dom (BitVec workW) := zext fallback
+  zext (unsignedDivOr numeratorWork denominatorWork fallbackWork)
+
+/-- Signed division with caller-selected work and result widths. The quotient
+    truncates toward zero, matching SystemVerilog signed division. -/
+def signedDivOrTo {numW denW workW outW : Nat}
+    (numerator : Signal dom (BitVec numW))
+    (denominator : Signal dom (BitVec denW))
+    (fallback : Signal dom (BitVec outW)) : Signal dom (BitVec outW) :=
+  let numeratorWork : Signal dom (BitVec workW) := signExtend numerator
+  let denominatorWork : Signal dom (BitVec workW) := signExtend denominator
+  let fallbackWork : Signal dom (BitVec workW) := signExtend fallback
+  signExtend (signedDivOr numeratorWork denominatorWork fallbackWork)
+
+/-- Absolute value of a two's-complement input, represented at an explicit
+    output width. The most-negative value still wraps when `outW` is not wide
+    enough to represent its positive magnitude. -/
+def signedAbsTo {inW outW : Nat}
+    (value : Signal dom (BitVec inW)) : Signal dom (BitVec outW) :=
+  let widened : Signal dom (BitVec outW) := signExtend value
+  let zero : Signal dom (BitVec outW) := Signal.pure (zeroBV outW)
+  Signal.mux (signedLT widened zero) (zero - widened) widened
+
+/-- Mean of two signed values using SystemVerilog-style division semantics:
+    the sum is formed at `workW`, divided by two, and rounded toward zero. -/
+def signedMeanTowardZeroTo {lhsW rhsW workW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let sum : Signal dom (BitVec workW) := signedAddTo lhs rhs
+  let two : Signal dom (BitVec workW) := Signal.pure (BitVec.ofNat workW 2)
+  let zero : Signal dom (BitVec workW) := Signal.pure (zeroBV workW)
+  signExtend (signedDivOr sum two zero)
+
+/-- Mean of two signed values rounded toward negative infinity. This is the
+    arithmetic-shift interpretation and differs from signed division for a
+    negative odd sum. -/
+def signedMeanFloorTo {lhsW rhsW workW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let sum : Signal dom (BitVec workW) := signedAddTo lhs rhs
+  signExtend (arithShiftRightC sum (BitVec.ofNat workW 1))
+
+/-- Divide a signed value by `2^amount`, rounding toward zero. This is useful
+    for fixed-point rescaling when arithmetic right shift's floor behavior is
+    not the desired contract. -/
+def signedDivPow2TowardZeroTo {inW workW outW : Nat}
+    (value : Signal dom (BitVec inW))
+    (amount : Signal dom (BitVec workW)) : Signal dom (BitVec outW) :=
+  let valueWork : Signal dom (BitVec workW) := signExtend value
+  let one : Signal dom (BitVec workW) := Signal.pure (BitVec.ofNat workW 1)
+  let denominator := one <<< amount
+  let zero : Signal dom (BitVec workW) := Signal.pure (zeroBV workW)
+  signExtend (signedDivOr valueWork denominator zero)
+
 /-- Full-width signed product of two W-bit two's-complement values. -/
 def signedMulWide {w : Nat}
     (lhs rhs : Signal dom (BitVec w)) : Signal dom (BitVec (w + w)) :=
@@ -423,6 +534,14 @@ def reverseBlocks {W BLOCKS : Nat}
       ) 0
   ) x
 
+/-- Reverse the order of equal-width lanes while preserving the bit order
+    inside each lane. Lane zero is the least-significant `LANEW`-bit chunk.
+    Both `LANES` and `LANEW` may be retained hardware parameters. -/
+def reversePackedLanes {LANES LANEW : Nat}
+    (x : Signal dom (BitVec (LANES * LANEW)))
+    : Signal dom (BitVec (LANES * LANEW)) :=
+  reverseBlocks (BLOCKS := LANES) (reverseBits x)
+
 /-- Repeat a packed `W`-bit value `N` times into a `N * W`-bit vector.
     The compiler lowers this to a SystemVerilog generate-for loop, so `N`
     remains a retained hardware parameter rather than a Lean elaboration-time
@@ -433,6 +552,14 @@ def repeatVector {W N : Nat}
     BitVec.ofNat (N * W) <|
       (List.range N).foldl (fun acc _ => acc * 2 ^ W + value.toNat) 0
   ) x
+
+/-- Sum signed packed lanes at an explicit accumulator width. -/
+def signedSumPacked {laneW accW lanes : Nat}
+    (values : Signal dom (BitVec (lanes * laneW))) : Signal dom (BitVec accW) :=
+  let one : Signal dom (BitVec laneW) := Signal.pure (BitVec.ofNat laneW 1)
+  let coefficients : Signal dom (BitVec (lanes * laneW)) :=
+    repeatVector (N := lanes) one
+  signedDotPacked values coefficients
 
 /-- Build packed lanes with the one-based sequence `[1, 2, ..., N]`.
     Lane zero occupies the least-significant `W` bits. The compiler lowers

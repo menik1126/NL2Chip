@@ -36,7 +36,7 @@ CVDP_HARNESS_PROFILE_DEFAULT = "race-safe-v1"
 COMPACT_SPARKLE_GENERATION_SKILL = """You are an expert hardware engineer translating natural-language RTL specifications into Sparkle HDL, a Lean 4 hardware DSL.
 
 ## Goal
-Produce one Lean file that compiles, synthesizes SystemVerilog with `#synthesizeVerilog`, and is behaviorally faithful to the benchmark spec.
+Produce one Lean file that compiles, synthesizes SystemVerilog with the synthesis command required by the parameter contract, and is behaviorally faithful to the benchmark spec.
 
 ## File Template
 ```lean
@@ -52,7 +52,7 @@ def <target_module> {dom : DomainConfig}
     (<inputs>) : <output_type> :=
   <implementation>
 
-#synthesizeVerilog <target_module>
+#synthesizeVerilog <target_module>  -- use the parameterized form for retained Nat dimensions
 ```
 
 ## Core Types
@@ -393,7 +393,7 @@ def build_system_prompt(
     elif design_name:
         design_rule = (
             f"- The output file is `Generated/{prob_id}.lean`, but the Lean function/top module must be `{design_name}`.\n"
-            f"- Use `#synthesizeVerilog {design_name}`. Do not name the synthesized function `{prob_id}` unless the problem explicitly says that is the target module.\n"
+            f"- Use `#synthesizeVerilog {design_name}` when there are no retained public dimensions. If the Benchmark Interface Contract lists public build parameters used in widths/depths, keep direct top-level Nat binders and use `#synthesizeParameterizedVerilog` (or its Design form for named child modules) instead. Do not name the synthesized function `{prob_id}` unless the problem explicitly says that is the target module.\n"
         )
     skill_section = ""
     if prompt_profile == "cvdp-skill-fewshot":
@@ -416,7 +416,7 @@ def build_system_prompt(
         + "- For CVDP parameters, follow the Benchmark Interface Contract and the active P0/P3 parameter contract exactly.\n"
         + "- Match benchmark output names exactly. If you must return a packed output internally, construct an explicit named MSB-to-LSB concat so the CVDP wrapper can recover each output field.\n"
         + "- Preserve benchmark clock, reset polarity, and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
-        + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and `#synthesizeVerilog`; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
+        + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and the contract-appropriate synthesis command; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
         + "- Keep repository exploration short: read at most three examples, then write a complete candidate and iterate from compiler feedback.\n"
         + "- Use the guarded `grep`, `glob`, and `list_directory` tools for repository searches; shell file-discovery commands are blocked so concurrent tasks cannot see each other's artifacts.\n"
         + "- If you need a directory listing, use `list_directory`; do not call `read_file` on directories.\n"
@@ -735,7 +735,7 @@ def build_fresh_candidate_prompt(
         + "\n\n### Earlier Candidate Summaries\n\n"
         + attempts
         + ("\n\n" + advisory if advisory else "")
-        + "\n\nLean-check the complete fresh candidate including `#synthesizeVerilog`. Stop only when the check also returns generated Verilog; the harness will save that compile-safe candidate."
+        + "\n\nLean-check the complete fresh candidate including the contract-appropriate synthesis command. Stop only when the check also returns generated Verilog; the harness will save that compile-safe candidate."
     )
 
 
@@ -1054,7 +1054,7 @@ def process_problem_guided(
                 extra_constraints=(
                     repair_instruction
                     + "Remain within the current candidate architecture unless a fresh-candidate restart is explicitly requested. "
-                    + "Before ending, Lean-check the complete candidate including `#synthesizeVerilog` and require generated Verilog; the outer evaluator will rerun simulation."
+                    + "Before ending, Lean-check the complete candidate including the contract-appropriate synthesis command and require generated Verilog; the outer evaluator will rerun simulation."
                 ),
             )
             if delivery_guard:

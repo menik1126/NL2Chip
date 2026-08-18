@@ -120,6 +120,12 @@ def emitGenerateFor (label index : String) (start stop : DimExpr)
   let m ← getModule
   setModule (m.addStmt (.generateFor label index start stop body))
 
+def emitSignedDot (output : String) (lhs rhs : Expr)
+    (laneCount lhsWidth rhsWidth resultWidth : DimExpr) : CircuitM Unit := do
+  let m ← getModule
+  setModule (m.addStmt
+    (.signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth))
+
 /--
   Emit a register statement (D flip-flop).
   Returns the name of the output wire.

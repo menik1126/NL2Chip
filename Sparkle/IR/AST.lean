@@ -37,6 +37,8 @@ inductive Operator where
   | add  : Operator  -- Addition
   | sub  : Operator  -- Subtraction
   | mul  : Operator  -- Multiplication
+  | udiv : Operator  -- Unsigned division
+  | sdiv : Operator  -- Signed division, truncating toward zero
   | mod  : Operator  -- Unsigned remainder
   | eq   : Operator  -- Equality comparison
   | lt_u : Operator  -- Less than comparison (unsigned)
@@ -67,6 +69,8 @@ def toString : Operator → String
   | add  => "add"
   | sub  => "sub"
   | mul  => "mul"
+  | udiv => "udiv"
+  | sdiv => "sdiv"
   | mod  => "mod"
   | eq   => "eq"
   | lt_u => "lt_u"
@@ -126,6 +130,8 @@ def not (a : Expr) : Expr := .op .not [a]
 def add (a b : Expr) : Expr := .op .add [a, b]
 def sub (a b : Expr) : Expr := .op .sub [a, b]
 def mul (a b : Expr) : Expr := .op .mul [a, b]
+def udiv (a b : Expr) : Expr := .op .udiv [a, b]
+def sdiv (a b : Expr) : Expr := .op .sdiv [a, b]
 def mod (a b : Expr) : Expr := .op .mod [a, b]
 def eq (a b : Expr) : Expr := .op .eq [a, b]
 def lt_u (a b : Expr) : Expr := .op .lt_u [a, b]
@@ -168,6 +174,11 @@ inductive Stmt where
       (start stop : DimExpr)
       (body : List Stmt)
       : Stmt
+  | signedDot
+      (output : String)
+      (lhs rhs : Expr)
+      (laneCount lhsWidth rhsWidth resultWidth : DimExpr)
+      : Stmt
   | register
       (output : String)      -- Output wire name
       (clock : String)       -- Clock signal name
@@ -204,6 +215,9 @@ partial def toString : Stmt → String
   | generateFor label index start stop body =>
       let bodyStr := String.intercalate "; " (body.map toString)
       s!"generate {label}: for {index} in [{start}, {stop}): {bodyStr}"
+  | signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+      s!"{output} := signedDot({lhs}, {rhs}; lanes={laneCount}, " ++
+        s!"lhsWidth={lhsWidth}, rhsWidth={rhsWidth}, resultWidth={resultWidth})"
   | register output clock reset input initValue =>
       s!"reg {output} @(posedge {clock}, {reset}) <= {input} (init: {initValue})"
   | memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>

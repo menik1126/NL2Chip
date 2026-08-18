@@ -15,6 +15,7 @@ Returns a score dict for each problem.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import json
 import os
@@ -77,6 +78,18 @@ def _env_flag(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _cvdp_case_random_seed(case_id: str, collection_seed: int) -> int:
+    """Derive a stable, distinct Cocotb seed from a collected pytest case."""
+
+    path, separator, suffix = str(case_id).partition("::")
+    identity = Path(path).name + (separator + suffix if separator else "")
+    digest = hashlib.sha256(
+        f"{int(collection_seed)}:{identity}".encode("utf-8")
+    ).digest()
+    # Cocotb accepts non-negative 32-bit seeds; avoid zero for older releases.
+    return int.from_bytes(digest[:4], "big") or 1
 
 
 def _cvdp_harness_options_from_env(
@@ -1137,8 +1150,20 @@ def _cvdp_unpacked_loop_bounds(unpacked_range: str) -> tuple[str, str] | None:
 
 def _cvdp_name_forms(name: str) -> set[str]:
     base = _base_port_name(name)
-    forms = {base, re.sub(r"[^a-z0-9]", "", base)}
-    variants = {base, re.sub(r"_\d+$", "", base)}
+    raw = name[5:] if name.startswith("_gen_") else name
+    camel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", raw).lower()
+    forms = {
+        base,
+        camel,
+        re.sub(r"[^a-z0-9]", "", base),
+        re.sub(r"[^a-z0-9]", "", camel),
+    }
+    variants = {
+        base,
+        camel,
+        re.sub(r"_\d+$", "", base),
+        re.sub(r"_\d+$", "", camel),
+    }
     for prefix in ("o_", "out_", "output_", "final_", "final", "reg_", "reg", "predict_branch_", "predict_", "dmem_", "saved_", "req_"):
         if base.startswith(prefix):
             variants.add(base[len(prefix):])
@@ -1256,6 +1281,7 @@ def _cvdp_infer_bundled_output_mapping(
     expected_outputs: list[tuple[str, str, str]],
     sparkle_ports: list[tuple[str, str, str]],
     parameter_cases: list[dict[str, int]] | None = None,
+    allow_untyped_expected: bool = False,
 ) -> list[tuple[tuple[str, str, str], str, str | None]]:
     """Return a width-proved, MSB-first mapping to packed output fields.
 
@@ -1281,8 +1307,11 @@ def _cvdp_infer_bundled_output_mapping(
         field_type = type_lookup.get(field_name)
         if field_name.startswith("_gen_"):
             field_type = field_type or type_lookup.get(field_name[5:])
-        if field_type is None or not _cvdp_types_match_across_cases(
-            matched[1], field_type, parameter_cases
+        if field_type is None or (
+            not allow_untyped_expected
+            and not _cvdp_types_match_across_cases(
+                matched[1], field_type, parameter_cases
+            )
         ):
             continue
         mapping_by_index[index] = (matched, field, field_type)
@@ -1294,7 +1323,7 @@ def _cvdp_infer_bundled_output_mapping(
     unresolved_outputs = [
         output for output in expected_outputs if output[2] not in used
     ]
-    if len(unresolved_indices) == len(unresolved_outputs):
+    if not allow_untyped_expected and len(unresolved_indices) == len(unresolved_outputs):
         positional: list[
             tuple[int, tuple[tuple[str, str, str], str, str | None]]
         ] = []
@@ -1611,6 +1640,12 @@ def generate_cvdp_wrapper(
     }
     sp_inputs = [(d, t, n) for d, t, n in sparkle_ports if d == "input"]
     sp_outputs = [(d, t, n) for d, t, n in sparkle_ports if d == "output"]
+    core_module = next(
+        (module for module in parse_native_modules(sv_code) if module.name == sparkle_mod_name),
+        None,
+    )
+    core_parameters = list(core_module.parameter_names) if core_module else []
+    mapping_sv_code = core_module.source if core_module is not None else sv_code
     bundled_type_by_output: dict[str, str] = {}
     if len(sp_outputs) == 1:
         candidate_output_names = sorted(
@@ -1619,11 +1654,12 @@ def generate_cvdp_wrapper(
         if expected_ports_override is None or len(candidate_output_names) > 1:
             pseudo_outputs = [("output", "logic", n) for n in candidate_output_names]
             for out_port, _, field_type in _cvdp_infer_bundled_output_mapping(
-                sv_code,
+                mapping_sv_code,
                 sp_outputs[0][2],
                 pseudo_outputs,
                 sparkle_ports,
                 parameter_cases,
+                allow_untyped_expected=True,
             ):
                 if field_type:
                     bundled_type_by_output[out_port[2]] = field_type
@@ -1659,8 +1695,10 @@ def generate_cvdp_wrapper(
         expected_ports_override is None
         or sum(direction == "output" for direction, _, _ in expected_ports) > 1
     ):
-        bundle_fields = _cvdp_infer_concat_fields(sv_code, sp_outputs[0][2]) or []
-        bundle_types = _cvdp_signal_type_lookup(sv_code, sparkle_ports)
+        bundle_fields = _cvdp_infer_concat_fields(
+            mapping_sv_code, sp_outputs[0][2]
+        ) or []
+        bundle_types = _cvdp_signal_type_lookup(mapping_sv_code, sparkle_ports)
         inferred = [
             _cvdp_expr_numeric_width(field, bundle_types) for field in bundle_fields
         ]
@@ -1691,11 +1729,44 @@ def generate_cvdp_wrapper(
     param_decls = (
         _cvdp_parse_module_parameters(
             ref_code,
-            usage["params"],
+            set(usage["params"]) if public_case_defaults else set(),
             fallback_defaults=public_case_defaults,
         )
         if expose_parameters else []
     )
+    if expose_parameters and core_module is not None:
+        public_type_text = "\n".join(
+            typ for _, typ, _ in [*expected_ports, *sparkle_ports]
+        )
+        declared_public_parameters = {
+            match.group(1)
+            for decl in param_decls
+            if (
+                match := re.search(
+                    r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)",
+                    decl,
+                )
+            )
+        }
+        for name, default in core_module.parameters:
+            if name in declared_public_parameters:
+                continue
+            if (
+                name not in usage["params"]
+                and not re.search(rf"\b{re.escape(name)}\b", public_type_text)
+            ):
+                continue
+            # Native Sparkle dimensions are integral elaboration parameters.
+            # Preserve the generated default when no public reference RTL is
+            # available to declare the parameter for the adapter wrapper.
+            param_decls.append(
+                f"parameter integer {name} = {default or '1'}"
+            )
+            declared_public_parameters.add(name)
+        for name in sorted(usage["params"] - declared_public_parameters):
+            param_decls.append(
+                f"parameter integer {name} = {public_case_defaults.get(name, 1)}"
+            )
     derived_expressions = dict(derived_parameter_expressions or {})
     if expose_parameters and derived_expressions:
         rewritten_decls = []
@@ -1810,11 +1881,6 @@ def generate_cvdp_wrapper(
     if observed_internal_arrays:
         lines.append("")
 
-    core_module = next(
-        (module for module in parse_native_modules(sv_code) if module.name == sparkle_mod_name),
-        None,
-    )
-    core_parameters = list(core_module.parameter_names) if core_module else []
     forwarded_parameters = [name for name in core_parameters if name in param_names]
     if strict_mapping and set(required_parameter_names or ()) - param_names:
         return None
@@ -1935,17 +2001,16 @@ def generate_cvdp_wrapper(
 
     if len(sp_outputs) == 1:
         sp_out_d, sp_out_t, sp_out_n = sp_outputs[0]
-        packed_fields = _cvdp_infer_concat_fields(sv_code, sp_out_n) or []
+        packed_fields = _cvdp_infer_concat_fields(mapping_sv_code, sp_out_n) or []
         packed_mapping = _cvdp_infer_bundled_output_mapping(
-            sv_code,
+            mapping_sv_code,
             sp_out_n,
             expected_outputs,
             sparkle_ports,
             parameter_cases,
         )
         if (
-            strict_mapping
-            and not assigned_outputs
+            not assigned_outputs
             and len(packed_mapping) == len(expected_outputs) == len(packed_fields)
         ):
             ordered_outputs = [entry[0][2] for entry in packed_mapping]
@@ -1953,10 +2018,55 @@ def generate_cvdp_wrapper(
                 f"    assign {{{', '.join(ordered_outputs)}}} = {sp_out_n}_wire;"
             )
             assigned_outputs.update(ordered_outputs)
+
+        # A generated tuple may contain useful internal fields in addition to
+        # the benchmark outputs.  Destructure the complete tuple into typed
+        # temporary wires, then expose only fields whose semantic name and
+        # symbolic width were proved above.  This keeps parameter expressions
+        # intact and avoids hierarchy references to child-module internals.
+        if packed_fields and packed_mapping and len(packed_fields) > len(packed_mapping):
+            type_lookup = _cvdp_signal_type_lookup(mapping_sv_code, sparkle_ports)
+            packed_field_types: list[str] = []
+            for field in packed_fields:
+                field_name = _cvdp_expr_signal_name(field) or ""
+                field_type = type_lookup.get(field_name)
+                if field_name.startswith("_gen_"):
+                    field_type = field_type or type_lookup.get(field_name[5:])
+                if field_type is None:
+                    packed_field_types = []
+                    break
+                packed_field_types.append(field_type)
+            if packed_field_types:
+                temp_names = [
+                    f"_cvdp_bundle_field_{index}" for index in range(len(packed_fields))
+                ]
+                for field_type, temp_name in zip(packed_field_types, temp_names):
+                    lines.append(f"    {field_type} {temp_name};")
+                lines.append(
+                    f"    assign {{{', '.join(temp_names)}}} = {sp_out_n}_wire;"
+                )
+                used_field_indices: set[int] = set()
+                for expected, field_expr, _field_type in packed_mapping:
+                    field_index = next(
+                        (
+                            index
+                            for index, field in enumerate(packed_fields)
+                            if index not in used_field_indices and field == field_expr
+                        ),
+                        None,
+                    )
+                    if field_index is None or expected[2] in assigned_outputs:
+                        continue
+                    used_field_indices.add(field_index)
+                    lines.append(
+                        f"    assign {expected[2]} = {temp_names[field_index]};"
+                    )
+                    assigned_outputs.add(expected[2])
+
         remaining = [(d, t, n) for d, t, n in expected_outputs if n not in assigned_outputs]
         for expected, field_expr, field_type in (
             _cvdp_infer_bundled_output_mapping(
-                sv_code, sp_out_n, remaining, sparkle_ports, parameter_cases
+                mapping_sv_code, sp_out_n, remaining, sparkle_ports, parameter_cases
             )
             if strict_mapping and any(
                 _cvdp_numeric_width(port_type) is None
@@ -1995,7 +2105,7 @@ def generate_cvdp_wrapper(
                     sp_out_name=sp_out_n,
                     sp_out_type=sp_out_t,
                     remaining_outputs=remaining,
-                    sv_code=sv_code,
+                    sv_code=mapping_sv_code,
                     sparkle_ports=sparkle_ports,
                 )
                 field_assigned = bool(field_assigns)
@@ -2010,7 +2120,7 @@ def generate_cvdp_wrapper(
             if (
                 len(remaining) == 1
                 and not field_assigned
-                and not _cvdp_infer_concat_fields(sv_code, sp_out_n)
+                and not _cvdp_infer_concat_fields(mapping_sv_code, sp_out_n)
                 and (not strict_mapping or len(expected_outputs) == 1)
             ):
                 lines.append(f"    assign {remaining[0][2]} = {sp_out_n}_wire;")
@@ -2024,7 +2134,7 @@ def generate_cvdp_wrapper(
             ):
                 total = sum(w for w, _ in ref_widths if w is not None)
                 if total == sp_w:
-                    concat_order = _cvdp_infer_concat_order(sv_code, sp_out_n)
+                    concat_order = _cvdp_infer_concat_order(mapping_sv_code, sp_out_n)
                     remaining_names = {n for _, _, n in remaining}
                     if (
                         concat_order
@@ -2375,6 +2485,26 @@ def _strip_verilog_info_block(text: str) -> str:
     code = code[start:]
     last_end = code.rfind("endmodule")
     return code[: last_end + len("endmodule")].strip() if last_end >= 0 else ""
+
+
+def _merge_verilog_info_blocks(blocks: list[str]) -> str:
+    """Merge hierarchical synthesis output without duplicating module names."""
+    modules: dict[str, str] = {}
+    unparsed: list[str] = []
+    for raw_block in blocks:
+        block = _strip_verilog_info_block(raw_block)
+        if not block:
+            continue
+        parsed = parse_native_modules(block)
+        if not parsed:
+            if block not in unparsed:
+                unparsed.append(block)
+            continue
+        for module in parsed:
+            # A later synthesis info message is the authoritative definition
+            # when a file emits the same helper more than once.
+            modules[module.name] = module.source.strip()
+    return "\n\n".join([*modules.values(), *unparsed])
 
 
 def _specialize_sv_type(typ: str, values: dict[str, int]) -> str:
@@ -3068,10 +3198,9 @@ class Evaluator:
                 for block in getattr(repl_result, "verilog_modules", [])
                 if (cleaned := _strip_verilog_info_block(block))
             ]
-            if native_plan is not None:
-                sv_code = "\n\n".join(sv_modules)
-            else:
-                sv_code = sv_modules[0] if sv_modules else _strip_verilog_info_block(repl_result.verilog or "")
+            if not sv_modules and repl_result.verilog:
+                sv_modules = [_strip_verilog_info_block(repl_result.verilog)]
+            sv_code = _merge_verilog_info_blocks(sv_modules)
         else:
             # ── Fallback: lake build (~10s) ──
             try:
@@ -3104,7 +3233,7 @@ class Evaluator:
             result["compile_pass"] = True
             result["has_sorry"] = bool(re.search(r"declaration uses `sorry`", build_output))
             sv_modules = self._extract_sv_modules(build_output)
-            sv_code = "\n\n".join(sv_modules) if native_plan is not None else (sv_modules[0] if sv_modules else "")
+            sv_code = _merge_verilog_info_blocks(sv_modules)
 
         if finite_plan is not None:
             modules_by_name = {}
@@ -3332,6 +3461,16 @@ class Evaluator:
         elif native_plan is not None:
             sparkle_mod_name, sparkle_ports = parse_module_ports(
                 sv_code, module_name=native_plan.design_name
+            )
+        elif (
+            self.dataset_name == "cvdp"
+            and info is not None
+            and getattr(info, "design_name", "") in {
+                name for name, _, _ in _module_records(sv_code)
+            }
+        ):
+            sparkle_mod_name, sparkle_ports = parse_module_ports(
+                sv_code, module_name=info.design_name
             )
         else:
             sparkle_mod_name, sparkle_ports = parse_module_ports(sv_code)
@@ -3838,15 +3977,16 @@ class Evaluator:
             or info.metadata.get("finite_parameter_plan")
             or {}
         )
+        harness_usage = _cvdp_parse_harness_usage(harness_files)
         public_input_ports = [
             str(name)
             for direction, _, name in parameter_payload.get("expected_ports", [])
             if direction == "input"
-        ]
+        ] or sorted(harness_usage["inputs"])
         public_observed_ports = [
             str(name)
             for _, _, name in parameter_payload.get("expected_ports", [])
-        ]
+        ] or sorted(harness_usage["ports"])
         public_clock_ports = infer_cvdp_clock_ports(
             harness_files,
             public_input_ports,
@@ -3980,6 +4120,44 @@ class Evaluator:
                             + "\n".join(snapshots)
                             + "\n"
                         )
+            elif (
+                _env_flag("CVDP_MISMATCH_DIAGNOSTIC", True)
+                and not emit_progress_monitor
+                and scored_result[0] == "sim_fail"
+            ):
+                snapshots = self._run_cvdp_mismatch_diagnostic(
+                    prob_id=prob_id,
+                    run_dir=run_dir,
+                    scored_sim_dir=sim_dir,
+                    original_harness_files=original_harness_files,
+                    reset_polarities=dict(
+                        parameter_payload.get("reset_polarities", {})
+                    ),
+                    public_input_ports=public_input_ports,
+                    public_observed_ports=public_observed_ports,
+                    public_clock_ports=public_clock_ports,
+                    normalize_reset_helpers=normalize_reset_helpers,
+                    stabilize_cocotb_edges=stabilize_cocotb_edges,
+                    initialize_cocotb_inputs=initialize_cocotb_inputs,
+                    align_reset_release=align_reset_release,
+                    harness_profile=harness_profile,
+                    harness_profile_overrides=harness_profile_overrides,
+                )
+                if snapshots:
+                    detail = (
+                        scored_result[2]
+                        + "\nRead-only mismatch diagnostic replay (not used for "
+                        "scoring; bounded actual/expected trace and public DUT ports):\n"
+                        + "\n".join(snapshots)
+                    )
+                    scored_result = (scored_result[0], scored_result[1], detail)
+                    output_path = sim_dir / "cvdp_local_output.txt"
+                    with output_path.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            "\n[CVDP READ-ONLY MISMATCH DIAGNOSTIC; SCORE UNCHANGED]\n"
+                            + "\n".join(snapshots)
+                            + "\n"
+                        )
             return scored_result
 
         compose_path = sim_dir / "docker-compose.yml"
@@ -4106,7 +4284,84 @@ class Evaluator:
         changes no DUT inputs and exposes no expected values or harness source.
         """
 
-        diagnostic_dir = run_dir / "cvdp_timeout_diagnostic" / prob_id
+        return self._run_cvdp_readonly_diagnostic(
+            prob_id=prob_id,
+            run_dir=run_dir,
+            scored_sim_dir=scored_sim_dir,
+            original_harness_files=original_harness_files,
+            reset_polarities=reset_polarities,
+            public_input_ports=public_input_ports,
+            public_observed_ports=public_observed_ports,
+            public_clock_ports=public_clock_ports,
+            normalize_reset_helpers=normalize_reset_helpers,
+            stabilize_cocotb_edges=stabilize_cocotb_edges,
+            initialize_cocotb_inputs=initialize_cocotb_inputs,
+            align_reset_release=align_reset_release,
+            harness_profile=harness_profile,
+            harness_profile_overrides=harness_profile_overrides,
+            diagnostic_kind="timeout",
+        )
+
+    def _run_cvdp_mismatch_diagnostic(
+        self,
+        *,
+        prob_id: str,
+        run_dir: Path,
+        scored_sim_dir: Path,
+        original_harness_files: dict,
+        reset_polarities: dict[str, str],
+        public_input_ports: list[str],
+        public_observed_ports: list[str],
+        public_clock_ports: list[str],
+        normalize_reset_helpers: bool,
+        stabilize_cocotb_edges: bool,
+        initialize_cocotb_inputs: bool,
+        align_reset_release: bool,
+        harness_profile: str,
+        harness_profile_overrides: dict[str, bool],
+    ) -> list[str]:
+        """Replay one mismatching case without changing the scored result."""
+
+        return self._run_cvdp_readonly_diagnostic(
+            prob_id=prob_id,
+            run_dir=run_dir,
+            scored_sim_dir=scored_sim_dir,
+            original_harness_files=original_harness_files,
+            reset_polarities=reset_polarities,
+            public_input_ports=public_input_ports,
+            public_observed_ports=public_observed_ports,
+            public_clock_ports=public_clock_ports,
+            normalize_reset_helpers=normalize_reset_helpers,
+            stabilize_cocotb_edges=stabilize_cocotb_edges,
+            initialize_cocotb_inputs=initialize_cocotb_inputs,
+            align_reset_release=align_reset_release,
+            harness_profile=harness_profile,
+            harness_profile_overrides=harness_profile_overrides,
+            diagnostic_kind="mismatch",
+        )
+
+    def _run_cvdp_readonly_diagnostic(
+        self,
+        *,
+        prob_id: str,
+        run_dir: Path,
+        scored_sim_dir: Path,
+        original_harness_files: dict,
+        reset_polarities: dict[str, str],
+        public_input_ports: list[str],
+        public_observed_ports: list[str],
+        public_clock_ports: list[str],
+        normalize_reset_helpers: bool,
+        stabilize_cocotb_edges: bool,
+        initialize_cocotb_inputs: bool,
+        align_reset_release: bool,
+        harness_profile: str,
+        harness_profile_overrides: dict[str, bool],
+        diagnostic_kind: str,
+    ) -> list[str]:
+        """Replay one case with read-only public-port snapshots."""
+
+        diagnostic_dir = run_dir / f"cvdp_{diagnostic_kind}_diagnostic" / prob_id
         if diagnostic_dir.exists():
             shutil.rmtree(diagnostic_dir)
         shutil.copytree(
@@ -4132,6 +4387,7 @@ class Evaluator:
             initialize_cocotb_inputs=initialize_cocotb_inputs,
             align_reset_release=align_reset_release,
             emit_progress_monitor=True,
+            emit_assertion_trace=diagnostic_kind == "mismatch",
             harness_profile=harness_profile,
             harness_profile_overrides={
                 **harness_profile_overrides,
@@ -4155,14 +4411,20 @@ class Evaluator:
         )
         output_path = diagnostic_dir / "cvdp_local_output.txt"
         output = output_path.read_text(errors="replace") if output_path.exists() else ""
-        snapshots = []
-        seen = set()
+        snapshots: list[str] = []
+        assertion_traces: list[str] = []
+        seen: set[str] = set()
         for raw_line in output.splitlines():
             line = raw_line.strip()
-            if not line.startswith("[CVDP_PROGRESS after=") or line in seen:
+            if line in seen:
+                continue
+            if line.startswith("[CVDP_PROGRESS after="):
+                snapshots.append(line)
+            elif line.startswith("[CVDP_ASSERTION_TRACE "):
+                assertion_traces.append(line)
+            else:
                 continue
             seen.add(line)
-            snapshots.append(line)
         audit = {
             "schema_version": 1,
             "score_unchanged": True,
@@ -4171,16 +4433,18 @@ class Evaluator:
             "diagnostic_detail": diagnostic_detail[:1200],
             "snapshot_count": len(snapshots),
             "snapshots": snapshots,
+            "assertion_trace_count": len(assertion_traces),
+            "assertion_traces": assertion_traces,
             "diagnostic_harness_changed_file_count": manifest.get(
                 "changed_file_count", 0
             ),
             "diagnostic_transformations": manifest.get("transformations", []),
         }
-        (scored_sim_dir / "cvdp_timeout_diagnostic.json").write_text(
+        (scored_sim_dir / f"cvdp_{diagnostic_kind}_diagnostic.json").write_text(
             json.dumps(audit, indent=2),
             encoding="utf-8",
         )
-        return snapshots
+        return [*snapshots, *assertion_traces]
 
     def _run_sim_cvdp_local(
         self,
@@ -4212,6 +4476,16 @@ class Evaluator:
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["PYTHONPATH"] = str(sim_dir / "src") + os.pathsep + env.get("PYTHONPATH", "")
 
+        collection_seed = int(os.environ.get("CVDP_LOCAL_RANDOM_SEED", "0"))
+        seed_plugin_name = "_cvdp_pytest_seed"
+        (sim_dir / "src" / f"{seed_plugin_name}.py").write_text(
+            "import random\n\n"
+            f"COLLECTION_SEED = {collection_seed}\n\n"
+            "def pytest_configure(config):\n"
+            "    random.seed(COLLECTION_SEED)\n",
+            encoding="utf-8",
+        )
+
         rundir = sim_dir / "rundir"
         rundir.mkdir(parents=True, exist_ok=True)
         cache_dir = sim_dir / "harness" / ".cache"
@@ -4223,6 +4497,7 @@ class Evaluator:
         base_cmd = [
             sys.executable, "-m", "pytest", "-s",
             "-o", f"cache_dir={cache_dir}",
+            "-p", seed_plugin_name,
         ]
         case_ids: list[str] = []
         collection_output = ""
@@ -4283,10 +4558,13 @@ class Evaluator:
                 })
                 continue
             current_timeout = min(case_timeout_s, remaining)
+            case_seed = _cvdp_case_random_seed(case_id, collection_seed)
+            case_env = env.copy()
+            case_env["COCOTB_RANDOM_SEED"] = str(case_seed)
             returncode, case_output, timed_out = _run_cvdp_pytest_command(
                 [*base_cmd, case_id],
                 cwd=rundir,
-                env=env,
+                env=case_env,
                 timeout_s=current_timeout,
             )
             status, case_detail = _classify_cvdp_case_result(
@@ -4301,6 +4579,7 @@ class Evaluator:
                 "returncode": returncode,
                 "timed_out": timed_out,
                 "timeout_seconds": current_timeout,
+                "random_seed": case_seed,
                 "attempts": 1,
                 "detail": case_detail,
             })
@@ -4345,10 +4624,12 @@ class Evaluator:
                 if remaining <= 0:
                     break
                 retry_timeout = max(1, remaining // retries_left)
+                retry_env = env.copy()
+                retry_env["COCOTB_RANDOM_SEED"] = str(row["random_seed"])
                 returncode, retry_output, timed_out = _run_cvdp_pytest_command(
                     [*base_cmd, str(row["case"])],
                     cwd=rundir,
-                    env=env,
+                    env=retry_env,
                     timeout_s=retry_timeout,
                 )
                 status, case_detail = _classify_cvdp_case_result(
@@ -4380,6 +4661,8 @@ class Evaluator:
                 "total_timeout_seconds": timeout_s,
                 "case_timeout_seconds": case_timeout_s,
                 "progress_timeout_patience": progress_timeout_patience,
+                "collection_random_seed": collection_seed,
+                "stimulus_seed_policy": "sha256(collection_seed, normalized_case_id)",
                 "cases": case_rows,
             }, indent=2),
             encoding="utf-8",

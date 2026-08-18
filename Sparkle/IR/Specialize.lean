@@ -109,6 +109,19 @@ partial def specializeStmt
       for statement in body do
         result := result ++ (← specializeStmt bindings ((index, iteration) :: indices) statement)
     return result
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth => do
+    let concreteLanes ← requireDimension bindings "signed dot-product lane count" laneCount
+    let concreteLhsWidth ← requireDimension bindings "signed dot-product lhs lane width" lhsWidth
+    let concreteRhsWidth ← requireDimension bindings "signed dot-product rhs lane width" rhsWidth
+    let concreteResultWidth ← requireDimension bindings "signed dot-product result width" resultWidth
+    if concreteLanes == 0 || concreteLhsWidth == 0 || concreteRhsWidth == 0 ||
+        concreteResultWidth == 0 then
+      throw "signed dot product specializes to a zero dimension"
+    return [.signedDot output
+      (← specializeExpr bindings indices lhs)
+      (← specializeExpr bindings indices rhs)
+      (.literal concreteLanes) (.literal concreteLhsWidth)
+      (.literal concreteRhsWidth) (.literal concreteResultWidth)]
   | .register output clock reset input initValue =>
     return [.register output clock reset
       (← specializeExpr bindings indices input)

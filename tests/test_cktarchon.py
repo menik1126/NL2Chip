@@ -1243,7 +1243,7 @@ def test_chat_response_to_responses_sse():
     assert "\"type\": \"response.completed\"" in payload
 
 
-def test_candidate_tracker_rewrites_only_after_repeated_diagnostic_signature(tmp_path: Path):
+def test_candidate_tracker_rewrites_after_two_non_improving_repairs(tmp_path: Path):
     tracker = CandidateTracker(
         snapshot_root=tmp_path / "candidates",
         prob_id="prob_b",
@@ -1258,14 +1258,26 @@ def test_candidate_tracker_rewrites_only_after_repeated_diagnostic_signature(tmp
     assert repeated.stagnation_reason == "evaluation failure signature repeated"
 
     changed = tracker.observe({"rank": 0, "detail": "second error"}, "candidate A2", reason="repair")
-    assert changed.stagnation_count == 0
-    assert changed.stagnation_reason == "evaluation failure signature changed"
-    assert not tracker.is_stagnant
-
-    tracker.observe({"rank": 0, "detail": "second error"}, "candidate A3", reason="repair")
-    final = tracker.observe({"rank": 0, "detail": "second error"}, "candidate A4", reason="repair")
-    assert final.stagnation_count == 2
+    assert changed.stagnation_count == 2
+    assert changed.stagnation_reason == "evaluation signature changed without measurable progress"
     assert tracker.is_stagnant
+
+
+def test_candidate_tracker_resets_rewrite_counter_only_on_measurable_progress(tmp_path: Path):
+    tracker = CandidateTracker(
+        snapshot_root=tmp_path / "candidates",
+        prob_id="prob_progress",
+        progress_key=_progress,
+        max_candidates=3,
+        patience=2,
+    )
+    tracker.start_candidate({"rank": 0, "detail": "first error"}, "candidate A", reason="initial")
+    tracker.observe({"rank": 0, "detail": "different error"}, "candidate A1", reason="repair")
+    improved = tracker.observe({"rank": 1, "detail": "later stage"}, "candidate A2", reason="repair")
+
+    assert improved.improved_candidate
+    assert improved.stagnation_count == 0
+    assert not tracker.is_stagnant
 
 
 def test_candidate_tracker_prefers_stable_evaluator_diagnostic_signature(tmp_path: Path):
@@ -1288,3 +1300,26 @@ def test_candidate_tracker_prefers_stable_evaluator_diagnostic_signature(tmp_pat
 
     assert observation.stagnation_count == 1
     assert observation.stagnation_reason == "evaluation failure signature repeated"
+
+
+def test_harness_accepts_parameterized_synthesis_as_complete_candidate(tmp_path: Path):
+    class Result:
+        passed = True
+        complete = True
+        verilog = "module demo; endmodule"
+        verilog_modules = [verilog]
+
+    runner = object.__new__(AnthropicHarnessRunner)
+    runner.required_verilog_modules = ()
+    runner._last_complete_code = None
+    runner._last_complete_sequence = None
+    runner._tool_sequence = 3
+    runner._autosave_last_complete_candidate = lambda: None
+
+    code = """def demo {W : Nat} := by sorry
+#synthesizeParameterizedVerilog demo [W := 8]
+"""
+    runner._remember_complete_candidate(code, Result())
+
+    assert runner._last_complete_code == code
+    assert runner._last_complete_sequence == 3

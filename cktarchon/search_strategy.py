@@ -489,8 +489,13 @@ class CandidateTracker:
             self.stagnation_count += 1
             stagnation_reason = "evaluation failure signature repeated"
         else:
-            self.stagnation_count = 0
-            stagnation_reason = "evaluation failure signature changed"
+            # A different assertion value or failure timestamp is not measurable
+            # progress.  Reset the rewrite counter only when the evaluator's
+            # progress key improves (for example, more tests pass or simulation
+            # advances to sim_pass).  Otherwise local edits can consume every
+            # repair iteration while oscillating among equally bad signatures.
+            self.stagnation_count += 1
+            stagnation_reason = "evaluation signature changed without measurable progress"
 
         if accepted:
             self.active_best_result = dict(result)

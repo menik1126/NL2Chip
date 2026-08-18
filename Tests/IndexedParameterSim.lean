@@ -24,8 +24,12 @@ def runIndexedParameterLeanSimulation : IO Unit := do
     indexedHammingEncode (DATAW := 4) (PARITYW := 3) data4
   let corrupted : Signal defaultDomain (BitVec 8) :=
     Signal.pure (BitVec.ofNat 8 0xA2)
+  let chunkInput : Signal defaultDomain (BitVec 8) :=
+    Signal.pure (BitVec.ofNat 8 0)
 
   check "generateBitsWithIndex" (at0 (indexedGenerateIdentity data17) == BitVec.ofNat 17 0x15555)
+  check "generateChunksWithIndex"
+    (at0 (indexedGenerateChunks (N := 5) chunkInput) == BitVec.ofNat 20 0x43210)
   check "scatterNonPowerOfTwoBits" (at0 scattered == BitVec.ofNat 8 0xA8)
   check "parityByIndexMask" (at0 parity == BitVec.ofNat 3 0x1)
   check "placeParityBits" (at0 placed == BitVec.ofNat 8 0xAA)

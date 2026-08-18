@@ -89,6 +89,8 @@ def test_indexed_parameter_primitives_at_unseen_widths(tmp_path: Path):
     declarations = [
         "logic [16:0] identity_in;",
         "wire [16:0] identity_out;",
+        "logic [7:0] chunks_in;",
+        "wire [19:0] chunks_out;",
         "logic [3:0] primitive_data;",
         "wire [7:0] scatter_out;",
         "wire [2:0] parity_out;",
@@ -100,6 +102,8 @@ def test_indexed_parameter_primitives_at_unseen_widths(tmp_path: Path):
     instances = [
         "indexedGenerateIdentity #(.W(17)) identity_dut "
         "(._gen_data(identity_in), .out(identity_out));",
+        "indexedGenerateChunks #(.N(5)) chunks_dut "
+        "(._gen_data(chunks_in), .out(chunks_out));",
         "indexedScatter #(.DATAW(4), .PARITYW(3)) scatter_dut "
         "(._gen_data(primitive_data), .out(scatter_out));",
         "indexedParity #(.W(8), .PARITYW(3)) parity_dut "
@@ -113,10 +117,12 @@ def test_indexed_parameter_primitives_at_unseen_widths(tmp_path: Path):
     ]
     checks = [
         "identity_in = 17'h15555;",
+        "chunks_in = 8'h00;",
         "primitive_data = 4'hb;",
         "roundtrip_in = 16'hbeef;",
         "#1;",
         "if (identity_out !== identity_in) $fatal(1, \"indexed identity mismatch\");",
+        "if (chunks_out !== 20'h43210) $fatal(1, \"indexed chunks mismatch\");",
         f"if (scatter_out !== {_literal(8, _scatter(0xB, 4, 3))}) "
         "$fatal(1, \"scatter mismatch\");",
         f"if (parity_out !== {_literal(3, _encode(0xB, 4, 3)[1])}) "
@@ -185,6 +191,7 @@ def test_indexed_parameter_primitives_at_unseen_widths(tmp_path: Path):
         timeout=60,
     )
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    assert "expects" not in compiled.stderr, compiled.stderr
     simulated = subprocess.run(
         ["vvp", str(executable)],
         cwd=PROJECT_ROOT,

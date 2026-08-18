@@ -31,6 +31,8 @@ PROGRESS_SNAPSHOT_DELAYS_NS = (
     20, 30, 50, 100, 500, 9000,
 )
 PROGRESS_MONITOR_NAME = "__cvdp_progress_monitor"
+ASSERTION_TRACE_HELPER_NAME = "__cvdp_record_assertion"
+ASSERTION_TRACE_LIMIT = 12
 
 
 def _sha256(text: str) -> str:
@@ -781,6 +783,7 @@ async def {PROGRESS_MONITOR_NAME}(dut):
     elapsed_ns = 0
     for delay_ns in {PROGRESS_SNAPSHOT_DELAYS_NS!r}:
         await Timer(delay_ns, unit="ns")
+        await ReadOnly()
         elapsed_ns += delay_ns
         values = []
         for name in {tuple(port_names)!r}:
@@ -843,6 +846,115 @@ class _CocotbProgressMonitorInjector(ast.NodeTransformer):
         return node
 
 
+def _assertion_trace_helper_definition(port_names: list[str]) -> list[ast.stmt]:
+    source = f"""
+{ASSERTION_TRACE_HELPER_NAME}_count = 0
+
+def {ASSERTION_TRACE_HELPER_NAME}(dut, line, actual, expected):
+    global {ASSERTION_TRACE_HELPER_NAME}_count
+    if {ASSERTION_TRACE_HELPER_NAME}_count >= {ASSERTION_TRACE_LIMIT}:
+        return
+    {ASSERTION_TRACE_HELPER_NAME}_count += 1
+    try:
+        from cocotb.utils import get_sim_time
+        time_ns = get_sim_time("ns")
+    except Exception:
+        time_ns = "?"
+    values = []
+    for name in {tuple(port_names)!r}:
+        try:
+            values.append(f"{{name}}={{getattr(dut, name).value}}")
+        except Exception as exc:
+            values.append(f"{{name}}=<unavailable:{{type(exc).__name__}}>")
+    print(
+        f"[CVDP_ASSERTION_TRACE time={{time_ns}}ns line={{line}} "
+        f"got={{actual!r}} expected={{expected!r}}] "
+        + " ".join(values),
+        flush=True,
+    )
+"""
+    return ast.parse(source).body
+
+
+class _CocotbAssertionTraceTransformer(ast.NodeTransformer):
+    """Make assertions nonfatal in a diagnostic-only copy and log values."""
+
+    def __init__(self) -> None:
+        self.in_cocotb_test = 0
+        self.assertions = 0
+        self.functions: list[str] = []
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        is_test = (
+            any(_is_cocotb_test_decorator(item) for item in node.decorator_list)
+            and any(
+                arg.arg == "dut"
+                for arg in [*node.args.posonlyargs, *node.args.args]
+            )
+        )
+        if not is_test:
+            return self.generic_visit(node)
+        self.in_cocotb_test += 1
+        node = self.generic_visit(node)
+        self.in_cocotb_test -= 1
+        self.functions.append(node.name)
+        return node
+
+    def visit_Assert(self, node: ast.Assert) -> ast.AST | list[ast.AST]:
+        if not self.in_cocotb_test:
+            return node
+        self.assertions += 1
+        suffix = self.assertions
+        actual_name = f"__cvdp_actual_{suffix}"
+        expected_name = f"__cvdp_expected_{suffix}"
+        is_simple_equality = (
+            isinstance(node.test, ast.Compare)
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+        )
+        if is_simple_equality:
+            actual_expr = node.test.left
+            expected_expr = node.test.comparators[0]
+        else:
+            actual_expr = node.test
+            expected_expr = ast.Constant(value=True)
+        actual_store = ast.Assign(
+            targets=[ast.Name(id=actual_name, ctx=ast.Store())],
+            value=actual_expr,
+        )
+        expected_store = ast.Assign(
+            targets=[ast.Name(id=expected_name, ctx=ast.Store())],
+            value=expected_expr,
+        )
+        if not is_simple_equality:
+            failure_test: ast.expr = ast.UnaryOp(
+                op=ast.Not(),
+                operand=ast.Name(id=actual_name, ctx=ast.Load()),
+            )
+        else:
+            failure_test = ast.Compare(
+                left=ast.Name(id=actual_name, ctx=ast.Load()),
+                ops=[ast.NotEq()],
+                comparators=[ast.Name(id=expected_name, ctx=ast.Load())],
+            )
+        trace_call = ast.Expr(value=ast.Call(
+            func=ast.Name(id=ASSERTION_TRACE_HELPER_NAME, ctx=ast.Load()),
+            args=[
+                ast.Name(id="dut", ctx=ast.Load()),
+                ast.Constant(value=getattr(node, "lineno", 0)),
+                ast.Name(id=actual_name, ctx=ast.Load()),
+                ast.Name(id=expected_name, ctx=ast.Load()),
+            ],
+            keywords=[],
+        ))
+        trace_if = ast.If(test=failure_test, body=[trace_call], orelse=[])
+        return [
+            ast.copy_location(item, node)
+            for item in (actual_store, expected_store, trace_if)
+        ]
+
+
 def adapt_python_harness(
     source: str,
     *,
@@ -852,6 +964,7 @@ def adapt_python_harness(
     initialize_cocotb_inputs: bool,
     align_reset_release: bool,
     emit_progress_monitor: bool,
+    emit_assertion_trace: bool,
     input_ports: set[str] | None = None,
     observed_ports: set[str] | None = None,
     clock_ports: set[str] | None = None,
@@ -917,6 +1030,25 @@ def adapt_python_harness(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     if (
+        emit_assertion_trace
+        and progress_ports
+        and ASSERTION_TRACE_HELPER_NAME not in existing_names
+    ):
+        assertion_transformer = _CocotbAssertionTraceTransformer()
+        tree = assertion_transformer.visit(tree)
+        if assertion_transformer.assertions:
+            tree.body.extend(_assertion_trace_helper_definition(progress_ports))
+            transformations.append({
+                "code": "cocotb_nonfatal_assertion_trace_inserted",
+                "file": path,
+                "functions": assertion_transformer.functions,
+                "assertions": assertion_transformer.assertions,
+                "ports": progress_ports,
+                "trace_limit": ASSERTION_TRACE_LIMIT,
+            })
+            changed = True
+
+    if (
         emit_progress_monitor
         and progress_ports
         and PROGRESS_MONITOR_NAME not in existing_names
@@ -926,6 +1058,7 @@ def adapt_python_harness(
         if monitor_injector.functions:
             tree.body.append(_progress_monitor_definition(progress_ports))
             _ensure_trigger_import(tree, "Timer")
+            _ensure_trigger_import(tree, "ReadOnly")
             transformations.append({
                 "code": "cocotb_public_port_progress_monitor_inserted",
                 "file": path,
@@ -963,6 +1096,7 @@ def adapt_cvdp_harness_files(
     initialize_cocotb_inputs: bool = False,
     align_reset_release: bool = False,
     emit_progress_monitor: bool = False,
+    emit_assertion_trace: bool = False,
     clock_ports: list[str] | tuple[str, ...] | set[str] | None = None,
     observed_ports: list[str] | tuple[str, ...] | set[str] | None = None,
     harness_profile: str = "custom",
@@ -1018,6 +1152,7 @@ def adapt_cvdp_harness_files(
                 initialize_cocotb_inputs=initialize_cocotb_inputs,
                 align_reset_release=align_reset_release,
                 emit_progress_monitor=emit_progress_monitor,
+                emit_assertion_trace=emit_assertion_trace,
                 input_ports=set(input_ports or ()),
                 observed_ports=set(observed_ports or ()),
                 clock_ports=set(resolved_clock_ports),
@@ -1045,12 +1180,14 @@ def adapt_cvdp_harness_files(
             "initialize_cocotb_inputs": bool(initialize_cocotb_inputs),
             "align_reset_release": bool(align_reset_release),
             "emit_progress_monitor": bool(emit_progress_monitor),
+            "emit_assertion_trace": bool(emit_assertion_trace),
         },
         "reset_helper_normalization_enabled": bool(normalize_reset_helpers),
         "cocotb_phase_stabilization_enabled": bool(stabilize_cocotb_edges),
         "cocotb_input_initialization_enabled": bool(initialize_cocotb_inputs),
         "cocotb_reset_release_alignment_enabled": bool(align_reset_release),
         "cocotb_progress_monitor_enabled": bool(emit_progress_monitor),
+        "cocotb_assertion_trace_enabled": bool(emit_assertion_trace),
         "public_input_ports": sorted(str(name) for name in (input_ports or ())),
         "public_observed_ports": sorted(str(name) for name in (observed_ports or ())),
         "clock_ports": resolved_clock_ports,

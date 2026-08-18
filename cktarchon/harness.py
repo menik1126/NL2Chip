@@ -727,7 +727,10 @@ class AnthropicHarnessRunner:
         if not (
             bool(getattr(result, "passed", False))
             and bool(getattr(result, "complete", False))
-            and "#synthesizeVerilog" in code
+            and re.search(
+                r"#synthesize(?:Parameterized)?Verilog(?:Design)?\b",
+                code,
+            )
             and generated_verilog.strip()
             and not missing_modules
         ):

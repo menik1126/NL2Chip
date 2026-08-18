@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,10 +14,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "agent"))
 
 from dataset import ProblemInfo  # noqa: E402
+from cvdp_harness_adapter import adapt_python_harness  # noqa: E402
 import evaluator as evaluator_module  # noqa: E402
 from evaluator import (  # noqa: E402
     Evaluator,
     _classify_cvdp_local_timeout,
+    _cvdp_case_random_seed,
     _cvdp_collected_case_ids,
     _simulation_diagnostic_stage,
     generate_cvdp_wrapper,
@@ -128,6 +132,7 @@ def test_cvdp_harness_profiles_are_applied_and_audited(
         "initialize_cocotb_inputs": False,
         "align_reset_release": reset_alignment,
         "emit_progress_monitor": False,
+        "emit_assertion_trace": False,
     }
     assert manifest["changed_file_count"] == changed_files
     assert ("await Timer(1, unit='step')" in source) is phase_adapter
@@ -368,6 +373,51 @@ def test_cvdp_collect_parser_returns_absolute_parameter_case_ids(tmp_path: Path)
     ]
 
 
+def test_cvdp_case_seed_is_path_independent_stable_and_case_distinct():
+    first = _cvdp_case_random_seed(
+        "/tmp/run_a/src/test_runner.py::test_width[2]", 1729
+    )
+    replay = _cvdp_case_random_seed(
+        "/different/run_b/src/test_runner.py::test_width[2]", 1729
+    )
+    other_case = _cvdp_case_random_seed(
+        "/tmp/run_a/src/test_runner.py::test_width[4]", 1729
+    )
+
+    assert first == replay
+    assert first != other_case
+    assert 0 < first < 2**32
+
+
+def test_cvdp_isolated_random_parameter_cases_are_reproducible(
+    tmp_path: Path,
+    monkeypatch,
+):
+    sim_dir = tmp_path / "sim"
+    (sim_dir / "src").mkdir(parents=True)
+    (sim_dir / "src" / ".env").write_text("PYTHONPATH=/code/src\n")
+    (sim_dir / "src" / "test_runner.py").write_text(
+        "import random\n"
+        "import pytest\n\n"
+        "WIDTHS = [random.randint(2, 64) for _ in range(4)]\n\n"
+        "@pytest.mark.parametrize('width', WIDTHS)\n"
+        "def test_width(width):\n"
+        "    assert 2 <= width <= 64\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CVDP_LOCAL_RANDOM_SEED", "1729")
+    monkeypatch.setenv("CVDP_LOCAL_TIMEOUT", "30")
+    monkeypatch.setenv("CVDP_LOCAL_CASE_TIMEOUT", "5")
+
+    result = Evaluator(project_root=tmp_path)._run_sim_cvdp_local(sim_dir)
+
+    assert result[0] == "sim_pass", result[2]
+    manifest = json.loads((sim_dir / "cvdp_case_results.json").read_text())
+    assert manifest["collection_random_seed"] == 1729
+    assert len(manifest["cases"]) == 4
+    assert {row["status"] for row in manifest["cases"]} == {"sim_pass"}
+
+
 def test_cvdp_slow_case_retries_with_remaining_global_budget(
     tmp_path: Path,
     monkeypatch,
@@ -390,10 +440,12 @@ def test_cvdp_slow_case_retries_with_remaining_global_budget(
 
     attempts = []
     wave_values = []
+    case_seeds = []
 
     def fake_case(command, *, cwd, env, timeout_s):
         attempts.append(timeout_s)
         wave_values.append(env.get("WAVE"))
+        case_seeds.append(env.get("COCOTB_RANDOM_SEED"))
         if len(attempts) == 1:
             return None, "0.00ns INFO cocotb Running tests\n", True
         return 0, "1 passed\n", False
@@ -410,6 +462,7 @@ def test_cvdp_slow_case_retries_with_remaining_global_budget(
     assert attempts[0] == 5
     assert attempts[1] > attempts[0]
     assert wave_values == [None, None]
+    assert case_seeds[0] == case_seeds[1]
     manifest = json.loads((sim_dir / "cvdp_case_results.json").read_text())
     assert manifest["waves_enabled"] is False
     assert manifest["progress_timeout_patience"] == 2
@@ -419,6 +472,7 @@ def test_cvdp_slow_case_retries_with_remaining_global_budget(
         "returncode": 0,
         "timed_out": False,
         "timeout_seconds": 5,
+        "random_seed": _cvdp_case_random_seed(case_id, 0),
         "attempts": 2,
         "detail": "CVDP case passed",
         "retry_timeout_seconds": attempts[1],
@@ -486,14 +540,6 @@ def test_cvdp_timeout_diagnostic_preserves_scored_harness_and_score(
         "    await RisingEdge(dut.clk)\n"
         "    assert dut.valid.value == 1\n",
     )
-    info.metadata["native_parameter_sweep_plan"] = {
-        "expected_ports": [
-            ["input", "logic", "clk"],
-            ["input", "logic", "start"],
-            ["output", "logic", "valid"],
-        ],
-        "reset_polarities": {},
-    }
     evaluator = Evaluator(project_root=tmp_path)
     evaluator.dataset_obj = SimpleNamespace(load_problem=lambda _: info)
     calls = []
@@ -507,6 +553,7 @@ def test_cvdp_timeout_diagnostic_preserves_scored_harness_and_score(
             (sim_dir / "cvdp_local_output.txt").write_text("scored timeout\n")
             return "sim_fail", 1, "CVDP simulation timed out after 45s"
         assert "[CVDP_PROGRESS after=" in source
+        assert "await ReadOnly()" in source
         (sim_dir / "cvdp_local_output.txt").write_text(
             "[CVDP_PROGRESS after=10ns] clk=0 start=0 valid=0\n"
         )
@@ -529,6 +576,10 @@ def test_cvdp_timeout_diagnostic_preserves_scored_harness_and_score(
     assert "valid=0" in detail
     assert len(calls) == 2
     assert calls[1][1]["max_cases"] == 1
+    diagnostic_source = (
+        calls[1][0] / "src" / "test_runner.py"
+    ).read_text()
+    assert "('clk', 'start', 'valid')" in diagnostic_source
     scored_dir = tmp_path / "cvdp_sim" / "cvdp_test"
     scored_manifest = json.loads(
         (scored_dir / "cvdp_harness_adapter.json").read_text()
@@ -544,10 +595,121 @@ def test_cvdp_timeout_diagnostic_preserves_scored_harness_and_score(
         "initialize_cocotb_inputs": False,
         "align_reset_release": True,
         "emit_progress_monitor": False,
+        "emit_assertion_trace": False,
     }
     assert scored_manifest["changed_file_count"] == 1
     assert diagnostic_manifest["score_unchanged"] is True
     assert diagnostic_manifest["snapshot_count"] == 1
+
+
+def test_cvdp_mismatch_diagnostic_replays_public_ports_without_changing_score(
+    tmp_path: Path,
+    monkeypatch,
+):
+    info = _cvdp_info(
+        "module dut(input logic clk, input logic start, output logic valid); endmodule",
+        "import cocotb\n"
+        "from cocotb.triggers import RisingEdge\n\n"
+        "@cocotb.test()\n"
+        "async def test_dut(dut):\n"
+        "    dut.start.value = 1\n"
+        "    await RisingEdge(dut.clk)\n"
+        "    assert dut.valid.value == 1\n",
+    )
+    info.metadata["native_parameter_sweep_plan"] = {
+        "expected_ports": [
+            ["input", "logic", "clk"],
+            ["input", "logic", "start"],
+            ["output", "logic", "valid"],
+        ],
+        "reset_polarities": {},
+    }
+    evaluator = Evaluator(project_root=tmp_path)
+    evaluator.dataset_obj = SimpleNamespace(load_problem=lambda _: info)
+    calls = []
+
+    def fake_local(sim_dir, **kwargs):
+        calls.append((sim_dir, kwargs))
+        source = (sim_dir / "src" / "test_runner.py").read_text()
+        if len(calls) == 1:
+            assert "[CVDP_PROGRESS after=" not in source
+            assert "__cvdp_record_assertion" not in source
+            (sim_dir / "cvdp_local_output.txt").write_text(
+                "AssertionError: assert 0 == 1\n"
+            )
+            return "sim_fail", 1, "CVDP assertion mismatch"
+        assert "[CVDP_PROGRESS after=" in source
+        assert "assert dut.valid.value == 1" not in source
+        assert "__cvdp_record_assertion" in source
+        (sim_dir / "cvdp_local_output.txt").write_text(
+            "[CVDP_PROGRESS after=10ns] clk=0 start=1 valid=0\n"
+            "[CVDP_ASSERTION_TRACE time=20.0ns line=8 got=0 expected=1] "
+            "clk=0 start=1 valid=0\n"
+        )
+        return "sim_fail", 1, "diagnostic mismatch"
+
+    monkeypatch.setattr(evaluator, "_run_sim_cvdp_local", fake_local)
+    status, mismatches, detail = evaluator._run_sim_cvdp(
+        "cvdp_test",
+        "module dut(input logic clk, input logic start, output logic valid); "
+        "assign valid = 1'b0; endmodule",
+        "dut",
+        [],
+        tmp_path,
+        direct_top=True,
+        problem_info=info,
+    )
+
+    assert (status, mismatches) == ("sim_fail", 1)
+    assert "not used for scoring" in detail.lower()
+    assert "start=1 valid=0" in detail
+    assert "got=0 expected=1" in detail
+    assert len(calls) == 2
+    assert calls[1][1]["max_cases"] == 1
+    audit = json.loads(
+        (tmp_path / "cvdp_sim" / "cvdp_test" / "cvdp_mismatch_diagnostic.json").read_text()
+    )
+    assert audit["score_unchanged"] is True
+    assert audit["public_ports_only"] is True
+    assert audit["snapshot_count"] == 1
+    assert audit["assertion_trace_count"] == 1
+
+
+def test_cvdp_assertion_trace_preserves_truthiness_and_evaluates_once():
+    source = """
+import cocotb
+
+@cocotb.test()
+async def test_dut(dut):
+    assert observe_actual()
+    assert observe_left() == observe_right()
+
+def helper_without_dut():
+    assert untouched()
+"""
+
+    adapted, transformations, warnings = adapt_python_harness(
+        source,
+        path="src/test_runner.py",
+        normalize_reset_helpers=False,
+        stabilize_cocotb_edges=False,
+        initialize_cocotb_inputs=False,
+        align_reset_release=False,
+        emit_progress_monitor=False,
+        emit_assertion_trace=True,
+        observed_ports={"out"},
+    )
+
+    assert warnings == []
+    assert len(transformations) == 1
+    assert transformations[0]["assertions"] == 2
+    assert adapted.count("observe_actual()") == 1
+    assert adapted.count("observe_left()") == 1
+    assert adapted.count("observe_right()") == 1
+    assert "if not __cvdp_actual_1:" in adapted
+    assert "if __cvdp_actual_2 != __cvdp_expected_2:" in adapted
+    assert "assert untouched()" in adapted
+    assert "get_sim_time('ns')" in adapted
 
 
 def test_cvdp_contract_lists_parameter_sweep_values():
@@ -765,6 +927,45 @@ def test_cvdp_contract_does_not_treat_prompt_parameters_as_output_ports():
     assert "output OUT_WIDTH" not in contract
 
 
+def test_cvdp_contract_preserves_symbolic_width_ending_in_constant():
+    info = _cvdp_info(
+        "(no public reference Verilog available)",
+        """
+        runner.build(parameters={"DATA_WIDTH": DATA_WIDTH})
+        dut.x.value = 0
+        int(dut.result.value)
+        int(dut.internal_state.value)
+        """,
+        design_name="symbolic_accumulator",
+        prompt_text="""
+        ## Parameters
+        | Parameter | Description | Default |
+        |-----------|-------------|---------|
+        | `DATA_WIDTH` | Input width | 16 |
+
+        ### Inputs
+        | Port | Size | Description |
+        |------|------|-------------|
+        | `x` | `DATA_WIDTH` bits | Signed input |
+
+        ### Outputs
+        | Port | Size | Description |
+        |------|------|-------------|
+        | `result` | `DATA_WIDTH+1` bits | Widened signed sum |
+        """,
+    )
+
+    contract = format_benchmark_interface_contract(info)
+
+    assert "input x: logic [DATA_WIDTH-1:0]" in contract
+    assert "output result: logic [DATA_WIDTH+1-1:0]" in contract
+    assert "output result: logic;" not in contract
+    assert (
+        "output internal_state: width unspecified by the public interface; "
+        "infer it from the behavioral specification instead of assuming 1 bit"
+    ) in contract
+
+
 def test_cvdp_contract_parses_bullet_ports_but_not_later_register_table():
     info = _cvdp_info(
         "(no public reference Verilog available)",
@@ -953,9 +1154,7 @@ def test_cvdp_wrapper_maps_visible_concat_fields_by_name_and_width():
     )
 
     assert wrapper is not None
-    assert "assign sum = _gen_out_wire[4:2];" in wrapper
-    assert "assign carry = _gen_out_wire[1];" in wrapper
-    assert "assign parity = _gen_out_wire[0];" in wrapper
+    assert "assign {sum, carry, parity} = _gen_out_wire;" in wrapper
 
 
 def test_cvdp_wrapper_normalizes_scalar_data_inputs_to_two_state_bool(
@@ -1141,6 +1340,164 @@ def test_cvdp_wrapper_notes_fixed_width_core_for_parameterized_port():
     assert "benchmark port data_in is parameterized as logic [WIDTH-1:0]" in wrapper
 
 
+def test_cvdp_wrapper_inherits_native_core_parameter_without_reference_rtl(tmp_path):
+    core_sv = """
+        module signed_comparator_sparkle_inner #(
+            parameter integer WIDTH = 5
+        ) (
+            input logic [WIDTH-1:0] _gen_lhs,
+            input logic [WIDTH-1:0] _gen_rhs,
+            output logic out
+        );
+            assign out = $signed(_gen_lhs) < $signed(_gen_rhs);
+        endmodule
+        """
+    wrapper = generate_cvdp_wrapper(
+        design_name="signed_comparator",
+        sparkle_mod_name="signed_comparator_sparkle_inner",
+        sparkle_ports=[
+            ("input", "logic [WIDTH-1:0]", "_gen_lhs"),
+            ("input", "logic [WIDTH-1:0]", "_gen_rhs"),
+            ("output", "logic", "out"),
+        ],
+        ref_code="(no public reference Verilog available)",
+        harness_files={
+            "src/test.py": """
+            dut.lhs.value = 1
+            dut.rhs.value = 2
+            assert int(dut.out.value) == 1
+            """,
+        },
+        sv_code=core_sv,
+    )
+
+    assert wrapper is not None
+    assert "module signed_comparator\n #(\n    parameter integer WIDTH = 5\n)" in wrapper
+    assert ".WIDTH(WIDTH)" in wrapper
+    assert "input logic [WIDTH-1:0] lhs" in wrapper
+    assert "input logic [WIDTH-1:0] rhs" in wrapper
+
+    iverilog = shutil.which("iverilog")
+    if iverilog is None:
+        pytest.skip("iverilog is unavailable")
+    design = tmp_path / "native_wrapper.sv"
+    design.write_text(f"{core_sv}\n{wrapper}\n", encoding="utf-8")
+    compiled = subprocess.run(
+        [iverilog, "-g2012", "-s", "signed_comparator", str(design)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+
+
+def test_cvdp_wrapper_maps_symbolic_camelcase_bundle_without_reference_rtl():
+    core_sv = """
+    module mapper_sparkle_inner #(
+        parameter integer N = 4,
+        parameter integer IN_WIDTH = 4,
+        parameter integer OUT_WIDTH = 3
+    ) (
+        input logic [(N * IN_WIDTH)-1:0] _gen_bits,
+        output logic [2 * ((N + N / 2) * OUT_WIDTH)-1:0] out
+    );
+        logic [((N + N / 2) * OUT_WIDTH)-1:0] _gen_iOut;
+        logic [((N + N / 2) * OUT_WIDTH)-1:0] _gen_qOut;
+        assign _gen_iOut = '0;
+        assign _gen_qOut = '0;
+        assign out = {_gen_iOut, _gen_qOut};
+    endmodule
+    """
+    wrapper = generate_cvdp_wrapper(
+        design_name="mapper",
+        sparkle_mod_name="mapper_sparkle_inner",
+        sparkle_ports=[
+            ("input", "logic [(N * IN_WIDTH)-1:0]", "_gen_bits"),
+            (
+                "output",
+                "logic [2 * ((N + N / 2) * OUT_WIDTH)-1:0]",
+                "out",
+            ),
+        ],
+        ref_code="(no public reference Verilog available)",
+        harness_files={
+            "src/test.py": """
+            N = int(dut.N.value)
+            IN_WIDTH = int(dut.IN_WIDTH.value)
+            OUT_WIDTH = int(dut.OUT_WIDTH.value)
+            dut.bits.value = 0
+            int(dut.I.value)
+            int(dut.Q.value)
+            """,
+        },
+        sv_code=core_sv,
+    )
+
+    assert wrapper is not None
+    assert "parameter integer N = 4" in wrapper
+    assert "parameter integer IN_WIDTH = 4" in wrapper
+    assert "parameter integer OUT_WIDTH = 3" in wrapper
+    assert "output logic [((N + N / 2) * OUT_WIDTH)-1:0] I" in wrapper
+    assert "output logic [((N + N / 2) * OUT_WIDTH)-1:0] Q" in wrapper
+    assert "assign {I, Q} = out_wire;" in wrapper
+    assert "CVDP adapter fallback: output I" not in wrapper
+    assert "CVDP adapter fallback: output Q" not in wrapper
+
+
+def test_cvdp_wrapper_maps_symbolic_output_subset_from_larger_bundle():
+    core_sv = """
+    module demapper_sparkle_inner #(
+        parameter integer N = 4,
+        parameter integer OUT_WIDTH = 4
+    ) (
+        input logic [(N * OUT_WIDTH)-1:0] _gen_samples,
+        output logic [((N * OUT_WIDTH) + 2)-1:0] out
+    );
+        logic [(N * OUT_WIDTH)-1:0] _gen_bits;
+        logic _gen_error_flag;
+        logic _gen_internal_threshold;
+        assign _gen_bits = _gen_samples;
+        assign _gen_error_flag = 1'b0;
+        assign _gen_internal_threshold = 1'b1;
+        assign out = {_gen_bits, {_gen_error_flag, _gen_internal_threshold}};
+    endmodule
+    """
+    wrapper = generate_cvdp_wrapper(
+        design_name="demapper",
+        sparkle_mod_name="demapper_sparkle_inner",
+        sparkle_ports=[
+            ("input", "logic [(N * OUT_WIDTH)-1:0]", "_gen_samples"),
+            ("output", "logic [((N * OUT_WIDTH) + 2)-1:0]", "out"),
+        ],
+        ref_code="""
+        module demapper #(
+            parameter integer N = 4,
+            parameter integer OUT_WIDTH = 4
+        ) (
+            input logic [(N * OUT_WIDTH)-1:0] samples,
+            output logic [(N * OUT_WIDTH)-1:0] bits,
+            output logic error_flag
+        );
+        endmodule
+        """,
+        harness_files={
+            "src/test.py": """
+            dut.samples.value = 0
+            int(dut.bits.value)
+            int(dut.error_flag.value)
+            """,
+        },
+        sv_code=core_sv,
+    )
+
+    assert wrapper is not None
+    assert "assign {_cvdp_bundle_field_0, _cvdp_bundle_field_1, _cvdp_bundle_field_2} = out_wire;" in wrapper
+    assert "assign bits = _cvdp_bundle_field_0;" in wrapper
+    assert "assign error_flag = _cvdp_bundle_field_1;" in wrapper
+    assert "CVDP adapter fallback: output bits" not in wrapper
+    assert "CVDP adapter fallback: output error_flag" not in wrapper
+
+
 def test_cvdp_wrapper_bridges_observed_internal_memory_without_making_it_a_port():
     wrapper = generate_cvdp_wrapper(
         design_name="fifo_policy",
@@ -1298,3 +1655,79 @@ def test_cvdp_direct_top_is_evaluated_without_sparkle_wrapper(tmp_path, monkeypa
     assert (status, mismatches, detail) == ("sim_pass", 0, "ok")
     assert captured["source"] == code
     assert "dut_sparkle_inner" not in captured["source"]
+
+
+def test_evaluator_preserves_hierarchical_verilog_and_selects_cvdp_top(
+    tmp_path,
+    monkeypatch,
+):
+    prob_id = "hierarchical_design"
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / f"{prob_id}.lean").write_text(
+        "#synthesizeParameterizedVerilogDesign hierarchical_top [W := 4]\n",
+        encoding="utf-8",
+    )
+    child = """
+    // Generated by Sparkle HDL
+    module lane_child(input logic x, output logic y);
+        assign y = x;
+    endmodule
+    """
+    helper = """
+    // Generated by Sparkle HDL
+    module lane_helper(input logic x, output logic y);
+        lane_child child(.x(x), .y(y));
+    endmodule
+    """
+    top = """
+    // Generated by Sparkle HDL
+    module hierarchical_top(input logic data_in, output logic data_out);
+        lane_helper helper(.x(data_in), .y(data_out));
+    endmodule
+    """
+    repl_result = SimpleNamespace(
+        passed=True,
+        complete=True,
+        errors=[],
+        error_text="",
+        verilog=child,
+        verilog_modules=[child, helper, top],
+    )
+    lean_repl = SimpleNamespace(check_file=lambda _path: repl_result)
+    info = _cvdp_info(
+        "(no public reference Verilog available)",
+        "dut.data_in.value = 1\nassert int(dut.data_out.value) == 1\n",
+        design_name="hierarchical_top",
+    )
+    evaluator = Evaluator(
+        project_root=tmp_path,
+        lean_repl=lean_repl,
+        dataset="cvdp",
+    )
+    monkeypatch.setattr(evaluator, "_run_lint", lambda _path: True)
+    captured = {}
+
+    def fake_sim(prob, sv_code, module_name, ports, run_dir):
+        captured.update({
+            "prob_id": prob,
+            "sv_code": sv_code,
+            "module_name": module_name,
+            "ports": ports,
+            "run_dir": run_dir,
+        })
+        return "sim_pass", 0, "ok"
+
+    monkeypatch.setattr(evaluator, "_run_sim", fake_sim)
+
+    result = evaluator.evaluate(prob_id, tmp_path / "run", problem_info=info)
+
+    assert result["sim_status"] == "sim_pass"
+    assert captured["module_name"] == "hierarchical_top"
+    assert [name for name, _, _ in evaluator_module._module_records(
+        captured["sv_code"]
+    )] == ["lane_child", "lane_helper", "hierarchical_top"]
+    saved_sv = (tmp_path / "run" / "sv" / f"{prob_id}.sv").read_text()
+    assert "module lane_child" in saved_sv
+    assert "module lane_helper" in saved_sv
+    assert "module hierarchical_top" in saved_sv

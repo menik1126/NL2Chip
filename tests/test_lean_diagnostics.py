@@ -18,8 +18,9 @@ from dataset import ProblemInfo  # noqa: E402
 from cktarchon.harness import AnthropicHarnessRunner  # noqa: E402
 from evaluator import _record_lean_compile_failure  # noqa: E402
 from search import (  # noqa: E402
-    build_sim_feedback,
     build_compact_repair_prompt,
+    build_sim_feedback,
+    build_user_message,
     compact_repair_feedback,
     lean_repair_playbook,
     native_parameter_repair_capabilities,
@@ -91,6 +92,7 @@ def test_symbolic_width_normalization_gets_concat_guidance():
 
     assert records[0]["code"] == "symbolic_width_normalization"
     assert "A + B + C" in hint
+    assert "signedMulTo" in hint
 
 
 def test_hardware_type_diagnostic_rejects_bundleall_top_level_output():
@@ -292,9 +294,13 @@ def test_native_parameter_repair_sessions_receive_native_primitive_summary():
     assert "Signal.mapChunks laneStep packed" in section
     assert "Signal.mapChunksWithIndex laneStep packed" in section
     assert "Signal.generateBitsWithIndex bitStep packed" in section
+    assert "Signal.generateChunksWithIndex laneStep packed" in section
     assert "scatterNonPowerOfTwoBits" in section
     assert "regFile1R1W" in section
     assert "arithShiftRight" in section
+    assert "signedMeanTowardZeroTo" in section
+    assert "signedDotPacked" in section
+    assert "signedSumPacked" in section
     assert "Signal.cast" in section
 
 
@@ -303,6 +309,7 @@ def test_skill_documents_verified_stage4_parameterized_apis():
 
     for api in (
         "Signal.generateBitsWithIndex",
+        "Signal.generateChunksWithIndex",
         "scatterNonPowerOfTwoBits",
         "parityByIndexMask",
         "placeParityBits",
@@ -311,6 +318,10 @@ def test_skill_documents_verified_stage4_parameterized_apis():
         "regFile1R1W",
         "signExtend",
         "arithShiftRight",
+        "signedAddTo",
+        "signedMeanTowardZeroTo",
+        "signedDotPacked",
+        "signedSumPacked",
     ):
         assert api in skill
 
@@ -350,3 +361,141 @@ def test_compact_repair_prompt_keeps_native_primitive_summary():
     assert "### Native P3 Repair Primitives" in prompt
     assert "repeatVector (N := COUNT) x" in prompt
     assert prompt.index("Native P3 Repair Primitives") < prompt.index("Current Lean Candidate")
+    assert "#synthesizeVerilog native_demo" not in prompt
+    assert "#synthesizeParameterizedVerilog" in prompt
+    assert "WIDTH := 3, COUNT := 4" in prompt
+
+
+def test_sim_feedback_extracts_parameterized_assertions_and_buffered_fsm_hint(tmp_path: Path):
+    prob_id = "generic_buffered_fsm"
+    sim_dir = tmp_path / "cvdp_sim" / prob_id
+    sim_dir.mkdir(parents=True)
+    (sim_dir / "cvdp_local_output.txt").write_text(
+        """[CVDP CASE src/test_runner.py::test_data[0-16] STATUS=sim_fail]
+[DEBUG] Parameters: {'DATA_WIDTH': 16}
+    41.00ns WARNING test assert 536838144 == 0
+      assert result1 == model_out[0]
+      AssertionError: assert 536838144 == 0
+""",
+        encoding="utf-8",
+    )
+    xml_dir = sim_dir / "rundir" / "sim_build"
+    xml_dir.mkdir(parents=True)
+    (xml_dir / "test.result.xml").write_text(
+        """<testsuites><testsuite><testcase name="test_fsm" sim_time_ns="51.0">
+<failure error_type="AssertionError" error_msg="assert 0 == 1" />
+</testcase></testsuite></testsuites>""",
+        encoding="utf-8",
+    )
+    info = ProblemInfo(
+        prob_id=prob_id,
+        design_name="generic_buffered_fsm",
+        prompt_text="A registered FSM",
+        ref_code=(
+            "module generic_buffered_fsm(input logic start, "
+            "output logic [31:0] result1, output logic done, "
+            "output logic [1:0] current_state); endmodule"
+        ),
+        testbench_path=Path("test.py"),
+        ref_path=None,
+        metadata={},
+    )
+    result = {
+        "compile_pass": True,
+        "sv_extracted": True,
+        "lint_pass": True,
+        "sim_status": "sim_fail",
+        "sim_mismatches": 1,
+        "detail": "TESTS=1 PASS=0 FAIL=1",
+    }
+
+    feedback = build_sim_feedback(
+        prob_id=prob_id,
+        result=result,
+        iteration=0,
+        history=[],
+        run_dir=tmp_path,
+        info=info,
+    )
+    compact = compact_repair_feedback(feedback)
+
+    assert "case=test_data[0-16]" in compact
+    assert "parameters={'DATA_WIDTH': 16}" in compact
+    assert "signal=result1" in compact
+    assert "got=536838144 expected=0" in compact
+    assert "[COCOTB_RESULT test=test_fsm" in feedback
+    assert "internal result buffer" in compact
+    assert "nextVisible := oldBuffer" in compact
+    assert "accepting edge as latency 1" in compact
+
+
+def test_compact_repair_infers_parameterized_synthesis_from_current_candidate():
+    info = ProblemInfo(
+        prob_id="symbolic_fsm",
+        design_name="symbolic_fsm",
+        prompt_text="A parameterized state machine",
+        ref_code="module symbolic_fsm; endmodule",
+        testbench_path=Path("test.py"),
+        ref_path=None,
+        metadata={},
+    )
+    current_lean = """def symbolic_fsm {dom : DomainConfig} {DATA_WIDTH : Nat}
+    (x : Signal dom (BitVec DATA_WIDTH)) : Signal dom (BitVec DATA_WIDTH) := x
+
+#synthesizeParameterizedVerilog symbolic_fsm [DATA_WIDTH := 16]
+"""
+
+    prompt = build_compact_repair_prompt(
+        prob_id="symbolic_fsm",
+        info=info,
+        dataset_name="cvdp",
+        has_repl=True,
+        phase="guided semantic repair",
+        iteration=1,
+        current_lean=current_lean,
+        latest_feedback="sim_fail",
+        recent_attempts=[],
+    )
+
+    assert "#synthesizeVerilog symbolic_fsm" not in prompt
+    assert "#synthesizeParameterizedVerilog" in prompt
+    assert "DATA_WIDTH := 16" in prompt
+    assert "retained parameters DATA_WIDTH" in prompt
+
+
+def test_generation_prompt_infers_native_parameter_contract_from_public_cvdp_build():
+    info = ProblemInfo(
+        prob_id="parameterized_filter",
+        design_name="parameterized_filter",
+        prompt_text=(
+            "Module parameter DATA_WIDTH controls input x and output y widths.\n"
+            "Inputs: `x` (`DATA_WIDTH` bits)\nOutputs: `y` (`DATA_WIDTH` bits)"
+        ),
+        ref_code="(no public reference Verilog available)",
+        testbench_path=Path("test_runner.py"),
+        ref_path=None,
+        metadata={
+            "dataset": "cvdp",
+            "harness_files": {
+                "src/test_runner.py": """
+import pytest
+@pytest.mark.parametrize('DATA_WIDTH', [4, 8, 16])
+def test_data(DATA_WIDTH):
+    parameters = {'DATA_WIDTH': DATA_WIDTH}
+    runner.build(parameters=parameters)
+""",
+            },
+        },
+    )
+
+    prompt = build_user_message(
+        "parameterized_filter",
+        has_repl=True,
+        info=info,
+        dataset_name="cvdp",
+    )
+
+    assert "### Native Parameter Sweep (P3)" in prompt
+    assert "Retained parameters: DATA_WIDTH" in prompt
+    assert "#synthesizeParameterizedVerilog parameterized_filter [DATA_WIDTH := 4]" in prompt
+    assert "#synthesizeVerilog parameterized_filter" not in prompt

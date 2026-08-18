@@ -61,6 +61,67 @@ CPP_CASES = {
         dut._gen_value = 0x9c; dut.eval();
         return dut.out == 0xf6 ? 0 : 1;
     """,
+    "/tmp/p3_cppsim_signed_add_to_w4.h": """
+        signedHelperAddTo dut;
+        dut._gen_lhs = 0xd; dut._gen_rhs = 2; dut.eval();
+        return dut.out == 0xff ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_sub_to_w4.h": """
+        signedHelperSubTo dut;
+        dut._gen_lhs = 0xd; dut._gen_rhs = 2; dut.eval();
+        return dut.out == 0xfb ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_mul_to_w4.h": """
+        signedHelperMulTo dut;
+        dut._gen_lhs = 0xd; dut._gen_rhs = 2; dut.eval();
+        return dut.out == 0xfa ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_unsigned_div_or_w4.h": """
+        signedHelperUnsignedDivOr dut;
+        dut._gen_numerator = 13; dut._gen_denominator = 2;
+        dut._gen_fallback = 9; dut.eval();
+        if (dut.out != 6) return 1;
+        dut._gen_denominator = 0; dut.eval();
+        return dut.out == 9 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_div_or_w4.h": """
+        signedHelperSignedDivOr dut;
+        dut._gen_numerator = 0xd; dut._gen_denominator = 2;
+        dut._gen_fallback = 9; dut.eval();
+        if (dut.out != 0xf) return 1;
+        dut._gen_denominator = 0; dut.eval();
+        return dut.out == 9 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_abs_to_w4.h": """
+        signedHelperAbsTo dut;
+        dut._gen_value = 0xd; dut.eval();
+        return dut.out == 3 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_mean_tz_w4.h": """
+        signedHelperMeanTowardZero dut;
+        dut._gen_lhs = 0xd; dut._gen_rhs = 0; dut.eval();
+        return dut.out == 0xf ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_mean_floor_w4.h": """
+        signedHelperMeanFloor dut;
+        dut._gen_lhs = 0xd; dut._gen_rhs = 0; dut.eval();
+        return dut.out == 0xe ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_div_pow2_tz_w4.h": """
+        signedHelperDivPow2TowardZero dut;
+        dut._gen_value = 0xd; dut._gen_amount = 1; dut.eval();
+        return dut.out == 0xf ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_dot_packed.h": """
+        signedHelperDotPacked dut;
+        dut._gen_lhs = 0xf2d; dut._gen_rhs = 0x1f2; dut.eval();
+        return dut.out == 0x3f7 ? 0 : 1;
+    """,
+    "/tmp/p3_cppsim_signed_sum_packed.h": """
+        signedHelperSumPacked dut;
+        dut._gen_values = 0xf2d; dut.eval();
+        return dut.out == 0x3fe ? 0 : 1;
+    """,
 }
 
 

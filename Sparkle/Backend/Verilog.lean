@@ -58,6 +58,8 @@ def emitOperator (op : Operator) : String :=
   | .add => "+"
   | .sub => "-"
   | .mul => "*"
+  | .udiv => "/"
+  | .sdiv => "/"
   | .mod => "%"
   | .eq  => "=="
   | .lt_u => "<"
@@ -144,6 +146,13 @@ partial def emitExpr (e : Expr) : String :=
       match operator with
       | .lt_s | .le_s | .gt_s | .ge_s =>
         s!"($signed({emitExpr arg1}) {emitOperator operator} $signed({emitExpr arg2}))"
+      | .udiv =>
+        s!"(({emitExpr arg2} == '0) ? ({emitExpr arg1} ^ {emitExpr arg1}) : " ++
+          s!"({emitExpr arg1} / {emitExpr arg2}))"
+      | .sdiv =>
+        s!"(($signed({emitExpr arg2}) == 0) ? " ++
+          s!"($signed({emitExpr arg1}) - $signed({emitExpr arg1})) : " ++
+          s!"($signed({emitExpr arg1}) / $signed({emitExpr arg2})))"
       | .asr =>
         s!"($signed({emitExpr arg1}) >>> {emitExpr arg2})"
       | _ =>
@@ -173,6 +182,29 @@ partial def emitStmt (stmt : Stmt) (indent : String := "    ")
       bodyCode ++ "\n" ++
       s!"{indent}    end\n" ++
       s!"{indent}endgenerate"
+
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    let outputName := sanitizeName output
+    let indexName := sanitizeName (output ++ "_dot_index")
+    let accumName := sanitizeName (output ++ "_dot_accum")
+    let resultWidthText := emitDimExpr resultWidth
+    let lhsSlice :=
+      s!"{emitExpr lhs}[({indexName} * {emitDimExpr lhsWidth}) +: {emitDimExpr lhsWidth}]"
+    let rhsSlice :=
+      s!"{emitExpr rhs}[({indexName} * {emitDimExpr rhsWidth}) +: {emitDimExpr rhsWidth}]"
+    let lhsSigned := s!"$signed({resultWidthText}'($signed({lhsSlice})))"
+    let rhsSigned := s!"$signed({resultWidthText}'($signed({rhsSlice})))"
+    s!"{indent}always_comb begin : {outputName}_signed_dot\n" ++
+      s!"{indent}    integer {indexName};\n" ++
+      s!"{indent}    logic signed [{resultWidthText}-1:0] {accumName};\n" ++
+      s!"{indent}    {accumName} = '0;\n" ++
+      s!"{indent}    for ({indexName} = 0; {indexName} < {emitDimExpr laneCount}; " ++
+      s!"{indexName} = {indexName} + 1) begin\n" ++
+      s!"{indent}        {accumName} = $signed({accumName}) + " ++
+      s!"({lhsSigned} * {rhsSigned});\n" ++
+      s!"{indent}    end\n" ++
+      s!"{indent}    {outputName} = {accumName};\n" ++
+      s!"{indent}end"
 
   | .register output clock reset input initValue =>
     -- Generate always_ff block for register
