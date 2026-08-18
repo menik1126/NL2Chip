@@ -90,6 +90,10 @@ lean_exe «verilog-tests» where
   root := `Tests.VerilogTests
   supportInterpreter := true
 
+lean_exe «signed-helper-smoke» where
+  root := `Tests.SignedHelperSmoke
+  supportInterpreter := true
+
 lean_exe «provenance-tests» where
   root := `Tests.ProvenanceTests
   supportInterpreter := true

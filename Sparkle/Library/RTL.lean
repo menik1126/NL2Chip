@@ -65,6 +65,91 @@ def trunc {w outW : Nat} (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) 
 def zext {w outW : Nat} (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) :=
   Signal.map (fun v => v.zeroExtend outW) x
 
+/-- Sign-extend or truncate a two's-complement packed vector. This is built
+    from existing packed operations so its behavior remains explicit in both
+    Lean simulation and synthesized RTL. -/
+def signExtend {w outW : Nat} (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) :=
+  let unsignedValue : Signal dom (BitVec outW) := zext x
+  let upperMask : BitVec outW :=
+    BitVec.ofNat outW ((2 ^ (outW - w) - 1) * 2 ^ w)
+  let signedValue : Signal dom (BitVec outW) :=
+    unsignedValue ||| (Signal.pure upperMask : Signal dom (BitVec outW))
+  Signal.mux (bitBool x (w - 1))
+    signedValue unsignedValue
+
+/-- Arithmetic right shift for a two's-complement packed vector. -/
+def arithShiftRight {w : Nat}
+    (x amount : Signal dom (BitVec w)) : Signal dom (BitVec w) :=
+  Signal.ashr x amount
+
+/-- Arithmetic right shift by a concrete, exact-width packed amount. -/
+def arithShiftRightC {w : Nat}
+    (x : Signal dom (BitVec w)) (amount : BitVec w) : Signal dom (BitVec w) :=
+  Signal.ashrC x amount
+
+/-- Signed two's-complement comparisons. -/
+def signedLT {w : Nat} (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.slt lhs rhs
+
+def signedLE {w : Nat} (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.sle lhs rhs
+
+def signedGT {w : Nat} (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.slt rhs lhs
+
+def signedGE {w : Nat} (lhs rhs : Signal dom (BitVec w)) : Signal dom Bool :=
+  Signal.sle rhs lhs
+
+/-- Signed arithmetic with a caller-selected result width. The widened packed
+    representations preserve the low `outW` bits of two's-complement results. -/
+def signedAddTo {lhsW rhsW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let lhsOut : Signal dom (BitVec outW) := signExtend lhs
+  let rhsOut : Signal dom (BitVec outW) := signExtend rhs
+  lhsOut + rhsOut
+
+def signedSubTo {lhsW rhsW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let lhsOut : Signal dom (BitVec outW) := signExtend lhs
+  let rhsOut : Signal dom (BitVec outW) := signExtend rhs
+  lhsOut - rhsOut
+
+def signedMulTo {lhsW rhsW outW : Nat}
+    (lhs : Signal dom (BitVec lhsW))
+    (rhs : Signal dom (BitVec rhsW)) : Signal dom (BitVec outW) :=
+  let lhsOut : Signal dom (BitVec outW) := signExtend lhs
+  let rhsOut : Signal dom (BitVec outW) := signExtend rhs
+  lhsOut * rhsOut
+
+/-- Full-width two's-complement product. -/
+def signedMulWide {w : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom (BitVec (w + w)) :=
+  signedMulTo (outW := w + w) lhs rhs
+
+/-- Signed product retaining its low result bits. -/
+def signedMulTrunc {w outW : Nat}
+    (lhs rhs : Signal dom (BitVec w)) : Signal dom (BitVec outW) :=
+  trunc (signedMulWide lhs rhs)
+
+/-- Fixed-point signed product: widen, arithmetic-shift, then retain low bits. -/
+def signedMulShiftTrunc {w outW : Nat}
+    (lhs rhs : Signal dom (BitVec w))
+    (amount : Signal dom (BitVec (w + w))) : Signal dom (BitVec outW) :=
+  trunc (arithShiftRight (signedMulWide lhs rhs) amount)
+
+/-- Clamp a two's-complement value to explicit signed lower and upper bounds. -/
+def signedSaturate {w : Nat}
+    (value lower upper : Signal dom (BitVec w)) : Signal dom (BitVec w) :=
+  Signal.mux (signedLT value lower) lower
+    (Signal.mux (signedGT value upper) upper value)
+
+def signedSaturateC {w : Nat}
+    (value : Signal dom (BitVec w)) (lower upper : BitVec w)
+    : Signal dom (BitVec w) :=
+  signedSaturate value (Signal.pure lower) (Signal.pure upper)
+
 /-- D flip-flop alias. Prefer this when mirroring Verilog `q <= d`. -/
 def dff {α : Type} (init : α) (d : Signal dom α) : Signal dom α :=
   Signal.register init d
