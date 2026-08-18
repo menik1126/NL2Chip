@@ -190,7 +190,39 @@ top-level-binder error and does not form a P3 generic module.
   `regFile1R1W`/`Signal.memoryComboRead` for a current-address combinational
   read of writes from prior cycles. Memory does not implement FIFO control:
   keep count, read/write pointers, `full`, and `empty` as explicit resettable
-  feedback state and match the contract's read latency.
+  feedback state and match the contract's read latency. `allOnes pointer` is a
+  native-symbolic-safe full-sentinel check.
+- For a LIFO, write the current next-free pointer and read `pointer - 1` on a
+  valid pop. Derive `writeFire` and `readFire` from the current `full`/`empty`
+  state before updating the pointer. There are two legitimate full conventions:
+  an `(ADDR_WIDTH + 1)`-bit count can use all `2^ADDR_WIDTH` entries, while an
+  `ADDR_WIDTH`-bit pointer may reserve the all-ones value as a full sentinel and
+  expose `2^ADDR_WIDTH - 1` usable entries. Follow the contract and simulator
+  boundary timing exactly; do not mix the sentinel flag from one convention
+  with the write acceptance rule from the other. With combinational-read
+  `regFile1R1W`, choose the output timing from the contract: expose
+  `memory[pointer - 1]` directly when `data_out` denotes the current top before
+  the pop edge, and register it only when registered-pop latency is explicitly
+  required. A stale zero on the first pop commonly means an unnecessary output
+  register added one cycle of latency.
+- For ready/valid protocols such as AXI-Lite, address and data channels are
+  independent. Capture each channel separately if they can arrive in different
+  cycles. A response state must give newly accepted work priority over clearing
+  an old response and must hold response data plus `valid` until a visible
+  `valid && ready` handshake. Never create and retire a response in the same
+  next-state decision, and never make `RVALID` or `BVALID` a one-cycle pulse
+  that can disappear before the requester observes it.
+- Reset every state field involved in protocol progress. Normal state evolution
+  must remain gated by its semantic enable after reset: for example, a timer
+  that counts after a running countdown reaches zero must also require the
+  running/completed state, because `value == 0` is already true in the reset
+  state.
+- Sparkle can emit the implicit domain `rst` together with an explicit
+  `_gen_rst` when reset is also a function argument. The CVDP wrapper connects
+  both by name and applies the inferred polarity; two inner reset ports alone
+  do not shift `start` or prove an adapter disconnection. Prefer one reset
+  mechanism when that matches the contract, and restructure reset only when
+  simulator timing or assertion evidence requires it.
 - A design that uses `Signal.mapChunks`, `Signal.mapChunksWithIndex`,
   `Signal.generateBitsWithIndex`, or any named `@[sparkle_module]`
   helper is hierarchical. End it with

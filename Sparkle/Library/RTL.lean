@@ -47,7 +47,10 @@ def nonZero {w : Nat} (x : Signal dom (BitVec w)) : Signal dom Bool :=
 
 /-- Hardware all-ones comparison. Useful for reduction-AND style checks. -/
 def allOnes {w : Nat} (x : Signal dom (BitVec w)) : Signal dom Bool :=
-  x === (Signal.pure (onesBV w))
+  -- Modular increment wraps exactly the all-ones vector to zero.  This form
+  -- preserves a symbolic `w`; materializing `2 ^ w - 1` as a host value does
+  -- not lower reliably through the native parameter backend.
+  isZero (x + BitVec.ofNat w 1)
 
 /-- Extract one bit as a 1-bit BitVec signal. `i = 0` is the LSB. -/
 def bit {w : Nat} (x : Signal dom (BitVec w)) (i : Nat) : Signal dom (BitVec 1) :=

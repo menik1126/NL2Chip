@@ -668,8 +668,10 @@ opaque memory {addrWidth dataWidth : Nat}
   previous cycle), `memoryComboRead` reads `readAddr` from the current cycle.
   Writes from previous cycles (0..t-1) are visible; the write at cycle t is not.
 
-  Use this for register files where reads must be combinational.
-  NOT synthesizable — use `memory` for synthesis targets.
+  Use this for register files where reads must be combinational. The Sparkle
+  Verilog backend synthesizes it as a clocked-write memory with an asynchronous
+  read port; the implementation below provides matching Lean simulation
+  semantics. Use `memory` instead when a one-cycle registered read is required.
 -/
 -- HashMap-backed sparse memory with combinational (same-cycle) reads.
 -- For large address spaces (addrWidth > 20) where a flat Array would be too large.

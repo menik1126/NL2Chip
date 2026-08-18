@@ -22,6 +22,8 @@ class AgentStats:
     uncached_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    token_accounting_complete: bool = True
+    recovered_usage_sessions: int = 0
 
     def add_usage(self, usage: dict[str, int]) -> None:
         self.uncached_input_tokens += int(usage["uncached_input_tokens"])
@@ -119,6 +121,11 @@ def parse_agent_log(path: Path) -> AgentStats:
     stats = AgentStats()
     if not path.exists():
         return stats
+    is_codex = False
+    codex_action_events = 0
+    codex_reported_turns = 0
+    budget_exceeded = False
+    recovered_usage = False
     for line in path.read_text(errors="replace").splitlines():
         if not line.strip():
             continue
@@ -127,12 +134,18 @@ def parse_agent_log(path: Path) -> AgentStats:
         except json.JSONDecodeError:
             continue
         event = row.get("event") or row.get("type")
+        if event == "session_start" and row.get("runner") == "codex":
+            is_codex = True
         if event in {"assistant", "assistant_turn"}:
             stats.turns = max(stats.turns, int(row.get("turn", -1)) + 1)
             stats.add_usage(normalize_token_usage(_row_usage(row)))
+        elif event == "text":
+            codex_action_events += 1
         elif event == "turn_usage":
             stats.add_usage(normalize_token_usage(_row_usage(row)))
         elif event == "tool_call":
+            if is_codex:
+                codex_action_events += 1
             name = str(row.get("name") or row.get("tool") or row.get("tool_name") or "unknown")
             stats.tool_counts[name] = stats.tool_counts.get(name, 0) + 1
             name_l = name.lower()
@@ -143,7 +156,17 @@ def parse_agent_log(path: Path) -> AgentStats:
                 stats.compile_checks += 1
         elif event in {"session_meta", "thread.started"}:
             stats.session_id = row.get("session_id") or row.get("thread_id") or stats.session_id
+        elif event == "session_usage_recovered":
+            stats.set_usage(normalize_token_usage(_row_usage(row)))
+            stats.recovered_usage_sessions += 1
+            recovered_usage = True
+        elif event == "cktarchon_budget_exceeded":
+            budget_exceeded = True
+        elif event == "cktarchon_token_accounting_incomplete":
+            stats.token_accounting_complete = False
         elif event == "session_end":
+            if row.get("runner") == "codex":
+                is_codex = True
             usage = _row_usage(row)
             has_breakdown = any(
                 usage.get(key) is not None
@@ -169,5 +192,17 @@ def parse_agent_log(path: Path) -> AgentStats:
                 stats.set_usage(normalize_token_usage(usage))
             elif usage.get("output_tokens") is not None and not stats.output_tokens:
                 stats.output_tokens = int(usage.get("output_tokens") or 0)
-            stats.turns = max(stats.turns, int(row.get("turns") or row.get("num_turns") or row.get("num_items") or 0))
+            reported = int(
+                row.get("turns") or row.get("num_turns") or row.get("num_items") or 0
+            )
+            codex_reported_turns = max(codex_reported_turns, reported)
+            if not is_codex:
+                stats.turns = max(stats.turns, reported)
+    if is_codex:
+        # CktArchon's Codex budget counts model text decisions and tool calls.
+        # Archon's num_items also includes reasoning items, so using it would
+        # report a different unit from the one enforced by the watcher.
+        stats.turns = codex_action_events or codex_reported_turns
+    if budget_exceeded and not recovered_usage and stats.input_tokens == 0:
+        stats.token_accounting_complete = False
     return stats

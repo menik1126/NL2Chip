@@ -19,8 +19,10 @@ from cktarchon.run import (
     candidate_delivery_guard,
     clear_generated_target,
     evaluate_with_infrastructure_retries,
+    finalize_guided_candidate,
     parse_args,
 )
+from cktarchon.run_verilog import parse_args as parse_verilog_args
 from cktarchon.search_strategy import (
     CandidateTracker,
     TurnBudget,
@@ -52,19 +54,24 @@ def test_skill_requires_outputs_outside_signal_loop():
     assert "Signal.loop fun (q : Signal dom (BitVec W)) =>" in prompt
     assert "`Signal.const` and `Signal.not` are not Sparkle APIs" in prompt
     assert "Do not use Lean `if`/`match` to select hardware behavior" in prompt
+    assert "There are two legitimate full conventions" in prompt
+    assert "Capture each channel separately" in prompt
+    assert "a timer\n  that counts after a running countdown" in prompt
 
 
 def test_fresh_candidate_prompt_requires_source_before_exploration():
     guard = candidate_delivery_guard("prob_a", 10)
 
     assert "at most 10 turns" in guard
-    assert "first tool call MUST be `write_file`" in guard
+    assert "first tool action MUST create" in guard
     assert "Generated/prob_a.lean" in guard
-    assert "Do not call `glob`, `grep`, `read_file`" in guard
+    assert "`write_file`, `apply_patch`, or the equivalent" in guard
+    assert "do not call `glob`, `grep`" in guard
 
     fake_search = SimpleNamespace(
         build_user_message=lambda *args, **kwargs: "## Base Problem",
         summarize_eval_result=lambda result: "prior result",
+        compact_repair_feedback=lambda feedback: f"compact: {feedback}",
         summarize_recent_attempts=lambda attempts: "prior attempts",
     )
     prompt = build_fresh_candidate_prompt(
@@ -76,13 +83,16 @@ def test_fresh_candidate_prompt_requires_source_before_exploration():
         candidate_id=2,
         guide_text="guide",
         prior_result={},
+        prior_feedback="Expected 9, got 0",
         recent_attempts=[],
         latest_self_test=None,
         turn_limit=10,
     )
 
     assert prompt.startswith("## Mandatory Candidate Delivery")
-    assert prompt.index("first tool call MUST") < prompt.index("## Base Problem")
+    assert prompt.index("first tool action MUST") < prompt.index("## Base Problem")
+    assert "### Failure Evidence To Avoid" in prompt
+    assert "compact: Expected 9, got 0" in prompt
 
 
 def test_model_alias_sonnet_45():
@@ -120,6 +130,39 @@ def test_sim_feedback_rewrite_is_opt_in(monkeypatch: pytest.MonkeyPatch):
     assert not args.disable_guided_self_test
 
 
+def test_cvdp_harness_profile_defaults_and_official_ablation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(sys, "argv", ["run.py", "--results-dir", "out"])
+    assert parse_args().cvdp_harness_profile == "race-safe-v1"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run.py",
+            "--results-dir",
+            "out",
+            "--cvdp-harness-profile",
+            "official",
+        ],
+    )
+    assert parse_args().cvdp_harness_profile == "official"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_verilog.py",
+            "--results-dir",
+            "out",
+            "--cvdp-harness-profile",
+            "official",
+        ],
+    )
+    assert parse_verilog_args().cvdp_harness_profile == "official"
+
+
 def test_runtime_env_prioritizes_guarded_iverilog_wrapper(monkeypatch: pytest.MonkeyPatch):
     raw_iverilog_bin = "/home/sgli/work/toolcache/iverilog_deb/extract/usr/bin"
     guarded_bin = "/home/sgli/.local/bin"
@@ -134,6 +177,24 @@ def test_runtime_env_prioritizes_guarded_iverilog_wrapper(monkeypatch: pytest.Mo
 
     parts = os.environ["PATH"].split(":")
     assert parts.index(guarded_bin) < parts.index(raw_iverilog_bin)
+
+
+def test_runtime_env_replaces_stale_host_specific_lake_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    local_lake = tmp_path / "lake"
+    local_lake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    local_lake.chmod(0o755)
+    monkeypatch.setenv("LAKE_PATH", "/home/other-host/.elan/bin/lake")
+    monkeypatch.setattr(
+        "cktarchon.env.shutil.which",
+        lambda name, path=None: str(local_lake) if name == "lake" else None,
+    )
+
+    ensure_runtime_env()
+
+    assert os.environ["LAKE_PATH"] == str(local_lake)
 
 
 def test_evaluator_retries_infrastructure_without_model_turns(
@@ -514,6 +575,54 @@ def test_parse_codex_archon_log(tmp_path: Path):
     assert stats.tool_counts == {"Bash": 1}
 
 
+def test_parse_codex_log_uses_the_enforced_action_unit(tmp_path: Path):
+    log = tmp_path / "codex-actions.jsonl"
+    append_jsonl(log, {"event": "session_start", "runner": "codex"})
+    append_jsonl(log, {"event": "thinking", "content": "private reasoning"})
+    append_jsonl(log, {"event": "text", "content": "I will check it."})
+    append_jsonl(log, {"event": "tool_call", "tool": "Bash", "input": {}})
+    append_jsonl(log, {"event": "tool_result", "content": "ok"})
+    append_jsonl(
+        log,
+        {
+            "event": "session_end",
+            "runner": "codex",
+            "num_items": 9,
+            "input_tokens_total": 100,
+            "output_tokens": 10,
+        },
+    )
+
+    stats = parse_agent_log(log)
+
+    assert stats.turns == 2
+    assert stats.token_accounting_complete
+
+
+def test_codex_budget_stop_without_recovered_usage_is_marked_incomplete(
+    tmp_path: Path,
+):
+    log = tmp_path / "codex-incomplete.jsonl"
+    append_jsonl(log, {"event": "session_start", "runner": "codex"})
+    append_jsonl(log, {"event": "tool_call", "tool": "Edit", "input": {}})
+    append_jsonl(log, {"event": "cktarchon_budget_exceeded"})
+    append_jsonl(
+        log,
+        {
+            "event": "session_end",
+            "runner": "codex",
+            "num_items": 1,
+            "input_tokens_total": 0,
+            "output_tokens": 0,
+        },
+    )
+
+    stats = parse_agent_log(log)
+
+    assert stats.turns == 1
+    assert not stats.token_accounting_complete
+
+
 def test_anthropic_cache_usage_is_counted_once(tmp_path: Path):
     first = normalize_token_usage(
         SimpleNamespace(
@@ -608,6 +717,8 @@ def test_codex_prompt_points_to_lean_check(tmp_path: Path):
     prompt = runner._codex_prompt("problem", max_turns=80)
     assert ".venv/bin/python -m cktarchon.tools lean-check Generated/prob_a.lean" in prompt
     assert "Only edit `Generated/prob_a.lean`" in prompt
+    assert "Never read prior benchmark candidates or run artifacts" in prompt
+    assert "experiments/p3_replay_candidates" in prompt
     assert "Final CktArchon override" in prompt
     assert "Do not run simulation, pytest, cocotb, or a final `lake build` after lean-check succeeds" in prompt
 
@@ -632,6 +743,74 @@ def test_codex_budget_watcher_sets_cancel(tmp_path: Path):
 
     assert cancel.is_set()
     assert "cktarchon_budget_exceeded" in runner.log_path.read_text(encoding="utf-8")
+
+
+def test_codex_runner_recovers_usage_from_persistent_rollout(tmp_path: Path):
+    codex_home = tmp_path / "codex-home"
+    rollout = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "08"
+        / "18"
+        / "rollout-thread-usage.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 120,
+                            "cached_input_tokens": 80,
+                            "cache_write_input_tokens": 0,
+                            "output_tokens": 9,
+                        }
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runner = CodexAgentHarnessRunner(
+        project_root=tmp_path,
+        prob_id="prob_a",
+        model="gpt-5.6-sol",
+        role="ckt-generator",
+        log_base=tmp_path / "logs" / "generate",
+        system_prompt="system",
+    )
+    append_jsonl(runner.log_path, {"event": "session_start", "runner": "codex"})
+    append_jsonl(
+        runner.log_path,
+        {"event": "session_meta", "session_id": "thread-usage"},
+    )
+    append_jsonl(runner.log_path, {"event": "cktarchon_budget_exceeded"})
+    append_jsonl(
+        runner.log_path,
+        {
+            "event": "session_end",
+            "runner": "codex",
+            "num_items": 1,
+            "input_tokens_total": 0,
+            "output_tokens": 0,
+        },
+    )
+
+    runner._recover_rollout_usage({"CODEX_HOME": str(codex_home)})
+    stats = parse_agent_log(runner.log_path)
+
+    assert stats.input_tokens == 120
+    assert stats.uncached_input_tokens == 40
+    assert stats.cache_read_input_tokens == 80
+    assert stats.output_tokens == 9
+    assert stats.recovered_usage_sessions == 1
+    assert stats.token_accounting_complete
+    assert not rollout.exists()
 
 
 def test_system_prompt_separates_file_name_from_target_module():
@@ -854,6 +1033,62 @@ def test_candidate_tracker_keeps_local_and_global_best(tmp_path: Path):
     tracker.restore_global(target)
     assert target.read_text() == "candidate B improved"
     assert (tmp_path / "candidates" / "prob_a" / "candidate_02" / "best.lean").exists()
+
+
+def test_guided_finalization_replays_global_best_when_last_artifacts_are_stale(
+    tmp_path: Path,
+):
+    target = tmp_path / "Generated" / "prob_a.lean"
+    tracker = CandidateTracker(
+        snapshot_root=tmp_path / "candidates",
+        prob_id="prob_a",
+        progress_key=_progress,
+        max_candidates=2,
+        patience=1,
+    )
+    tracker.start_candidate({"rank": 5, "sim_status": "sim_fail"}, "candidate A", reason="initial")
+    tracker.observe({"rank": 5, "sim_status": "sim_fail"}, "candidate A2", reason="repair")
+    calls = []
+
+    def evaluate_selected():
+        calls.append(target.read_text())
+        return {"rank": 5, "sim_status": "sim_pass"}
+
+    result, replayed = finalize_guided_candidate(
+        tracker,
+        target,
+        last_evaluated_code="candidate A2",
+        evaluate_selected=evaluate_selected,
+    )
+
+    assert replayed
+    assert calls == ["candidate A"]
+    assert result == {"rank": 5, "sim_status": "sim_pass"}
+    assert target.read_text() == "candidate A"
+
+
+def test_guided_finalization_skips_replay_when_selected_source_was_evaluated_last(
+    tmp_path: Path,
+):
+    target = tmp_path / "Generated" / "prob_a.lean"
+    tracker = CandidateTracker(
+        snapshot_root=tmp_path / "candidates",
+        prob_id="prob_a",
+        progress_key=_progress,
+    )
+    expected = {"rank": 5, "sim_status": "sim_fail"}
+    tracker.start_candidate(expected, "candidate A", reason="initial")
+
+    result, replayed = finalize_guided_candidate(
+        tracker,
+        target,
+        last_evaluated_code="candidate A",
+        evaluate_selected=lambda: pytest.fail("unexpected replay"),
+    )
+
+    assert not replayed
+    assert result == expected
+    assert target.read_text() == "candidate A"
 
 
 def test_generated_self_test_runs_in_isolated_directory(tmp_path: Path):

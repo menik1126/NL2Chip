@@ -40,6 +40,7 @@ from coding_agent import CodingAgent, create_message_with_retries, load_env
 from dataset import Dataset, ProblemInfo
 from evaluator import Evaluator, _rename_module_declaration, parse_module_ports
 from cvdp_specialization import (
+    discover_finite_parameter_plan,
     format_specialization_contract,
     plan_from_dict,
 )
@@ -47,6 +48,7 @@ from cvdp_native_parameters import (
     format_native_parameter_contract,
     native_plan_from_dict,
 )
+from cvdp_harness_adapter import infer_cvdp_reset_polarities
 from lean_repl import LeanREPLPool
 from report import generate_report
 from cktarchon.diagnostics import format_lean_diagnostics
@@ -302,7 +304,16 @@ def _cvdp_parse_parameter_sweeps(
                 if len(names) == 1:
                     param = names[0]
                     if param in param_values:
-                        param_values[param].update(_format_param_value(v) for v in values)
+                        # A one-name pytest parameter is scalar. If a heuristic
+                        # helper expansion produced tuple rows, do not claim
+                        # those tuples are legal values of that scalar parameter.
+                        scalar_values = [
+                            value for value in values
+                            if not isinstance(value, (list, tuple))
+                        ]
+                        param_values[param].update(
+                            _format_param_value(value) for value in scalar_values
+                        )
                 else:
                     for row in values:
                         if not isinstance(row, (list, tuple)) or len(row) != len(names):
@@ -413,37 +424,7 @@ def _classify_reset_drive(values: list[str]) -> str | None:
 
 
 def _infer_cvdp_reset_polarities(harness_files: dict, reset_names: list[str]) -> dict[str, str]:
-    py_text = "\n\n".join(
-        str(content) for path, content in harness_files.items() if str(path).endswith(".py")
-    )
-    inferred: dict[str, str] = {}
-    for name in reset_names:
-        direct = re.findall(rf"\bdut\.{re.escape(name)}\.value\s*=\s*([01])\b", py_text)
-        polarity = _classify_reset_drive(direct)
-        if polarity:
-            inferred[name] = polarity
-
-    helper_polarity: dict[str, str] = {}
-    func_re = re.compile(
-        r"(?ms)^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*:\s*(.*?)(?=^(?:async\s+)?def\s+|\Z)"
-    )
-    for match in func_re.finditer(py_text):
-        func_name = match.group(1)
-        args = [arg.strip().split("=")[0].strip() for arg in match.group(2).split(",") if arg.strip()]
-        if not args:
-            continue
-        body = match.group(3)
-        for arg in args[:2]:
-            values = re.findall(rf"\b{re.escape(arg)}\.value\s*=\s*([01])\b", body)
-            polarity = _classify_reset_drive(values)
-            if polarity:
-                helper_polarity[func_name] = polarity
-                break
-    for func_name, polarity in helper_polarity.items():
-        for name in re.findall(rf"\b{re.escape(func_name)}\s*\(\s*dut\.([A-Za-z_]\w*)", py_text):
-            if name in reset_names and name not in inferred:
-                inferred[name] = polarity
-    return inferred
+    return infer_cvdp_reset_polarities(harness_files, reset_names)
 
 
 def _format_port(direction: str, typ: str, name: str, reset_polarities: dict[str, str] | None = None) -> str:
@@ -1067,6 +1048,7 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
     metadata = info.metadata or {}
     design_name = info.design_name
     harness_usage: dict[str, set[str]] = {"ports": set(), "inputs": set(), "outputs": set(), "params": set()}
+    contract_parameter_names: set[str] = set()
 
     if metadata.get("dataset") == "cvdp":
         harness_files = metadata.get("harness_files", {}) or {}
@@ -1074,7 +1056,38 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
         design_name = _parse_env_value(env_text, "TOPLEVEL") or design_name
         harness_usage = _parse_cvdp_harness_usage(harness_files)
         harness_usage = _apply_prompt_parameters(harness_usage, info.prompt_text or "")
-        param_values, param_combos = _cvdp_parse_parameter_sweeps(harness_files, harness_usage["params"])
+        parameter_plan = plan_from_dict(metadata.get("finite_parameter_plan"))
+        if parameter_plan is None:
+            parameter_plan = native_plan_from_dict(
+                metadata.get("native_parameter_sweep_plan")
+            )
+        if parameter_plan is None:
+            discovered_plan = discover_finite_parameter_plan(
+                design_name=design_name or info.design_name or "dut",
+                harness_files=harness_files,
+            )
+            if discovered_plan.supported:
+                parameter_plan = discovered_plan
+        if parameter_plan is not None:
+            # The configured plan has already parsed and validated the public
+            # build configurations. Reusing it prevents a second heuristic
+            # parser from mistaking helper tuples such as (WIDTH, ITERATIONS)
+            # for values of the single WIDTH parameter.
+            plan_cases = [case.values for case in parameter_plan.cases]
+            param_values = {
+                name: list(dict.fromkeys(
+                    str(case[name]) for case in plan_cases if name in case
+                ))
+                for name in parameter_plan.parameter_names
+            }
+            param_combos = plan_cases if len(parameter_plan.parameter_names) > 1 else []
+            contract_parameter_names.update(parameter_plan.parameter_names)
+        else:
+            param_values, param_combos = _cvdp_parse_parameter_sweeps(
+                harness_files,
+                harness_usage["params"],
+            )
+        contract_parameter_names.update(harness_usage["params"])
     else:
         param_values, param_combos = {}, []
 
@@ -1092,8 +1105,11 @@ def format_benchmark_interface_contract(info: ProblemInfo | None) -> str:
     verilog_sources = metadata.get("verilog_sources")
     if verilog_sources:
         lines.append(f"- Benchmark RTL source target(s): {', '.join(str(s) for s in verilog_sources)}")
-    if harness_usage["params"]:
-        lines.append(f"- Benchmark parameters referenced by harness: {', '.join(sorted(harness_usage['params']))}")
+    if contract_parameter_names:
+        lines.append(
+            "- Benchmark parameters referenced by harness/validated plan: "
+            + ", ".join(sorted(contract_parameter_names))
+        )
         if param_values:
             value_text = "; ".join(
                 f"{name}={{{', '.join(values[:8])}{', ...' if len(values) > 8 else ''}}}"
@@ -1692,6 +1708,108 @@ def extract_sim_diagnostics(detail: str | None, max_chars: int = SIM_DIAGNOSTIC_
     return truncate_text(text, max_chars, keep="tail")
 
 
+def extract_cvdp_progress_snapshots(
+    detail: str | None,
+    *,
+    max_snapshots: int = 8,
+    max_chars: int = 3600,
+) -> str:
+    """Return read-only public DUT snapshots emitted by the CVDP adapter.
+
+    These lines contain observed port values only.  Keeping them in a separate
+    section prevents the generic simulator-diagnostic filter from discarding
+    the most useful evidence for a ready/valid timeout.
+    """
+    text = clean_diagnostic_text(detail)
+    if not text:
+        return ""
+    snapshots: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("[CVDP_PROGRESS after=") or line in seen:
+            continue
+        seen.add(line)
+        snapshots.append(line)
+        if len(snapshots) >= max_snapshots:
+            break
+    return truncate_text("\n".join(snapshots), max_chars, keep="head")
+
+
+def semantic_repair_hints(
+    result: dict,
+    info: ProblemInfo | None,
+    progress_snapshots: str,
+) -> str:
+    """Build non-oracle semantic hints from the public contract and failures."""
+    detail = clean_diagnostic_text(result.get("detail"))
+    expected_inputs, expected_outputs = benchmark_expected_port_names(info)
+    ports = {name.lower() for name in expected_inputs | expected_outputs}
+    hints: list[str] = []
+
+    if progress_snapshots and any(
+        name in ports
+        for name in {
+            "axi_arvalid", "axi_arready", "axi_rvalid", "axi_rready",
+            "axi_awvalid", "axi_awready", "axi_wvalid", "axi_wready",
+        }
+    ):
+        hints.append(
+            "For each ready/valid channel, distinguish request acceptance from "
+            "response retirement. Latch independent request fields, give creation "
+            "of a new response priority over retirement, and hold response data/valid "
+            "until an observable valid-and-ready handshake. Do not emit a transient "
+            "valid pulse or require independent AXI address/data channels to arrive "
+            "in the same cycle."
+        )
+
+    if {
+        "axi_awvalid", "axi_awready", "axi_wvalid", "axi_wready",
+        "axi_arvalid", "axi_arready", "axi_rvalid", "axi_rready",
+    } <= ports and re.search(
+        r"(?:wrote\s+\d+\s*,\s*read\s+0|countdown value mismatch)",
+        detail,
+        re.IGNORECASE,
+    ):
+        hints.append(
+            "The AXI transactions now make progress, but a nonzero written payload "
+            "reads back as zero. Treat this as a write-commit/register-map datapath "
+            "failure rather than another ready/valid timeout: verify the public "
+            "specification's byte-address map, combine independently captured AW and W "
+            "payloads on exactly one commit, honor WSTRB where required, and decode the "
+            "read address from the stored state updated by that commit."
+        )
+
+    if re.search(r"after reset[^\n]*expected\s+0", detail, re.IGNORECASE):
+        hints.append(
+            "A state value is nonzero after reset. Reset every related state field, "
+            "then gate its normal evolution with the actual active/run/completed "
+            "condition; a zero data value alone must not make an elapsed/age counter "
+            "start advancing immediately after reset."
+        )
+
+    stack_ports = {"data_in", "data_out", "read_en", "write_en", "empty", "full"}
+    if stack_ports <= ports and re.search(
+        r"Expected\s+\d+\s*,\s*got\s+\d+", detail, re.IGNORECASE
+    ):
+        hints.append(
+            "Audit the stack boundary and pop timing before changing widths: decide "
+            "whether the contract uses all 2^ADDR_WIDTH entries or reserves the "
+            "all-ones pointer as a full sentinel. Compute writeFire from the current "
+            "full state, write only committed items, and read address pointer-1. If "
+            "the contract observes the current top before the pop edge, expose the "
+            "combinational `regFile1R1W` result directly; add a data_out register only "
+            "for an explicitly registered-pop contract. A stale zero suggests an extra "
+            "latency cycle, while an item newer than expected often means the write "
+            "that made full visible was committed under the wrong boundary convention. "
+            "If every parameter width returns zero while `empty` has already deasserted, "
+            "the width pipeline is working; inspect the memory write address/enable and "
+            "remove any stale registered-pop datapath before changing parameter types."
+        )
+
+    return "\n".join(f"- {hint}" for hint in hints)
+
+
 def extract_sim_test_counts(detail: str | None) -> tuple[int, int, int] | None:
     """Return (tests, pass, fail) from simulator summaries when present."""
     text = clean_diagnostic_text(detail)
@@ -2081,7 +2199,16 @@ def summarize_eval_result(result: dict | None) -> str:
         if ppa["power_uw"] is not None:
             metrics.append(f"power={ppa['power_uw']:.4f}")
         lines.append(f"- PPA: {', '.join(metrics)}")
-    if result.get("synth_pass") is not None:
+    synth_attempted = result.get("synth_attempted")
+    if synth_attempted is None:
+        # Backward-compatible inference for results written before the explicit
+        # attempted bit existed. A default ``synth_pass=False`` with the PPA
+        # policy disabled means "not run", not a synthesis failure.
+        synth_attempted = (
+            result.get("synth_pass") is True
+            or result.get("ppa_status") not in {None, "not_run"}
+        )
+    if synth_attempted:
         lines.append(f"- Synthesis: {bool_status(result.get('synth_pass'))}")
     return "\n".join(lines)
 
@@ -2266,8 +2393,10 @@ def compact_repair_feedback(feedback: str) -> str:
         selected.append(truncate_text(preamble, 900, keep="head"))
     for heading, limit in (
         ("First Failing Assertions", COMPACT_ASSERTION_CHARS),
+        ("Protocol Progress Snapshots", 3600),
         ("Waveform Context", COMPACT_ASSERTION_CHARS),
         ("Cleaned Simulator Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
+        ("Targeted Semantic Repair", 2200),
         ("Actionable Lean Diagnostics", COMPACT_DIAGNOSTIC_CHARS),
         ("Targeted Lean Repair", 1200),
         ("Lean Source Context", 1800),
@@ -2325,7 +2454,15 @@ def native_parameter_repair_capabilities(info: ProblemInfo | None) -> str:
         "`gatherNonPowerOfTwoBits`; keep `DATAW` and `PARITYW` symbolic.\n"
         "- Symbolic-width memory is supported: `syncRam1R1W` has one-cycle read latency and "
         "`regFile1R1W` has current-address combinational read semantics. Keep FIFO pointers, "
-        "count, full, and empty in explicit resettable `Signal.loop` state.\n"
+        "count, full, and empty in explicit resettable `Signal.loop` state. `allOnes pointer` "
+        "is safe for a symbolic full sentinel. For a stack, read `pointer - 1` and expose "
+        "that combinational top directly unless the contract explicitly requires a "
+        "registered-pop output.\n"
+        "- Sparkle may expose an implicit domain `rst` as well as an explicit `_gen_rst` "
+        "when reset is also a function argument. The CVDP wrapper connects these ports by "
+        "name and applies the inferred polarity; their mere presence does not shift another "
+        "port or prove an adapter disconnection. Prefer one reset mechanism when it matches "
+        "the contract, and change reset structure only when assertion/timing evidence supports it.\n"
         "- `popCount x`, `reverseBits x`, and `reverseBlocks (BLOCKS := k) x` preserve "
         "symbolic widths. `Signal.cast` only converts Signals; do not apply it to a "
         "raw `BitVec` or use it to prove non-definitional arithmetic width equalities. For "
@@ -2531,6 +2668,7 @@ def build_sim_feedback(
         part for part in [str(result.get("detail") or ""), simulator_output] if part.strip()
     )
     sim_diagnostics = extract_sim_diagnostics(combined_detail, SIM_DIAGNOSTIC_CHARS)
+    progress_snapshots = extract_cvdp_progress_snapshots(combined_detail)
     benchmark_contract = format_benchmark_interface_contract(info)
     if benchmark_contract:
         lines.extend([
@@ -2547,6 +2685,22 @@ def build_sim_feedback(
             "```text",
             sim_diagnostics,
             "```",
+        ])
+    if progress_snapshots:
+        lines.extend([
+            "",
+            "### Protocol Progress Snapshots",
+            "Read-only values of public DUT ports at fixed simulation times; no expected values or benchmark source are included.",
+            "```text",
+            progress_snapshots,
+            "```",
+        ])
+    semantic_hints = semantic_repair_hints(result, info, progress_snapshots)
+    if semantic_hints:
+        lines.extend([
+            "",
+            "### Targeted Semantic Repair",
+            semantic_hints,
         ])
     first_failures = extract_first_failure_diagnostics(combined_detail)
     if first_failures:

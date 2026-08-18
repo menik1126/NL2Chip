@@ -4,6 +4,7 @@ import argparse
 import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 import re
 import shutil
 import sys
@@ -17,6 +18,8 @@ from .harness import AnthropicHarnessRunner
 from .logs import AgentStats, append_jsonl, parse_agent_log
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CVDP_HARNESS_PROFILES = ("official", "race-safe-v1")
+CVDP_HARNESS_PROFILE_DEFAULT = "race-safe-v1"
 
 DEFAULT_MAGE_PROMPTS = Path(
     "/home/sgli/work/external_baselines/"
@@ -72,6 +75,15 @@ def _add_agent_paths() -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CktArchon baseline: Archon-style direct SystemVerilog generation with sim feedback")
     p.add_argument("--dataset", default="cvdp", choices=["verilogeval", "rtllm", "resbench", "cvdp", "realbench"])
+    p.add_argument(
+        "--cvdp-harness-profile",
+        choices=CVDP_HARNESS_PROFILES,
+        default=CVDP_HARNESS_PROFILE_DEFAULT,
+        help=(
+            "Versioned CVDP testbench scheduling profile. Use `official` only "
+            "for the unchanged-harness ablation."
+        ),
+    )
     p.add_argument("--problem-file", type=str, default=None)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--filter", type=str, default=None)
@@ -463,6 +475,7 @@ def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir:
         "dataset": args.dataset,
         "model": model_alias(args.model),
         "harness": "cktarchon-anthropic-verilog",
+        "cvdp_harness_profile": args.cvdp_harness_profile,
         "feedback_mode": args.feedback_mode,
         "agent_error": agent_error,
         "agent_turns_total": agent_stats.turns,
@@ -489,7 +502,13 @@ def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir:
     return record
 
 
-def update_summary(run_dir: Path, total: int, records: list[dict[str, Any]], skipped: int = 0) -> dict[str, Any]:
+def update_summary(
+    run_dir: Path,
+    total: int,
+    records: list[dict[str, Any]],
+    skipped: int = 0,
+    harness_profile: str = CVDP_HARNESS_PROFILE_DEFAULT,
+) -> dict[str, Any]:
     summary = {
         "total": total,
         "completed": len(records),
@@ -507,6 +526,7 @@ def update_summary(run_dir: Path, total: int, records: list[dict[str, Any]], ski
         "tokens_in_cache_read": 0,
         "tokens_out": 0,
         "turns": 0,
+        "cvdp_harness_profile": harness_profile,
     }
     for row in records:
         if row.get("compile_pass"):
@@ -538,6 +558,7 @@ def update_summary(run_dir: Path, total: int, records: list[dict[str, Any]], ski
 
 def main() -> None:
     args = parse_args()
+    os.environ["CVDP_HARNESS_PROFILE"] = args.cvdp_harness_profile
     ensure_runtime_env()
     load_env_file(Path(args.key_env))
     _add_agent_paths()
@@ -557,7 +578,8 @@ def main() -> None:
     num_workers = max(1, args.workers)
     print(
         f"CktArchon-Verilog: {len(problems)} problems, model={model_alias(args.model)}, "
-        f"workers={num_workers}, run_dir={run_dir}",
+        f"cvdp_harness_profile={args.cvdp_harness_profile}, workers={num_workers}, "
+        f"run_dir={run_dir}",
         flush=True,
     )
 
@@ -579,6 +601,7 @@ def main() -> None:
                 "dataset": args.dataset,
                 "model": model_alias(args.model),
                 "harness": "cktarchon-anthropic-verilog",
+                "cvdp_harness_profile": args.cvdp_harness_profile,
                 "agent_error": f"{type(exc).__name__}: {exc}",
                 "compile_pass": False,
                 "sim_status": "sim_error",
@@ -599,7 +622,13 @@ def main() -> None:
                 _, _, record = future.result()
                 records.append(record)
                 append_jsonl(results_path, record)
-                update_summary(run_dir, len(problems), records, skipped)
+                update_summary(
+                    run_dir,
+                    len(problems),
+                    records,
+                    skipped,
+                    args.cvdp_harness_profile,
+                )
                 print(
                     f"[{idx}/{len(problems)}] {prob_id}: done "
                     f"compile={record.get('compile_pass')} sim={record.get('sim_status')} "
@@ -608,7 +637,13 @@ def main() -> None:
                     flush=True,
                 )
     finally:
-        summary = update_summary(run_dir, len(problems), records, skipped)
+        summary = update_summary(
+            run_dir,
+            len(problems),
+            records,
+            skipped,
+            args.cvdp_harness_profile,
+        )
         print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
 
 

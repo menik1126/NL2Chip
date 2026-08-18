@@ -130,6 +130,32 @@ def symbolicPairLoop {dom : DomainConfig} {W : Nat}
     let next := bundle2 (state.fst ^^^ x) state.snd
     Signal.register (BitVec.ofNat W 0, BitVec.ofNat W 0) next
 
+/-- A wide mixed-width tuple state with its reset seed in a local Lean let.
+    Plain tuple seeds must stay host values until register-reset extraction;
+    treating them as Signal-valued hardware attempts to instantiate `Prod.mk`. -/
+def symbolicWideTupleLoop {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) :
+    Signal dom
+      (BitVec W × BitVec W × BitVec (W + 1) × BitVec W ×
+       BitVec W × BitVec 1 × BitVec 1 × BitVec 1) :=
+  Signal.loop fun state =>
+    let nextState := bundleAll! [
+      projN! state 8 0 ^^^ x,
+      projN! state 8 1,
+      projN! state 8 2,
+      projN! state 8 3,
+      projN! state 8 4,
+      projN! state 8 5,
+      projN! state 8 6,
+      projN! state 8 7
+    ]
+    let initState :
+        BitVec W × BitVec W × BitVec (W + 1) × BitVec W ×
+        BitVec W × BitVec 1 × BitVec 1 × BitVec 1 :=
+      (BitVec.ofNat W 0, BitVec.ofNat W 0, BitVec.ofNat (W + 1) 0,
+       BitVec.ofNat W 0, BitVec.ofNat W 0, 0#1, 0#1, 0#1)
+    Signal.register initState nextState
+
 /-- Compare symbolic-width state against a retained parameter value. -/
 def symbolicDepthCompare {dom : DomainConfig} {DEPTH : Nat}
     (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 (DEPTH + 1))))
@@ -161,6 +187,21 @@ def symbolicParameterLiteral {dom : DomainConfig} {D : Nat}
     (x : Signal dom (BitVec (Sparkle.Library.RTL.clog2 D + 1)))
     : Signal dom (BitVec (Sparkle.Library.RTL.clog2 D + 1)) :=
   Signal.pure (BitVec.ofNat (Sparkle.Library.RTL.clog2 D + 1) D)
+
+/-- A BitVec value may be an arithmetic expression over the retained width.
+    This is common for counters, terminal indices, and width-wide masks. -/
+def symbolicValueExpression {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  let terminal := BitVec.ofNat W (W - 1)
+  let mask := BitVec.ofNat W (2 ^ W - 1)
+  (x + terminal) ^^^ mask
+
+/-- Top-level variadic tuple packing must remain a packed hardware result even
+    when Lean reduces `bundleAll!` through applicative `Prod.mk`. -/
+def symbolicBundleAllOutput {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) :
+    Signal dom (BitVec W × BitVec W × BitVec 1) :=
+  bundleAll! [x, x ^^^ BitVec.ofNat W 1, Signal.pure 1#1]
 
 /-- Generic reduction primitive used by parameterized datapaths. -/
 def symbolicPopCount {dom : DomainConfig} {W : Nat}

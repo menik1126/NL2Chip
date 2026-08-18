@@ -58,6 +58,10 @@ module symbolic_parameter_behavior_tb;
     wire [5:0] pair3_out;
     logic [16:0] pair17_in;
     wire [33:0] pair17_out;
+    logic [2:0] wide_tuple3_in;
+    wire [18:0] wide_tuple3_out;
+    logic [4:0] wide_tuple5_in;
+    wire [28:0] wide_tuple5_out;
     logic [3:0] depth8_in;
     wire depth8_out;
     logic [3:0] depth12_in;
@@ -95,6 +99,14 @@ module symbolic_parameter_behavior_tb;
     wire [2:0] letmask3_out;
     logic [16:0] letmask17_in;
     wire [16:0] letmask17_out;
+    logic [2:0] value_expr3_in;
+    wire [2:0] value_expr3_out;
+    logic [4:0] value_expr5_in;
+    wire [4:0] value_expr5_out;
+    logic [2:0] bundle_all3_in;
+    wire [6:0] bundle_all3_out;
+    logic [4:0] bundle_all5_in;
+    wire [10:0] bundle_all5_out;
 
     logic [2:0] generate3_in;
     wire [2:0] generate3_out;
@@ -242,6 +254,14 @@ module symbolic_parameter_behavior_tb;
     symbolicPairLoop #(.W(17)) pair17_dut (
         ._gen_x(pair17_in), .clk(clk), .rst(rst), .out(pair17_out)
     );
+
+    symbolicWideTupleLoop #(.W(3)) wide_tuple3_dut (
+        ._gen_x(wide_tuple3_in), .clk(clk), .rst(rst), .out(wide_tuple3_out)
+    );
+
+    symbolicWideTupleLoop #(.W(5)) wide_tuple5_dut (
+        ._gen_x(wide_tuple5_in), .clk(clk), .rst(rst), .out(wide_tuple5_out)
+    );
     symbolicDepthCompare #(.DEPTH(8)) depth8_dut (
         ._gen_x(depth8_in), .clk(clk), .rst(rst), .out(depth8_out)
     );
@@ -347,6 +367,22 @@ module symbolic_parameter_behavior_tb;
         ._gen_x(reverse_blocks_in), .out(reverse_blocks8_out)
     );
 
+    symbolicValueExpression #(.W(3)) value_expr3_dut (
+        ._gen_x(value_expr3_in), .out(value_expr3_out)
+    );
+
+    symbolicValueExpression #(.W(5)) value_expr5_dut (
+        ._gen_x(value_expr5_in), .out(value_expr5_out)
+    );
+
+    symbolicBundleAllOutput #(.W(3)) bundle_all3_dut (
+        ._gen_x(bundle_all3_in), .out(bundle_all3_out)
+    );
+
+    symbolicBundleAllOutput #(.W(5)) bundle_all5_dut (
+        ._gen_x(bundle_all5_in), .out(bundle_all5_out)
+    );
+
     initial begin
         concat_hi = 3'b101;
         concat_lo = 5'b10011;
@@ -367,6 +403,8 @@ module symbolic_parameter_behavior_tb;
         loop17_in = 17'h1_2345;
         pair3_in = 3'b101;
         pair17_in = 17'h1_2345;
+        wide_tuple3_in = 3'b101;
+        wide_tuple5_in = 5'b10011;
 
         depth8_in = 4'd8;
         depth12_in = 4'd12;
@@ -387,6 +425,10 @@ module symbolic_parameter_behavior_tb;
         hier65_rhs = {1'b0, 64'hffff_0000_ffff_0000};
         letmask3_in = 3'b101;
         letmask17_in = 17'h1_2345;
+        value_expr3_in = 3'd0;
+        value_expr5_in = 5'd0;
+        bundle_all3_in = 3'b101;
+        bundle_all5_in = 5'b10011;
         generate3_in = 3'b101;
         generate17_in = 17'h1_2468;
         generate65_in = {1'b1, 64'h0123_4567_89ab_cdef};
@@ -446,6 +488,11 @@ module symbolic_parameter_behavior_tb;
         if (letmask3_out !== (letmask3_in ^ 3'd1) ||
             letmask17_out !== (letmask17_in ^ 17'd1))
             $fatal(1, "symbolic let-bound BitVec constant lowering failed");
+        if (value_expr3_out !== 3'd5 || value_expr5_out !== 5'd27)
+            $fatal(1, "symbolic BitVec value-expression lowering failed");
+        if (bundle_all3_out !== {3'b101, 3'b100, 1'b1} ||
+            bundle_all5_out !== {5'b10011, 5'b10010, 1'b1})
+            $fatal(1, "symbolic bundleAll top-level packing failed");
         if (generate3_out !== ~generate3_in ||
             generate17_out !== ~generate17_in ||
             generate65_out !== ~generate65_in)
@@ -475,6 +522,8 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic-width comparison reset flags failed");
         if (pair3_out !== {3'd0, 3'd0} || pair17_out !== {17'd0, 17'd0})
             $fatal(1, "symbolic packed-pair reset failed");
+        if (wide_tuple3_out !== 19'd0 || wide_tuple5_out !== 29'd0)
+            $fatal(1, "symbolic wide-tuple reset failed");
 
 
 
@@ -492,6 +541,9 @@ module symbolic_parameter_behavior_tb;
             $fatal(1, "symbolic-width comparison update flags failed");
         if (pair3_out !== {pair3_in, 3'd0} || pair17_out !== {pair17_in, 17'd0})
             $fatal(1, "symbolic packed-pair update failed");
+        if (wide_tuple3_out !== {wide_tuple3_in, 16'd0} ||
+            wide_tuple5_out !== {wide_tuple5_in, 24'd0})
+            $fatal(1, "symbolic wide-tuple update failed");
 
         if (depth8_out !== 1'b1 || depth12_out !== 1'b1 || depth16_out !== 1'b1)
             $fatal(1, "parameter-valued symbolic comparison failed");

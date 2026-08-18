@@ -278,6 +278,22 @@ partial def extractDimExpr (expr : Lean.Expr) : CompilerM DimExpr := do
   if rawFn.isConstOf (Lean.Name.str (Lean.Name.str (Lean.Name.str (Lean.Name.str Lean.Name.anonymous "Sparkle") "Library") "RTL") "clog2") && !rawArgs.isEmpty then
     return .clog2 (← extractDimExpr rawArgs.back!)
 
+  -- Preserve overloaded Nat arithmetic before whnf unfolds operations such as
+  -- subtraction and exponentiation into implementation-specific match terms.
+  if let .const rawName _ := rawFn then
+    let rawBinary (constructor : DimExpr → DimExpr → DimExpr) : CompilerM DimExpr := do
+      if rawArgs.size < 2 then
+        CompilerM.liftMetaM $ throwError s!"Malformed symbolic dimension operation {rawName}"
+      let lhs ← extractDimExpr rawArgs[rawArgs.size - 2]!
+      let rhs ← extractDimExpr rawArgs[rawArgs.size - 1]!
+      return constructor lhs rhs
+    if rawName == ``HAdd.hAdd then return ← rawBinary DimExpr.mkAdd
+    else if rawName == ``HSub.hSub then return ← rawBinary DimExpr.mkSub
+    else if rawName == ``HMul.hMul then return ← rawBinary DimExpr.mkMul
+    else if rawName == ``HDiv.hDiv then return ← rawBinary .div
+    else if rawName == ``HMod.hMod then return ← rawBinary .mod
+    else if rawName == ``HPow.hPow then return ← rawBinary .pow
+
   match expr with
   | .fvar fvarId =>
     match ← CompilerM.lookupDimVar fvarId with
@@ -563,7 +579,7 @@ partial def extractBitVecLiteralDim (expr : Lean.Expr) : CompilerM (Nat × DimEx
       extractBitVecLiteralDim reduced
     else
       CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
-/-- Extract a BitVec literal whose value may itself be a retained parameter. -/
+/-- Extract a BitVec literal whose value may depend on retained parameters. -/
 partial def extractBitVecLiteralValueDim
     (expr : Lean.Expr) : CompilerM (Sparkle.IR.AST.Expr × DimExpr) := do
   let fn := expr.getAppFn
@@ -577,10 +593,7 @@ partial def extractBitVecLiteralValueDim
         pure (.const (Int.ofNat (← extractNat valueArg)) 32)
       catch _ =>
         let valueDim ← extractDimExpr valueArg
-        match valueDim with
-        | .parameter parameterName => pure (.ref parameterName)
-        | _ => CompilerM.liftMetaM $ throwError
-          "A symbolic BitVec literal value must be a retained hardware parameter"
+        pure (.dimension valueDim)
       return (value, width)
     else if name == ``BitVec.ofFin && args.size >= 2 then
       let width ← extractDimExpr args[0]!
@@ -589,10 +602,7 @@ partial def extractBitVecLiteralValueDim
         pure (.const (Int.ofNat (← extractNat valueArg)) 32)
       catch _ =>
         let valueDim ← extractDimExpr valueArg
-        match valueDim with
-        | .parameter parameterName => pure (.ref parameterName)
-        | _ => CompilerM.liftMetaM $ throwError
-          "A symbolic BitVec literal value must be a retained hardware parameter"
+        pure (.dimension valueDim)
       return (value, width)
     else
       CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got application of {name}"
@@ -602,6 +612,16 @@ partial def extractBitVecLiteralValueDim
       extractBitVecLiteralValueDim reduced
     else
       CompilerM.liftMetaM $ throwError s!"Expected BitVec literal, got: {expr}"
+
+/-- Size a lowered BitVec value with its symbolic destination width. Other
+    symbolic expressions are assigned through a width-typed wire, which gives
+    SystemVerilog the same truncation behavior as `BitVec.ofNat`. -/
+def sizeBitVecLiteralValue (value : Sparkle.IR.AST.Expr) (width : DimExpr) :
+    Sparkle.IR.AST.Expr :=
+  match value, width.toNat? with
+  | .const literalValue _, some concreteWidth => .const literalValue concreteWidth
+  | .const literalValue _, none => .constDim literalValue width
+  | expression, _ => expression
 /-- Extract a Nat literal from an expression -/
 def extractNatLiteral (expr : Lean.Expr) : CompilerM (Nat × Unit) := do
   let n ← extractNat expr
@@ -759,11 +779,9 @@ mutual
         -- Preserve a BitVec literal as one sized RTL constant. Do not unwrap it
         -- to its Nat payload: local BitVec lets otherwise reach OfNat fallback.
         if (name == ``BitVec.ofNat || name == ``BitVec.ofFin) && args.size >= 2 then
-          let (value, width) ← extractBitVecLiteralDim e
+          let (value, width) ← extractBitVecLiteralValueDim e
           let resWire ← CompilerM.makeWire hint (hwTypeFromDim width) (named := isNamed)
-          match width.toNat? with
-          | some concreteWidth => CompilerM.emitAssign resWire (.const (Int.ofNat value) concreteWidth)
-          | none => CompilerM.emitAssign resWire (.constDim (Int.ofNat value) width)
+          CompilerM.emitAssign resWire (sizeBitVecLiteralValue value width)
           return resWire
 
         -- OfNat.ofNat: numeric literal (e.g., 0#4, 0xFFFFF#20, 35)
@@ -835,13 +853,7 @@ mutual
            match literalDim? with
            | some (value, width) =>
              let resWire ← CompilerM.makeWire hint (hwTypeFromDim width) (named := isNamed)
-             let literal := match value, width.toNat? with
-               | .const literalValue _, some concreteWidth =>
-                 Sparkle.IR.AST.Expr.const literalValue concreteWidth
-               | .const literalValue _, none =>
-                 Sparkle.IR.AST.Expr.constDim literalValue width
-               | expression, _ => expression
-             CompilerM.emitAssign resWire literal
+             CompilerM.emitAssign resWire (sizeBitVecLiteralValue value width)
              return resWire
            | none => pure ()
            let (value, width) ← try
@@ -1265,12 +1277,11 @@ mutual
         CompilerM.liftMetaM $ throwError s!"Unbound variable: {fvarId.name}. Known: {known}"
 
     | .letE name type value body _ => do
-      -- For any let binding, just use normal let handling
-      let isHW ← try
-        let _ ← inferHWTypeFromSignal type
-        pure true
-      catch _ =>
-        pure false
+      -- Only Signal-valued lets denote hardware wires. Plain packable values
+      -- (notably tuple-valued register seeds) must remain Lean lets so reset
+      -- extraction can inspect their constructors instead of trying to lower
+      -- the host-level `Prod.mk` as combinational hardware.
+      let isHW ← isSignalBinderType type
 
       if isHW then
         -- Hardware let: translate value to wire
@@ -1467,6 +1478,15 @@ mutual
           CompilerM.emitAssign resWire (.op op [.ref wireA, .ref wireB])
           return some resWire
         | none =>
+          -- `bundle2`/`bundleAll!` may reduce to applicative `Prod.mk` at a
+          -- top-level return. Products are represented by high-to-low packed
+          -- concatenation, matching the direct bundle2 lowering.
+          if opName == ``Prod.mk then
+            let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+            let hwType ← inferHWTypeFromSignal exprType
+            let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
+            CompilerM.emitAssign resWire (.concat [.ref wireA, .ref wireB])
+            return some resWire
           -- Special: BitVec.append / HAppend → concat
           if opName == ``HAppend.hAppend || opName == ``BitVec.append then
             let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)

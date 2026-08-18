@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 
@@ -36,10 +37,12 @@ def model_alias(name: str) -> str:
 
 
 def ensure_runtime_env() -> None:
-    """Expose Lean/Lake binaries used by the H20 NL2Chip experiments."""
+    """Expose the local Lean/Lake runtime without assuming the H20 home path."""
     project_root = Path(__file__).resolve().parents[1]
     prefixes = [
         str(project_root / ".venv" / "bin"),
+        str(Path.home() / ".elan" / "bin"),
+        str(Path.home() / ".local" / "bin"),
         "/home/sgli/.elan/bin",
         "/home/sgli/.elan/toolchains/leanprover--lean4---v4.28.0-rc1/bin",
         "/home/sgli/.local/bin",
@@ -51,4 +54,16 @@ def ensure_runtime_env() -> None:
         if Path(prefix).exists() and prefix not in parts:
             parts.insert(0, prefix)
     os.environ["PATH"] = os.pathsep.join(parts)
-    os.environ.setdefault("LAKE_PATH", "/home/sgli/.elan/bin/lake")
+
+    configured = os.environ.get("LAKE_PATH", "").strip()
+    configured_path = Path(configured).expanduser() if configured else None
+    if configured_path is not None and configured_path.is_file():
+        return
+
+    discovered = shutil.which("lake", path=os.environ["PATH"])
+    if discovered:
+        os.environ["LAKE_PATH"] = discovered
+    else:
+        # Do not preserve a stale host-specific path. LeanREPL will report its
+        # normal local fallback if Lake truly is unavailable on this host.
+        os.environ.pop("LAKE_PATH", None)

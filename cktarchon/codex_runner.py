@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import shlex
@@ -43,6 +44,7 @@ class CodexAgentHarnessRunner:
     auto_chat_proxy: bool = True
     chat_proxy_timeout_s: float = 300.0
     required_verilog_modules: tuple[str, ...] = ()
+    recover_usage_from_rollout: bool = True
 
     @property
     def log_path(self) -> Path:
@@ -89,7 +91,20 @@ class CodexAgentHarnessRunner:
                 wire_api=self.wire_api,
                 raw=raw,
             )
-            agent = CodexAgent(descriptor=descriptor, role=self.role)
+            agent_class = CodexAgent
+            if self.recover_usage_from_rollout:
+                # Codex reports aggregate usage only when a turn completes.
+                # A strict action-budget kill can happen before that event, but
+                # the persistent rollout records incremental token_count rows.
+                # Archon currently hard-codes --ephemeral, so remove only that
+                # flag while retaining the official runner and parser.
+                class PersistentCodexAgent(CodexAgent):
+                    def build_argv(inner_self, *args, **kwargs):
+                        argv = super().build_argv(*args, **kwargs)
+                        return [arg for arg in argv if arg != "--ephemeral"]
+
+                agent_class = PersistentCodexAgent
+            agent = agent_class(descriptor=descriptor, role=self.role)
             full_prompt = self._codex_prompt(prompt, max_turns=max_turns)
             cancel_event = threading.Event()
             monitor = threading.Thread(
@@ -99,6 +114,7 @@ class CodexAgentHarnessRunner:
                 daemon=True,
             )
             monitor.start()
+            ok = False
             try:
                 ok = agent.run(
                     full_prompt,
@@ -112,16 +128,18 @@ class CodexAgentHarnessRunner:
             finally:
                 cancel_event.set()
                 monitor.join(timeout=5)
+                if self.recover_usage_from_rollout:
+                    self._recover_rollout_usage(env_overrides)
         stats = parse_agent_log(self.log_path)
         if not ok:
             if self._budget_exceeded_logged():
                 append_jsonl(self.log_path, {
-                    "event": "cktarchon_error",
+                    "event": "cktarchon_budget_stop",
                     "runner": "codex-agent",
                     "prob_id": self.prob_id,
                     "detail": f"official Archon CodexAgent stopped after CktArchon max-turns budget {max_turns}",
                 })
-                raise RuntimeError(f"official Archon CodexAgent exceeded max-turns budget {max_turns}")
+                return stats
             append_jsonl(self.log_path, {
                 "event": "cktarchon_error",
                 "runner": "codex-agent",
@@ -130,6 +148,151 @@ class CodexAgentHarnessRunner:
             })
             raise RuntimeError("official Archon CodexAgent returned non-zero")
         return stats
+
+    def _recover_rollout_usage(self, env: dict[str, str]) -> None:
+        """Recover usage after a strict-budget stop, then remove the rollout.
+
+        Codex's stdout exposes usage only in ``turn.completed``.  Its local
+        persistent rollout additionally emits cumulative ``token_count``
+        records after each provider response, including responses followed by
+        a tool call.  Reading the last cumulative row preserves exact usage
+        even when the action watcher terminates the session mid-turn.
+        """
+        session_id = self._logged_session_id()
+        if not session_id:
+            if self._budget_exceeded_logged() or not self._log_has_usage():
+                self._record_incomplete_token_accounting(
+                    "Codex thread id was not recorded; rollout usage unavailable"
+                )
+            return
+
+        codex_home = Path(env.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+        sessions_root = codex_home / "sessions"
+        rollout = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                matches = list(sessions_root.rglob(f"*{session_id}*.jsonl"))
+            except OSError:
+                matches = []
+            if matches:
+                rollout = max(matches, key=lambda path: path.stat().st_mtime)
+                break
+            time.sleep(0.1)
+
+        if rollout is None:
+            if self._budget_exceeded_logged() or not self._log_has_usage():
+                self._record_incomplete_token_accounting(
+                    f"Codex rollout for thread {session_id} was not found"
+                )
+            return
+
+        total_usage: dict[str, object] | None = None
+        try:
+            for line in rollout.read_text(errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = row.get("payload") or {}
+                if (
+                    row.get("type") == "event_msg"
+                    and payload.get("type") == "token_count"
+                ):
+                    info = payload.get("info") or {}
+                    candidate = info.get("total_token_usage")
+                    if isinstance(candidate, dict):
+                        total_usage = candidate
+        except OSError as exc:
+            self._record_incomplete_token_accounting(
+                f"Could not read Codex rollout for thread {session_id}: {exc}"
+            )
+            return
+        finally:
+            keep = str(env.get("CKTARCHON_KEEP_CODEX_ROLLOUT", "")).lower()
+            if keep not in {"1", "true", "yes", "on"}:
+                try:
+                    rollout.unlink()
+                except OSError:
+                    pass
+
+        if not total_usage:
+            if self._budget_exceeded_logged() or not self._log_has_usage():
+                self._record_incomplete_token_accounting(
+                    f"Codex rollout for thread {session_id} had no token_count row"
+                )
+            return
+
+        input_total = int(total_usage.get("input_tokens") or 0)
+        cache_read = int(total_usage.get("cached_input_tokens") or 0)
+        cache_creation = int(total_usage.get("cache_write_input_tokens") or 0)
+        uncached = max(0, input_total - cache_read - cache_creation)
+        output = int(total_usage.get("output_tokens") or 0)
+        if input_total <= 0 and output <= 0:
+            self._record_incomplete_token_accounting(
+                f"Codex rollout for thread {session_id} reported zero usage"
+            )
+            return
+        append_jsonl(
+            self.log_path,
+            {
+                "event": "session_usage_recovered",
+                "runner": "codex-agent",
+                "prob_id": self.prob_id,
+                "session_id": session_id,
+                "source": "codex_rollout_token_count",
+                "input_tokens": uncached,
+                "uncached_input_tokens": uncached,
+                "cache_creation_input_tokens": cache_creation,
+                "cache_read_input_tokens": cache_read,
+                "input_tokens_total": input_total,
+                "output_tokens": output,
+            },
+        )
+
+    def _logged_session_id(self) -> str | None:
+        try:
+            for line in self.log_path.read_text(errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("event") in {"session_meta", "thread.started"}:
+                    value = row.get("session_id") or row.get("thread_id")
+                    if value:
+                        return str(value)
+        except OSError:
+            return None
+        return None
+
+    def _log_has_usage(self) -> bool:
+        try:
+            for line in self.log_path.read_text(errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                usage = row.get("usage") if isinstance(row.get("usage"), dict) else row
+                if int(usage.get("input_tokens_total") or 0) > 0:
+                    return True
+                if int(usage.get("input_tokens") or 0) > 0:
+                    return True
+                if int(usage.get("output_tokens") or 0) > 0:
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def _record_incomplete_token_accounting(self, detail: str) -> None:
+        append_jsonl(
+            self.log_path,
+            {
+                "event": "cktarchon_token_accounting_incomplete",
+                "runner": "codex-agent",
+                "prob_id": self.prob_id,
+                "detail": detail,
+            },
+        )
 
     def _should_auto_proxy(self) -> bool:
         return self.auto_chat_proxy and self.wire_api == "responses" and not self.base_url_env
@@ -229,6 +392,7 @@ class CodexAgentHarnessRunner:
             + f"- For Lean feedback, run `{lean_check_command}` from the repository root.\n"
             + "- `cktarchon.tools lean-check` checks the file path argument only; it does not read candidate code from stdin. Write the target file before checking it.\n"
             + "- Use `grep`/`find` rather than `rg`; `rg` is not installed on this H20 image.\n"
+            + "- Never read prior benchmark candidates or run artifacts, including `experiments/p3_replay_candidates`, `results*`, `preexisting_generated`, candidate snapshots, or another task's `Generated/cvdp_*` file. They are evaluation leakage, not examples.\n"
             + "- Leave benchmark, Sparkle, evaluator, and harness files unchanged.\n"
             + "- Do not run simulation, pytest, cocotb, or a final `lake build` after lean-check succeeds; the outer evaluator does that.\n\n"
             + "## NL2Chip problem prompt\n"

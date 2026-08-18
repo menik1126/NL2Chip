@@ -335,7 +335,7 @@ module parking #(parameter integer TOTAL_SPACES = 9) (
         assert {row["verilog_elaboration"] for row in rows} == {"passed"}
 
 
-def test_native_wrapper_maps_real_car_parking_seven_output_bundle():
+def test_native_wrapper_maps_real_car_parking_seven_output_bundle(tmp_path: Path):
     plan = FiniteParameterPlan(
         design_name="car_parking_system",
         parameter_names=("TOTAL_SPACES",),
@@ -413,12 +413,20 @@ endmodule
     )
     assert design is not None, manifest
     assert manifest["contract_pass"] is True
+    assert manifest["wrapper_parameter_declarations"] == [
+        "parameter TOTAL_SPACES = 9"
+    ]
+    assert "parameter TOTAL_SPACES = 9" in design
     assert (
         "assign {available_spaces, count_car, led_status, "
         "seven_seg_display_available_tens, seven_seg_display_available_units, "
         "seven_seg_display_count_tens, seven_seg_display_count_units} = out_wire;"
         in design
     )
+    if shutil.which("iverilog") is not None:
+        sv_file = tmp_path / "car_parking_system.sv"
+        sv_file.write_text(design, encoding="utf-8")
+        assert Evaluator._run_lint(sv_file)
 
 
 def test_native_wrapper_rejects_positional_bundle_when_any_sweep_width_differs():
@@ -665,6 +673,8 @@ def test_evaluator_native_path_keeps_all_modules_and_writes_one_hash_manifest(
     assert result["compile_pass"] is True
     assert result["native_parameter_contract_pass"] is True
     assert result["native_parameter_elaboration_pass"] is True
+    assert result["lint_pass"] is True
+    assert result["lint_scope"] == "native_parameter_cases"
     assert result["sim_status"] == "sim_pass"
     assert result["failure_stage"] is None
     assert result["formal_status"] == "unsupported"
@@ -680,6 +690,53 @@ def test_evaluator_native_path_keeps_all_modules_and_writes_one_hash_manifest(
     assert manifest["all_cases_elaborated"] is True
     assert {row["verilog_elaboration"] for row in manifest["cases"]} == {"passed"}
     assert len({row["sv_sha256"] for row in manifest["cases"]}) == 1
+
+
+def test_native_case_elaboration_overrides_invalid_wrapper_default_lint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    generated = tmp_path / "Generated"
+    generated.mkdir()
+    (generated / "native_case.lean").write_text("-- checked by fake REPL\n")
+    evaluator = Evaluator(
+        project_root=tmp_path,
+        dataset="cvdp",
+        dataset_obj=object(),
+        lean_repl=_FakeRepl([GENERIC_XOR]),
+    )
+
+    # Models the CVDP car-parking wrapper: its fallback default can create a
+    # zero-width $clog2 expression, while every declared sweep value is valid.
+    monkeypatch.setattr(evaluator, "_run_lint", lambda _sv_file: False)
+    monkeypatch.setattr(
+        evaluator,
+        "_run_native_parameter_elaboration",
+        lambda **_kwargs: (
+            True,
+            [
+                {"parameters": case.values, "verilog_elaboration": "passed"}
+                for case in _plan().cases
+            ],
+            "all native parameter cases elaborated",
+            "verilog_elaboration",
+        ),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_run_sim_cvdp",
+        lambda *_args, **_kwargs: ("sim_pass", 0, "ok"),
+    )
+
+    result = evaluator.evaluate(
+        "native_case",
+        tmp_path / "run",
+        problem_info=_native_info(),
+    )
+
+    assert result["native_parameter_elaboration_pass"] is True
+    assert result["lint_pass"] is True
+    assert result["lint_scope"] == "native_parameter_cases"
 
 
 def test_evaluator_classifies_fixed_inner_as_parameter_contract_failure(

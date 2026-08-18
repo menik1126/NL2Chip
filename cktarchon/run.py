@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import json
+import os
 import re
 import shutil
 import sys
@@ -29,6 +30,8 @@ from .search_strategy import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ARCHON_SRC = Path("/home/sgli/work/archon-official/src")
+CVDP_HARNESS_PROFILES = ("official", "race-safe-v1")
+CVDP_HARNESS_PROFILE_DEFAULT = "race-safe-v1"
 
 COMPACT_SPARKLE_GENERATION_SKILL = """You are an expert hardware engineer translating natural-language RTL specifications into Sparkle HDL, a Lean 4 hardware DSL.
 
@@ -95,6 +98,15 @@ def _add_legacy_agent_path() -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CktArchon: Archon-style NL2Chip benchmark runner")
     p.add_argument("--dataset", default="cvdp", choices=["verilogeval", "rtllm", "resbench", "cvdp", "realbench"])
+    p.add_argument(
+        "--cvdp-harness-profile",
+        choices=CVDP_HARNESS_PROFILES,
+        default=CVDP_HARNESS_PROFILE_DEFAULT,
+        help=(
+            "Versioned CVDP testbench scheduling profile. Use `official` only "
+            "for the unchanged-harness ablation."
+        ),
+    )
     p.add_argument("--problem-file", type=str, default=None)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--filter", type=str, default=None)
@@ -515,6 +527,10 @@ def merge_agent_stats(total: AgentStats, extra: AgentStats) -> None:
     total.output_tokens += extra.output_tokens
     total.turns += extra.turns
     total.compile_checks += extra.compile_checks
+    total.token_accounting_complete = (
+        total.token_accounting_complete and extra.token_accounting_complete
+    )
+    total.recovered_usage_sessions += extra.recovered_usage_sessions
     for name, count in extra.tool_counts.items():
         total.tool_counts[name] = total.tool_counts.get(name, 0) + count
 
@@ -661,13 +677,14 @@ def candidate_delivery_guard(prob_id: str, turn_limit: int) -> str:
     """Front-load artifact delivery when a session starts without source code."""
     return (
         "## Mandatory Candidate Delivery\n\n"
-        f"You have at most {turn_limit} turns in this session. Your first tool call "
-        f"MUST be `write_file` for `Generated/{prob_id}.lean` with a complete draft, "
-        "including the synthesis command. Do not call `glob`, `grep`, `read_file`, "
-        "`list_directory`, or `bash` before that first write; the prompt already "
-        "contains the interface and supported Sparkle APIs. Use the remaining turns "
-        "for `lean_check`, focused inspection, and edits. A session that ends without "
-        "creating the target file is discarded."
+        f"You have at most {turn_limit} turns in this session. Your first tool action "
+        f"MUST create `Generated/{prob_id}.lean` with a complete draft, including the "
+        "synthesis command. Use the file-edit tool available in this harness "
+        "(`write_file`, `apply_patch`, or the equivalent); do not call `glob`, `grep`, "
+        "`read_file`, `list_directory`, or a shell command before that first write. "
+        "The prompt already contains the interface and supported Sparkle APIs. Use the "
+        "remaining turns for `lean_check`, focused inspection, and edits. A session "
+        "that ends without creating the target file is discarded."
     )
 
 
@@ -681,6 +698,7 @@ def build_fresh_candidate_prompt(
     candidate_id: int,
     guide_text: str,
     prior_result: dict | None,
+    prior_feedback: str,
     recent_attempts: list[dict[str, Any]],
     latest_self_test: SelfTestResult | None,
     turn_limit: int,
@@ -693,6 +711,11 @@ def build_fresh_candidate_prompt(
         condition_sv=None,
     )
     prior_summary = search.summarize_eval_result(prior_result)
+    failure_evidence = (
+        search.compact_repair_feedback(prior_feedback)
+        if str(prior_feedback or "").strip()
+        else "No structured failure evidence was captured."
+    )
     attempts = search.summarize_recent_attempts(recent_attempts)
     advisory = self_test_feedback(latest_self_test)
     return (
@@ -707,11 +730,37 @@ def build_fresh_candidate_prompt(
         + "Use a materially different state representation, pipeline/latency structure, or combinational decomposition where appropriate.\n\n"
         + "### Constraints Learned From Earlier Candidates\n\n"
         + prior_summary
+        + "\n\n### Failure Evidence To Avoid\n\n"
+        + failure_evidence
         + "\n\n### Earlier Candidate Summaries\n\n"
         + attempts
         + ("\n\n" + advisory if advisory else "")
         + "\n\nLean-check the complete fresh candidate including `#synthesizeVerilog`. Stop only when the check also returns generated Verilog; the harness will save that compile-safe candidate."
     )
+
+
+def finalize_guided_candidate(
+    tracker: CandidateTracker,
+    generated_target: Path,
+    *,
+    last_evaluated_code: str | None,
+    evaluate_selected: Any,
+) -> tuple[dict | None, bool]:
+    """Restore and, when needed, re-evaluate the selected global-best source.
+
+    Evaluator artifacts are mutable per-problem paths.  If search ends while a
+    different candidate was evaluated last, merely restoring global_best.lean
+    leaves sv/, diagnostics/, and cvdp_sim/ describing the wrong candidate.
+    """
+
+    tracker.restore_global(generated_target)
+    selected_result = tracker.global_best_result
+    selected_code = tracker.global_best_code
+    if selected_result is None:
+        return None, False
+    if selected_code is None or selected_code == last_evaluated_code:
+        return dict(selected_result), False
+    return evaluate_selected(), True
 
 
 def process_problem_guided(
@@ -812,7 +861,7 @@ def process_problem_guided(
 
     full_guide_text = format_self_test_guidance(guide, include_testbench=True) if self_test_enabled else ""
     plan_only_text = format_self_test_guidance(guide, include_testbench=False) if self_test_enabled else ""
-    user_message = search.build_user_message(
+    base_user_message = search.build_user_message(
         prob_id,
         has_repl=has_repl,
         info=info,
@@ -821,6 +870,13 @@ def process_problem_guided(
     ) + (("\n\n" + full_guide_text) if full_guide_text else "")
 
     generation_limit = budget.session_limit(args.max_turns)
+    user_message = (
+        candidate_delivery_guard(prob_id, generation_limit)
+        + "\n\n"
+        + base_user_message
+        if generation_limit > 0
+        else base_user_message
+    )
     generation_error: str | None = None
     if generation_limit > 0:
         log_base = run_dir / "logs" / prob_id / "generate"
@@ -865,6 +921,7 @@ def process_problem_guided(
     eval_elapsed += time.monotonic() - eval_t0
 
     code = generated_target.read_text(errors="replace") if generated_target.exists() else None
+    last_evaluated_code = code
     tracker = CandidateTracker(
         snapshot_root=run_dir / "candidates",
         prob_id=prob_id,
@@ -945,6 +1002,7 @@ def process_problem_guided(
                 candidate_id=next_candidate,
                 guide_text=full_guide_text,
                 prior_result=previous_result,
+                prior_feedback=active_feedback,
                 recent_attempts=search_history,
                 latest_self_test=latest_self_test,
                 turn_limit=turn_limit,
@@ -1049,6 +1107,7 @@ def process_problem_guided(
             }
         eval_elapsed += time.monotonic() - attempt_eval_t0
         new_code = generated_target.read_text(errors="replace") if generated_target.exists() else None
+        last_evaluated_code = new_code
 
         if fresh_candidate:
             observation = tracker.start_candidate(
@@ -1128,9 +1187,39 @@ def process_problem_guided(
             sim_feedback_success = True
             break
 
-    tracker.restore_global(generated_target)
-    if tracker.global_best_result is not None:
-        result = tracker.global_best_result
+    final_eval_t0 = time.monotonic()
+    selected_result, global_best_replayed = finalize_guided_candidate(
+        tracker,
+        generated_target,
+        last_evaluated_code=last_evaluated_code,
+        evaluate_selected=lambda: evaluate_with_infrastructure_retries(
+            evaluator, prob_id, run_dir, info
+        ),
+    )
+    if global_best_replayed:
+        eval_elapsed += time.monotonic() - final_eval_t0
+        result = selected_result or result
+        search_history.append({
+            "phase": "final_global_best_replay",
+            "iteration": sim_feedback_iterations,
+            "candidate_id": tracker.candidate_id,
+            "note": (
+                "Re-evaluated restored global-best Lean so final RTL, simulator "
+                "artifacts, and score all describe the selected candidate."
+            ),
+            "result_summary": search.summarize_eval_result(result),
+            "remaining_turns": budget.remaining,
+        })
+        append_jsonl(run_dir / "events.jsonl", {
+            "prob_id": prob_id,
+            "event": "final_global_best_replay",
+            "iteration": sim_feedback_iterations,
+            "sim_status": result.get("sim_status"),
+            "compile_pass": result.get("compile_pass"),
+            "remaining_turns": budget.remaining,
+        })
+    elif selected_result is not None:
+        result = selected_result
 
     all_stats = AgentStats()
     merge_agent_stats(all_stats, planner_stats)
@@ -1144,10 +1233,13 @@ def process_problem_guided(
         "agent_cache_creation_input_tokens": all_stats.cache_creation_input_tokens,
         "agent_cache_read_input_tokens": all_stats.cache_read_input_tokens,
         "agent_output_tokens": all_stats.output_tokens,
+        "agent_token_accounting_complete": all_stats.token_accounting_complete,
+        "agent_token_usage_recovered_sessions": all_stats.recovered_usage_sessions,
         "agent_compile_checks": all_stats.compile_checks,
         "agent_tool_counts": all_stats.tool_counts,
         "agent_turn_budget": args.max_turns,
         "prompt_profile": args.prompt_profile,
+        "cvdp_harness_profile": args.cvdp_harness_profile,
         "agent_generation_turns": generation_stats.turns,
         "agent_turns_total": all_stats.turns,
         "search_total_turn_budget": budget.total,
@@ -1169,6 +1261,7 @@ def process_problem_guided(
         "candidate_max": tracker.max_candidates,
         "candidate_stagnation_patience": tracker.patience,
         "candidate_search_history": search_history,
+        "global_best_replayed": global_best_replayed,
         "agent_errors": agent_errors,
         "sim_feedback_enabled": bool(args.sim_feedback),
         "sim_feedback_iterations": sim_feedback_iterations,
@@ -1462,6 +1555,14 @@ def process_problem(
             agent_stats.cache_read_input_tokens + repair_stats_total.cache_read_input_tokens
         ),
         "agent_output_tokens": agent_stats.output_tokens + repair_stats_total.output_tokens,
+        "agent_token_accounting_complete": (
+            agent_stats.token_accounting_complete
+            and repair_stats_total.token_accounting_complete
+        ),
+        "agent_token_usage_recovered_sessions": (
+            agent_stats.recovered_usage_sessions
+            + repair_stats_total.recovered_usage_sessions
+        ),
         "agent_compile_checks": agent_stats.compile_checks + repair_stats_total.compile_checks,
         "agent_tool_counts": {
             **agent_stats.tool_counts,
@@ -1472,6 +1573,7 @@ def process_problem(
         },
         "agent_turn_budget": args.max_turns,
         "prompt_profile": args.prompt_profile,
+        "cvdp_harness_profile": args.cvdp_harness_profile,
         "agent_generation_turns": agent_stats.turns,
         "agent_turns_total": agent_stats.turns + repair_stats_total.turns,
         "sim_feedback_enabled": bool(args.sim_feedback),
@@ -1500,6 +1602,7 @@ def process_problem(
 
 def main() -> None:
     args = parse_args()
+    os.environ["CVDP_HARNESS_PROFILE"] = args.cvdp_harness_profile
     load_env_file(Path(args.key_env))
     ensure_runtime_env()
     _add_legacy_agent_path()
@@ -1518,7 +1621,11 @@ def main() -> None:
     (PROJECT_ROOT / "Generated").mkdir(exist_ok=True)
 
     num_workers = max(1, args.workers)
-    print(f"[cktarchon] problems={len(problems)} model={model_alias(args.model)} harness={args.harness} workers={num_workers} run_dir={run_dir}")
+    print(
+        f"[cktarchon] problems={len(problems)} model={model_alias(args.model)} "
+        f"harness={args.harness} cvdp_harness_profile={args.cvdp_harness_profile} "
+        f"workers={num_workers} run_dir={run_dir}"
+    )
 
     if not args.no_repl:
         try:
@@ -1547,6 +1654,10 @@ def main() -> None:
         "tokens_in_cache_read": 0,
         "tokens_out": 0,
         "turns": 0,
+        "token_accounting_complete": True,
+        "token_accounting_incomplete_tasks": 0,
+        "token_usage_recovered_sessions": 0,
+        "cvdp_harness_profile": args.cvdp_harness_profile,
     }
     summary_lock = Lock()
 
@@ -1600,6 +1711,8 @@ def main() -> None:
                         "lint_pass": False,
                         "sim_status": "agent_error",
                         "agent_error": f"{type(exc).__name__}: {exc}",
+                        "cvdp_harness_profile": args.cvdp_harness_profile,
+                        "agent_token_accounting_complete": False,
                     }
                     append_jsonl(run_dir / "results.jsonl", record)
                 with summary_lock:
@@ -1614,6 +1727,15 @@ def main() -> None:
                     summary["tokens_in_cache_read"] += int(record.get("agent_cache_read_input_tokens") or 0)
                     summary["tokens_out"] += int(record.get("agent_output_tokens") or 0)
                     summary["turns"] += int(record.get("agent_turns_total") or 0)
+                    accounting_complete = bool(
+                        record.get("agent_token_accounting_complete", True)
+                    )
+                    if not accounting_complete:
+                        summary["token_accounting_complete"] = False
+                        summary["token_accounting_incomplete_tasks"] += 1
+                    summary["token_usage_recovered_sessions"] += int(
+                        record.get("agent_token_usage_recovered_sessions") or 0
+                    )
                     status = record.get("sim_status")
                     if status == "sim_pass":
                         summary["sim_pass"] += 1
@@ -1634,7 +1756,13 @@ def main() -> None:
         2,
     )
     summary["avg_turns"] = round(summary["turns"] / attempted, 2)
-    summary.update({"dataset": args.dataset, "model": model_alias(args.model), "harness": args.harness, "run_dir": str(run_dir)})
+    summary.update({
+        "dataset": args.dataset,
+        "model": model_alias(args.model),
+        "harness": args.harness,
+        "cvdp_harness_profile": args.cvdp_harness_profile,
+        "run_dir": str(run_dir),
+    })
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

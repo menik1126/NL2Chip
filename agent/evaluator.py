@@ -23,8 +23,15 @@ import signal
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+from cvdp_harness_adapter import (
+    CVDP_HARNESS_PROFILE_RACE_SAFE,
+    adapt_cvdp_harness_files,
+    cvdp_harness_profile_defaults,
+    infer_cvdp_clock_ports,
+)
 from cvdp_native_parameters import (
     native_plan_from_dict,
     parse_native_modules,
@@ -63,6 +70,41 @@ LVS_TIMEOUT = 300
 STA_TIMEOUT = 120
 GLS_TIMEOUT = 120
 MIN_DIE_SIDE_UM = 50  # minimum die side for sky130hd PDN straps
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _cvdp_harness_options_from_env(
+) -> tuple[str, dict[str, bool], dict[str, bool]]:
+    """Resolve one auditable CVDP harness profile plus legacy flag overrides."""
+
+    profile = os.environ.get(
+        "CVDP_HARNESS_PROFILE", CVDP_HARNESS_PROFILE_RACE_SAFE
+    ).strip().lower()
+    defaults = cvdp_harness_profile_defaults(profile)
+    env_names = {
+        "normalize_reset_helpers": "CVDP_HARNESS_RESET_NORMALIZATION",
+        "stabilize_cocotb_edges": "CVDP_COCOTB_PHASE_ADAPTER",
+        "initialize_cocotb_inputs": "CVDP_COCOTB_INPUT_INITIALIZATION",
+        "align_reset_release": "CVDP_COCOTB_RESET_RELEASE_ALIGNMENT",
+        "emit_progress_monitor": "CVDP_COCOTB_PROGRESS_MONITOR",
+    }
+    options = {
+        option: _env_flag(env_name, defaults[option])
+        for option, env_name in env_names.items()
+    }
+    overrides = {
+        option: value
+        for option, value in options.items()
+        if value != defaults[option]
+    }
+    return profile, options, overrides
+
 
 DIAGNOSTIC_STAGES = {
     "lean_elaboration",
@@ -183,6 +225,68 @@ def _classify_cvdp_local_timeout(
     if tail:
         detail += f"\nPartial simulator output:\n{tail[:1800]}"
     return "sim_fail", -1, detail
+
+
+def _run_cvdp_pytest_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_s: int,
+) -> tuple[int | None, str, bool]:
+    proc = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return proc.returncode, stdout + stderr, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = proc.communicate()
+        return None, stdout + stderr, True
+
+
+def _cvdp_collected_case_ids(output: str, test_runner: Path) -> list[str]:
+    case_ids: list[str] = []
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        if "::" not in line or not re.search(r"\.py::", line):
+            continue
+        suffix = line.split("::", 1)[1]
+        if not suffix or any(char.isspace() for char in suffix):
+            continue
+        case_ids.append(f"{test_runner}::{suffix}")
+    return list(dict.fromkeys(case_ids))
+
+
+def _classify_cvdp_case_result(
+    *,
+    returncode: int | None,
+    output: str,
+    timed_out: bool,
+    timeout_s: int,
+) -> tuple[str, str]:
+    if timed_out:
+        status, _, detail = _classify_cvdp_local_timeout(output, timeout_s)
+        return status, detail
+    if returncode == 0:
+        return "sim_pass", "CVDP case passed"
+    if re.search(
+        r"AssertionError|assert .*failed|\bFAILED\b|Failed \d+ of \d+ tests",
+        output,
+        re.IGNORECASE,
+    ):
+        return "sim_fail", "CVDP case failed"
+    return "sim_error", "CVDP case execution error"
 
 
 def _iverilog_failure_stage(output: str) -> str:
@@ -1366,7 +1470,11 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
     }
 
 
-def _cvdp_parse_module_parameters(ref_code: str, usage_params: set[str]) -> list[str]:
+def _cvdp_parse_module_parameters(
+    ref_code: str,
+    usage_params: set[str],
+    fallback_defaults: dict[str, int] | None = None,
+) -> list[str]:
     """Parse parameter declarations from the reference/context module header."""
     text = re.sub(r"//.*", "", ref_code)
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -1390,8 +1498,9 @@ def _cvdp_parse_module_parameters(ref_code: str, usage_params: set[str]) -> list
             expr = (m.group("expr") or "1").strip()
             params.setdefault(name, f"parameter {name} = {expr}")
 
+    defaults = fallback_defaults or {}
     for name in sorted(usage_params):
-        params.setdefault(name, f"parameter {name} = 1")
+        params.setdefault(name, f"parameter {name} = {defaults.get(name, 1)}")
     return list(params.values())
 
 
@@ -1571,8 +1680,20 @@ def generate_cvdp_wrapper(
 
     expected_inputs = [(d, t, n) for d, t, n in expected_ports if d == "input"]
     expected_outputs = [(d, t, n) for d, t, n in expected_ports if d == "output"]
+    normalize_two_state_inputs = _env_flag(
+        "CVDP_TWO_STATE_INPUT_NORMALIZATION", True
+    )
+    public_clock_inputs = set(infer_cvdp_clock_ports(
+        harness_files,
+        [name for _, _, name in expected_inputs],
+    ))
+    public_case_defaults = dict(parameter_cases[0]) if parameter_cases else {}
     param_decls = (
-        _cvdp_parse_module_parameters(ref_code, usage["params"])
+        _cvdp_parse_module_parameters(
+            ref_code,
+            usage["params"],
+            fallback_defaults=public_case_defaults,
+        )
         if expose_parameters else []
     )
     derived_expressions = dict(derived_parameter_expressions or {})
@@ -1630,6 +1751,7 @@ def generate_cvdp_wrapper(
                 f"benchmark port {exp_n} is parameterized as {exp_t}"
             )
 
+    two_state_normalized_inputs: set[str] = set()
     for sp_port in sp_inputs:
         _, _, sn = sp_port
         matched_name = _cvdp_clock_or_reset_match(sn, expected_inputs)
@@ -1640,6 +1762,24 @@ def generate_cvdp_wrapper(
             base = sn[5:] if sn.startswith("_gen_") else sn
             matched_port = _cvdp_match_port(base, expected_inputs, direction="input")
         note_fixed_width_core_port(sp_port, matched_port)
+        if (
+            normalize_two_state_inputs
+            and matched_port is not None
+            and matched_port[2] not in public_clock_inputs
+            and "clk" not in matched_port[2].lower()
+            and "clock" not in matched_port[2].lower()
+            and not _is_reset_like(matched_port[2])
+            and _cvdp_numeric_width(sp_port[1]) == 1
+            and _cvdp_numeric_width(matched_port[1]) == 1
+        ):
+            two_state_normalized_inputs.add(matched_port[2])
+
+    if two_state_normalized_inputs:
+        wrapper_notes.append(
+            "scalar data/control inputs normalized to Lean Bool semantics "
+            "(1=true, 0/X/Z=false): "
+            + ", ".join(sorted(two_state_normalized_inputs))
+        )
 
     for sp_port in sp_outputs:
         _, _, sn = sp_port
@@ -1731,6 +1871,8 @@ def generate_cvdp_wrapper(
             if matched is None and strict_mapping:
                 return None
             conn = _cvdp_bridge_reset_expr(sn, matched) if matched else "'0"
+        if matched in two_state_normalized_inputs:
+            conn = f"({conn} === 1'b1)"
         if matched is not None:
             matched_expected_inputs.add(matched)
         inst_conns.append(f"        .{sn}({conn})")
@@ -2165,7 +2307,9 @@ def prepare_cvdp_native_parameter_design(
     manifest["wrapped_core_ports"] = [list(port) for port in inner_ports]
     manifest["wrapper_usage_parameters"] = sorted(wrapper_usage["params"])
     manifest["wrapper_parameter_declarations"] = _cvdp_parse_module_parameters(
-        ref_code, wrapper_usage["params"]
+        ref_code,
+        wrapper_usage["params"],
+        fallback_defaults=(dict(plan.cases[0].values) if plan.cases else {}),
     )
     wrapper = generate_cvdp_wrapper(
         design_name=design_name,
@@ -2840,6 +2984,7 @@ class Evaluator:
             "lint_pass": False,
             "sim_status": "not_run",
             "sim_mismatches": -1,
+            "synth_attempted": False,
             "synth_pass": False,
             "area_um2": None,
             "cell_count": None,
@@ -3145,6 +3290,13 @@ class Evaluator:
             )
             result["native_parameter_elaboration_pass"] = elaboration_pass
             result["native_parameter_case_results"] = case_results
+            # A native family is valid over its declared public configurations,
+            # not necessarily the wrapper's fallback default.  For example,
+            # TOTAL_SPACES=1 makes $clog2(TOTAL_SPACES) zero-width even when all
+            # benchmark sweep values are valid.  The all-case elaboration below
+            # is therefore the authoritative lint gate for a native family.
+            result["lint_pass"] = elaboration_pass
+            result["lint_scope"] = "native_parameter_cases"
             if native_manifest is not None:
                 by_parameters = {
                     tuple(sorted(row["parameters"].items())): row
@@ -3213,6 +3365,7 @@ class Evaluator:
 
         # 5. Synthesis + PPA (optional)
         if self.enable_synth and result["sv_extracted"]:
+            result["synth_attempted"] = True
             if native_plan is not None:
                 ppa_dir = run_dir / "ppa_parameter_family" / prob_id
                 ppa_manifest = run_ppa_parameter_policy(
@@ -3667,6 +3820,7 @@ class Evaluator:
 
         info = problem_info or self.dataset_obj.load_problem(prob_id)
         harness_files = info.metadata.get("harness_files", {})
+        original_harness_files = dict(harness_files)
         verilog_sources = info.metadata.get("verilog_sources", [])
         design_name = info.design_name
         if not harness_files:
@@ -3678,6 +3832,53 @@ class Evaluator:
         if sim_dir.exists():
             shutil.rmtree(sim_dir)
         sim_dir.mkdir(parents=True, exist_ok=True)
+
+        parameter_payload = (
+            info.metadata.get("native_parameter_sweep_plan")
+            or info.metadata.get("finite_parameter_plan")
+            or {}
+        )
+        public_input_ports = [
+            str(name)
+            for direction, _, name in parameter_payload.get("expected_ports", [])
+            if direction == "input"
+        ]
+        public_observed_ports = [
+            str(name)
+            for _, _, name in parameter_payload.get("expected_ports", [])
+        ]
+        public_clock_ports = infer_cvdp_clock_ports(
+            harness_files,
+            public_input_ports,
+        )
+        harness_profile, harness_options, harness_profile_overrides = (
+            _cvdp_harness_options_from_env()
+        )
+        normalize_reset_helpers = harness_options["normalize_reset_helpers"]
+        stabilize_cocotb_edges = harness_options["stabilize_cocotb_edges"]
+        initialize_cocotb_inputs = harness_options["initialize_cocotb_inputs"]
+        align_reset_release = harness_options["align_reset_release"]
+        emit_progress_monitor = harness_options["emit_progress_monitor"]
+        harness_files, harness_adapter_manifest = adapt_cvdp_harness_files(
+            harness_files,
+            reset_polarities=dict(parameter_payload.get("reset_polarities", {})),
+            input_ports=public_input_ports,
+            observed_ports=public_observed_ports,
+            clock_ports=public_clock_ports,
+            # The selected profile is part of the scored protocol and must be
+            # identical for every compared method.
+            normalize_reset_helpers=normalize_reset_helpers,
+            stabilize_cocotb_edges=stabilize_cocotb_edges,
+            initialize_cocotb_inputs=initialize_cocotb_inputs,
+            align_reset_release=align_reset_release,
+            emit_progress_monitor=emit_progress_monitor,
+            harness_profile=harness_profile,
+            harness_profile_overrides=harness_profile_overrides,
+        )
+        (sim_dir / "cvdp_harness_adapter.json").write_text(
+            json.dumps(harness_adapter_manifest, indent=2),
+            encoding="utf-8",
+        )
 
         image_override = os.environ.get("OSS_SIM_IMAGE", "").strip()
         image_name = image_override or "nvidia/cvdp-sim:v1.0.0"
@@ -3739,7 +3940,47 @@ class Evaluator:
 
         sim_mode = os.environ.get("CVDP_SIM_MODE", "local").lower()
         if sim_mode != "docker":
-            return self._run_sim_cvdp_local(sim_dir)
+            scored_result = self._run_sim_cvdp_local(sim_dir)
+            if (
+                _env_flag("CVDP_TIMEOUT_DIAGNOSTIC", True)
+                and not emit_progress_monitor
+                and scored_result[0] == "sim_fail"
+                and "timed out" in scored_result[2].lower()
+            ):
+                snapshots = self._run_cvdp_timeout_diagnostic(
+                    prob_id=prob_id,
+                    run_dir=run_dir,
+                    scored_sim_dir=sim_dir,
+                    original_harness_files=original_harness_files,
+                    reset_polarities=dict(
+                        parameter_payload.get("reset_polarities", {})
+                    ),
+                    public_input_ports=public_input_ports,
+                    public_observed_ports=public_observed_ports,
+                    public_clock_ports=public_clock_ports,
+                    normalize_reset_helpers=normalize_reset_helpers,
+                    stabilize_cocotb_edges=stabilize_cocotb_edges,
+                    initialize_cocotb_inputs=initialize_cocotb_inputs,
+                    align_reset_release=align_reset_release,
+                    harness_profile=harness_profile,
+                    harness_profile_overrides=harness_profile_overrides,
+                )
+                if snapshots:
+                    detail = (
+                        scored_result[2]
+                        + "\nRead-only timeout diagnostic replay (not used for "
+                        "scoring; public DUT ports only):\n"
+                        + "\n".join(snapshots)
+                    )
+                    scored_result = (scored_result[0], scored_result[1], detail)
+                    output_path = sim_dir / "cvdp_local_output.txt"
+                    with output_path.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            "\n[CVDP READ-ONLY TIMEOUT DIAGNOSTIC; SCORE UNCHANGED]\n"
+                            + "\n".join(snapshots)
+                            + "\n"
+                        )
+            return scored_result
 
         compose_path = sim_dir / "docker-compose.yml"
         compose_text = compose_path.read_text(errors="replace")
@@ -3841,7 +4082,115 @@ class Evaluator:
             return "sim_fail", -1, f"CVDP harness failed:\n{tail[:1200]}"
         return "sim_error", -1, f"CVDP harness error:\n{tail[:1200]}"
 
-    def _run_sim_cvdp_local(self, sim_dir: Path) -> tuple[str, int, str]:
+    def _run_cvdp_timeout_diagnostic(
+        self,
+        *,
+        prob_id: str,
+        run_dir: Path,
+        scored_sim_dir: Path,
+        original_harness_files: dict,
+        reset_polarities: dict[str, str],
+        public_input_ports: list[str],
+        public_observed_ports: list[str],
+        public_clock_ports: list[str],
+        normalize_reset_helpers: bool,
+        stabilize_cocotb_edges: bool,
+        initialize_cocotb_inputs: bool,
+        align_reset_release: bool,
+        harness_profile: str,
+        harness_profile_overrides: dict[str, bool],
+    ) -> list[str]:
+        """Replay one timed-out case with a read-only public-port monitor.
+
+        The scored directory and result remain untouched. The diagnostic copy
+        changes no DUT inputs and exposes no expected values or harness source.
+        """
+
+        diagnostic_dir = run_dir / "cvdp_timeout_diagnostic" / prob_id
+        if diagnostic_dir.exists():
+            shutil.rmtree(diagnostic_dir)
+        shutil.copytree(
+            scored_sim_dir,
+            diagnostic_dir,
+            ignore=shutil.ignore_patterns(
+                "rundir",
+                "harness",
+                "sim_build",
+                "__pycache__",
+                "cvdp_local_output.txt",
+                "cvdp_case_results.json",
+            ),
+        )
+        diagnostic_files, manifest = adapt_cvdp_harness_files(
+            original_harness_files,
+            reset_polarities=reset_polarities,
+            input_ports=public_input_ports,
+            observed_ports=public_observed_ports,
+            clock_ports=public_clock_ports,
+            normalize_reset_helpers=normalize_reset_helpers,
+            stabilize_cocotb_edges=stabilize_cocotb_edges,
+            initialize_cocotb_inputs=initialize_cocotb_inputs,
+            align_reset_release=align_reset_release,
+            emit_progress_monitor=True,
+            harness_profile=harness_profile,
+            harness_profile_overrides={
+                **harness_profile_overrides,
+                "emit_progress_monitor": True,
+            },
+        )
+        for rel_path, content in diagnostic_files.items():
+            out_path = diagnostic_dir / rel_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(str(content), encoding="utf-8")
+        (diagnostic_dir / "cvdp_harness_adapter.json").write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+        diagnostic_status, _, diagnostic_detail = self._run_sim_cvdp_local(
+            diagnostic_dir,
+            timeout_s_override=15,
+            case_timeout_s_override=12,
+            progress_timeout_patience_override=1,
+            max_cases=1,
+        )
+        output_path = diagnostic_dir / "cvdp_local_output.txt"
+        output = output_path.read_text(errors="replace") if output_path.exists() else ""
+        snapshots = []
+        seen = set()
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("[CVDP_PROGRESS after=") or line in seen:
+                continue
+            seen.add(line)
+            snapshots.append(line)
+        audit = {
+            "schema_version": 1,
+            "score_unchanged": True,
+            "public_ports_only": True,
+            "diagnostic_status": diagnostic_status,
+            "diagnostic_detail": diagnostic_detail[:1200],
+            "snapshot_count": len(snapshots),
+            "snapshots": snapshots,
+            "diagnostic_harness_changed_file_count": manifest.get(
+                "changed_file_count", 0
+            ),
+            "diagnostic_transformations": manifest.get("transformations", []),
+        }
+        (scored_sim_dir / "cvdp_timeout_diagnostic.json").write_text(
+            json.dumps(audit, indent=2),
+            encoding="utf-8",
+        )
+        return snapshots
+
+    def _run_sim_cvdp_local(
+        self,
+        sim_dir: Path,
+        *,
+        timeout_s_override: int | None = None,
+        case_timeout_s_override: int | None = None,
+        progress_timeout_patience_override: int | None = None,
+        max_cases: int | None = None,
+    ) -> tuple[str, int, str]:
         """Run a CVDP harness directly with local pytest/cocotb and Icarus."""
         env_file = sim_dir / "src" / ".env"
         test_runner = sim_dir / "src" / "test_runner.py"
@@ -3857,46 +4206,219 @@ class Evaluator:
             key = key.strip()
             value = value.strip().replace("/code/", f"{sim_dir}/")
             env[key] = value
+        waves_enabled = _env_flag("CVDP_LOCAL_WAVES", False)
+        if not waves_enabled:
+            env.pop("WAVE", None)
+        env.setdefault("PYTHONUNBUFFERED", "1")
         env["PYTHONPATH"] = str(sim_dir / "src") + os.pathsep + env.get("PYTHONPATH", "")
 
         rundir = sim_dir / "rundir"
         rundir.mkdir(parents=True, exist_ok=True)
         cache_dir = sim_dir / "harness" / ".cache"
-        timeout_s = int(os.environ.get("CVDP_LOCAL_TIMEOUT", "180"))
-        cmd = [
+        timeout_s = (
+            int(timeout_s_override)
+            if timeout_s_override is not None
+            else int(os.environ.get("CVDP_LOCAL_TIMEOUT", "240"))
+        )
+        base_cmd = [
             sys.executable, "-m", "pytest", "-s",
             "-o", f"cache_dir={cache_dir}",
-            str(test_runner),
         ]
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(rundir),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
+        case_ids: list[str] = []
+        collection_output = ""
+        if _env_flag("CVDP_LOCAL_ISOLATE_CASES", True):
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = proc.communicate()
-            output = stdout + stderr
-            (sim_dir / "cvdp_local_output.txt").write_text(output)
-            return _classify_cvdp_local_timeout(output, timeout_s)
+                collected = subprocess.run(
+                    [*base_cmd, "--collect-only", "-q", str(test_runner)],
+                    cwd=str(rundir),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(30, timeout_s),
+                )
+                collection_output = (collected.stdout or "") + (collected.stderr or "")
+                if collected.returncode == 0:
+                    case_ids = _cvdp_collected_case_ids(
+                        collection_output, test_runner
+                    )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                case_ids = []
+        if not case_ids:
+            case_ids = [str(test_runner)]
+        if max_cases is not None:
+            case_ids = case_ids[:max(0, int(max_cases))]
 
-        output = stdout + stderr
+        case_timeout_s = max(1, (
+            int(case_timeout_s_override)
+            if case_timeout_s_override is not None
+            else int(os.environ.get("CVDP_LOCAL_CASE_TIMEOUT", "45"))
+        ))
+        progress_timeout_patience = max(1, (
+            int(progress_timeout_patience_override)
+            if progress_timeout_patience_override is not None
+            else int(os.environ.get("CVDP_LOCAL_PROGRESS_TIMEOUT_PATIENCE", "2"))
+        ))
+        deadline = time.monotonic() + timeout_s
+        case_rows: list[dict] = []
+        output_parts = []
+        saw_passing_case = False
+        consecutive_progress_timeouts = 0
+        stopped_reason: str | None = None
+        if collection_output:
+            output_parts.append("[CVDP PYTEST COLLECTION]\n" + collection_output)
+        for case_id in case_ids:
+            if stopped_reason is not None:
+                case_rows.append({
+                    "case": case_id,
+                    "status": "not_run",
+                    "detail": stopped_reason,
+                })
+                continue
+            remaining = int(deadline - time.monotonic())
+            if remaining <= 0:
+                case_rows.append({
+                    "case": case_id,
+                    "status": "not_run",
+                    "detail": f"global CVDP timeout budget of {timeout_s}s exhausted",
+                })
+                continue
+            current_timeout = min(case_timeout_s, remaining)
+            returncode, case_output, timed_out = _run_cvdp_pytest_command(
+                [*base_cmd, case_id],
+                cwd=rundir,
+                env=env,
+                timeout_s=current_timeout,
+            )
+            status, case_detail = _classify_cvdp_case_result(
+                returncode=returncode,
+                output=case_output,
+                timed_out=timed_out,
+                timeout_s=current_timeout,
+            )
+            case_rows.append({
+                "case": case_id,
+                "status": status,
+                "returncode": returncode,
+                "timed_out": timed_out,
+                "timeout_seconds": current_timeout,
+                "attempts": 1,
+                "detail": case_detail,
+            })
+            output_parts.append(
+                f"[CVDP CASE {case_id} STATUS={status}]\n{case_output}"
+            )
+            if status == "sim_pass":
+                saw_passing_case = True
+                consecutive_progress_timeouts = 0
+            elif timed_out:
+                consecutive_progress_timeouts += 1
+                if (
+                    not saw_passing_case
+                    and consecutive_progress_timeouts >= progress_timeout_patience
+                ):
+                    stopped_reason = (
+                        "stopped after "
+                        f"{consecutive_progress_timeouts} consecutive functional "
+                        "progress timeouts before any parameter case passed"
+                    )
+            else:
+                consecutive_progress_timeouts = 0
+
+        # A large valid parameter case can be much slower than the fixed
+        # first-pass window (for example, an Icarus simulation of a 128-bit
+        # generated reduction). Retry only when every conclusive case passed,
+        # and stay inside the original per-task wall-clock budget. A genuinely
+        # stuck DUT therefore cannot prevent the other sweep cases from running.
+        retry_rows = [row for row in case_rows if row.get("timed_out")]
+        conclusive_failure = any(
+            row["status"] != "sim_pass" and not row.get("timed_out")
+            for row in case_rows
+        )
+        if (
+            retry_rows
+            and not conclusive_failure
+            and (saw_passing_case or len(case_ids) == 1)
+        ):
+            for retry_index, row in enumerate(retry_rows):
+                remaining = int(deadline - time.monotonic())
+                retries_left = len(retry_rows) - retry_index
+                if remaining <= 0:
+                    break
+                retry_timeout = max(1, remaining // retries_left)
+                returncode, retry_output, timed_out = _run_cvdp_pytest_command(
+                    [*base_cmd, str(row["case"])],
+                    cwd=rundir,
+                    env=env,
+                    timeout_s=retry_timeout,
+                )
+                status, case_detail = _classify_cvdp_case_result(
+                    returncode=returncode,
+                    output=retry_output,
+                    timed_out=timed_out,
+                    timeout_s=retry_timeout,
+                )
+                row.update({
+                    "status": status,
+                    "returncode": returncode,
+                    "timed_out": timed_out,
+                    "retry_timeout_seconds": retry_timeout,
+                    "attempts": int(row.get("attempts", 1)) + 1,
+                    "detail": case_detail,
+                })
+                output_parts.append(
+                    f"[CVDP CASE RETRY {row['case']} STATUS={status}]\n"
+                    f"{retry_output}"
+                )
+
+        output = "\n\n".join(output_parts)
         (sim_dir / "cvdp_local_output.txt").write_text(output)
-        tail = "\n".join(output.splitlines()[-40:])
-        if proc.returncode == 0:
-            return "sim_pass", 0, "CVDP local harness passed"
-        if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
-            return "sim_fail", -1, f"CVDP local harness failed:\n{tail[:1200]}"
-        return "sim_error", -1, f"CVDP local harness error:\n{tail[:1200]}"
+        (sim_dir / "cvdp_case_results.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "isolated": len(case_ids) > 1,
+                "waves_enabled": waves_enabled,
+                "total_timeout_seconds": timeout_s,
+                "case_timeout_seconds": case_timeout_s,
+                "progress_timeout_patience": progress_timeout_patience,
+                "cases": case_rows,
+            }, indent=2),
+            encoding="utf-8",
+        )
+
+        passed = sum(row["status"] == "sim_pass" for row in case_rows)
+        failed = sum(row["status"] == "sim_fail" for row in case_rows)
+        errors = sum(row["status"] == "sim_error" for row in case_rows)
+        not_run = sum(row["status"] == "not_run" for row in case_rows)
+        summary = (
+            f"TESTS={len(case_rows)} PASS={passed} FAIL={failed} "
+            f"ERROR={errors} NOT_RUN={not_run}"
+        )
+        if passed == len(case_rows):
+            return "sim_pass", 0, f"CVDP local harness passed; {summary}"
+
+        first_bad = next(
+            (row for row in case_rows if row["status"] != "sim_pass"),
+            None,
+        )
+        first_output = ""
+        if first_bad is not None:
+            marker = f"[CVDP CASE {first_bad['case']} STATUS={first_bad['status']}]"
+            if marker in output:
+                first_output = output.split(marker, 1)[1]
+                first_output = first_output.split("[CVDP CASE ", 1)[0]
+        tail = "\n".join(first_output.splitlines()[-60:])
+        detail = summary
+        if first_bad is not None:
+            detail += (
+                f"\nFirst non-passing case: {first_bad['case']} "
+                f"({first_bad['status']}): {first_bad['detail']}"
+            )
+        if tail:
+            detail += f"\nFirst-case simulator tail:\n{tail[:2400]}"
+
+        if failed:
+            return "sim_fail", failed + not_run, f"CVDP local harness failed; {detail}"
+        return "sim_error", -1, f"CVDP local harness error; {detail}"
 
     def _run_sim_resbench(
         self, prob_id: str, sv_code: str,
