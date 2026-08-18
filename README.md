@@ -150,6 +150,54 @@ This generates a fully synthesizable Verilog module with proper clock/reset hand
 
 **Feedback loops** use `Signal.circuit` with imperative `<~` register assignment — see the counter example above. For complex state machines, see `Examples/RV32/SoC.lean`.
 
+## CVDP Evaluation Profiles
+
+The CVDP evaluator does not overwrite the benchmark's checked-in harness
+files. For each evaluation it copies the public harness into that task's
+temporary simulation directory, then applies the selected, versioned profile
+to the copy. The exact input files, transformations, and effective options are
+recorded in `cvdp_harness_adapter.json` next to the simulation artifacts.
+
+| Profile | Behavior | Intended use |
+|---|---|---|
+| `official` | Runs an unchanged copy of the CVDP cocotb harness. | Original-harness ablation. |
+| `race-safe-v1` | Adds a one-simulator-step settle after cocotb edge waits and aligns Timer-based reset release to the clock low phase. | Default scored protocol for new CVDP experiments. |
+
+`race-safe-v1` changes scheduling only. It does not alter DUT stimulus values,
+expected values, test assertions, or the benchmark source tree. Its purpose is
+to avoid cocotb/HDL same-timestamp scheduling races in which a sequential DUT
+and the testbench observe a clock edge in different phases.
+
+Run the P3 CVDP-12 experiment with the default race-safe profile:
+
+```bash
+KEY_ENV=<credential-env> MODEL=<model> WORKERS=4 \
+  bash experiments/run_p3_cvdp12.sh
+```
+
+Run the unchanged-harness ablation explicitly:
+
+```bash
+CVDP_HARNESS_PROFILE=official KEY_ENV=<credential-env> MODEL=<model> \
+  bash experiments/run_p3_cvdp12.sh
+```
+
+Both the Lean/Sparkle runner and the CktArchon direct-Verilog runner accept
+`--cvdp-harness-profile {official,race-safe-v1}` and write the selected profile
+into every task record and `summary.json`. All methods in a scored comparison,
+including baselines, must use the same profile. The legacy `CVDP_*` environment
+flags remain explicit overrides and should be reported if used.
+
+On the fixed 12-task native-parameter slice, the latest `race-safe-v1` Codex
+run compiled and simulated 12/12 tasks, elaborated all 60 public parameter
+configurations, and passed all 64 cocotb cases. Seven tasks passed on their
+first candidate and five after feedback repair, using 247 total turns. An
+independent `official`-profile run compiled 12/12 and simulated 11/12. These
+are separate stochastic agent runs, so their one-task difference is not a
+causal estimate of the profile alone. Do not report the 12/12 race-safe result
+as an unchanged-harness result, and do not compare it against baselines run
+under a different profile.
+
 ## Key Features
 
 ### 🎯 Cycle-Accurate Simulation
