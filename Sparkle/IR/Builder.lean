@@ -159,6 +159,12 @@ def makeWire (hint : String) (ty : HWType) (named : Bool := false) : CircuitM St
 def emitAssign (lhs : String) (rhs : Expr) : CircuitM Unit := do
   modify fun s => { s with pendingBodyRev := .assign lhs rhs :: s.pendingBodyRev }
 
+def emitSignedDot (output : String) (lhs rhs : Expr)
+    (laneCount lhsWidth rhsWidth resultWidth : DimExpr) : CircuitM Unit := do
+  modify fun s =>
+    { s with pendingBodyRev :=
+        (.signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth) :: s.pendingBodyRev }
+
 /--
   Emit a register statement (D flip-flop).
   Returns the name of the output wire.

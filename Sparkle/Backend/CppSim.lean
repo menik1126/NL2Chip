@@ -44,6 +44,10 @@ partial def exprHasSymbolicDimension : Expr → Bool
 /-- True when a statement cannot be represented by the concrete C++ backend. -/
 def stmtHasSymbolicDimension : Stmt → Bool
   | .assign _ rhs => exprHasSymbolicDimension rhs
+  | .signedDot _ lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+      exprHasSymbolicDimension lhs || exprHasSymbolicDimension rhs ||
+        !laneCount.isConcrete || !lhsWidth.isConcrete ||
+        !rhsWidth.isConcrete || !resultWidth.isConcrete
   | .register _ _ _ input _ => exprHasSymbolicDimension input
   | .memory _ addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ =>
       !addrWidth.isConcrete || !dataWidth.isConcrete || !depth.isConcrete ||
@@ -138,6 +142,10 @@ partial def passiveExprWidth (typeMap : TypeMap) : Expr → Nat
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
   | .op .le_s _ | .op .gt_u _ | .op .gt_s _ | .op .ge_u _
   | .op .ge_s _ => 1
+  | .op .udiv args | .op .sdiv args =>
+    match args with
+    | [arg, _] => passiveExprWidth typeMap arg
+    | _ => 0
   | .op .mux args =>
       match args with
       | [_, thenValue, elseValue] =>
@@ -351,6 +359,12 @@ def validateSpecializedDesign (d : Design)
     let typeMap := buildTypeMap module_
     for statement in module_.body do
       match statement with
+      | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+          unless laneCount.isConcrete && lhsWidth.isConcrete &&
+            rhsWidth.isConcrete && resultWidth.isConcrete do
+            throw s!"Sparkle CppSim signed dot '{module_.name}.{output}' retains symbolic dimensions"
+          unless passiveExprWidth typeMap lhs ≤ 64 && passiveExprWidth typeMap rhs ≤ 64 do
+            throw s!"Sparkle CppSim signed dot '{module_.name}.{output}' exceeds the 64-bit concrete backend limit"
       | .assign lhs rhs =>
           let width := lookupWidth typeMap lhs
           if width > 64 && !isSupportedPassiveWideAssignment typeMap lhs width rhs then
@@ -458,6 +472,8 @@ def emitCppOperator (op : Operator) : String :=
   | .add => "+"
   | .sub => "-"
   | .mul => "*"
+  | .udiv => "/"
+  | .sdiv => "/"
   | .eq  => "=="
   | .lt_u => "<"
   | .lt_s => "<"
@@ -470,6 +486,7 @@ def emitCppOperator (op : Operator) : String :=
   | .shl => "<<"
   | .shr => ">>"
   | .asr => ">>"
+  | .sext => "$signed"
   | .neg => "-"
   | .mux => "?"
 
@@ -479,6 +496,15 @@ def signedCastType (w : Nat) : String :=
   else if w ≤ 16 then "int16_t"
   else if w ≤ 32 then "int32_t"
   else "int64_t"
+
+/-- Interpret a packed C++ value as a two's-complement integer with exactly
+    `width` meaningful bits. -/
+def emitSignedValue (value : String) (width : Nat) : String :=
+  if width == 0 then "0"
+  else if width >= 64 then
+    s!"((int64_t)(uint64_t)({value}))"
+  else
+    s!"((int64_t)(((uint64_t)({value}) ^ (1ULL << {width - 1})) - (1ULL << {width - 1})))"
 
 /-- Best-effort width inference for an expression -/
 partial def inferExprWidth (typeMap : TypeMap) : Expr → Nat
@@ -559,7 +585,10 @@ partial def validateResizeExpr (typeMap : TypeMap)
 def validateModuleResizeExprs (m : Module) : Except String Unit := do
   let typeMap := buildTypeMap m
   for statement in m.body do
-    match statement with
+      match statement with
+    | .signedDot _ lhs rhs _ _ _ _ =>
+        validateResizeExpr typeMap m.name "signed dot lhs" lhs *>
+          validateResizeExpr typeMap m.name "signed dot rhs" rhs
     | .assign lhs rhs =>
         let width := lookupWidth typeMap lhs
         if width > 64 then
@@ -744,6 +773,13 @@ partial def emitExpr (typeMap : TypeMap) (e : Expr) : String :=
     | [arg] => s!"(-{emitExpr typeMap arg})"
     | _ => "/* ERROR: neg requires 1 argument */"
 
+  | .op .sext args =>
+    match args with
+    | [arg] =>
+      let width := inferExprWidth typeMap arg
+      emitSignedValue (emitExpr typeMap arg) width
+    | _ => "/* ERROR: sext requires 1 argument */"
+
   | .op operator args =>
     match args with
     | [arg1, arg2] =>
@@ -793,6 +829,16 @@ partial def emitExpr (typeMap : TypeMap) (e : Expr) : String :=
         let w := inferExprWidth typeMap arg1
         let stype := signedCastType w
         s!"(({stype}){emitExpr typeMap arg1} {emitCppOperator operator} ({stype}){emitExpr typeMap arg2} ? 1 : 0)"
+      | .udiv =>
+        let lhs := emitExpr typeMap arg1
+        let rhs := emitExpr typeMap arg2
+        s!"(({rhs} == 0) ? 0 : ({lhs} / {rhs}))"
+      | .sdiv =>
+        let w := inferExprWidth typeMap arg1
+        let stype := signedCastType w
+        let lhs := s!"({stype}){emitExpr typeMap arg1}"
+        let rhs := s!"({stype}){emitExpr typeMap arg2}"
+        s!"(({rhs} == 0) ? 0 : ({lhs} / {rhs}))"
       | .eq | .lt_u | .le_u | .gt_u | .ge_u =>
         s!"({emitExpr typeMap arg1} {emitCppOperator operator} {emitExpr typeMap arg2} ? 1 : 0)"
       | _ =>
@@ -925,6 +971,32 @@ def emitStmt (stmt : Stmt) (typeMap : TypeMap)
       , tickBody := []
       , resetBody := []
       , evalTickLocals := [] }
+
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    let lanes := laneCount.toNat?.getD 0
+    let lhsW := lhsWidth.toNat?.getD 0
+    let rhsW := rhsWidth.toNat?.getD 0
+    let accW := resultWidth.toNat?.getD 0
+    let outputName := sanitizeName output
+    let indexName := sanitizeName (output ++ "_dot_index")
+    let laneExpr (packed : Expr) (width : Nat) : String :=
+      let shifted := s!"((uint64_t)({emitExpr typeMap packed}) >> ({indexName} * {width}))"
+      if width == 64 then shifted else s!"({shifted} & ((1ULL << {width}) - 1))"
+    let lhsSigned := emitSignedValue (laneExpr lhs lhsW) lhsW
+    let rhsSigned := emitSignedValue (laneExpr rhs rhsW) rhsW
+    let rawUpdate := s!"((int64_t){emitSignedValue outputName accW} + ((int64_t){lhsSigned} * (int64_t){rhsSigned}))"
+    let updated := applyMask rawUpdate accW
+    let body :=
+      s!"        {outputName} = 0;\n" ++
+      s!"        for (size_t {indexName} = 0; {indexName} < {lanes}; ++{indexName}) " ++
+      ob ++ "\n" ++
+      s!"            {outputName} = {updated};\n" ++
+      cb
+    { declarations := []
+    , evalBody := [body]
+    , tickBody := []
+    , resetBody := []
+    , evalTickLocals := [] }
 
   | .register output _clock _reset input initValue =>
     let width := lookupWidth typeMap output

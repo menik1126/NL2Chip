@@ -118,6 +118,13 @@ def emitAssign (lhs : String) (rhs : Sparkle.IR.AST.Expr) : CompilerM Unit := do
   let ((), cs') := CircuitM.emitAssign lhs rhs cs
   set cs'
 
+def emitSignedDot (output : String) (lhs rhs : Sparkle.IR.AST.Expr)
+    (laneCount lhsWidth rhsWidth resultWidth : DimExpr) : CompilerM Unit := do
+  let cs ← get
+  let ((), cs') := CircuitM.emitSignedDot output lhs rhs
+    laneCount lhsWidth rhsWidth resultWidth cs
+  set cs'
+
 def addInput (name : String) (ty : HWType) : CompilerM Unit := do
   let cs ← get
   let ((), cs') := CircuitM.addInput name ty cs
@@ -237,6 +244,8 @@ def primitiveRegistry : List (Name × Sparkle.IR.AST.Operator) :=
     (``HSub.hSub, .sub),
     (``BitVec.mul, .mul),
     (``HMul.hMul, .mul),
+    (``Sparkle.Core.Signal.Signal.udiv, .udiv),
+    (``Sparkle.Core.Signal.Signal.sdiv, .sdiv),
     -- Comparison operations (unsigned)
     (``BitVec.ult, .lt_u),
     (``BitVec.ule, .le_u),
@@ -538,6 +547,13 @@ partial def validateExprDefaults (m : Sparkle.IR.AST.Module) (role : String) : S
 
 def validateStmtDefaults (m : Sparkle.IR.AST.Module) : Stmt → MetaM Unit
   | .assign lhs rhs => validateExprDefaults m s!"assignment to '{lhs}'" rhs
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth => do
+      validatePositiveDefaultDim m s!"signed dot '{output}' lane count" laneCount
+      validatePositiveDefaultDim m s!"signed dot '{output}' lhs width" lhsWidth
+      validatePositiveDefaultDim m s!"signed dot '{output}' rhs width" rhsWidth
+      validatePositiveDefaultDim m s!"signed dot '{output}' result width" resultWidth
+      validateExprDefaults m s!"signed dot '{output}' lhs" lhs
+      validateExprDefaults m s!"signed dot '{output}' rhs" rhs
   | .register output _ _ input _ => validateExprDefaults m s!"register '{output}' input" input
   | .memory name addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ => do
       validatePositiveDefaultDim m s!"memory '{name}' address width" addrWidth
@@ -1710,6 +1726,15 @@ mutual
 
   /-- Handle BitVec.extractLsb', shifts, concat, isPrimitive dispatch -/
   partial def handleBitVecOps (e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.signExtend && args.size >= 1 then
+      trace[sparkle.compiler] "-> signExtend"
+      let srcWire ← translateExprToWire args.back! "sext_src"
+      let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal exprType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      CompilerM.emitAssign resultWire (.op .sext [.ref srcWire])
+      return some resultWire
+
     -- BitVec.extractLsb': bit slice extraction
     if name == ``BitVec.extractLsb' && args.size >= 4 then
       trace[sparkle.compiler] "→ extractLsb'"
@@ -1796,6 +1821,23 @@ mutual
       | none =>
         CompilerM.liftMetaM $ throwError s!"Internal error: {name} is marked as primitive but has no operator"
 
+    return none
+
+  partial def handleSignedDotChunks (e : Lean.Expr) (name : Name)
+      (args : Array Lean.Expr) (hint : String) (isNamed : Bool)
+      : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.signedDotChunks && args.size >= 6 then
+      let lhsWidth ← lowerDimExpr "signed dot lhs width" args[args.size - 6]!
+      let rhsWidth ← lowerDimExpr "signed dot rhs width" args[args.size - 5]!
+      let laneCount ← lowerDimExpr "signed dot lane count" args[args.size - 3]!
+      let lhsWire ← translateExprToWire args[args.size - 2]! "signed_dot_lhs"
+      let rhsWire ← translateExprToWire args.back! "signed_dot_rhs"
+      let resultType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+      let hwType ← inferHWTypeFromSignal resultType
+      let resultWire ← CompilerM.makeWire hint hwType (named := isNamed)
+      CompilerM.emitSignedDot resultWire (.ref lhsWire) (.ref rhsWire)
+        laneCount lhsWidth rhsWidth hwType.width
+      return some resultWire
     return none
 
   /-- Handle Signal.register, Signal.registerNeg, Signal.registerWithEnable -/
@@ -2095,6 +2137,7 @@ mutual
       if let some w ← handleTupleProjections e name args hint isNamed then return w
       if let some w ← handleApplicative e name args hint isNamed then return w
       if let some w ← handleBitVecOps e name args hint isNamed then return w
+      if let some w ← handleSignedDotChunks e name args hint isNamed then return w
       if let some w ← handleRegister e name args hint isNamed then return w
       if let some w ← handleMux e name args hint isNamed then return w
       if let some w ← handleMemory e name args hint isNamed then return w

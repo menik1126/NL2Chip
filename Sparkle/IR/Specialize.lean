@@ -244,6 +244,14 @@ private def validateConcreteModule (module_ : Module) : Except String Unit := do
       throw s!"specialized module '{module_.name}' retains symbolic dimension '{dimension}'"
   for statement in module_.body do
     match statement with
+    | .signedDot _ lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+        validateSliceOrder
+          s!"specialized signed dot lhs in '{module_.name}'" lhs *>
+          validateSliceOrder
+            s!"specialized signed dot rhs in '{module_.name}'" rhs *>
+          unless laneCount.isConcrete && lhsWidth.isConcrete &&
+            rhsWidth.isConcrete && resultWidth.isConcrete do
+            throw s!"specialized signed dot in '{module_.name}' retains a symbolic dimension"
     | .inst _ instanceName connections overrides =>
         unless overrides.isEmpty do
           throw s!"specialized instance '{module_.name}.{instanceName}' retains parameter overrides"

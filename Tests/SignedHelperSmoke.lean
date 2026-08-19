@@ -32,6 +32,18 @@ def runSignedHelperSmoke : IO Unit := do
   let upper : Signal defaultDomain (BitVec 8) := Signal.pure (BitVec.ofNat 8 10)
   let high : Signal defaultDomain (BitVec 8) := Signal.pure (BitVec.ofNat 8 100)
   check "signedSaturate" (at0 (signedSaturate high lower upper) == BitVec.ofNat 8 10)
+  let fallback : Signal defaultDomain (BitVec 4) := Signal.pure (BitVec.ofNat 4 9)
+  check "unsignedDivOr" (at0 (unsignedDivOr neg3 pos2 fallback) == BitVec.ofNat 4 6)
+  check "signedDivOr" (at0 (signedDivOr neg3 pos2 fallback) == BitVec.ofNat 4 15)
+  let zero4 : Signal defaultDomain (BitVec 4) := Signal.pure (BitVec.ofNat 4 0)
+  check "division fallback" (at0 (signedDivOr neg3 zero4 fallback) == BitVec.ofNat 4 9)
+  let dotLhs : Signal defaultDomain (BitVec (3 * 4)) :=
+    Signal.pure (BitVec.ofNat (3 * 4) 0xF2D)
+  let dotRhs : Signal defaultDomain (BitVec (3 * 3)) :=
+    Signal.pure (BitVec.ofNat (3 * 3) 0x1F2)
+  check "signed dot product"
+    (at0 (Signal.signedDotChunks (LHSW := 4) (RHSW := 3)
+      (ACCW := 10) (N := 3) dotLhs dotRhs) == BitVec.ofNat 10 0x3F7)
   IO.println "E83_SIGNED_HELPER_SMOKE_PASS"
 
 def main : IO Unit := runSignedHelperSmoke

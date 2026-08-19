@@ -3897,6 +3897,9 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     wires := dedupWires
     body := (topoSortBody dedupBody).map fun statement => match statement with
       | .assign lhs rhs => .assign lhs (materialize rhs)
+      | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+          .signedDot output (materialize lhs) (materialize rhs)
+            laneCount lhsWidth rhsWidth resultWidth
       | .register output clock reset input initValue =>
           .register output clock reset (materialize input) initValue
       | .memory name addrWidth dataWidth depth clock writeAddr writeData writeEnable
@@ -4043,6 +4046,11 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
             let prefixed := match s with
               | .assign name rhs =>
                 .assign s!"{instName}_{name}" (prefixExprNames instName subNames rhs)
+              | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+                .signedDot s!"{instName}_{output}"
+                  (prefixExprNames instName subNames lhs)
+                  (prefixExprNames instName subNames rhs)
+                  laneCount lhsWidth rhsWidth resultWidth
               | .register name clk rst input init =>
                 .register s!"{instName}_{name}" s!"{instName}_{clk}" s!"{instName}_{rst}"
                   (prefixExprNames instName subNames input) init
@@ -4078,6 +4086,9 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
     let genExpr := genExprRefs internalWireNames
     let genBody := flatBody.map fun s => match s with
       | .assign n rhs => .assign (addGen n) (genExpr rhs)
+      | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+        .signedDot (addGen output) (genExpr lhs) (genExpr rhs)
+          laneCount lhsWidth rhsWidth resultWidth
       | .register n clk rst input init => .register n clk rst (genExpr input) init
       | .inst mn in_ conns parameterOverrides =>
         .inst mn in_ (conns.map fun (p, e) => (p, genExpr e)) parameterOverrides

@@ -69,13 +69,7 @@ def zext {w outW : Nat} (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) :
     from existing packed operations so its behavior remains explicit in both
     Lean simulation and synthesized RTL. -/
 def signExtend {w outW : Nat} (x : Signal dom (BitVec w)) : Signal dom (BitVec outW) :=
-  let unsignedValue : Signal dom (BitVec outW) := zext x
-  let upperMask : BitVec outW :=
-    BitVec.ofNat outW ((2 ^ (outW - w) - 1) * 2 ^ w)
-  let signedValue : Signal dom (BitVec outW) :=
-    unsignedValue ||| (Signal.pure upperMask : Signal dom (BitVec outW))
-  Signal.mux (bitBool x (w - 1))
-    signedValue unsignedValue
+  Signal.signExtend x
 
 /-- Arithmetic right shift for a two's-complement packed vector. -/
 def arithShiftRight {w : Nat}
@@ -149,6 +143,25 @@ def signedSaturateC {w : Nat}
     (value : Signal dom (BitVec w)) (lower upper : BitVec w)
     : Signal dom (BitVec w) :=
   signedSaturate value (Signal.pure lower) (Signal.pure upper)
+
+/-- Unsigned division with explicit divide-by-zero behavior. -/
+def unsignedDivOr {w : Nat}
+    (numerator denominator fallback : Signal dom (BitVec w))
+    : Signal dom (BitVec w) :=
+  Signal.mux (isZero denominator) fallback (Signal.udiv numerator denominator)
+
+/-- Signed division with truncation toward zero and explicit divide-by-zero
+    behavior. -/
+def signedDivOr {w : Nat}
+    (numerator denominator fallback : Signal dom (BitVec w))
+    : Signal dom (BitVec w) :=
+  Signal.mux (isZero denominator) fallback (Signal.sdiv numerator denominator)
+
+/-- Packed signed dot product. Lane zero is the least-significant chunk. -/
+def signedDotPacked {lhsW rhsW accW lanes : Nat}
+    (lhs : Signal dom (BitVec (lanes * lhsW)))
+    (rhs : Signal dom (BitVec (lanes * rhsW))) : Signal dom (BitVec accW) :=
+  Signal.signedDotChunks lhs rhs
 
 /-- D flip-flop alias. Prefer this when mirroring Verilog `q <= d`. -/
 def dff {α : Type} (init : α) (d : Signal dom α) : Signal dom α :=

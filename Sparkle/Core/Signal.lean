@@ -123,6 +123,14 @@ def clock {dom : DomainConfig} : Signal dom Bool :=
 def map (f : α → β) (s : Signal dom α) : Signal dom β :=
   ⟨fun t => f (s.val t)⟩
 
+private def signExtendImpl {inW outW : Nat}
+    (s : Signal dom (BitVec inW)) : Signal dom (BitVec outW) :=
+  s.map (fun value => value.signExtend outW)
+
+@[implemented_by signExtendImpl]
+opaque signExtend {inW outW : Nat}
+    (s : Signal dom (BitVec inW)) : Signal dom (BitVec outW)
+
 /-- Apply a signal of functions to a signal of values -/
 def ap (sf : Signal dom (α → β)) (s : Signal dom α) : Signal dom β :=
   ⟨fun t => sf.val t (s.val t)⟩
@@ -365,6 +373,38 @@ def Signal.ultC (a : Signal dom (BitVec n)) (b : BitVec n) : Signal dom Bool :=
   (fun x => BitVec.ult x b) <$> a
 def Signal.ashrC (a : Signal dom (BitVec n)) (b : BitVec n) : Signal dom (BitVec n) :=
   (fun x => BitVec.sshiftRight x b.toNat) <$> a
+
+/-- Unsigned packed-vector division. Division by zero returns zero. -/
+private def udivImpl (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
+  (BitVec.udiv · ·) <$> a <*> b
+
+@[implemented_by udivImpl]
+opaque Signal.udiv (a b : Signal dom (BitVec n)) : Signal dom (BitVec n)
+
+/-- Signed two's-complement division, truncating toward zero. -/
+private def sdivImpl (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
+  (BitVec.sdiv · ·) <$> a <*> b
+
+@[implemented_by sdivImpl]
+opaque Signal.sdiv (a b : Signal dom (BitVec n)) : Signal dom (BitVec n)
+
+/-- Simulation implementation for a packed signed dot product. Lane zero is
+    the least-significant packed lane. -/
+private def signedDotChunksImpl {LHSW RHSW ACCW N : Nat}
+    (lhs : Signal dom (BitVec (N * LHSW)))
+    (rhs : Signal dom (BitVec (N * RHSW))) : Signal dom (BitVec ACCW) :=
+  ⟨fun t =>
+    let total := (List.range N).foldl (fun acc index =>
+      let lhsLane := BitVec.extractLsb' (index * LHSW) LHSW (lhs.val t)
+      let rhsLane := BitVec.extractLsb' (index * RHSW) RHSW (rhs.val t)
+      acc + lhsLane.toInt * rhsLane.toInt
+    ) (0 : Int)
+    BitVec.ofInt ACCW total⟩
+
+@[implemented_by signedDotChunksImpl]
+opaque Signal.signedDotChunks {LHSW RHSW ACCW N : Nat}
+    (lhs : Signal dom (BitVec (N * LHSW)))
+    (rhs : Signal dom (BitVec (N * RHSW))) : Signal dom (BitVec ACCW)
 
 -- Negation for Signal (BitVec n)
 

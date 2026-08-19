@@ -15,6 +15,7 @@ open Sparkle.IR.AST
 def findDriver (body : List Stmt) (wireName : String) : Option Stmt :=
   body.find? fun
     | .assign lhs _ => lhs == wireName
+    | .signedDot output .. => output == wireName
     | .register output .. => output == wireName
     | .memory (readData := rd) .. => rd == wireName
     | .inst _ instName _ _ => instName == wireName
@@ -30,6 +31,7 @@ def checkRegisteredOutputs (m : Module) : List String :=
       -- Find the assign statement for this output port
       let assignStmt := m.body.find? fun
         | .assign lhs _ => lhs == port.name
+        | .signedDot output .. => output == port.name
         | _ => false
       match assignStmt with
       | none => none  -- No assign found, skip

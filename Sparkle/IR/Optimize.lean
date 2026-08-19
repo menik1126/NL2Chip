@@ -214,6 +214,8 @@ def countAllUses (stmts : List Stmt) : HashMap String Nat :=
   stmts.foldl (fun counts stmt =>
     match stmt with
     | .assign _ rhs => countExprUses rhs counts
+    | .signedDot _ lhs rhs _ _ _ _ =>
+      countExprUses rhs (countExprUses lhs counts)
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
@@ -224,6 +226,9 @@ def countAllUses (stmts : List Stmt) : HashMap String Nat :=
 /-- Optimize a single statement's expressions -/
 def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
   | .assign lhs rhs => .assign lhs (optimizeExpr dm wm rhs)
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    .signedDot output (optimizeExpr dm wm lhs) (optimizeExpr dm wm rhs)
+      laneCount lhsWidth rhsWidth resultWidth
   | .register output clock reset input initValue =>
     .register output clock reset (optimizeExpr dm wm input) initValue
   | .memory name aw dw depth clk wa wd we ra rd cr =>
@@ -311,6 +316,10 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
     match stmt with
     | .assign lhs rhs =>
       .assign lhs (substituteExpr dm inlinable 100 rhs)
+    | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+      .signedDot output (substituteExpr dm inlinable 100 lhs)
+        (substituteExpr dm inlinable 100 rhs)
+        laneCount lhsWidth rhsWidth resultWidth
     | .register output clock reset input initValue =>
       .register output clock reset (substituteExpr dm inlinable 100 input) initValue
     | .memory name aw dw depth clk wa wd we ra rd cr =>

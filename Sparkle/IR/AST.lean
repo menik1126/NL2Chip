@@ -41,6 +41,8 @@ inductive Operator where
   | add  : Operator  -- Addition
   | sub  : Operator  -- Subtraction
   | mul  : Operator  -- Multiplication
+  | udiv : Operator  -- Unsigned division
+  | sdiv : Operator  -- Signed division, truncating toward zero
   | eq   : Operator  -- Equality comparison
   | lt_u : Operator  -- Less than comparison (unsigned)
   | lt_s : Operator  -- Less than comparison (signed)
@@ -54,6 +56,7 @@ inductive Operator where
   | shl  : Operator  -- Shift left
   | shr  : Operator  -- Shift right (logical)
   | asr  : Operator  -- Arithmetic shift right (signed)
+  | sext : Operator  -- Sign extension/truncation to the destination width
   | neg  : Operator  -- Arithmetic negation
   deriving Repr, BEq, DecidableEq
 
@@ -68,6 +71,8 @@ def toString : Operator → String
   | add  => "add"
   | sub  => "sub"
   | mul  => "mul"
+  | udiv => "udiv"
+  | sdiv => "sdiv"
   | eq   => "eq"
   | lt_u => "lt_u"
   | lt_s => "lt_s"
@@ -81,6 +86,7 @@ def toString : Operator → String
   | shl  => "shl"
   | shr  => "shr"
   | asr  => "asr"
+  | sext => "sext"
   | neg  => "neg"
 
 instance : ToString Operator where
@@ -138,6 +144,8 @@ def not (a : Expr) : Expr := .op .not [a]
 def add (a b : Expr) : Expr := .op .add [a, b]
 def sub (a b : Expr) : Expr := .op .sub [a, b]
 def mul (a b : Expr) : Expr := .op .mul [a, b]
+def udiv (a b : Expr) : Expr := .op .udiv [a, b]
+def sdiv (a b : Expr) : Expr := .op .sdiv [a, b]
 def eq (a b : Expr) : Expr := .op .eq [a, b]
 def lt_u (a b : Expr) : Expr := .op .lt_u [a, b]
 def lt_s (a b : Expr) : Expr := .op .lt_s [a, b]
@@ -223,6 +231,12 @@ end Expr
 -/
 inductive Stmt where
   | assign (lhs : String) (rhs : Expr) : Stmt
+  /-- A packed signed dot product lowered by both concrete backends. -/
+  | signedDot
+      (output : String)
+      (lhs rhs : Expr)
+      (laneCount lhsWidth rhsWidth resultWidth : DimExpr)
+      : Stmt
   | register
       (output : String)      -- Output wire name
       (clock : String)       -- Clock signal name
@@ -256,6 +270,10 @@ namespace Stmt
 /-- Replace module parameters throughout a statement. -/
 def substituteDimensions (lookup : String → Option DimExpr) : Stmt → Stmt
   | .assign lhs rhs => .assign lhs (rhs.substituteDimensions lookup)
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+      .signedDot output (lhs.substituteDimensions lookup) (rhs.substituteDimensions lookup)
+        (laneCount.substitute lookup) (lhsWidth.substitute lookup)
+        (rhsWidth.substitute lookup) (resultWidth.substitute lookup)
   | .register output clock reset input initValue =>
       .register output clock reset (input.substituteDimensions lookup) initValue
   | .memory name addrWidth dataWidth depth clock writeAddr writeData writeEnable
@@ -275,6 +293,9 @@ def substituteDimensions (lookup : String → Option DimExpr) : Stmt → Stmt
 /-- All dimension expressions occurring in a statement. -/
 def dimensionExpressions : Stmt → List DimExpr
   | .assign _ rhs => rhs.dimensionExpressions
+  | .signedDot _ lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+      [laneCount, lhsWidth, rhsWidth, resultWidth] ++
+        lhs.dimensionExpressions ++ rhs.dimensionExpressions
   | .register _ _ _ input _ => input.dimensionExpressions
   | .memory _ addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ =>
       [addrWidth, dataWidth, depth] ++
@@ -286,6 +307,13 @@ def dimensionExpressions : Stmt → List DimExpr
 /-- Dimensions in a statement that must elaborate to positive values. -/
 def positiveDimensions (role : String) : Stmt → List (String × DimExpr)
   | .assign lhs rhs => rhs.positiveDimensions s!"{role} assignment '{lhs}'"
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+      [(s!"{role} signed dot '{output}' lane count", laneCount),
+       (s!"{role} signed dot '{output}' lhs width", lhsWidth),
+       (s!"{role} signed dot '{output}' rhs width", rhsWidth),
+       (s!"{role} signed dot '{output}' result width", resultWidth)] ++
+        lhs.positiveDimensions s!"{role} signed dot '{output}' lhs" ++
+        rhs.positiveDimensions s!"{role} signed dot '{output}' rhs"
   | .register output _ _ input _ =>
       input.positiveDimensions s!"{role} register '{output}'"
   | .memory name addrWidth dataWidth depth _ writeAddr writeData writeEnable readAddr _ _ =>
@@ -301,6 +329,9 @@ def positiveDimensions (role : String) : Stmt → List (String × DimExpr)
 /-- Convert statement to string (for debugging) -/
 def toString : Stmt → String
   | assign lhs rhs => s!"{lhs} := {rhs}"
+  | signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+      s!"{output} := signedDot({lhs}, {rhs}; lanes={laneCount}, " ++
+        s!"lhsWidth={lhsWidth}, rhsWidth={rhsWidth}, resultWidth={resultWidth})"
   | register output clock reset input initValue =>
       s!"reg {output} @(posedge {clock}, {reset}) <= {input} (init: {initValue})"
   | memory name addrWidth dataWidth depth clock writeAddr writeData writeEnable readAddr readData comboRead =>
