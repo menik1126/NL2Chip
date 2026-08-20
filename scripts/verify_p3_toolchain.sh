@@ -29,6 +29,10 @@ lake build Sparkle
 # target in the gate so new statements or symbolic dimensions cannot silently
 # break SVParser lowering while the Lean-to-Verilog path still passes.
 lake build Tools.SVParser.Lower
+# A few P3 pytest cases invoke `lake env lean` on fixtures that import these
+# modules directly. Build them here so the gate works from a clean worktree,
+# rather than accidentally depending on stale `.olean` files from development.
+lake build Tests.SymbolicParameterCircuits Tests.IndexedParameterCircuits Tests.SignedHelperCircuits
 "$python_bin" -m pytest -q --junitxml="$work_dir/pytest.xml"
 "$python_bin" - "$work_dir/pytest.xml" <<'PY'
 import sys
