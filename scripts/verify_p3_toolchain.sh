@@ -25,6 +25,10 @@ cd "$repo_root"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 
 lake build Sparkle
+# The P3 IR is also consumed by the SystemVerilog import/JIT path. Keep this
+# target in the gate so new statements or symbolic dimensions cannot silently
+# break SVParser lowering while the Lean-to-Verilog path still passes.
+lake build Tools.SVParser.Lower
 "$python_bin" -m pytest -q --junitxml="$work_dir/pytest.xml"
 "$python_bin" - "$work_dir/pytest.xml" <<'PY'
 import sys

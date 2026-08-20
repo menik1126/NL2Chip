@@ -1389,9 +1389,10 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
         fun n => !arrayRegNames.any (· == n)
       for regName in regNames do
         let hwTy := env.getHWType regName
-        let initVal := match initMap.find? (·.1 == regName) with
-          | some (_, v) => v
-          | none => 0
+        let initWidth := widthToBits (env.getWidth regName)
+        let initVal : Expr := match initMap.find? (·.1 == regName) with
+          | some (_, v) => .const (Int.ofNat v) initWidth
+          | none => .const 0 initWidth
         let dataExpr := stmtsToMuxExpr regName stmts
         body := body ++ [.register regName clock resetName dataExpr initVal]
         if !(wireExists wires regName) then
@@ -1451,14 +1452,19 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
               writeEnable := enableExpr
             | [] => pure ()
         | _ => pure ()
-      body := body ++ [.memory name addrWidth dataWidth "clk"
+      body := body ++ [.memory name (.literal addrWidth) (.literal dataWidth) "clk"
         writeAddr writeData writeEnable
         (.const 0 addrWidth) s!"{name}_rdata" true]
       wires := wires ++ [{ name := s!"{name}_rdata", ty := widthToHWType width }]
-    | .instantiation modName instName conns _paramOvr =>
-      -- Module instantiation → Stmt.inst (parameter overrides resolved at flatten time)
+    | .instantiation modName instName conns paramOvr =>
+      -- Preserve concrete parameter overrides. The parser evaluates module
+      -- parameters before lowering, so non-constant overrides are deliberately
+      -- left to the existing flattening path rather than guessed here.
       let irConns := conns.map fun (portName, expr) => (portName, lowerExpr expr)
-      body := body ++ [.inst modName instName irConns]
+      let irParams := paramOvr.filterMap fun (name, value) =>
+        (evalConstExpr paramVals value).map fun concrete =>
+          (name, DimExpr.literal concrete)
+      body := body ++ [.inst modName instName irConns irParams]
     | _ => pure ()
 
   -- Deduplicate wires
@@ -1550,14 +1556,128 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     isPrimitive := false
   }
 
-/-- Prefix all wire/register names in an expression -/
-partial def prefixExprNames (pfx : String) (nameSet : List String) : Expr → Expr
+/-- Rename generated-loop dimensions while flattening a submodule. -/
+partial def prefixDimExprNames (renames : List (String × String)) : DimExpr → DimExpr
+  | .literal value => .literal value
+  | .parameter name =>
+    let renamed := (renames.find? fun entry => entry.1 == name).map (·.2)
+    .parameter (renamed.getD name)
+  | .add lhs rhs => .add (prefixDimExprNames renames lhs) (prefixDimExprNames renames rhs)
+  | .sub lhs rhs => .sub (prefixDimExprNames renames lhs) (prefixDimExprNames renames rhs)
+  | .mul lhs rhs => .mul (prefixDimExprNames renames lhs) (prefixDimExprNames renames rhs)
+  | .div lhs rhs => .div (prefixDimExprNames renames lhs) (prefixDimExprNames renames rhs)
+  | .mod lhs rhs => .mod (prefixDimExprNames renames lhs) (prefixDimExprNames renames rhs)
+  | .pow base exponent =>
+    .pow (prefixDimExprNames renames base) (prefixDimExprNames renames exponent)
+  | .clog2 value => .clog2 (prefixDimExprNames renames value)
+  | .min lhs rhs => .min (prefixDimExprNames renames lhs) (prefixDimExprNames renames rhs)
+  | .max lhs rhs => .max (prefixDimExprNames renames lhs) (prefixDimExprNames renames rhs)
+
+/-- Prefix wire/register names and local generated dimensions in an expression. -/
+partial def prefixExprNamesWithDims
+    (pfx : String) (nameSet : List String) (dimRenames : List (String × String)) : Expr → Expr
+  | .const value width => .const value width
+  | .constDim value width => .constDim value (prefixDimExprNames dimRenames width)
+  | .dimension value => .dimension (prefixDimExprNames dimRenames value)
   | .ref name => if nameSet.any (· == name) then .ref s!"{pfx}_{name}" else .ref name
-  | .op o args => .op o (args.map (prefixExprNames pfx nameSet))
-  | .concat args => .concat (args.map (prefixExprNames pfx nameSet))
-  | .slice e hi lo => .slice (prefixExprNames pfx nameSet e) hi lo
-  | .index arr idx => .index (prefixExprNames pfx nameSet arr) (prefixExprNames pfx nameSet idx)
-  | e => e
+  | .op o args => .op o (args.map (prefixExprNamesWithDims pfx nameSet dimRenames))
+  | .concat args => .concat (args.map (prefixExprNamesWithDims pfx nameSet dimRenames))
+  | .slice e hi lo => .slice (prefixExprNamesWithDims pfx nameSet dimRenames e) hi lo
+  | .sliceDim e hi lo => .sliceDim (prefixExprNamesWithDims pfx nameSet dimRenames e)
+      (prefixDimExprNames dimRenames hi) (prefixDimExprNames dimRenames lo)
+  | .index arr idx => .index (prefixExprNamesWithDims pfx nameSet dimRenames arr)
+      (prefixExprNamesWithDims pfx nameSet dimRenames idx)
+
+def prefixExprNames (pfx : String) (nameSet : List String) : Expr → Expr :=
+  prefixExprNamesWithDims pfx nameSet []
+
+/-- Prefix every name-bearing field of a statement while flattening a submodule. -/
+partial def prefixStmtNames
+    (pfx : String) (nameSet : List String) (dimRenames : List (String × String) := []) : Stmt → Stmt
+  | .assign name rhs =>
+    .assign s!"{pfx}_{name}" (prefixExprNamesWithDims pfx nameSet dimRenames rhs)
+  | .assignExpr lhs rhs =>
+    .assignExpr (prefixExprNamesWithDims pfx nameSet dimRenames lhs)
+      (prefixExprNamesWithDims pfx nameSet dimRenames rhs)
+  | .generateFor label index start stop body =>
+    let prefixedIndex := s!"{pfx}_{index}"
+    .generateFor s!"{pfx}_{label}" prefixedIndex
+      (prefixDimExprNames dimRenames start)
+      (prefixDimExprNames dimRenames stop)
+      (body.map (prefixStmtNames pfx nameSet ((index, prefixedIndex) :: dimRenames)))
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    .signedDot s!"{pfx}_{output}"
+      (prefixExprNamesWithDims pfx nameSet dimRenames lhs)
+      (prefixExprNamesWithDims pfx nameSet dimRenames rhs)
+      (prefixDimExprNames dimRenames laneCount)
+      (prefixDimExprNames dimRenames lhsWidth)
+      (prefixDimExprNames dimRenames rhsWidth)
+      (prefixDimExprNames dimRenames resultWidth)
+  | .register output clock reset input initValue =>
+    .register s!"{pfx}_{output}" s!"{pfx}_{clock}" s!"{pfx}_{reset}"
+      (prefixExprNamesWithDims pfx nameSet dimRenames input)
+      (prefixExprNamesWithDims pfx nameSet dimRenames initValue)
+  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
+    .memory s!"{pfx}_{name}"
+      (prefixDimExprNames dimRenames addrWidth)
+      (prefixDimExprNames dimRenames dataWidth)
+      s!"{pfx}_{clock}"
+      (prefixExprNamesWithDims pfx nameSet dimRenames writeAddr)
+      (prefixExprNamesWithDims pfx nameSet dimRenames writeData)
+      (prefixExprNamesWithDims pfx nameSet dimRenames writeEnable)
+      (prefixExprNamesWithDims pfx nameSet dimRenames readAddr)
+      s!"{pfx}_{readData}" comboRead
+  | .inst moduleName instName connections parameterBindings =>
+    .inst moduleName s!"{pfx}_{instName}"
+      (connections.map fun (portName, expr) =>
+        (portName, prefixExprNamesWithDims pfx nameSet dimRenames expr))
+      (parameterBindings.map fun (name, value) =>
+        (name, prefixDimExprNames dimRenames value))
+
+/-- Rename an internal flattened wire without changing public ports or registers. -/
+def renameInternalName (wireNames : List String) (name : String) : String :=
+  if name.startsWith "_gen_" then name
+  else if wireNames.any (· == name) then s!"_gen_{name}"
+  else name
+
+/-- Rewrite references to internal flattened wires. -/
+partial def prefixInternalExprRefs (wireNames : List String) : Expr → Expr
+  | .const value width => .const value width
+  | .constDim value width => .constDim value width
+  | .dimension value => .dimension value
+  | .ref name => .ref (renameInternalName wireNames name)
+  | .op operator args => .op operator (args.map (prefixInternalExprRefs wireNames))
+  | .concat args => .concat (args.map (prefixInternalExprRefs wireNames))
+  | .slice expr hi lo => .slice (prefixInternalExprRefs wireNames expr) hi lo
+  | .sliceDim expr hi lo => .sliceDim (prefixInternalExprRefs wireNames expr) hi lo
+  | .index array index => .index (prefixInternalExprRefs wireNames array)
+      (prefixInternalExprRefs wireNames index)
+
+/-- Rewrite all name-bearing fields of a statement after flattening. -/
+partial def prefixInternalStmtRefs (wireNames : List String) : Stmt → Stmt
+  | .assign name rhs =>
+    .assign (renameInternalName wireNames name) (prefixInternalExprRefs wireNames rhs)
+  | .assignExpr lhs rhs =>
+    .assignExpr (prefixInternalExprRefs wireNames lhs) (prefixInternalExprRefs wireNames rhs)
+  | .generateFor label index start stop body =>
+    .generateFor label index start stop (body.map (prefixInternalStmtRefs wireNames))
+  | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
+    .signedDot (renameInternalName wireNames output)
+      (prefixInternalExprRefs wireNames lhs) (prefixInternalExprRefs wireNames rhs)
+      laneCount lhsWidth rhsWidth resultWidth
+  | .register output clock reset input initValue =>
+    .register (renameInternalName wireNames output) clock reset
+      (prefixInternalExprRefs wireNames input) (prefixInternalExprRefs wireNames initValue)
+  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
+    .memory (renameInternalName wireNames name) addrWidth dataWidth clock
+      (prefixInternalExprRefs wireNames writeAddr) (prefixInternalExprRefs wireNames writeData)
+      (prefixInternalExprRefs wireNames writeEnable) (prefixInternalExprRefs wireNames readAddr)
+      (renameInternalName wireNames readData) comboRead
+  | .inst moduleName instName connections parameterBindings =>
+    .inst moduleName instName
+      (connections.map fun (portName, expr) =>
+        (portName, prefixInternalExprRefs wireNames expr))
+      parameterBindings
 
 /-- Flatten a design: inline all sub-module instantiations into a single module.
     The optional `svDesign` parameter provides access to the original SV AST
@@ -1572,7 +1692,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
     for stmt in top.body do
       match stmt with
-      | .inst modName instName conns =>
+      | .inst modName instName conns _parameterBindings =>
         -- Find the sub-module
         match moduleMap.find? fun (m : Module) => m.name == modName with
         | none =>
@@ -1652,23 +1772,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
           -- Add prefixed body statements from sub-module
           for s in effectiveSubMod.body do
-            let prefixed := match s with
-              | .assign name rhs =>
-                .assign s!"{instName}_{name}" (prefixExprNames instName subNames rhs)
-              | .register name clk rst input init =>
-                .register s!"{instName}_{name}" s!"{instName}_{clk}" s!"{instName}_{rst}"
-                  (prefixExprNames instName subNames input) init
-              | .inst subModName subInstName subConns =>
-                -- Keep nested .inst with prefixed names — will be flattened in next iteration
-                .inst subModName s!"{instName}_{subInstName}"
-                  (subConns.map fun (pn, e) => (pn, prefixExprNames instName subNames e))
-              | .memory name aw dw clk wa wd we ra rd combo =>
-                .memory s!"{instName}_{name}" aw dw s!"{instName}_{clk}"
-                  (prefixExprNames instName subNames wa)
-                  (prefixExprNames instName subNames wd)
-                  (prefixExprNames instName subNames we)
-                  (prefixExprNames instName subNames ra)
-                  s!"{instName}_{rd}" combo
+            let prefixed := prefixStmtNames instName subNames [] s
             flatBody := flatBody ++ [prefixed]
       | other => flatBody := flatBody ++ [other]
 
@@ -1686,13 +1790,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
       else if internalWireNames.any (· == n) then s!"_gen_{n}"
       else n
     let genWires := flatWires.map fun w => { w with name := addGen w.name }
-    let genExpr := genExprRefs internalWireNames
-    let genBody := flatBody.map fun s => match s with
-      | .assign n rhs => .assign (addGen n) (genExpr rhs)
-      | .register n clk rst input init => .register n clk rst (genExpr input) init
-      | .inst mn in_ conns => .inst mn in_ (conns.map fun (p, e) => (p, genExpr e))
-      | .memory n aw dw clk wa wd we ra rd combo =>
-        .memory n aw dw clk (genExpr wa) (genExpr wd) (genExpr we) (genExpr ra) rd combo
+    let genBody := flatBody.map (prefixInternalStmtRefs internalWireNames)
 
     let flatModule : Module := {
       name := top.name
@@ -1703,15 +1801,6 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
       isPrimitive := false
     }
     return { topModule := design.topModule, modules := [flatModule] }
-  where
-    genExprRefs (wireNames : List String) : Expr → Expr
-      | .ref n => if wireNames.any (· == n) && !n.startsWith "_gen_"
-                  then .ref s!"_gen_{n}" else .ref n
-      | .op o args => .op o (args.map (genExprRefs wireNames))
-      | .concat args => .concat (args.map (genExprRefs wireNames))
-      | .slice e hi lo => .slice (genExprRefs wireNames e) hi lo
-      | .index a i => .index (genExprRefs wireNames a) (genExprRefs wireNames i)
-      | e => e
 
 /-- Lower a full SV design to Sparkle IR -/
 def lowerDesign (svDesign : SVDesign) : Except String Design := do
