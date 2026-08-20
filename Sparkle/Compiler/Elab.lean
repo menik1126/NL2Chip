@@ -224,6 +224,10 @@ partial def inferHWType (type : Lean.Expr) : MetaM (Option HWType) := do
 where
   extractWidth (e : Lean.Expr) : MetaM Nat := do
     let e ← whnf e
+    let unresolvedWidth : MetaM Nat := do
+      let rendered ← ppExpr e
+      throwError s!"Unresolved symbolic hardware width '{rendered}' in ordinary synthesis. " ++
+        "Specialize it to a concrete Nat before synthesis."
     match e with
     | .lit (.natVal n) => return n
     | .app fn _arg =>
@@ -234,10 +238,10 @@ where
         if args.size >= 2 then
           extractWidth args[1]!
         else
-          return 8
+          unresolvedWidth
       else
-        return 8
-    | _ => return 8
+        unresolvedWidth
+    | _ => unresolvedWidth
 
 
 def inferHWTypeFromSignal (signalType : Lean.Expr) : CompilerM HWType := do
@@ -262,6 +266,14 @@ def inferHWTypeFromSignal (signalType : Lean.Expr) : CompilerM HWType := do
     match ← CompilerM.liftMetaM (inferHWType signalType) with
     | some hwType => return hwType
     | none => CompilerM.liftMetaM $ throwError s!"Cannot infer hardware type from {signalType}"
+
+/-- Syntactically identify Signal binders so hardware-width errors are not
+    swallowed by the fallback path for erased configuration arguments. -/
+def isSignalBinderType (type : Lean.Expr) : CompilerM Bool := do
+  let type ← CompilerM.liftMetaM (whnf type)
+  match type.getAppFn with
+  | .const name _ => return name.toString.endsWith "Signal"
+  | _ => return false
 
 /-- Helper to extract a Nat literal or OfNat.ofNat wrap. -/
 partial def extractNat (e : Lean.Expr) : CompilerM Nat := do
@@ -973,10 +985,16 @@ mutual
           translateExprToWire bodyInst hint isTopLevel isNamed
 
     | .lam binderName binderType body _ => do
-      let isHWArg ← try
-        let _ ← inferHWTypeFromSignal binderType
+      let isSignalArg ← isSignalBinderType binderType
+      let isHWArg ← if isSignalArg then
+        -- Signal binders are hardware ports. Let unresolved widths surface as
+        -- diagnostics instead of treating the whole port as erased logic.
         pure true
-      catch _ => pure false
+      else
+        try
+          let _ ← inferHWTypeFromSignal binderType
+          pure true
+        catch _ => pure false
 
       if isHWArg then
           let hwType ← inferHWTypeFromSignal binderType

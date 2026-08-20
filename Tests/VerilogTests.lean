@@ -38,6 +38,15 @@ def synthesizeDesignToString (declName : Name) : Lean.MetaM String := do
   let design ← synthesizeHierarchical declName
   return toVerilogDesign design
 
+/-- Check that synthesis rejects an invalid top with the intended reason. -/
+def synthesisRejectsWith (declName : Name) (needle : String) : Lean.MetaM Bool := do
+  try
+    let _ ← synthesizeCombinational declName
+    return false
+  catch error =>
+    let message ← error.toMessageData.toString
+    return message.containsSubstr needle
+
 /-- Extract a specific module from multi-module Verilog output -/
 def extractModule (verilog : String) (moduleName : String) : String :=
   let lines := verilog.splitOn "\n"
@@ -64,6 +73,8 @@ structure VerilogOutputs where
   muxVerilog : String
   flipflopVerilog : String
   hierarchicalVerilog : String
+  genericXor17Verilog : String
+  rejectsUnresolvedWidth : Bool
 
 /-- Synthesize all modules for testing -/
 def synthesizeAll : Lean.MetaM VerilogOutputs := do
@@ -72,7 +83,13 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
   let muxVerilog ← synthesizeToString `test_mux
   let flipflopVerilog ← synthesizeToString `test_flipflop
   let hierarchicalVerilog ← synthesizeDesignToString `test_hierarchical_alu
-  return { addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog }
+  let genericXor17Verilog ← synthesizeToString `test_generic_xor_17
+  let rejectsUnresolvedWidth ←
+    synthesisRejectsWith `test_generic_xor "Unresolved symbolic hardware width"
+  return {
+    addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
+    genericXor17Verilog, rejectsUnresolvedWidth
+  }
 
 /-- Create test suite from synthesized outputs -/
 def makeTests (outputs : VerilogOutputs) : TestSeq :=
@@ -95,6 +112,14 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
       group "test_mux (Multiplexer)" (
         test "module declared" (outputs.muxVerilog.containsSubstr "module test_mux") $
         test "has ternary operator" (outputs.muxVerilog.containsSubstr " ? ")
+      ) ++
+      group "width-generic circuits" (
+        test "ordinary synthesis rejects an unresolved width"
+          outputs.rejectsUnresolvedWidth $
+        test "a concrete specialization keeps its 17-bit inputs"
+          (outputs.genericXor17Verilog.containsSubstr "input logic [16:0]") $
+        test "a concrete specialization keeps its 17-bit output"
+          (outputs.genericXor17Verilog.containsSubstr "output logic [16:0]")
       )
     ) ++
     group "Hierarchical Circuits" (
