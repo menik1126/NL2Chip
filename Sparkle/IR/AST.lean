@@ -11,10 +11,78 @@ namespace Sparkle.IR.AST
 
 open Sparkle.IR.Type
 
+/-- Stable identifier for a clock domain within a module. -/
+abbrev DomainId := String
+
+/-- Active clock edge used by a hardware clock domain. -/
+inductive ClockEdge where
+  | rising
+  | falling
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- Reset timing relative to the domain clock. -/
+inductive ResetKind where
+  | synchronous
+  | asynchronous
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/--
+  A physical clock domain carried by the netlist IR.
+
+  `id` is the identity used by sequential statements. `clock` and `reset`
+  are public module ports. Keeping these separate prevents two equal-frequency
+  clocks from being collapsed into one domain.
+-/
+structure ClockDomain where
+  id         : DomainId
+  clock      : String
+  reset      : Option String := some "rst"
+  periodPs   : Nat := 10000
+  activeEdge : ClockEdge := .rising
+  resetKind  : ResetKind := .asynchronous
+  deriving Repr, BEq, Inhabited
+
+namespace ClockDomain
+
+/-- Legacy single-clock domain used by compatibility builder APIs. -/
+def legacy (clock reset : String) : ClockDomain :=
+  { id := clock
+  , clock := clock
+  , reset := some reset
+  , resetKind := .asynchronous
+  }
+
+end ClockDomain
+
+/-- Whether a register uses its domain reset or deliberately has no reset. -/
+inductive RegisterReset where
+  | domain
+  | none
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+instance : ToString RegisterReset where
+  toString
+    | .domain => "domain"
+    | .none => "none"
+
+/-- Audited kinds of intentional clock-domain crossing. -/
+inductive CdcKind where
+  | level
+  | pulse
+  | asyncFifo
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+instance : ToString CdcKind where
+  toString
+    | .level => "level"
+    | .pulse => "pulse"
+    | .asyncFifo => "async_fifo"
+
 /-- Port declaration (input/output of a module) -/
 structure Port where
-  name : String
-  ty   : HWType
+  name   : String
+  ty     : HWType
+  domain : Option DomainId := none
   deriving Repr, BEq, Inhabited
 
 
@@ -142,10 +210,17 @@ end Expr
 -/
 inductive Stmt where
   | assign (lhs : String) (rhs : Expr) : Stmt
+  | cdc
+      (output : String)
+      (sourceDomain : DomainId)
+      (destDomain : DomainId)
+      (input : Expr)
+      (kind : CdcKind)
+      : Stmt
   | register
       (output : String)      -- Output wire name
-      (clock : String)       -- Clock signal name
-      (reset : String)       -- Reset signal name
+      (domain : DomainId)    -- Owning clock domain
+      (reset : RegisterReset)-- Reset behavior for this register
       (input : Expr)         -- Input expression
       (initValue : Int)      -- Reset/initial value
       : Stmt
@@ -153,7 +228,7 @@ inductive Stmt where
       (name : String)         -- Memory instance name
       (addrWidth : Nat)       -- Address width (size = 2^addrWidth)
       (dataWidth : Nat)       -- Data width
-      (clock : String)        -- Clock signal
+      (domain : DomainId)     -- Owning clock domain
       (writeAddr : Expr)      -- Write address port
       (writeData : Expr)      -- Write data port
       (writeEnable : Expr)    -- Write enable port
@@ -165,6 +240,7 @@ inductive Stmt where
       (moduleName : String)   -- Name of module to instantiate
       (instName : String)     -- Instance name
       (connections : List (String × Expr))  -- Port connections
+      (domainMap : List (DomainId × DomainId) := []) -- Child domain -> parent domain
       : Stmt
   deriving Repr, BEq
 
@@ -173,15 +249,19 @@ namespace Stmt
 /-- Convert statement to string (for debugging) -/
 def toString : Stmt → String
   | assign lhs rhs => s!"{lhs} := {rhs}"
-  | register output clock reset input initValue =>
-      s!"reg {output} @(posedge {clock}, {reset}) <= {input} (init: {initValue})"
-  | memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
+  | cdc output sourceDomain destDomain input kind =>
+      s!"cdc[{kind}] {output}: {sourceDomain} -> {destDomain} <= {input}"
+  | register output domain reset input initValue =>
+      s!"reg {output} @domain({domain}, reset={reset}) <= {input} (init: {initValue})"
+  | memory name addrWidth dataWidth domain writeAddr writeData writeEnable readAddr readData comboRead =>
       let readKind := if comboRead then "combo_read" else "read"
-      s!"memory {name}[2^{addrWidth}][{dataWidth}] @(posedge {clock}) " ++
+      s!"memory {name}[2^{addrWidth}][{dataWidth}] @domain({domain}) " ++
       s!"write({writeAddr}, {writeData}, {writeEnable}) {readKind}({readAddr}) => {readData}"
-  | inst modName instName conns =>
+  | inst modName instName conns domainMap =>
       let connStr := String.intercalate ", " (conns.map fun (p, e) => s!".{p}({e})")
-      s!"{modName} {instName}({connStr})"
+      let domainStr := String.intercalate ", "
+        (domainMap.map fun (child, parent) => s!"{child}->{parent}")
+      s!"{modName} {instName}({connStr}) domains[{domainStr}]"
 
 instance : ToString Stmt where
   toString := Stmt.toString
@@ -202,6 +282,7 @@ structure Module where
   outputs     : List Port
   wires       : List Port    -- Internal wires (ignored for primitives)
   body        : List Stmt    -- Logic (ignored for primitives)
+  clockDomains : List ClockDomain := [] -- Physical clock/reset domains
   assertions  : List (String × Expr) := []  -- Formal assertions (name, condition)
   isPrimitive : Bool := false  -- True for vendor-provided blackbox modules
   deriving Repr, BEq
@@ -215,6 +296,7 @@ def empty (name : String) : Module :=
   , outputs := []
   , wires := []
   , body := []
+  , clockDomains := []
   , isPrimitive := false
   }
 
@@ -225,6 +307,7 @@ def primitive (name : String) (inputs : List Port) (outputs : List Port) : Modul
   , outputs := outputs
   , wires := []
   , body := []
+  , clockDomains := []
   , isPrimitive := true
   }
 
@@ -240,6 +323,15 @@ def addOutput (m : Module) (p : Port) : Module :=
 def addWire (m : Module) (p : Port) : Module :=
   { m with wires := m.wires ++ [p] }
 
+/-- Add a physical clock domain once. Conflicting duplicates are rejected by DRC. -/
+def addClockDomain (m : Module) (domain : ClockDomain) : Module :=
+  if m.clockDomains.any (fun existing => existing == domain) then m
+  else { m with clockDomains := m.clockDomains ++ [domain] }
+
+/-- Resolve a clock domain by its stable IR identifier. -/
+def findClockDomain? (m : Module) (id : DomainId) : Option ClockDomain :=
+  m.clockDomains.find? (fun domain => domain.id == id)
+
 /-- Add a statement to the body -/
 def addStmt (m : Module) (s : Stmt) : Module :=
   { m with body := m.body ++ [s] }
@@ -249,8 +341,10 @@ def toString (m : Module) : String :=
   let inputStr := String.intercalate ", " (m.inputs.map fun p => s!"{p.name}: {p.ty}")
   let outputStr := String.intercalate ", " (m.outputs.map fun p => s!"{p.name}: {p.ty}")
   let wireStr := String.intercalate ", " (m.wires.map fun p => s!"{p.name}: {p.ty}")
+  let domainStr := String.intercalate ", " (m.clockDomains.map fun d => s!"{d.id}:{d.clock}")
   let bodyStr := String.intercalate "\n  " (m.body.map Stmt.toString)
   s!"module {m.name}\n" ++
+  s!"  domains: {domainStr}\n" ++
   s!"  inputs:  {inputStr}\n" ++
   s!"  outputs: {outputStr}\n" ++
   s!"  wires:   {wireStr}\n" ++

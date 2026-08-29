@@ -33,6 +33,11 @@ typedef struct {
     void  (*eval)(void*);
     void  (*tick)(void*);
     void  (*eval_tick)(void*);
+    void  (*tick_domain)(void*, uint32_t);
+    void  (*eval_tick_domain)(void*, uint32_t);
+    uint32_t (*num_domains)(void);
+    const char* (*domain_name)(uint32_t);
+    uint64_t (*domain_period_ps)(uint32_t);
     void  (*reset)(void*);
     void  (*set_input)(void*, uint32_t, uint64_t);
     uint64_t (*get_output)(void*, uint32_t);
@@ -116,6 +121,11 @@ LEAN_EXPORT lean_obj_res sparkle_jit_load(b_lean_obj_arg path, lean_obj_arg w) {
     h->eval       = (void(*)(void*))dlsym(lib, "jit_eval");
     h->tick       = (void(*)(void*))dlsym(lib, "jit_tick");
     h->eval_tick  = (void(*)(void*))dlsym(lib, "jit_eval_tick");
+    h->tick_domain = (void(*)(void*, uint32_t))dlsym(lib, "jit_tick_domain");
+    h->eval_tick_domain = (void(*)(void*, uint32_t))dlsym(lib, "jit_eval_tick_domain");
+    h->num_domains = (uint32_t(*)(void))dlsym(lib, "jit_num_domains");
+    h->domain_name = (const char*(*)(uint32_t))dlsym(lib, "jit_domain_name");
+    h->domain_period_ps = (uint64_t(*)(uint32_t))dlsym(lib, "jit_domain_period_ps");
     h->reset      = (void(*)(void*))dlsym(lib, "jit_reset");
     h->set_input  = (void(*)(void*, uint32_t, uint64_t))dlsym(lib, "jit_set_input");
     h->get_output = (uint64_t(*)(void*, uint32_t))dlsym(lib, "jit_get_output");
@@ -174,6 +184,51 @@ LEAN_EXPORT lean_obj_res sparkle_jit_eval_tick(b_lean_obj_arg handle, lean_obj_a
     JITHandle* h = get_handle(handle);
     if (h->eval_tick) h->eval_tick(h->ctx);
     return mk_io_ok(lean_box(0));
+}
+
+/* sparkle_jit_tick_domain : @& JITHandle → UInt32 → IO Unit */
+LEAN_EXPORT lean_obj_res sparkle_jit_tick_domain(
+    b_lean_obj_arg handle, uint32_t domain, lean_obj_arg w) {
+    (void)w;
+    JITHandle* h = get_handle(handle);
+    if (h->tick_domain) h->tick_domain(h->ctx, domain);
+    return mk_io_ok(lean_box(0));
+}
+
+/* sparkle_jit_eval_tick_domain : @& JITHandle → UInt32 → IO Unit */
+LEAN_EXPORT lean_obj_res sparkle_jit_eval_tick_domain(
+    b_lean_obj_arg handle, uint32_t domain, lean_obj_arg w) {
+    (void)w;
+    JITHandle* h = get_handle(handle);
+    if (h->eval_tick_domain) h->eval_tick_domain(h->ctx, domain);
+    return mk_io_ok(lean_box(0));
+}
+
+/* sparkle_jit_num_domains : @& JITHandle → IO UInt32 */
+LEAN_EXPORT lean_obj_res sparkle_jit_num_domains(
+    b_lean_obj_arg handle, lean_obj_arg w) {
+    (void)w;
+    JITHandle* h = get_handle(handle);
+    uint32_t n = h->num_domains ? h->num_domains() : 0;
+    return mk_io_ok(lean_box_uint32(n));
+}
+
+/* sparkle_jit_domain_name : @& JITHandle → UInt32 → IO String */
+LEAN_EXPORT lean_obj_res sparkle_jit_domain_name(
+    b_lean_obj_arg handle, uint32_t domain, lean_obj_arg w) {
+    (void)w;
+    JITHandle* h = get_handle(handle);
+    const char* name = h->domain_name ? h->domain_name(domain) : "";
+    return mk_io_ok(lean_mk_string(name));
+}
+
+/* sparkle_jit_domain_period_ps : @& JITHandle → UInt32 → IO UInt64 */
+LEAN_EXPORT lean_obj_res sparkle_jit_domain_period_ps(
+    b_lean_obj_arg handle, uint32_t domain, lean_obj_arg w) {
+    (void)w;
+    JITHandle* h = get_handle(handle);
+    uint64_t period = h->domain_period_ps ? h->domain_period_ps(domain) : 0;
+    return mk_io_ok(lean_box_uint64(period));
 }
 
 /* sparkle_jit_reset : @& JITHandle → IO Unit */

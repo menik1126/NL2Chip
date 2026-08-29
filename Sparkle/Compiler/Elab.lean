@@ -15,13 +15,14 @@ import Sparkle.Backend.CppSim
 import Sparkle.IR.Optimize
 import Sparkle.Compiler.DRC
 import Sparkle.Core.Signal
+import Sparkle.Core.Circuit
 import Sparkle.Core.Vector
 
 namespace Sparkle.Compiler.Elab
 
 open Lean Lean.Elab Lean.Elab.Command Lean.Meta
 open Sparkle.IR.Builder
-open Sparkle.IR.AST (Operator Port Module Expr Stmt)
+open Sparkle.IR.AST (Operator Port Module Expr Stmt ClockDomain RegisterReset ClockEdge CdcKind)
 open Sparkle.IR.Type
 open Sparkle.Backend.Verilog
 
@@ -79,9 +80,10 @@ def liftMetaM {α : Type} (m : MetaM α) : CompilerM α :=
   liftM m
 
 /-- Lift CircuitM operations by modifying the circuit state -/
-def makeWire (hint : String) (ty : HWType) (named : Bool := false) : CompilerM String := do
+def makeWire (hint : String) (ty : HWType) (named : Bool := false)
+    (domain : Option Sparkle.IR.AST.DomainId := none) : CompilerM String := do
   let cs ← get
-  let (name, cs') := CircuitM.makeWire hint ty named cs
+  let (name, cs') := CircuitM.makeWire hint ty named domain cs
   set cs'
   return name
 
@@ -90,15 +92,31 @@ def emitAssign (lhs : String) (rhs : Sparkle.IR.AST.Expr) : CompilerM Unit := do
   let ((), cs') := CircuitM.emitAssign lhs rhs cs
   set cs'
 
-def addInput (name : String) (ty : HWType) : CompilerM Unit := do
+def addInput (name : String) (ty : HWType)
+    (domain : Option Sparkle.IR.AST.DomainId := none) : CompilerM Unit := do
   let cs ← get
-  let ((), cs') := CircuitM.addInput name ty cs
+  let ((), cs') := CircuitM.addInput name ty domain cs
   set cs'
 
-
-def addOutput (name : String) (ty : HWType) : CompilerM Unit := do
+def addClockDomain (domain : ClockDomain) : CompilerM Unit := do
   let cs ← get
-  let ((), cs') := CircuitM.addOutput name ty cs
+  let ((), cs') := CircuitM.addClockDomain domain cs
+  set cs'
+
+def emitCdc (hint : String) (sourceDomain destDomain : ClockDomain)
+    (input : Sparkle.IR.AST.Expr) (kind : CdcKind) (ty : HWType)
+    (named : Bool := false) : CompilerM String := do
+  let cs ← get
+  let (name, cs') := CircuitM.emitCdc hint sourceDomain destDomain
+    input kind ty named cs
+  set cs'
+  return name
+
+
+def addOutput (name : String) (ty : HWType)
+    (domain : Option Sparkle.IR.AST.DomainId := none) : CompilerM Unit := do
+  let cs ← get
+  let ((), cs') := CircuitM.addOutput name ty domain cs
   set cs'
 
 /-- Look up the HW width of a wire by name (from wires, inputs, or outputs) -/
@@ -115,10 +133,35 @@ def emitRegister (hint : String) (clk : String) (rst : String) (input : Sparkle.
   set cs'
   return name
 
+def emitRegisterInDomain (hint : String) (domain : ClockDomain)
+    (reset : RegisterReset) (input : Sparkle.IR.AST.Expr) (initVal : Nat)
+    (ty : HWType) (named : Bool := false) : CompilerM String := do
+  let cs ← get
+  let (name, cs') := CircuitM.emitRegisterInDomain hint domain reset
+    input initVal ty named cs
+  set cs'
+  return name
+
+def emitRegisterAt (outputName : String) (domain : ClockDomain)
+    (reset : RegisterReset) (input : Sparkle.IR.AST.Expr)
+    (initVal : Nat) : CompilerM Unit := do
+  let cs ← get
+  let ((), cs') := CircuitM.emitRegisterAt outputName domain reset input initVal cs
+  set cs'
+
 def emitMemory (hint : String) (addrWidth dataWidth : Nat) (clk : String)
     (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr) (named : Bool := false) : CompilerM String := do
   let cs ← get
   let (name, cs') := CircuitM.emitMemory hint addrWidth dataWidth clk writeAddr writeData writeEnable readAddr named cs
+  set cs'
+  return name
+
+def emitMemoryInDomain (hint : String) (addrWidth dataWidth : Nat)
+    (domain : ClockDomain) (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr)
+    (named : Bool := false) : CompilerM String := do
+  let cs ← get
+  let (name, cs') := CircuitM.emitMemoryInDomain hint addrWidth dataWidth domain
+    writeAddr writeData writeEnable readAddr named cs
   set cs'
   return name
 
@@ -129,9 +172,21 @@ def emitMemoryComboRead (hint : String) (addrWidth dataWidth : Nat) (clk : Strin
   set cs'
   return name
 
-def emitInstance (moduleName : String) (instName : String) (connections : List (String × Sparkle.IR.AST.Expr)) : CompilerM Unit := do
+def emitMemoryComboReadInDomain (hint : String) (addrWidth dataWidth : Nat)
+    (domain : ClockDomain) (writeAddr writeData writeEnable readAddr : Sparkle.IR.AST.Expr)
+    (named : Bool := false) : CompilerM String := do
   let cs ← get
-  let ((), cs') := CircuitM.emitInstance moduleName instName connections cs
+  let (name, cs') := CircuitM.emitMemoryComboReadInDomain hint addrWidth dataWidth domain
+    writeAddr writeData writeEnable readAddr named cs
+  set cs'
+  return name
+
+def emitInstance (moduleName : String) (instName : String)
+    (connections : List (String × Sparkle.IR.AST.Expr))
+    (domainMap : List (Sparkle.IR.AST.DomainId × Sparkle.IR.AST.DomainId) := [])
+    : CompilerM Unit := do
+  let cs ← get
+  let ((), cs') := CircuitM.emitInstance moduleName instName connections domainMap cs
   set cs'
 
 def addModuleToDesign (m : Sparkle.IR.AST.Module) : CompilerM Unit := do
@@ -280,6 +335,78 @@ partial def extractNat (e : Lean.Expr) : CompilerM Nat := do
        CompilerM.liftMetaM $ throwError s!"Expected Nat literal, got constant: {name}"
   | .lit (.natVal n) => return n
   | _ => CompilerM.liftMetaM $ throwError s!"Expected Nat, got: {e}"
+
+/-- Extract a reducible string literal from a domain configuration. -/
+def extractStringLiteral (expr : Lean.Expr) : CompilerM String := do
+  let expr ← CompilerM.liftMetaM (whnf expr)
+  match expr with
+  | .lit (.strVal value) => return value
+  | _ => CompilerM.liftMetaM $ throwError s!"Expected string literal, got: {expr}"
+
+/-- A deterministic fallback id for a named domain definition. -/
+def domainExprHint (expr : Lean.Expr) : String :=
+  match expr.getAppFn with
+  | .const name _ =>
+      (name.toString.replace "." "_").replace "-" "_"
+  | _ => "default"
+
+/-- Reify a type-level `DomainConfig` into first-class netlist metadata. -/
+def clockDomainFromExpr (domainExpr : Lean.Expr) : CompilerM ClockDomain := do
+  -- Generic `{dom : DomainConfig}` circuits retain the historical clk/rst ABI.
+  if domainExpr.isFVar || domainExpr.isMVar then
+    return ClockDomain.legacy "clk" "rst"
+  else
+    let fallbackId := domainExprHint domainExpr
+    let reduced ← CompilerM.liftMetaM (whnf domainExpr)
+    let fn := reduced.getAppFn
+    let args := reduced.getAppArgs
+    if fn.isConstOf ``Sparkle.Core.Domain.DomainConfig.mk && args.size >= 6 then
+      let period ← extractNat args[0]!
+      let edgeExpr ← CompilerM.liftMetaM (whnf args[1]!)
+      let resetExpr ← CompilerM.liftMetaM (whnf args[2]!)
+      let configuredId ← extractStringLiteral args[3]!
+      let configuredClock ← extractStringLiteral args[4]!
+      let configuredReset ← extractStringLiteral args[5]!
+      let id := if configuredId.isEmpty then fallbackId else configuredId
+      let clock := if configuredClock.isEmpty then
+        if id == "default" then "clk" else id ++ "_clk"
+      else configuredClock
+      let reset := if configuredReset.isEmpty then
+        if id == "default" then "rst" else id ++ "_rst"
+      else configuredReset
+      let activeEdge : ClockEdge :=
+        if edgeExpr.isConstOf ``Sparkle.Core.Domain.ActiveEdge.falling then .falling
+        else .rising
+      let resetKind : Sparkle.IR.AST.ResetKind :=
+        if resetExpr.isConstOf ``Sparkle.Core.Domain.ResetKind.synchronous then .synchronous
+        else .asynchronous
+      return { id, clock, reset := some reset, periodPs := period, activeEdge, resetKind }
+    else
+      -- Opaque domain values still remain distinct by declaration identity.
+      let id := fallbackId
+      let fallback : ClockDomain :=
+        { id := id
+        , clock := if id == "default" then "clk" else id ++ "_clk"
+        , reset := some (if id == "default" then "rst" else id ++ "_rst")
+        }
+      return fallback
+
+/-- Recover the domain carried by `Signal dom T` without erasing its identity. -/
+def inferClockDomainFromSignal (signalType : Lean.Expr) : CompilerM ClockDomain := do
+  let signalType ← CompilerM.liftMetaM (whnf signalType)
+  match signalType with
+  | .app (.app signalCtor domainExpr) _ =>
+      if signalCtor.isConstOf ``Sparkle.Core.Signal.Signal then
+        clockDomainFromExpr domainExpr
+      else
+        CompilerM.liftMetaM $ throwError s!"Expected Signal type, got: {signalType}"
+  | _ => CompilerM.liftMetaM $ throwError s!"Expected Signal type, got: {signalType}"
+
+def tryInferClockDomainFromSignal (signalType : Lean.Expr) : CompilerM (Option ClockDomain) := do
+  try
+    return some (← inferClockDomainFromSignal signalType)
+  catch _ =>
+    return none
 
 def extractBitVecLiteral (expr : Lean.Expr) : CompilerM (Nat × Nat) := do
   let expr ← CompilerM.liftMetaM (whnf expr)
@@ -504,11 +631,26 @@ mutual
             let payload := if name == ``Fin.mk && args.size >= 2 then args[args.size-2]! else args.back!
             return ← translateExprToWire payload hint (isNamed := isNamed)
 
-        -- Signal.clock: expose the implicit clock as a data signal (compiles to 'clk' wire reference)
+        -- Signal.clock: expose the physical clock for the signal's owning domain.
         if name == ``Sparkle.Core.Signal.Signal.clock then
-          -- Create a wire that references the 'clk' input directly
+          let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+          let domain ← inferClockDomainFromSignal exprType
+          CompilerM.addClockDomain domain
           let resWire ← CompilerM.makeWire hint .bit (named := isNamed)
-          CompilerM.emitAssign resWire (.ref "clk")
+          CompilerM.emitAssign resWire (.ref domain.clock)
+          return resWire
+
+        -- Signal.reset: expose the physical reset for the owning domain.
+        if name == ``Sparkle.Core.Signal.Signal.reset then
+          let exprType ← CompilerM.liftMetaM (Lean.Meta.inferType e)
+          let domain ← inferClockDomainFromSignal exprType
+          CompilerM.addClockDomain domain
+          let reset ← match domain.reset with
+            | some reset => pure reset
+            | none => CompilerM.liftMetaM $ throwError
+                s!"Signal.reset used in resetless domain '{domain.id}'"
+          let resWire ← CompilerM.makeWire hint .bit (named := isNamed)
+          CompilerM.emitAssign resWire (.ref reset)
           return resWire
 
         -- Signal.pure / Signal.lit (constant signals)
@@ -980,10 +1122,12 @@ mutual
 
       if isHWArg then
           let hwType ← inferHWTypeFromSignal binderType
-          let paramWire ← CompilerM.makeWire binderName.toString hwType (named := true)
+          let domain? ← tryInferClockDomainFromSignal binderType
+          let paramWire ← CompilerM.makeWire binderName.toString hwType
+            (named := true) (domain := domain?.map (·.id))
           -- Only add as input if this is a top-level function parameter
           if isTopLevel then
-            CompilerM.addInput paramWire hwType
+            CompilerM.addInput paramWire hwType (domain?.map (·.id))
 
           -- Process the lambda body within a proper local context
           CompilerM.withLocalDecl binderName binderType fun fvar => do
@@ -1237,6 +1381,97 @@ mutual
     return none
 
   /-- Handle Signal.register, Signal.registerNeg, Signal.registerWithEnable -/
+  partial def handleCdc (e : Lean.Expr) (name : Name) (args : Array Lean.Expr)
+      (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+    if name == ``Sparkle.Core.Signal.Signal.resetSynchronizer then
+      trace[sparkle.compiler] "→ resetSynchronizer"
+      let outputType ← CompilerM.liftMetaM (inferType e)
+      let domain ← inferClockDomainFromSignal outputType
+      let zero ← CompilerM.makeWire (hint ++ "_zero") .bit
+      CompilerM.emitAssign zero (.const 0 1)
+      let stage1 ← CompilerM.emitRegisterInDomain (hint ++ "_reset_sync1") domain
+        .domain (.ref zero) 1 .bit
+      let stage2 ← CompilerM.emitRegisterInDomain hint domain
+        .domain (.ref stage1) 1 .bit (named := isNamed)
+      return some stage2
+    if name == ``Sparkle.Core.Signal.Signal.synchronizeLevel && !args.isEmpty then
+      trace[sparkle.compiler] "→ synchronizeLevel"
+      let input := args.back!
+      let inputType ← CompilerM.liftMetaM (inferType input)
+      let outputType ← CompilerM.liftMetaM (inferType e)
+      let sourceDomain ← inferClockDomainFromSignal inputType
+      let destDomain ← inferClockDomainFromSignal outputType
+      if sourceDomain.id == destDomain.id then
+        CompilerM.liftMetaM $ throwError
+          s!"synchronizeLevel requires distinct domains, both resolved to '{sourceDomain.id}'"
+      let inputWire ← translateExprToWire input "cdc_level_input"
+      let hwType ← inferHWTypeFromSignal outputType
+      let crossing ← CompilerM.emitCdc (hint ++ "_crossing") sourceDomain destDomain
+        (.ref inputWire) .level hwType
+      let stage1 ← CompilerM.emitRegisterInDomain (hint ++ "_sync1") destDomain
+        .domain (.ref crossing) 0 hwType
+      let stage2 ← CompilerM.emitRegisterInDomain hint destDomain
+        .domain (.ref stage1) 0 hwType (named := isNamed)
+      return some stage2
+    if name == ``Sparkle.Core.Signal.Signal.synchronizePulse && !args.isEmpty then
+      trace[sparkle.compiler] "→ synchronizePulse"
+      let pulse := args.back!
+      let inputType ← CompilerM.liftMetaM (inferType pulse)
+      let outputType ← CompilerM.liftMetaM (inferType e)
+      let sourceDomain ← inferClockDomainFromSignal inputType
+      let destDomain ← inferClockDomainFromSignal outputType
+      if sourceDomain.id == destDomain.id then
+        CompilerM.liftMetaM $ throwError
+          s!"synchronizePulse requires distinct domains, both resolved to '{sourceDomain.id}'"
+      let pulseWire ← translateExprToWire pulse "cdc_pulse_input"
+      let toggle ← CompilerM.makeWire (hint ++ "_toggle") .bit
+      let inverted ← CompilerM.makeWire (hint ++ "_toggle_inv") .bit
+      CompilerM.emitAssign inverted (.op .not [.ref toggle])
+      let nextToggle ← CompilerM.makeWire (hint ++ "_toggle_next") .bit
+      CompilerM.emitAssign nextToggle (.op .mux
+        [.ref pulseWire, .ref inverted, .ref toggle])
+      CompilerM.emitRegisterAt toggle sourceDomain .domain (.ref nextToggle) 0
+      let crossing ← CompilerM.emitCdc (hint ++ "_crossing") sourceDomain destDomain
+        (.ref toggle) .pulse .bit
+      let stage1 ← CompilerM.emitRegisterInDomain (hint ++ "_sync1") destDomain
+        .domain (.ref crossing) 0 .bit
+      let stage2 ← CompilerM.emitRegisterInDomain (hint ++ "_sync2") destDomain
+        .domain (.ref stage1) 0 .bit
+      let previous ← CompilerM.emitRegisterInDomain (hint ++ "_previous") destDomain
+        .domain (.ref stage2) 0 .bit
+      let output ← CompilerM.makeWire hint .bit (named := isNamed)
+      CompilerM.emitAssign output (.op .xor [.ref stage2, .ref previous])
+      return some output
+    if name == ``Sparkle.Core.Signal.Signal.synchronizePulseVector && !args.isEmpty then
+      trace[sparkle.compiler] "→ synchronizePulseVector"
+      let pulse := args.back!
+      let inputType ← CompilerM.liftMetaM (inferType pulse)
+      let outputType ← CompilerM.liftMetaM (inferType e)
+      let sourceDomain ← inferClockDomainFromSignal inputType
+      let destDomain ← inferClockDomainFromSignal outputType
+      if sourceDomain.id == destDomain.id then
+        CompilerM.liftMetaM $ throwError
+          s!"synchronizePulseVector requires distinct domains, both resolved to '{sourceDomain.id}'"
+      let hwType ← inferHWTypeFromSignal outputType
+      let pulseWire ← translateExprToWire pulse "cdc_pulse_vector_input"
+      let toggle ← CompilerM.makeWire (hint ++ "_toggle") hwType
+      let nextToggle ← CompilerM.makeWire (hint ++ "_toggle_next") hwType
+      CompilerM.emitAssign nextToggle (.op .xor [.ref toggle, .ref pulseWire])
+      CompilerM.emitRegisterAt toggle sourceDomain .domain (.ref nextToggle) 0
+      let crossing ← CompilerM.emitCdc (hint ++ "_crossing") sourceDomain destDomain
+        (.ref toggle) .pulse hwType
+      let stage1 ← CompilerM.emitRegisterInDomain (hint ++ "_sync1") destDomain
+        .domain (.ref crossing) 0 hwType
+      let stage2 ← CompilerM.emitRegisterInDomain (hint ++ "_sync2") destDomain
+        .domain (.ref stage1) 0 hwType
+      let previous ← CompilerM.emitRegisterInDomain (hint ++ "_previous") destDomain
+        .domain (.ref stage2) 0 hwType
+      let output ← CompilerM.makeWire hint hwType (named := isNamed)
+      CompilerM.emitAssign output (.op .xor [.ref stage2, .ref previous])
+      return some output
+    return none
+
+  /-- Handle Signal.register, Signal.registerNeg, Signal.registerWithEnable -/
   partial def handleRegister (e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
     if name.toString.endsWith ".register" && args.size >= 2 then
       trace[sparkle.compiler] "→ register"
@@ -1246,7 +1481,9 @@ mutual
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
-      let w ← CompilerM.emitRegister hint "clk" "rst" (.ref inputWire) initVal hwType (named := isNamed)
+      let domain ← inferClockDomainFromSignal exprType
+      let w ← CompilerM.emitRegisterInDomain hint domain .domain
+        (.ref inputWire) initVal hwType (named := isNamed)
       return some w
 
     -- Signal.registerNeg: negedge-triggered register
@@ -1258,8 +1495,15 @@ mutual
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
-      -- Use "clk__neg" as clock name; backend detects suffix and emits @(negedge clk)
-      let w ← CompilerM.emitRegister hint "clk__neg" "rst" (.ref inputWire) initVal hwType (named := isNamed)
+      let baseDomain ← inferClockDomainFromSignal exprType
+      let domain :=
+        { baseDomain with
+          id := baseDomain.id ++ "__falling"
+          reset := none
+          activeEdge := .falling
+        }
+      let w ← CompilerM.emitRegisterInDomain hint domain .none
+        (.ref inputWire) initVal hwType (named := isNamed)
       return some w
 
     -- Signal.registerNoReset: posedge-triggered register without reset port
@@ -1271,8 +1515,9 @@ mutual
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
-      -- Use "clk__norst" as clock name; backend detects suffix and emits @(posedge clk) without reset
-      let w ← CompilerM.emitRegister hint "clk__norst" "rst" (.ref inputWire) initVal hwType (named := isNamed)
+      let domain ← inferClockDomainFromSignal exprType
+      let w ← CompilerM.emitRegisterInDomain hint domain .none
+        (.ref inputWire) initVal hwType (named := isNamed)
       return some w
 
     -- Signal.registerWithEnable: register with conditional update
@@ -1286,8 +1531,10 @@ mutual
       let inputWire ← translateExprToWire input "reg_input"
       let exprType ← CompilerM.liftMetaM (inferType e)
       let hwType ← inferHWTypeFromSignal exprType
+      let domain ← inferClockDomainFromSignal exprType
       let muxWire ← CompilerM.makeWire (hint ++ "_mux") hwType
-      let regWire ← CompilerM.emitRegister hint "clk" "rst" (.ref muxWire) initVal hwType (named := isNamed)
+      let regWire ← CompilerM.emitRegisterInDomain hint domain .domain
+        (.ref muxWire) initVal hwType (named := isNamed)
       CompilerM.emitAssign muxWire (.op .mux [.ref enWire, .ref inputWire, .ref regWire])
       return some regWire
 
@@ -1338,7 +1585,7 @@ mutual
     return none
 
   /-- Handle Signal.memory, Signal.memoryComboRead -/
-  partial def handleMemory (_e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
+  partial def handleMemory (e : Lean.Expr) (name : Name) (args : Array Lean.Expr) (hint : String) (isNamed : Bool) : CompilerM (Option String) := do
     -- Signal.memory: synchronous RAM/BRAM
     if name.toString.endsWith ".memory" && !name.toString.endsWith ".memoryComboRead" && args.size >= 4 then
       trace[sparkle.compiler] "→ memory (sync)"
@@ -1354,7 +1601,9 @@ mutual
       let wdW ← translateExprToWire writeData "mem_wdata"
       let weW ← translateExprToWire writeEnable "mem_we"
       let raW ← translateExprToWire readAddr "mem_raddr"
-      let w ← CompilerM.emitMemory hint addrWidth dataWidth "clk"
+      let exprType ← CompilerM.liftMetaM (inferType e)
+      let domain ← inferClockDomainFromSignal exprType
+      let w ← CompilerM.emitMemoryInDomain hint addrWidth dataWidth domain
         (.ref waW) (.ref wdW) (.ref weW) (.ref raW) (named := isNamed)
       return some w
 
@@ -1373,7 +1622,9 @@ mutual
       let wdW ← translateExprToWire writeData "mem_wdata"
       let weW ← translateExprToWire writeEnable "mem_we"
       let raW ← translateExprToWire readAddr "mem_raddr"
-      let w ← CompilerM.emitMemoryComboRead hint addrWidth dataWidth "clk"
+      let exprType ← CompilerM.liftMetaM (inferType e)
+      let domain ← inferClockDomainFromSignal exprType
+      let w ← CompilerM.emitMemoryComboReadInDomain hint addrWidth dataWidth domain
         (.ref waW) (.ref wdW) (.ref weW) (.ref raW) (named := isNamed)
       return some w
 
@@ -1465,7 +1716,17 @@ mutual
     CompilerM.addModuleToDesign subModule
 
     let mut connections := []
-    let inputPorts := subModule.inputs.filter (fun p => p.name != "clk" && p.name != "rst")
+    let mut domainMap := []
+    let domainPortNames := subModule.clockDomains.flatMap fun domain =>
+      domain.clock :: match domain.reset with | some reset => [reset] | none => []
+    for childDomain in subModule.clockDomains do
+      CompilerM.addClockDomain childDomain
+      connections := (childDomain.clock, .ref childDomain.clock) :: connections
+      if let some reset := childDomain.reset then
+        connections := (reset, .ref reset) :: connections
+      domainMap := (childDomain.id, childDomain.id) :: domainMap
+    let inputPorts := subModule.inputs.filter
+      (fun port => !domainPortNames.contains port.name)
     if args.size < inputPorts.length then
        CompilerM.liftMetaM $ throwError s!"Sub-module {name} requires {inputPorts.length} args, but got {args.size}"
 
@@ -1479,7 +1740,8 @@ mutual
     let resWire ← CompilerM.makeWire hint hwType (named := isNamed)
     connections := ("out", Sparkle.IR.AST.Expr.ref resWire) :: connections
 
-    CompilerM.emitInstance subModule.name s!"inst_{subModule.name}" connections.reverse
+    CompilerM.emitInstance subModule.name s!"inst_{subModule.name}"
+      connections.reverse domainMap.reverse
     return some resWire
 
   -- ===========================================================================
@@ -1503,6 +1765,7 @@ mutual
       if let some w ← handleTupleProjections e name args hint isNamed then return w
       if let some w ← handleApplicative e name args hint isNamed then return w
       if let some w ← handleBitVecOps e name args hint isNamed then return w
+      if let some w ← handleCdc e name args hint isNamed then return w
       if let some w ← handleRegister e name args hint isNamed then return w
       if let some w ← handleMux e name args hint isNamed then return w
       if let some w ← handleMemory e name args hint isNamed then return w
@@ -1553,51 +1816,140 @@ mutual
       | .const name _ => return name
       | _ => CompilerM.liftMetaM $ throwError s!"Could not identify primitive in lambda body: {e}"
 
+  /-- Compile one heterogeneous top-level output descriptor. -/
+  partial def translateCircuitOutput (outputExpr : Lean.Expr) : CompilerM Unit := do
+    let outputExpr ← CompilerM.liftMetaM (withTransparency .reducible $ whnf outputExpr)
+    let fn := outputExpr.getAppFn
+    let args := outputExpr.getAppArgs
+    if fn.isConstOf ``Sparkle.Core.Circuit.Output.bool && args.size >= 3 then
+      let outputName ← extractStringLiteral args[args.size - 3]!
+      let domain ← clockDomainFromExpr args[args.size - 2]!
+      let signal := args.back!
+      let wire ← translateExprToWire signal outputName (isNamed := true)
+      CompilerM.addOutput outputName .bit (some domain.id)
+      CompilerM.emitAssign outputName (.ref wire)
+    else if fn.isConstOf ``Sparkle.Core.Circuit.Output.bits && args.size >= 4 then
+      let outputName ← extractStringLiteral args[args.size - 4]!
+      let domain ← clockDomainFromExpr args[args.size - 3]!
+      let width ← extractNat args[args.size - 2]!
+      let signal := args.back!
+      let wire ← translateExprToWire signal outputName (isNamed := true)
+      CompilerM.addOutput outputName (.bitVector width) (some domain.id)
+      CompilerM.emitAssign outputName (.ref wire)
+    else
+      CompilerM.liftMetaM $ throwError
+        s!"Expected Circuit.Output.bool/bits, got: {outputExpr}"
+
+  /-- Compile the list stored in `Circuit.outputs`. -/
+  partial def translateCircuitOutputList (outputsExpr : Lean.Expr) : CompilerM Unit := do
+    let outputsExpr ← CompilerM.liftMetaM (withTransparency .reducible $ whnf outputsExpr)
+    let fn := outputsExpr.getAppFn
+    let args := outputsExpr.getAppArgs
+    if fn.isConstOf ``List.nil then
+      return
+    else if fn.isConstOf ``List.cons && args.size >= 3 then
+      translateCircuitOutput args[args.size - 2]!
+      translateCircuitOutputList args.back!
+    else
+      CompilerM.liftMetaM $ throwError s!"Circuit outputs must be a concrete list, got: {outputsExpr}"
+
+  /-- Translate top-level lambdas/lets ending in a heterogeneous `Circuit`. -/
+  partial def translateCircuitBody (expr : Lean.Expr) : CompilerM Unit := do
+    match expr with
+    | .lam binderName binderType body _ =>
+        let isHWArg ← try
+          let _ ← inferHWTypeFromSignal binderType
+          pure true
+        catch _ => pure false
+        if isHWArg then
+          let hwType ← inferHWTypeFromSignal binderType
+          let domain? ← tryInferClockDomainFromSignal binderType
+          let paramWire ← CompilerM.makeWire binderName.toString hwType
+            (named := true) (domain := domain?.map (·.id))
+          CompilerM.addInput paramWire hwType (domain?.map (·.id))
+          CompilerM.withLocalDecl binderName binderType fun fvar => do
+            CompilerM.withVarMapping fvar.fvarId! paramWire do
+              translateCircuitBody (body.instantiate1 fvar)
+        else
+          CompilerM.withLocalDecl binderName binderType fun fvar => do
+            translateCircuitBody (body.instantiate1 fvar)
+    | .letE name type value body _ =>
+        let isHW ← try
+          let _ ← inferHWTypeFromSignal type
+          pure true
+        catch _ => pure false
+        if isHW then
+          let valueWire ← translateExprToWire value name.toString (isNamed := true)
+          CompilerM.withLocalDecl name type fun fvar => do
+            CompilerM.withVarMapping fvar.fvarId! valueWire do
+              translateCircuitBody (body.instantiate1 fvar)
+        else
+          CompilerM.withLetDecl name type value fun fvar => do
+            translateCircuitBody (body.instantiate1 fvar)
+    | _ =>
+        let reduced ← CompilerM.liftMetaM (withTransparency .reducible $ whnf expr)
+        if reduced != expr then
+          translateCircuitBody reduced
+        else
+          let fn := reduced.getAppFn
+          let args := reduced.getAppArgs
+          if (fn.isConstOf ``Sparkle.Core.Circuit.Circuit.mk ||
+              fn.isConstOf ``Sparkle.Core.Circuit.Circuit.ofOutputs) && !args.isEmpty then
+            translateCircuitOutputList args.back!
+          else
+            CompilerM.liftMetaM $ throwError s!"Expected Circuit result, got: {reduced}"
+
+  partial def declarationReturnsCircuit (type : Lean.Expr) : MetaM Bool := do
+    let type ← whnf type
+    match type with
+    | .forallE _ _ body _ => declarationReturnsCircuit body
+    | _ => return type.isConstOf ``Sparkle.Core.Circuit.Circuit
+
+  partial def declarationResultClockDomain? (type : Lean.Expr)
+      : CompilerM (Option ClockDomain) := do
+    let type ← CompilerM.liftMetaM (whnf type)
+    match type with
+    | .forallE binderName binderType body _ =>
+        CompilerM.withLocalDecl binderName binderType fun fvar =>
+          declarationResultClockDomain? (body.instantiate1 fvar)
+    | _ => tryInferClockDomainFromSignal type
+
   partial def synthesizeCombinational (declName : Name) : MetaM (Sparkle.IR.AST.Module × Sparkle.IR.AST.Design) := do
     let constInfo ← getConstInfo declName
     match constInfo with
     | .defnInfo defnInfo =>
       let body := defnInfo.value
-      let compiler : CompilerM String := do
-        let resultWire ← translateExprToWire body "result" (isTopLevel := true)
-        -- Look up the actual wire type that was created
-        let cs ← get
-        let resultWireDecl := cs.module.wires.find? (fun (p : Port) => p.name == resultWire)
-        let outputType := match resultWireDecl with
-          | some decl =>
-            -- DEBUG: Found wire with correct type
-            decl.ty
-          | none =>
-            -- DEBUG: Wire not found, using fallback
-            -- This happens when result is input wire, not internal wire
-            -- Try to infer from inputs
-            match cs.module.inputs.find? (fun p => p.name == resultWire) with
-            | some inputPort => inputPort.ty
-            | none => .bitVector 8  -- True fallback
-        CompilerM.addOutput "out" outputType
-        CompilerM.emitAssign "out" (.ref resultWire)
-        return resultWire
+      let isCircuit ← declarationReturnsCircuit defnInfo.type
+      let compiler : CompilerM Unit := do
+        if isCircuit then
+          translateCircuitBody body
+        else
+          let resultDomain? ← declarationResultClockDomain? defnInfo.type
+          let resultWire ← translateExprToWire body "result" (isTopLevel := true)
+          -- Look up the actual wire type that was created
+          let cs ← get
+          let resultWireDecl := cs.module.wires.find? (fun (p : Port) => p.name == resultWire)
+          let outputType := match resultWireDecl with
+            | some decl => decl.ty
+            | none =>
+              match cs.module.inputs.find? (fun p => p.name == resultWire) with
+              | some inputPort => inputPort.ty
+              | none => .bitVector 8
+          CompilerM.addOutput "out" outputType (resultDomain?.map (·.id))
+          CompilerM.emitAssign "out" (.ref resultWire)
       let circuitState := CircuitM.init declName.toString
       let compilerState : CompilerState := { varMap := [], clockWire := none, resetWire := none }
       let (_, finalCircuitState) ← (compiler.run compilerState).run circuitState
       let mut module := finalCircuitState.module
-      let hasRegisters := module.body.any (fun stmt =>
-        match stmt with
-        | .register .. => true
-        | .memory .. => true
-        | _ => false
-      )
-      -- Check if any register uses reset (clock name doesn't end with __neg or __norst)
-      let hasResetRegisters := module.body.any (fun stmt =>
-        match stmt with
-        | .register _ clock _ _ _ => !(clock.endsWith "__neg" || clock.endsWith "__norst")
-        | .memory .. => true
-        | _ => false
-      )
-      if hasRegisters then
-        module := module.addInput { name := "clk", ty := .bit }
-        if hasResetRegisters then
-          module := module.addInput { name := "rst", ty := .bit }
+      for domain in module.clockDomains do
+        if !module.inputs.any (fun port => port.name == domain.clock) then
+          module := module.addInput { name := domain.clock, ty := .bit }
+        if let some reset := domain.reset then
+          if !module.inputs.any (fun port => port.name == reset) then
+            module := module.addInput { name := reset, ty := .bit }
+      let domainErrors := Sparkle.Compiler.DRC.checkClockDomains module
+      if !domainErrors.isEmpty then
+        throwError ("Clock-domain DRC failed:\n" ++ String.intercalate "\n" domainErrors)
       return (module, finalCircuitState.design)
     | _ =>
       throwError s!"Cannot synthesize {declName}: not a definition"
@@ -1627,6 +1979,9 @@ elab "#synthesize" id:ident : command => do
     IO.println "\n-- IR successfully generated!"
 
 def runDesignDRC (design : Sparkle.IR.AST.Design) : MetaM Unit := do
+  let domainErrors := Sparkle.Compiler.DRC.checkDesignClockDomains design
+  if !domainErrors.isEmpty then
+    throwError ("Clock-domain DRC failed:\n" ++ String.intercalate "\n" domainErrors)
   for m in design.modules do
     let warnings := Sparkle.Compiler.DRC.checkRegisteredOutputs m
     for w in warnings do
@@ -1637,7 +1992,8 @@ elab "#synthesizeVerilog" id:ident : command => do
     Lean.resolveGlobalConstNoOverload id
   Lean.Elab.Command.liftTermElabM do
     let (module, _) ← synthesizeCombinational declName
-    let warnings := Sparkle.Compiler.DRC.checkRegisteredOutputs module
+    let warnings := Sparkle.Compiler.DRC.checkClockDomains module ++
+      Sparkle.Compiler.DRC.checkRegisteredOutputs module
     for w in warnings do
       Lean.logWarning m!"{w}"
     let verilog := toVerilog module
@@ -1654,6 +2010,7 @@ elab "#synthesizeDesign" id:ident : command => do
     Lean.resolveGlobalConstNoOverload id
   Lean.Elab.Command.liftTermElabM do
     let design ← synthesizeHierarchical declName
+    runDesignDRC design
     for m in design.modules do
       printModule m
     IO.println "\n-- Hierarchical IR successfully generated!"
@@ -1686,6 +2043,7 @@ elab "#writeCppSimDesign" id:ident str:str : command => do
     Lean.resolveGlobalConstNoOverload id
   Lean.Elab.Command.liftTermElabM do
     let design ← synthesizeHierarchical declName
+    runDesignDRC design
     let optimized := Sparkle.IR.Optimize.optimizeDesign design
     let cpp := Sparkle.Backend.CppSim.toCppSimDesign optimized
     let path := str.getString

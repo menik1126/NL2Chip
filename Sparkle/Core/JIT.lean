@@ -39,6 +39,70 @@ opaque JIT.tick (h : @& JITHandle) : IO Unit
 @[extern "sparkle_jit_eval_tick"]
 opaque JIT.evalTick (h : @& JITHandle) : IO Unit
 
+/-- Commit next-state only for the selected clock-domain index. -/
+@[extern "sparkle_jit_tick_domain"]
+opaque JIT.tickDomain (h : @& JITHandle) (domain : UInt32) : IO Unit
+
+/-- Evaluate combinational logic and commit one selected clock domain. -/
+@[extern "sparkle_jit_eval_tick_domain"]
+opaque JIT.evalTickDomain (h : @& JITHandle) (domain : UInt32) : IO Unit
+
+/-- Number of physical clock domains in this generated module. -/
+@[extern "sparkle_jit_num_domains"]
+opaque JIT.numDomains (h : @& JITHandle) : IO UInt32
+
+/-- Stable IR name for a clock-domain index. -/
+@[extern "sparkle_jit_domain_name"]
+opaque JIT.domainName (h : @& JITHandle) (domain : UInt32) : IO String
+
+/-- Full active-edge period for a clock-domain index, in picoseconds. -/
+@[extern "sparkle_jit_domain_period_ps"]
+opaque JIT.domainPeriodPs (h : @& JITHandle) (domain : UInt32) : IO UInt64
+
+/-- Runtime metadata for one generated physical clock domain. -/
+structure DomainInfo where
+  index    : UInt32
+  name     : String
+  periodPs : Nat
+  deriving Repr, Inhabited
+
+/-- Discover the generated module's ordered clock-domain table. -/
+def JIT.domains (h : JITHandle) : IO (Array DomainInfo) := do
+  let count ← JIT.numDomains h
+  let mut result := #[]
+  for index in [:count.toNat] do
+    let domainIndex := index.toUInt32
+    let name ← JIT.domainName h domainIndex
+    let period ← JIT.domainPeriodPs h domainIndex
+    result := result.push { index := domainIndex, name, periodPs := period.toNat }
+  return result
+
+/--
+  Run one multi-domain module for a wall-time interval in picoseconds.
+
+  At simultaneous edges the simulator evaluates combinational logic once,
+  then commits every due domain. This preserves evaluate-all/commit-all event
+  ordering instead of letting one domain observe another domain's same-time
+  commit prematurely.
+-/
+def JIT.runForPicoseconds (h : JITHandle) (durationPs : Nat) : IO Unit := do
+  let domains ← JIT.domains h
+  if domains.isEmpty then
+    JIT.eval h
+    return
+  if domains.any (fun domain => domain.periodPs == 0) then
+    throw (IO.userError "JIT: clock-domain period must be positive")
+  let mut nextEdges := domains.map (fun domain => domain.periodPs)
+  while true do
+    let nextEvent := nextEdges.foldl min nextEdges[0]!
+    if nextEvent > durationPs then break
+    JIT.eval h
+    for index in [:domains.size] do
+      if nextEdges[index]! == nextEvent then
+        JIT.tickDomain h domains[index]!.index
+        nextEdges := nextEdges.set! index (nextEvent + domains[index]!.periodPs)
+  JIT.eval h
+
 /-- Reset all registers to initial values -/
 @[extern "sparkle_jit_reset"]
 opaque JIT.reset (h : @& JITHandle) : IO Unit

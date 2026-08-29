@@ -1326,6 +1326,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
 
   -- Build body statements
   let mut body : List Stmt := []
+  let mut clockDomains : List ClockDomain := []
   -- All always @* blocks now use MUX mode (SSA handles loop dependencies)
 
   -- Emit parameter values as constant assigns (with overrides applied)
@@ -1376,6 +1377,17 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
           | _ => none
       | none => pure ()
 
+      let hasReset := resetCheck.isSome
+      let domain : ClockDomain :=
+        { id := clock
+        , clock := clock
+        , reset := if hasReset then some resetName else none
+        , activeEdge := .rising
+        , resetKind := .asynchronous
+        }
+      if !clockDomains.any (fun existing => existing.id == domain.id) then
+        clockDomains := clockDomains ++ [domain]
+
       -- Extract blocking assigns as combinational intermediates (from full always body)
       let blockingNames := (collectBlockNamesTop stmts).eraseDups
       for sigName in blockingNames do
@@ -1393,9 +1405,10 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
           | some (_, v) => v
           | none => 0
         let dataExpr := stmtsToMuxExpr regName stmts
-        body := body ++ [.register regName clock resetName dataExpr initVal]
+        body := body ++
+          [.register regName domain.id (if hasReset then .domain else .none) dataExpr initVal]
         if !(wireExists wires regName) then
-          wires := wires ++ [{ name := regName, ty := hwTy }]
+          wires := wires ++ [{ name := regName, ty := hwTy, domain := some domain.id }]
 
     | .alwaysBlock .star stmts =>
       -- Sequential SSA: process statements top-to-bottom, creating SSA wires
@@ -1458,7 +1471,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     | .instantiation modName instName conns _paramOvr =>
       -- Module instantiation → Stmt.inst (parameter overrides resolved at flatten time)
       let irConns := conns.map fun (portName, expr) => (portName, lowerExpr expr)
-      body := body ++ [.inst modName instName irConns]
+      body := body ++ [.inst modName instName irConns []]
     | _ => pure ()
 
   -- Deduplicate wires
@@ -1546,6 +1559,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     outputs := outputs
     wires := dedupWires
     body := topoSortBody dedupBody
+    clockDomains := clockDomains
     assertions := assertions
     isPrimitive := false
   }
@@ -1572,7 +1586,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
     for stmt in top.body do
       match stmt with
-      | .inst modName instName conns =>
+      | .inst modName instName conns _domainMap =>
         -- Find the sub-module
         match moduleMap.find? fun (m : Module) => m.name == modName with
         | none =>
@@ -1655,13 +1669,18 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
             let prefixed := match s with
               | .assign name rhs =>
                 .assign s!"{instName}_{name}" (prefixExprNames instName subNames rhs)
-              | .register name clk rst input init =>
-                .register s!"{instName}_{name}" s!"{instName}_{clk}" s!"{instName}_{rst}"
+              | .register name domain reset input init =>
+                .register s!"{instName}_{name}" s!"{instName}_{domain}" reset
                   (prefixExprNames instName subNames input) init
-              | .inst subModName subInstName subConns =>
+              | .cdc output sourceDomain destDomain input kind =>
+                .cdc s!"{instName}_{output}" s!"{instName}_{sourceDomain}"
+                  s!"{instName}_{destDomain}"
+                  (prefixExprNames instName subNames input) kind
+              | .inst subModName subInstName subConns subDomainMap =>
                 -- Keep nested .inst with prefixed names — will be flattened in next iteration
                 .inst subModName s!"{instName}_{subInstName}"
                   (subConns.map fun (pn, e) => (pn, prefixExprNames instName subNames e))
+                  subDomainMap
               | .memory name aw dw clk wa wd we ra rd combo =>
                 .memory s!"{instName}_{name}" aw dw s!"{instName}_{clk}"
                   (prefixExprNames instName subNames wa)
@@ -1690,7 +1709,10 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
     let genBody := flatBody.map fun s => match s with
       | .assign n rhs => .assign (addGen n) (genExpr rhs)
       | .register n clk rst input init => .register n clk rst (genExpr input) init
-      | .inst mn in_ conns => .inst mn in_ (conns.map fun (p, e) => (p, genExpr e))
+      | .cdc output sourceDomain destDomain input kind =>
+          .cdc output sourceDomain destDomain (genExpr input) kind
+      | .inst mn in_ conns domainMap =>
+          .inst mn in_ (conns.map fun (p, e) => (p, genExpr e)) domainMap
       | .memory n aw dw clk wa wd we ra rd combo =>
         .memory n aw dw clk (genExpr wa) (genExpr wd) (genExpr we) (genExpr ra) rd combo
 

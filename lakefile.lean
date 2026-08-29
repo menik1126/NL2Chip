@@ -148,6 +148,10 @@ lean_exe «cdc-multi-clock-test» where
   root := `Tests.CDC.MultiClockTest
   supportInterpreter := true
 
+lean_exe «multidomain-ir-test» where
+  root := `Tests.MultiDomainJITTest
+  supportInterpreter := true
+
 lean_exe «svparser-test» where
   root := `Tests.SVParser.ParserTest
   supportInterpreter := true

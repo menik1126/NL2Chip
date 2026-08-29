@@ -178,24 +178,27 @@ def countAllUses (stmts : List Stmt) : HashMap String Nat :=
   stmts.foldl (fun counts stmt =>
     match stmt with
     | .assign _ rhs => countExprUses rhs counts
+    | .cdc _ _ _ input _ => countExprUses input counts
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
-    | .inst _ _ conns =>
+    | .inst _ _ conns _ =>
       conns.foldl (fun acc (_, e) => countExprUses e acc) counts
   ) {}
 
 /-- Optimize a single statement's expressions -/
 def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
   | .assign lhs rhs => .assign lhs (optimizeExpr dm wm rhs)
+  | .cdc output sourceDomain destDomain input kind =>
+    .cdc output sourceDomain destDomain (optimizeExpr dm wm input) kind
   | .register output clock reset input initValue =>
     .register output clock reset (optimizeExpr dm wm input) initValue
   | .memory name aw dw clk wa wd we ra rd cr =>
     .memory name aw dw clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
       (optimizeExpr dm wm we) (optimizeExpr dm wm ra) rd cr
-  | .inst modName instName conns =>
-    .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e))
+  | .inst modName instName conns domainMap =>
+    .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e)) domainMap
 
 /-- Recursively substitute inlinable references with their defining expressions -/
 partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
@@ -255,14 +258,17 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
     match stmt with
     | .assign lhs rhs =>
       .assign lhs (substituteExpr dm inlinable 100 rhs)
+    | .cdc output sourceDomain destDomain input kind =>
+      .cdc output sourceDomain destDomain (substituteExpr dm inlinable 100 input) kind
     | .register output clock reset input initValue =>
       .register output clock reset (substituteExpr dm inlinable 100 input) initValue
     | .memory name aw dw clk wa wd we ra rd cr =>
       .memory name aw dw clk
         (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
         (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
-    | .inst modName instName conns =>
-      .inst modName instName (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
+    | .inst modName instName conns domainMap =>
+      .inst modName instName
+        (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e)) domainMap
 
   -- Remove inlined assignments
   let filteredBody := inlinedBody.filter fun stmt =>
