@@ -44,8 +44,11 @@ def buildWidthMap (m : Module) : WidthMap :=
 /-- Infer the bit-width of an expression -/
 partial def inferWidth (wm : WidthMap) : Expr → Nat
   | .const _ w => w
+  | .constDim _ _ => 0
+  | .dimension _ => 32
   | .ref name => wm.getD name 0
   | .slice _ hi lo => hi - lo + 1
+  | .sliceDim _ _ _ => 0
   | .concat args => args.foldl (fun acc a => acc + inferWidth wm a) 0
   | .op .eq _ | .op .lt_u _ | .op .lt_s _ | .op .le_u _
   | .op .le_s _ | .op .gt_u _ | .op .gt_s _ | .op .ge_u _
@@ -157,9 +160,11 @@ def foldConstants : Expr → Expr
 partial def optimizeExpr (dm : DefMap) (wm : WidthMap) : Expr → Expr
   | .slice (.ref name) hi lo => foldConstants (resolveSlice dm wm name hi lo 500)
   | .slice e hi lo => foldConstants (.slice (optimizeExpr dm wm e) hi lo)
+  | .sliceDim e hi lo => .sliceDim (optimizeExpr dm wm e) hi lo
   | .op op args => foldConstants (.op op (args.map (optimizeExpr dm wm ·)))
   | .concat args => .concat (args.map (optimizeExpr dm wm ·))
   | .index arr idx => .index (optimizeExpr dm wm arr) (optimizeExpr dm wm idx)
+  | .dimension value => .dimension value
   | e => e
 
 /-- Count uses of each wire name in an expression -/
@@ -167,38 +172,46 @@ partial def countExprUses (e : Expr) (counts : HashMap String Nat)
     : HashMap String Nat :=
   match e with
   | .ref name => counts.insert name ((counts.getD name 0) + 1)
-  | .const _ _ => counts
+  | .const _ _ | .constDim _ _ | .dimension _ => counts
   | .slice inner _ _ => countExprUses inner counts
+  | .sliceDim inner _ _ => countExprUses inner counts
   | .concat args => args.foldl (fun acc a => countExprUses a acc) counts
   | .op _ args => args.foldl (fun acc a => countExprUses a acc) counts
   | .index arr idx => countExprUses idx (countExprUses arr counts)
 
 /-- Count uses of each wire across all statements -/
-def countAllUses (stmts : List Stmt) : HashMap String Nat :=
+partial def countAllUses (stmts : List Stmt)
+    (initial : HashMap String Nat := {}) : HashMap String Nat :=
   stmts.foldl (fun counts stmt =>
     match stmt with
     | .assign _ rhs => countExprUses rhs counts
+    | .assignExpr lhs rhs => countExprUses rhs (countExprUses lhs counts)
+    | .generateFor _ _ _ _ body => countAllUses body counts
     | .cdc _ _ _ input _ => countExprUses input counts
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
-    | .inst _ _ conns _ =>
+    | .inst _ _ conns _ _ =>
       conns.foldl (fun acc (_, e) => countExprUses e acc) counts
-  ) {}
+  ) initial
 
 /-- Optimize a single statement's expressions -/
-def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
+partial def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
   | .assign lhs rhs => .assign lhs (optimizeExpr dm wm rhs)
+  | .assignExpr lhs rhs => .assignExpr (optimizeExpr dm wm lhs) (optimizeExpr dm wm rhs)
+  | .generateFor label index start stop body =>
+    .generateFor label index start stop (body.map (optimizeStmt dm wm))
   | .cdc output sourceDomain destDomain input kind =>
     .cdc output sourceDomain destDomain (optimizeExpr dm wm input) kind
   | .register output clock reset input initValue =>
-    .register output clock reset (optimizeExpr dm wm input) initValue
+    .register output clock reset (optimizeExpr dm wm input) (optimizeExpr dm wm initValue)
   | .memory name aw dw clk wa wd we ra rd cr =>
     .memory name aw dw clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
       (optimizeExpr dm wm we) (optimizeExpr dm wm ra) rd cr
-  | .inst modName instName conns domainMap =>
-    .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e)) domainMap
+  | .inst modName instName conns parameterBindings domainMap =>
+    .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e))
+      parameterBindings domainMap
 
 /-- Recursively substitute inlinable references with their defining expressions -/
 partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
@@ -211,11 +224,35 @@ partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
       | none => .ref name
     else .ref name
   | .const v w => .const v w
+  | .constDim v w => .constDim v w
+  | .dimension value => .dimension value
   | .slice e hi lo => .slice (substituteExpr dm inlinable fuel e) hi lo
+  | .sliceDim e hi lo => .sliceDim (substituteExpr dm inlinable fuel e) hi lo
   | .concat args => .concat (args.map (substituteExpr dm inlinable fuel ·))
   | .op op args => .op op (args.map (substituteExpr dm inlinable fuel ·))
   | .index arr idx =>
     .index (substituteExpr dm inlinable fuel arr) (substituteExpr dm inlinable fuel idx)
+
+partial def substituteStmt (dm : DefMap) (inlinable : HashMap String Bool) : Stmt → Stmt
+  | .assign lhs rhs => .assign lhs (substituteExpr dm inlinable 100 rhs)
+  | .assignExpr lhs rhs =>
+    .assignExpr (substituteExpr dm inlinable 100 lhs)
+      (substituteExpr dm inlinable 100 rhs)
+  | .generateFor label index start stop body =>
+    .generateFor label index start stop (body.map (substituteStmt dm inlinable))
+  | .cdc output sourceDomain destDomain input kind =>
+    .cdc output sourceDomain destDomain (substituteExpr dm inlinable 100 input) kind
+  | .register output clock reset input initValue =>
+    .register output clock reset (substituteExpr dm inlinable 100 input)
+      (substituteExpr dm inlinable 100 initValue)
+  | .memory name aw dw clk wa wd we ra rd cr =>
+    .memory name aw dw clk
+      (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
+      (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
+  | .inst modName instName conns parameterBindings domainMap =>
+    .inst modName instName
+      (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
+      parameterBindings domainMap
 
 /-- Inline single-use wires: replace references with their defining expressions
     and remove the now-dead assign statements. -/
@@ -254,21 +291,7 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
   ) ({} : HashMap String Bool)
 
   -- Substitute in all statements
-  let inlinedBody := body.map fun stmt =>
-    match stmt with
-    | .assign lhs rhs =>
-      .assign lhs (substituteExpr dm inlinable 100 rhs)
-    | .cdc output sourceDomain destDomain input kind =>
-      .cdc output sourceDomain destDomain (substituteExpr dm inlinable 100 input) kind
-    | .register output clock reset input initValue =>
-      .register output clock reset (substituteExpr dm inlinable 100 input) initValue
-    | .memory name aw dw clk wa wd we ra rd cr =>
-      .memory name aw dw clk
-        (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
-        (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
-    | .inst modName instName conns domainMap =>
-      .inst modName instName
-        (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e)) domainMap
+  let inlinedBody := body.map (substituteStmt dm inlinable)
 
   -- Remove inlined assignments
   let filteredBody := inlinedBody.filter fun stmt =>

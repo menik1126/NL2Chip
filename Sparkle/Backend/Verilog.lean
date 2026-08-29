@@ -20,14 +20,33 @@ def sanitizeName (name : String) : String :=
     |>.replace "'" "_prime"
     |>.replace "#" ""
 
+/-- Emit a symbolic hardware dimension as a SystemVerilog constant expression. -/
+partial def emitDimExpr : DimExpr → String
+  | .literal value => s!"{value}"
+  | .parameter name => sanitizeName name
+  | .add lhs rhs => s!"({emitDimExpr lhs} + {emitDimExpr rhs})"
+  | .sub lhs rhs => s!"({emitDimExpr lhs} - {emitDimExpr rhs})"
+  | .mul lhs rhs => s!"({emitDimExpr lhs} * {emitDimExpr rhs})"
+  | .div lhs rhs => s!"({emitDimExpr lhs} / {emitDimExpr rhs})"
+  | .mod lhs rhs => s!"({emitDimExpr lhs} % {emitDimExpr rhs})"
+  | .pow base exponent => s!"({emitDimExpr base} ** {emitDimExpr exponent})"
+  | .clog2 value => s!"$clog2({emitDimExpr value})"
+  | .min lhs rhs =>
+      s!"(({emitDimExpr lhs} < {emitDimExpr rhs}) ? {emitDimExpr lhs} : {emitDimExpr rhs})"
+  | .max lhs rhs =>
+      s!"(({emitDimExpr lhs} > {emitDimExpr rhs}) ? {emitDimExpr lhs} : {emitDimExpr rhs})"
+
 /-- Convert HWType to Verilog type declaration -/
 def emitType (ty : HWType) : String :=
   match ty with
   | .bit => "logic"
   | .bitVector 1 => "logic"
   | .bitVector w => s!"logic [{w-1}:0]"
+  | .bitVectorDim width => s!"logic [{emitDimExpr width}-1:0]"
   | .array size elemType =>
     s!"{emitType elemType} [{size-1}:0]"
+  | .arrayDim size elemType =>
+    s!"{emitType elemType} [{emitDimExpr size}-1:0]"
 
 /-- Convert Operator to Verilog operator symbol -/
 def emitOperator (op : Operator) : String :=
@@ -39,6 +58,7 @@ def emitOperator (op : Operator) : String :=
   | .add => "+"
   | .sub => "-"
   | .mul => "*"
+  | .mod => "%"
   | .eq  => "=="
   | .lt_u => "<"
   | .lt_s => "<" -- Handled in emitExpr with $signed()
@@ -51,7 +71,9 @@ def emitOperator (op : Operator) : String :=
   | .shl => "<<"
   | .shr => ">>"
   | .asr => ">>>"
+  | .sext => "$signed"
   | .neg => "-"
+  | .popcount => "$countones"
   | .mux => "?"  -- Special case, handled in emitExpr
 
 /-- Convert IR expression to Verilog expression -/
@@ -67,6 +89,10 @@ partial def emitExpr (e : Expr) : String :=
     else
       s!"{width}'d{value}"
 
+  | .constDim value width =>
+    s!"{emitDimExpr width}'({value})"
+  | .dimension value =>
+    emitDimExpr value
   | .ref name =>
     sanitizeName name
 
@@ -75,6 +101,9 @@ partial def emitExpr (e : Expr) : String :=
 
   | .slice e hi lo =>
     s!"{emitExpr e}[{hi}:{lo}]"
+
+  | .sliceDim e hi lo =>
+    s!"{emitExpr e}[{emitDimExpr hi}:{emitDimExpr lo}]"
 
   | .index arr idx =>
     s!"{emitExpr arr}[{emitExpr idx}]"
@@ -98,13 +127,25 @@ partial def emitExpr (e : Expr) : String :=
     | [arg] => s!"-{emitExpr arg}"
     | _ => "/* ERROR: neg requires 1 argument */"
 
+  | .op .popcount args =>
+    match args with
+    | [arg] => s!"$countones({emitExpr arg})"
+    | _ => "/* ERROR: popcount requires 1 argument */"
+
+  | .op .sext args =>
+    match args with
+    | [arg] => s!"$signed({emitExpr arg})"
+    | _ => "/* ERROR: sext requires 1 argument */"
+
   | .op operator args =>
     -- Binary operators
     match args with
     | [arg1, arg2] =>
       match operator with
-      | .lt_s | .le_s | .gt_s | .ge_s | .asr =>
+      | .lt_s | .le_s | .gt_s | .ge_s =>
         s!"($signed({emitExpr arg1}) {emitOperator operator} $signed({emitExpr arg2}))"
+      | .asr =>
+        s!"($signed({emitExpr arg1}) >>> {emitExpr arg2})"
       | _ =>
         s!"({emitExpr arg1} {emitOperator operator} {emitExpr arg2})"
     | _ => s!"/* ERROR: operator {operator} with wrong arity */"
@@ -117,24 +158,32 @@ def emitDomainEdge (domain : ClockDomain) : String :=
   s!"{edge} {sanitizeName domain.clock}"
 
 /-- Emit a single statement using the module's explicit clock-domain table. -/
-def emitStmt (stmt : Stmt) (domains : List ClockDomain)
+partial def emitStmt (stmt : Stmt) (domains : List ClockDomain)
     (indent : String := "    ") (wires : List Port := []) : String :=
   match stmt with
   | .assign lhs rhs =>
     s!"{indent}assign {sanitizeName lhs} = {emitExpr rhs};"
 
+  | .assignExpr lhs rhs =>
+    s!"{indent}assign {emitExpr lhs} = {emitExpr rhs};"
+
+  | .generateFor label index start stop body =>
+    let indexName := sanitizeName index
+    let bodyIndent := indent ++ "        "
+    let bodyCode := String.intercalate "\n"
+      (body.map (emitStmt · domains bodyIndent wires))
+    s!"{indent}genvar {indexName};\n" ++
+      s!"{indent}generate\n" ++
+      s!"{indent}    for ({indexName} = {emitDimExpr start}; " ++
+      s!"{indexName} < {emitDimExpr stop}; {indexName} = {indexName} + 1) begin : {sanitizeName label}\n" ++
+      bodyCode ++ "\n" ++
+      s!"{indent}    end\n" ++
+      s!"{indent}endgenerate"
+
   | .cdc output _sourceDomain _destDomain input kind =>
     s!"{indent}/* CDC: {kind} */ assign {sanitizeName output} = {emitExpr input};"
 
   | .register output domainId registerReset input initValue =>
-    -- Generate always_ff block for register
-    -- Look up output wire width for correct reset literal width
-    let resetWidth := match wires.find? (fun p => p.name == output) with
-      | some p => match p.ty with
-        | .bitVector w => w
-        | .bit => 1
-        | _ => 8
-      | none => 8
     match domains.find? (fun domain => domain.id == domainId) with
     | none => s!"{indent}/* ERROR: unknown clock domain '{domainId}' */"
     | some domain =>
@@ -151,45 +200,69 @@ def emitStmt (stmt : Stmt) (domains : List ClockDomain)
             | .asynchronous => s!"{edge} or posedge {sanitizeName reset}"
           s!"{indent}always_ff @({event}) begin\n" ++
           s!"{indent}    if ({sanitizeName reset})\n" ++
-          s!"{indent}        {sanitizeName output} <= {emitExpr (.const initValue resetWidth)};\n" ++
+          s!"{indent}        {sanitizeName output} <= {emitExpr initValue};\n" ++
           s!"{indent}    else\n" ++
           s!"{indent}        {sanitizeName output} <= {emitExpr input};\n" ++
           s!"{indent}end"
 
   | .memory name addrWidth dataWidth domainId writeAddr writeData writeEnable readAddr readData comboRead =>
     -- Generate memory array and always_ff block
-    let memSize := 2 ^ addrWidth
-    let memDecl := s!"{indent}logic [{dataWidth-1}:0] {sanitizeName name} [0:{memSize-1}];"
+    let lastAddress := match addrWidth.toNat? with
+      | some width => s!"{(2 ^ width) - 1}"
+      | none => s!"((2 ** {emitDimExpr addrWidth}) - 1)"
+    let resetIndex := sanitizeName s!"{name}_reset_index"
+    let memDecl :=
+      s!"{indent}{emitType (hwTypeFromDim dataWidth)} {sanitizeName name} [0:{lastAddress}];\n" ++
+      s!"{indent}integer {resetIndex};"
     match domains.find? (fun domain => domain.id == domainId) with
-    | none => memDecl ++ "\n" ++ s!"{indent}/* ERROR: unknown clock domain '{domainId}' */"
-    | some domain =>
-      let edge := emitDomainEdge domain
-      if comboRead then
-        -- Combinational read: assign readData = mem[readAddr]
-        let assignRead := s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
-        let alwaysBlock :=
-          s!"{indent}always_ff @({edge}) begin\n" ++
-          s!"{indent}    if ({emitExpr writeEnable}) begin\n" ++
-          s!"{indent}        {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
-          s!"{indent}    end\n" ++
-          s!"{indent}end"
-        memDecl ++ "\n" ++ assignRead ++ "\n" ++ alwaysBlock
-      else
-        -- Registered read: readData latched inside always_ff
-        let alwaysBlock :=
-          s!"{indent}always_ff @({edge}) begin\n" ++
-          s!"{indent}    if ({emitExpr writeEnable}) begin\n" ++
-          s!"{indent}        {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
-          s!"{indent}    end\n" ++
-          s!"{indent}    {sanitizeName readData} <= {sanitizeName name}[{emitExpr readAddr}];\n" ++
-          s!"{indent}end"
-        memDecl ++ "\n" ++ alwaysBlock
+      | none => memDecl ++ "\n" ++ s!"{indent}/* ERROR: unknown clock domain '{domainId}' */"
+      | some domain =>
+        let edge := emitDomainEdge domain
+        let writeAndRead :=
+          s!"{indent}        if ({emitExpr writeEnable}) begin\n" ++
+          s!"{indent}            {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
+          s!"{indent}        end" ++
+          (if comboRead then "" else
+            "\n" ++ s!"{indent}        {sanitizeName readData} <= {sanitizeName name}[{emitExpr readAddr}];")
+        let resetMemory :=
+          s!"{indent}        for ({resetIndex} = 0; {resetIndex} <= {lastAddress}; " ++
+          s!"{resetIndex} = {resetIndex} + 1) begin\n" ++
+          s!"{indent}            {sanitizeName name}[{resetIndex}] <= '0;\n" ++
+          s!"{indent}        end" ++
+          (if comboRead then "" else
+            "\n" ++ s!"{indent}        {sanitizeName readData} <= '0;")
+        let alwaysBlock := match domain.reset with
+          | none =>
+              s!"{indent}always_ff @({edge}) begin\n" ++
+              writeAndRead ++ "\n" ++
+              s!"{indent}end"
+          | some reset =>
+              let event := match domain.resetKind with
+                | .synchronous => edge
+                | .asynchronous => s!"{edge} or posedge {sanitizeName reset}"
+              s!"{indent}always_ff @({event}) begin\n" ++
+              s!"{indent}    if ({sanitizeName reset}) begin\n" ++
+              resetMemory ++ "\n" ++
+              s!"{indent}    end else begin\n" ++
+              writeAndRead ++ "\n" ++
+              s!"{indent}    end\n" ++
+              s!"{indent}end"
+        let assignRead := if comboRead then
+          "\n" ++ s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
+          else ""
+        memDecl ++ assignRead ++ "\n" ++ alwaysBlock
 
-  | .inst moduleName instName connections _domainMap =>
+  | .inst moduleName instName connections parameterBindings _domainMap =>
+    let parameterOverrides := if parameterBindings.isEmpty then "" else
+      let bindings := parameterBindings.map fun (name, value) =>
+        s!".{sanitizeName name}({emitDimExpr value})"
+      " #(\n" ++ indent ++ "    " ++
+        String.intercalate (",\n" ++ indent ++ "    ") bindings ++
+        "\n" ++ indent ++ ")"
     let connStrs := connections.map fun (portName, expr) =>
       s!".{sanitizeName portName}({emitExpr expr})"
     let connList := String.intercalate ", " connStrs
-    s!"{indent}{sanitizeName moduleName} {sanitizeName instName} ({connList});"
+    s!"{indent}{sanitizeName moduleName}{parameterOverrides} {sanitizeName instName} ({connList});"
 
 /-- Emit port declarations for module header -/
 def emitPortList (inputs : List Port) (outputs : List Port) : String :=
@@ -213,6 +286,15 @@ def emitWireDecls (wires : List Port) (indent : String := "    ") : String :=
       s!"{indent}{emitType p.ty} {sanitizeName p.name};"
     String.intercalate "\n" wireDecls ++ "\n"
 
+/-- Emit a SystemVerilog module parameter list. -/
+def emitParameterList (parameters : List Parameter) : String :=
+  if parameters.isEmpty then
+    ""
+  else
+    let declarations := parameters.map fun parameter =>
+      s!"parameter integer {sanitizeName parameter.name} = {parameter.defaultValue}"
+    " #(\n    " ++ String.intercalate ",\n    " declarations ++ "\n)"
+
 /-- Emit the full module -/
 def emitModule (m : Module) : String :=
   -- For primitive/blackbox modules, just emit a comment (actual module comes from vendor)
@@ -223,7 +305,8 @@ def emitModule (m : Module) : String :=
   else
     let header := s!"// Generated by Sparkle HDL\n" ++
                   s!"// Module: {m.name}\n\n" ++
-                  s!"module {sanitizeName m.name} ({emitPortList m.inputs m.outputs});\n"
+                  s!"module {sanitizeName m.name}{emitParameterList m.parameters} " ++
+                  s!"({emitPortList m.inputs m.outputs});\n"
 
     -- Filter out wires that are already declared as input/output ports
     let portNames := (m.inputs ++ m.outputs).map (·.name)

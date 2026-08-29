@@ -1402,8 +1402,8 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
       for regName in regNames do
         let hwTy := env.getHWType regName
         let initVal := match initMap.find? (·.1 == regName) with
-          | some (_, v) => v
-          | none => 0
+          | some (_, v) => Expr.const (Int.ofNat v) hwTy.bitWidth
+          | none => Expr.const 0 hwTy.bitWidth
         let dataExpr := stmtsToMuxExpr regName stmts
         body := body ++
           [.register regName domain.id (if hasReset then .domain else .none) dataExpr initVal]
@@ -1464,7 +1464,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
               writeEnable := enableExpr
             | [] => pure ()
         | _ => pure ()
-      body := body ++ [.memory name addrWidth dataWidth "clk"
+      body := body ++ [.memory name (.literal addrWidth) (.literal dataWidth) "clk"
         writeAddr writeData writeEnable
         (.const 0 addrWidth) s!"{name}_rdata" true]
       wires := wires ++ [{ name := s!"{name}_rdata", ty := widthToHWType width }]
@@ -1570,8 +1570,38 @@ partial def prefixExprNames (pfx : String) (nameSet : List String) : Expr → Ex
   | .op o args => .op o (args.map (prefixExprNames pfx nameSet))
   | .concat args => .concat (args.map (prefixExprNames pfx nameSet))
   | .slice e hi lo => .slice (prefixExprNames pfx nameSet e) hi lo
+  | .sliceDim e hi lo => .sliceDim (prefixExprNames pfx nameSet e) hi lo
   | .index arr idx => .index (prefixExprNames pfx nameSet arr) (prefixExprNames pfx nameSet idx)
   | e => e
+
+/-- Prefix one inlined child statement while preserving parameters and domain maps. -/
+partial def prefixStmtNames (pfx : String) (nameSet : List String) : Stmt → Stmt
+  | .assign name rhs =>
+      .assign s!"{pfx}_{name}" (prefixExprNames pfx nameSet rhs)
+  | .assignExpr lhs rhs =>
+      .assignExpr (prefixExprNames pfx nameSet lhs) (prefixExprNames pfx nameSet rhs)
+  | .generateFor label index start stop body =>
+      .generateFor s!"{pfx}_{label}" index start stop
+        (body.map (prefixStmtNames pfx nameSet))
+  | .register name domain reset input init =>
+      .register s!"{pfx}_{name}" s!"{pfx}_{domain}" reset
+        (prefixExprNames pfx nameSet input) (prefixExprNames pfx nameSet init)
+  | .cdc output sourceDomain destDomain input kind =>
+      .cdc s!"{pfx}_{output}" s!"{pfx}_{sourceDomain}" s!"{pfx}_{destDomain}"
+        (prefixExprNames pfx nameSet input) kind
+  | .inst moduleName instName connections parameterBindings domainMap =>
+      .inst moduleName s!"{pfx}_{instName}"
+        (connections.map fun (port, expr) => (port, prefixExprNames pfx nameSet expr))
+        parameterBindings
+        (domainMap.map fun (child, parent) => (child, s!"{pfx}_{parent}"))
+  | .memory name addrWidth dataWidth domain writeAddr writeData writeEnable
+      readAddr readData comboRead =>
+      .memory s!"{pfx}_{name}" addrWidth dataWidth s!"{pfx}_{domain}"
+        (prefixExprNames pfx nameSet writeAddr)
+        (prefixExprNames pfx nameSet writeData)
+        (prefixExprNames pfx nameSet writeEnable)
+        (prefixExprNames pfx nameSet readAddr)
+        s!"{pfx}_{readData}" comboRead
 
 /-- Flatten a design: inline all sub-module instantiations into a single module.
     The optional `svDesign` parameter provides access to the original SV AST
@@ -1586,7 +1616,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
     for stmt in top.body do
       match stmt with
-      | .inst modName instName conns _domainMap =>
+      | .inst modName instName conns _parameterBindings _domainMap =>
         -- Find the sub-module
         match moduleMap.find? fun (m : Module) => m.name == modName with
         | none =>
@@ -1666,28 +1696,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
           -- Add prefixed body statements from sub-module
           for s in effectiveSubMod.body do
-            let prefixed := match s with
-              | .assign name rhs =>
-                .assign s!"{instName}_{name}" (prefixExprNames instName subNames rhs)
-              | .register name domain reset input init =>
-                .register s!"{instName}_{name}" s!"{instName}_{domain}" reset
-                  (prefixExprNames instName subNames input) init
-              | .cdc output sourceDomain destDomain input kind =>
-                .cdc s!"{instName}_{output}" s!"{instName}_{sourceDomain}"
-                  s!"{instName}_{destDomain}"
-                  (prefixExprNames instName subNames input) kind
-              | .inst subModName subInstName subConns subDomainMap =>
-                -- Keep nested .inst with prefixed names — will be flattened in next iteration
-                .inst subModName s!"{instName}_{subInstName}"
-                  (subConns.map fun (pn, e) => (pn, prefixExprNames instName subNames e))
-                  subDomainMap
-              | .memory name aw dw clk wa wd we ra rd combo =>
-                .memory s!"{instName}_{name}" aw dw s!"{instName}_{clk}"
-                  (prefixExprNames instName subNames wa)
-                  (prefixExprNames instName subNames wd)
-                  (prefixExprNames instName subNames we)
-                  (prefixExprNames instName subNames ra)
-                  s!"{instName}_{rd}" combo
+            let prefixed := prefixStmtNames instName subNames s
             flatBody := flatBody ++ [prefixed]
       | other => flatBody := flatBody ++ [other]
 
@@ -1706,15 +1715,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
       else n
     let genWires := flatWires.map fun w => { w with name := addGen w.name }
     let genExpr := genExprRefs internalWireNames
-    let genBody := flatBody.map fun s => match s with
-      | .assign n rhs => .assign (addGen n) (genExpr rhs)
-      | .register n clk rst input init => .register n clk rst (genExpr input) init
-      | .cdc output sourceDomain destDomain input kind =>
-          .cdc output sourceDomain destDomain (genExpr input) kind
-      | .inst mn in_ conns domainMap =>
-          .inst mn in_ (conns.map fun (p, e) => (p, genExpr e)) domainMap
-      | .memory n aw dw clk wa wd we ra rd combo =>
-        .memory n aw dw clk (genExpr wa) (genExpr wd) (genExpr we) (genExpr ra) rd combo
+    let genBody := flatBody.map (genStmt internalWireNames)
 
     let flatModule : Module := {
       name := top.name
@@ -1732,8 +1733,34 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
       | .op o args => .op o (args.map (genExprRefs wireNames))
       | .concat args => .concat (args.map (genExprRefs wireNames))
       | .slice e hi lo => .slice (genExprRefs wireNames e) hi lo
+      | .sliceDim e hi lo => .sliceDim (genExprRefs wireNames e) hi lo
       | .index a i => .index (genExprRefs wireNames a) (genExprRefs wireNames i)
       | e => e
+    genStmt (wireNames : List String) : Stmt → Stmt
+      | .assign name rhs =>
+          let renamed := if wireNames.any (· == name) && !name.startsWith "_gen_"
+            then s!"_gen_{name}" else name
+          .assign renamed (genExprRefs wireNames rhs)
+      | .assignExpr lhs rhs =>
+          .assignExpr (genExprRefs wireNames lhs) (genExprRefs wireNames rhs)
+      | .generateFor label index start stop body =>
+          .generateFor label index start stop (body.map (genStmt wireNames))
+      | .register name domain reset input init =>
+          .register name domain reset (genExprRefs wireNames input)
+            (genExprRefs wireNames init)
+      | .cdc output sourceDomain destDomain input kind =>
+          .cdc output sourceDomain destDomain (genExprRefs wireNames input) kind
+      | .inst moduleName instName connections parameterBindings domainMap =>
+          .inst moduleName instName
+            (connections.map fun (port, expr) => (port, genExprRefs wireNames expr))
+            parameterBindings domainMap
+      | .memory name addrWidth dataWidth domain writeAddr writeData writeEnable
+          readAddr readData comboRead =>
+          .memory name addrWidth dataWidth domain
+            (genExprRefs wireNames writeAddr)
+            (genExprRefs wireNames writeData)
+            (genExprRefs wireNames writeEnable)
+            (genExprRefs wireNames readAddr) readData comboRead
 
 /-- Lower a full SV design to Sparkle IR -/
 def lowerDesign (svDesign : SVDesign) : Except String Design := do

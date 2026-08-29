@@ -43,9 +43,9 @@ def testModule : Module :=
       , { name := "rd_free_running_q", ty := .bitVector 8 }
       ]
   , body :=
-      [ .register "wr_q" "write" .domain (.ref "wr_data") 0
-      , .register "rd_q" "read" .domain (.ref "rd_data") 0
-      , .register "rd_free_running_q" "read" .none (.ref "rd_data") 0
+      [ .register "wr_q" "write" .domain (.ref "wr_data") (.const 0 8)
+      , .register "rd_q" "read" .domain (.ref "rd_data") (.const 0 8)
+      , .register "rd_free_running_q" "read" .none (.ref "rd_data") (.const 0 8)
       ]
   , clockDomains := [writeDomain, readDomain]
   }
@@ -60,14 +60,14 @@ def generated : String := toVerilog testModule
 
 def missingDomainModule : Module :=
   { testModule with
-    body := [.register "wr_q" "missing" .domain (.ref "wr_data") 0]
+    body := [.register "wr_q" "missing" .domain (.ref "wr_data") (.const 0 8)]
   }
 
 #guard (checkClockDomains missingDomainModule).any (fun issue => issue.contains "unknown domain 'missing'")
 
 def directCrossingModule : Module :=
   { testModule with
-    body := [.register "rd_q" "read" .domain (.ref "wr_data") 0]
+    body := [.register "rd_q" "read" .domain (.ref "wr_data") (.const 0 8)]
   }
 
 #guard (checkClockDomains directCrossingModule).any
@@ -88,7 +88,7 @@ def explicitCrossingModule : Module :=
       [{ name := "wr_to_rd", ty := .bitVector 8, domain := some "read" }]
     body :=
       [ .cdc "wr_to_rd" "write" "read" (.ref "wr_data") .level
-      , .register "rd_q" "read" .domain (.ref "wr_to_rd") 0
+      , .register "rd_q" "read" .domain (.ref "wr_to_rd") (.const 0 8)
       ]
   }
 
@@ -108,7 +108,7 @@ def hierarchyChild : Module := { testModule with name := "domain_child" }
 def hierarchyParent (domainMap : List (DomainId × DomainId)) : Module :=
   { testModule with
     name := "domain_parent"
-    body := [.inst "domain_child" "child" hierarchyConnections domainMap]
+    body := [.inst "domain_child" "child" hierarchyConnections [] domainMap]
   }
 
 def validHierarchyDesign : Design :=

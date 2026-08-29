@@ -51,6 +51,11 @@ def getDesign : CircuitM Design := do
 def addModuleToDesign (m : Module) : CircuitM Unit := do
   modify fun s => { s with design := s.design.addModule m }
 
+/-- Add a retained parameter to the module being built. -/
+def addParameter (name : String) (defaultValue : Nat) : CircuitM Unit := do
+  let m ← getModule
+  setModule (m.addParameter { name, defaultValue })
+
 /-- Generate a fresh wire name.
     When `named=true` (user let-bindings), produces `_gen_{hint}` — stable across recompilations.
     When `named=false` (compiler intermediates), produces `_tmp_{hint}_{counter}` — numbered. -/
@@ -111,6 +116,11 @@ def emitAssign (lhs : String) (rhs : Expr) : CircuitM Unit := do
   let m ← getModule
   setModule (m.addStmt (.assign lhs rhs))
 
+def emitGenerateFor (label index : String) (start stop : DimExpr)
+    (body : List Stmt) : CircuitM Unit := do
+  let m ← getModule
+  setModule (m.addStmt (.generateFor label index start stop body))
+
 /-- Register a physical clock domain in the current module. -/
 def addClockDomain (domain : ClockDomain) : CircuitM Unit := do
   let m ← getModule
@@ -147,6 +157,19 @@ def emitRegisterInDomain (hint : String) (domain : ClockDomain)
   let outputName ← freshName (sanitizeName hint) named
   let m ← getModule
   let m := m.addWire { name := outputName, ty := ty, domain := some domain.id }
+  let m := m.addStmt (.register outputName domain.id reset input
+    (.constDim initValue ty.bitWidthDim))
+  setModule m
+  return outputName
+
+/-- Emit a domain-owned register with an explicit packed reset expression. -/
+def emitRegisterExprInDomain (hint : String) (domain : ClockDomain)
+    (reset : RegisterReset) (input initValue : Expr)
+    (ty : HWType) (named : Bool := false) : CircuitM String := do
+  addClockDomain domain
+  let outputName ← freshName (sanitizeName hint) named
+  let m ← getModule
+  let m := m.addWire { name := outputName, ty := ty, domain := some domain.id }
   let m := m.addStmt (.register outputName domain.id reset input initValue)
   setModule m
   return outputName
@@ -158,10 +181,14 @@ def emitRegisterAt (outputName : String) (domain : ClockDomain)
   let m ← getModule
   if !m.wires.any (fun wire => wire.name == outputName) then
     panic! s!"Register output wire '{outputName}' must be declared before emitRegisterAt"
+  let width := match m.wires.find? (fun wire => wire.name == outputName) with
+    | some wire => wire.ty.bitWidthDim
+    | none => .literal 1
   let wires := m.wires.map fun wire =>
     if wire.name == outputName then { wire with domain := some domain.id } else wire
   setModule ({ m with wires }.addStmt
-    (.register outputName domain.id reset input initValue))
+    (.register outputName domain.id reset input
+      (.constDim initValue width)))
 
 /--
   Emit a register statement (D flip-flop).
@@ -186,20 +213,33 @@ def emitRegister (hint : String) (clock : String) (reset : String)
     emitRegisterInDomain hint (ClockDomain.legacy clock reset)
       .domain input initValue ty named
 
-/-- Emit a synchronous memory owned by an explicit clock domain. -/
-def emitMemoryInDomain (hint : String) (addrWidth : Nat) (dataWidth : Nat)
-    (domain : ClockDomain) (writeAddr : Expr) (writeData : Expr)
-    (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
+/-- Compatibility API for symbolic packed reset expressions. -/
+def emitRegisterExpr (hint : String) (clock : String) (reset : String)
+    (input initValue : Expr) (ty : HWType) (named : Bool := false) : CircuitM String :=
+  emitRegisterExprInDomain hint (ClockDomain.legacy clock reset) .domain
+    input initValue ty named
+
+/-- Emit a symbolic-dimension synchronous memory in an explicit domain. -/
+def emitMemoryDimInDomain (hint : String) (addrWidth dataWidth : DimExpr)
+    (domain : ClockDomain) (writeAddr writeData writeEnable readAddr : Expr)
+    (named : Bool := false) : CircuitM String := do
   addClockDomain domain
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
   let m ← getModule
   let m := m.addWire
-    { name := readDataName, ty := .bitVector dataWidth, domain := some domain.id }
+    { name := readDataName, ty := hwTypeFromDim dataWidth, domain := some domain.id }
   let m := m.addStmt (.memory memName addrWidth dataWidth domain.id
     writeAddr writeData writeEnable readAddr readDataName)
   setModule m
   return readDataName
+
+/-- Emit a concrete-dimension synchronous memory in an explicit domain. -/
+def emitMemoryInDomain (hint : String) (addrWidth dataWidth : Nat)
+    (domain : ClockDomain) (writeAddr writeData writeEnable readAddr : Expr)
+    (named : Bool := false) : CircuitM String :=
+  emitMemoryDimInDomain hint (.literal addrWidth) (.literal dataWidth) domain
+    writeAddr writeData writeEnable readAddr named
 
 /--
   Emit a synchronous memory (RAM/BRAM) primitive.
@@ -215,33 +255,54 @@ def emitMemoryInDomain (hint : String) (addrWidth : Nat) (dataWidth : Nat)
   - writeEnable: Write enable expression
   - readAddr: Read address expression
 -/
-def emitMemory (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+def emitMemoryDim (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr) (clock : String)
     (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
-  emitMemoryInDomain hint addrWidth dataWidth (ClockDomain.legacy clock "rst")
+  emitMemoryDimInDomain hint addrWidth dataWidth (ClockDomain.legacy clock "rst")
     writeAddr writeData writeEnable readAddr named
 
-/-- Emit a combinational-read memory owned by an explicit clock domain. -/
-def emitMemoryComboReadInDomain (hint : String) (addrWidth : Nat) (dataWidth : Nat)
-    (domain : ClockDomain) (writeAddr : Expr) (writeData : Expr)
-    (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
+/-- Emit a symbolic-dimension combinational-read memory in an explicit domain. -/
+def emitMemoryComboReadDimInDomain (hint : String) (addrWidth dataWidth : DimExpr)
+    (domain : ClockDomain) (writeAddr writeData writeEnable readAddr : Expr)
+    (named : Bool := false) : CircuitM String := do
   addClockDomain domain
   let memName ← freshName (sanitizeName hint) named
   let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
   let m ← getModule
   let m := m.addWire
-    { name := readDataName, ty := .bitVector dataWidth, domain := some domain.id }
+    { name := readDataName, ty := hwTypeFromDim dataWidth, domain := some domain.id }
   let m := m.addStmt (.memory memName addrWidth dataWidth domain.id
     writeAddr writeData writeEnable readAddr readDataName (comboRead := true))
   setModule m
   return readDataName
 
+/-- Emit a concrete-dimension combinational-read memory in an explicit domain. -/
+def emitMemoryComboReadInDomain (hint : String) (addrWidth dataWidth : Nat)
+    (domain : ClockDomain) (writeAddr writeData writeEnable readAddr : Expr)
+    (named : Bool := false) : CircuitM String :=
+  emitMemoryComboReadDimInDomain hint (.literal addrWidth) (.literal dataWidth) domain
+    writeAddr writeData writeEnable readAddr named
+
+def emitMemory (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
+    (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr)
+    (named : Bool := false) : CircuitM String :=
+  emitMemoryDim hint (.literal addrWidth) (.literal dataWidth) clock
+    writeAddr writeData writeEnable readAddr named
+
 /--
   Emit a memory with combinational (same-cycle) read.
   Returns the name of the read data output wire.
 -/
+def emitMemoryComboReadDim (hint : String) (addrWidth : DimExpr) (dataWidth : DimExpr)
+    (clock : String)
+    (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr)
+    (named : Bool := false) : CircuitM String := do
+  emitMemoryComboReadDimInDomain hint addrWidth dataWidth (ClockDomain.legacy clock "rst")
+    writeAddr writeData writeEnable readAddr named
+
 def emitMemoryComboRead (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clock : String)
-    (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr) (named : Bool := false) : CircuitM String := do
-  emitMemoryComboReadInDomain hint addrWidth dataWidth (ClockDomain.legacy clock "rst")
+    (writeAddr : Expr) (writeData : Expr) (writeEnable : Expr) (readAddr : Expr)
+    (named : Bool := false) : CircuitM String :=
+  emitMemoryComboReadDim hint (.literal addrWidth) (.literal dataWidth) clock
     writeAddr writeData writeEnable readAddr named
 
 /--
@@ -251,7 +312,15 @@ def emitInstance (moduleName : String) (instName : String)
     (connections : List (String × Expr))
     (domainMap : List (DomainId × DomainId) := []) : CircuitM Unit := do
   let m ← getModule
-  setModule (m.addStmt (.inst moduleName instName connections domainMap))
+  setModule (m.addStmt (.inst moduleName instName connections [] domainMap))
+
+def emitParameterizedInstance (moduleName : String) (instName : String)
+    (parameterBindings : List (String × DimExpr))
+    (connections : List (String × Expr))
+    (domainMap : List (DomainId × DomainId) := []) : CircuitM Unit := do
+  let m ← getModule
+  setModule (m.addStmt
+    (.inst moduleName instName connections parameterBindings domainMap))
 
 /--
   Add an input port to the module.

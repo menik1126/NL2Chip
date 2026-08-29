@@ -1,6 +1,7 @@
 import Sparkle
 import Sparkle.Compiler.Elab
 import Tests.TestCircuits
+import Tests.SymbolicParameterCircuits
 import LSpec
 
 open Sparkle.Core.Domain
@@ -38,6 +39,27 @@ def synthesizeDesignToString (declName : Name) : Lean.MetaM String := do
   let design ← synthesizeHierarchical declName
   return toVerilogDesign design
 
+/-- Synthesize one native parameterized module without specializing its widths. -/
+def synthesizeParameterizedToString (declName : Name)
+    (parameters : List (String × Nat)) : Lean.MetaM String := do
+  let (module, _) ← synthesizeCombinationalWithParameters declName parameters
+  return toVerilog module
+
+def synthesizeParameterizedDesignToString (declName : Name)
+    (parameters : List (String × Nat)) : Lean.MetaM String := do
+  let design ← synthesizeHierarchicalWithParameters declName parameters
+  return toVerilogDesign design
+
+/-- Check that a rejected parameter contract reports the intended reason. -/
+def parameterizedSynthesisRejectsWith (declName : Name)
+    (parameters : List (String × Nat)) (needle : String) : Lean.MetaM Bool := do
+  try
+    let _ ← synthesizeCombinationalWithParameters declName parameters
+    return false
+  catch error =>
+    let message ← error.toMessageData.toString
+    return message.containsSubstr needle
+
 /-- Extract a specific module from multi-module Verilog output -/
 def extractModule (verilog : String) (moduleName : String) : String :=
   let lines := verilog.splitOn "\n"
@@ -64,6 +86,19 @@ structure VerilogOutputs where
   muxVerilog : String
   flipflopVerilog : String
   hierarchicalVerilog : String
+  symbolicIdentityVerilog : String
+  symbolicXorVerilog : String
+  symbolicConcatVerilog : String
+  symbolicSliceLowVerilog : String
+  symbolicZeroExtendVerilog : String
+  symbolicRegisterVerilog : String
+  symbolicMemoryVerilog : String
+  symbolicHierarchyVerilog : String
+  symbolicGenerateVerilog : String
+  rejectsUnretainedWidth : Bool
+  rejectsMissingBinder : Bool
+  rejectsDuplicateParameter : Bool
+  rejectsZeroWidthDefault : Bool
 
 /-- Synthesize all modules for testing -/
 def synthesizeAll : Lean.MetaM VerilogOutputs := do
@@ -72,7 +107,43 @@ def synthesizeAll : Lean.MetaM VerilogOutputs := do
   let muxVerilog ← synthesizeToString `test_mux
   let flipflopVerilog ← synthesizeToString `test_flipflop
   let hierarchicalVerilog ← synthesizeDesignToString `test_hierarchical_alu
-  return { addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog }
+  let symbolicIdentityVerilog ←
+    synthesizeParameterizedToString `symbolicIdentity [("W", 8)]
+  let symbolicXorVerilog ←
+    synthesizeParameterizedToString `symbolicXor [("W", 8)]
+  let symbolicConcatVerilog ←
+    synthesizeParameterizedToString `symbolicConcat [("HI", 5), ("LO", 3)]
+  let symbolicSliceLowVerilog ←
+    synthesizeParameterizedToString `symbolicSliceLow [("W", 8)]
+  let symbolicZeroExtendVerilog ←
+    synthesizeParameterizedToString `symbolicZeroExtend [("W", 8)]
+  let symbolicRegisterVerilog ←
+    synthesizeParameterizedToString `symbolicRegister [("W", 8)]
+  let symbolicMemoryVerilog ←
+    synthesizeParameterizedToString `symbolicMemory [("ADDR_W", 3), ("DATA_W", 8)]
+  let symbolicHierarchyVerilog ←
+    synthesizeParameterizedDesignToString `symbolicXorHierarchy [("W", 8)]
+  let symbolicGenerateVerilog ←
+    synthesizeParameterizedToString `symbolicGenerateNot [("W", 8)]
+  let rejectsUnretainedWidth ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [] "was not retained"
+  let rejectsMissingBinder ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [("MISSING", 8)]
+      "is not a top-level Nat binder"
+  let rejectsDuplicateParameter ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [("W", 8), ("W", 16)]
+      "must be unique"
+  let rejectsZeroWidthDefault ←
+    parameterizedSynthesisRejectsWith `symbolicIdentity [("W", 0)]
+      "must have a positive default"
+  return {
+    addVerilog, andVerilog, muxVerilog, flipflopVerilog, hierarchicalVerilog,
+    symbolicIdentityVerilog, symbolicXorVerilog, symbolicConcatVerilog,
+    symbolicSliceLowVerilog, symbolicZeroExtendVerilog, symbolicRegisterVerilog,
+    symbolicMemoryVerilog, symbolicHierarchyVerilog, symbolicGenerateVerilog,
+    rejectsUnretainedWidth, rejectsMissingBinder, rejectsDuplicateParameter,
+    rejectsZeroWidthDefault
+  }
 
 /-- Create test suite from synthesized outputs -/
 def makeTests (outputs : VerilogOutputs) : TestSeq :=
@@ -95,6 +166,82 @@ def makeTests (outputs : VerilogOutputs) : TestSeq :=
       group "test_mux (Multiplexer)" (
         test "module declared" (outputs.muxVerilog.containsSubstr "module test_mux") $
         test "has ternary operator" (outputs.muxVerilog.containsSubstr " ? ")
+      )
+    ) ++
+    group "Native Symbolic Parameters" (
+      group "symbolicIdentity" (
+        test "module has a parameter list"
+          (outputs.symbolicIdentityVerilog.containsSubstr "module symbolicIdentity #(") $
+        test "retains W with its default"
+          (outputs.symbolicIdentityVerilog.containsSubstr "parameter integer W = 8") $
+        test "input width depends on W"
+          (outputs.symbolicIdentityVerilog.containsSubstr "input logic [W-1:0]") $
+        test "output width depends on W"
+          (outputs.symbolicIdentityVerilog.containsSubstr "output logic [W-1:0]") $
+        test "does not freeze the default width"
+          (!outputs.symbolicIdentityVerilog.containsSubstr "[7:0]")
+      ) ++
+      group "symbolicXor" (
+        test "retains W with its default"
+          (outputs.symbolicXorVerilog.containsSubstr "parameter integer W = 8") $
+        test "keeps generic ports"
+          (outputs.symbolicXorVerilog.containsSubstr "input logic [W-1:0]") $
+        test "emits XOR logic"
+          (outputs.symbolicXorVerilog.containsSubstr " ^ ")
+      ) ++
+      group "derived dimensions" (
+        test "concat retains both parameters"
+          (outputs.symbolicConcatVerilog.containsSubstr "parameter integer HI = 5" &&
+           outputs.symbolicConcatVerilog.containsSubstr "parameter integer LO = 3") $
+        test "concat output width is HI + LO"
+          (outputs.symbolicConcatVerilog.containsSubstr "logic [(HI + LO)-1:0]") $
+        test "slice length remains W"
+          (outputs.symbolicSliceLowVerilog.containsSubstr "[W-1:0]") $
+        test "slice high index remains W - 1"
+          (outputs.symbolicSliceLowVerilog.containsSubstr "[(W - 1):0]") $
+        test "extension output width remains W + 1"
+          (outputs.symbolicZeroExtendVerilog.containsSubstr "logic [(W + 1)-1:0]")
+      ) ++
+      group "parameterized register" (
+        test "register storage retains W"
+          (outputs.symbolicRegisterVerilog.containsSubstr "logic [W-1:0]") $
+        test "register reset value is sized by W"
+          (outputs.symbolicRegisterVerilog.containsSubstr "<= W'(1);")
+      ) ++
+      group "parameterized memory" (
+        test "memory retains address and data parameters"
+          (outputs.symbolicMemoryVerilog.containsSubstr "parameter integer ADDR_W = 3" &&
+           outputs.symbolicMemoryVerilog.containsSubstr "parameter integer DATA_W = 8") $
+        test "memory data storage retains DATA_W"
+          (outputs.symbolicMemoryVerilog.containsSubstr "logic [DATA_W-1:0]") $
+        test "memory depth retains ADDR_W"
+          (outputs.symbolicMemoryVerilog.containsSubstr "[0:((2 ** ADDR_W) - 1)]") $
+        test "memory reset clears every entry"
+          (outputs.symbolicMemoryVerilog.containsSubstr "always_ff @(posedge clk or posedge rst)" &&
+           outputs.symbolicMemoryVerilog.containsSubstr "for (" &&
+           outputs.symbolicMemoryVerilog.containsSubstr " <= '0;")
+      ) ++
+      group "parameterized hierarchy" (
+        test "design emits the child module"
+          (outputs.symbolicHierarchyVerilog.containsSubstr "module symbolicXorChild #(") $
+        test "child retains W"
+          (outputs.symbolicHierarchyVerilog.containsSubstr "parameter integer W = 8") $
+        test "parent explicitly forwards W"
+          (outputs.symbolicHierarchyVerilog.containsSubstr ".W(W)")
+      ) ++
+      group "symbolic generate" (
+        test "emits a generate block"
+          (outputs.symbolicGenerateVerilog.containsSubstr "generate") $
+        test "uses W as the exclusive loop bound"
+          (outputs.symbolicGenerateVerilog.containsSubstr " < W;") $
+        test "emits per-bit Boolean logic"
+          (outputs.symbolicGenerateVerilog.containsSubstr " = ~")
+      ) ++
+      group "fail-closed diagnostics" (
+        test "rejects an unretained generic width" outputs.rejectsUnretainedWidth $
+        test "rejects a requested name without a binder" outputs.rejectsMissingBinder $
+        test "rejects duplicate parameter names" outputs.rejectsDuplicateParameter $
+        test "rejects a zero hardware-width default" outputs.rejectsZeroWidthDefault
       )
     ) ++
     group "Hierarchical Circuits" (
@@ -140,7 +287,8 @@ def main : IO UInt32 := do
 
   -- Import required modules
   let env ← Lean.importModules
-    #[{module := `Sparkle.Compiler.Elab}, {module := `Sparkle.Backend.Verilog}, {module := `Tests.TestCircuits}]
+    #[{module := `Sparkle.Compiler.Elab}, {module := `Sparkle.Backend.Verilog},
+      {module := `Tests.TestCircuits}, {module := `Tests.SymbolicParameterCircuits}]
     {}
     (trustLevel := 1024)
 

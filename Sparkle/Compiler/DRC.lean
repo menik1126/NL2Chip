@@ -15,10 +15,13 @@ open Sparkle.IR.AST
 def findDriver (body : List Stmt) (wireName : String) : Option Stmt :=
   body.find? fun
     | .assign lhs _ => lhs == wireName
+    | .assignExpr (.ref lhs) _ => lhs == wireName
+    | .assignExpr _ _ => false
+    | .generateFor .. => false
     | .cdc output .. => output == wireName
     | .register output .. => output == wireName
     | .memory (readData := rd) .. => rd == wireName
-    | .inst _ instName _ _ => instName == wireName
+    | .inst _ instName _ _ _ => instName == wireName
 
 private def declaredDomain? (m : Module) (name : String) : Option DomainId :=
   (m.inputs ++ m.outputs ++ m.wires).find? (fun port => port.name == name)
@@ -29,7 +32,7 @@ private def declaredDomain? (m : Module) (name : String) : Option DomainId :=
 partial def inferExprDomains (m : Module) (expr : Expr)
     (visited : List String := []) : List DomainId :=
   match expr with
-  | .const .. => []
+  | .const .. | .constDim .. | .dimension .. => []
   | .ref name =>
       if visited.contains name then []
       else
@@ -44,6 +47,7 @@ partial def inferExprDomains (m : Module) (expr : Expr)
   | .op _ args | .concat args =>
       (args.flatMap (inferExprDomains m · visited)).eraseDups
   | .slice inner _ _ => inferExprDomains m inner visited
+  | .sliceDim inner _ _ => inferExprDomains m inner visited
   | .index array index =>
       (inferExprDomains m array visited ++ inferExprDomains m index visited).eraseDups
 
@@ -70,6 +74,12 @@ def checkDomainFlows (m : Module) : List String :=
           | some expected => expectedDomainIssues m s!"assignment '{lhs}'" expected rhs
           | none => []
         mixedIssue ++ ownerIssues
+    | .assignExpr lhs rhs =>
+        let domains := (inferExprDomains m lhs ++ inferExprDomains m rhs).eraseDups
+        if domains.length > 1 then
+          [s!"[DRC] Module '{m.name}': indexed assignment combines domains '{String.intercalate ", " domains}' without an explicit CDC"]
+        else []
+    | .generateFor .. => []
     | .cdc output sourceDomain destDomain input _ =>
         expectedDomainIssues m s!"CDC '{output}' input" sourceDomain input ++
         (match declaredDomain? m output with
@@ -134,7 +144,7 @@ def checkInstanceDomains (design : Design) : List String :=
   design.modules.flatMap fun parent =>
     parent.body.flatMap fun stmt =>
       match stmt with
-      | .inst moduleName instName connections domainMap =>
+      | .inst moduleName instName connections _parameterBindings domainMap =>
           match design.findModule moduleName with
           | none =>
               [s!"[DRC] Module '{parent.name}': instance '{instName}' references unknown module '{moduleName}'"]

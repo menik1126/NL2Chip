@@ -78,6 +78,12 @@ instance : ToString CdcKind where
     | .pulse => "pulse"
     | .asyncFifo => "async_fifo"
 
+/-- A retained top-level Lean `Nat` binder exposed as a module parameter. -/
+structure Parameter where
+  name : String
+  defaultValue : Nat
+  deriving Repr, BEq, Inhabited
+
 /-- Port declaration (input/output of a module) -/
 structure Port where
   name   : String
@@ -99,6 +105,7 @@ inductive Operator where
   | add  : Operator  -- Addition
   | sub  : Operator  -- Subtraction
   | mul  : Operator  -- Multiplication
+  | mod  : Operator  -- Unsigned remainder
   | eq   : Operator  -- Equality comparison
   | lt_u : Operator  -- Less than comparison (unsigned)
   | lt_s : Operator  -- Less than comparison (signed)
@@ -112,7 +119,9 @@ inductive Operator where
   | shl  : Operator  -- Shift left
   | shr  : Operator  -- Shift right (logical)
   | asr  : Operator  -- Arithmetic shift right (signed)
+  | sext : Operator  -- Signed width conversion
   | neg  : Operator  -- Arithmetic negation
+  | popcount : Operator  -- Population count
   deriving Repr, BEq, DecidableEq
 
 namespace Operator
@@ -126,6 +135,7 @@ def toString : Operator → String
   | add  => "add"
   | sub  => "sub"
   | mul  => "mul"
+  | mod  => "mod"
   | eq   => "eq"
   | lt_u => "lt_u"
   | lt_s => "lt_s"
@@ -139,7 +149,9 @@ def toString : Operator → String
   | shl  => "shl"
   | shr  => "shr"
   | asr  => "asr"
+  | sext => "sext"
   | neg  => "neg"
+  | popcount => "popcount"
 
 instance : ToString Operator where
   toString := Operator.toString
@@ -155,10 +167,13 @@ end Operator
 -/
 inductive Expr where
   | const (value : Int) (width : Nat) : Expr
+  | constDim (value : Int) (width : DimExpr) : Expr
+  | dimension (value : DimExpr) : Expr
   | ref (name : String) : Expr
   | op (operator : Operator) (args : List Expr) : Expr
   | concat (args : List Expr) : Expr
   | slice (expr : Expr) (hi lo : Nat) : Expr
+  | sliceDim (expr : Expr) (hi lo : DimExpr) : Expr
   | index (array : Expr) (idx : Expr) : Expr
   deriving Repr, BEq, Inhabited
 
@@ -179,6 +194,7 @@ def not (a : Expr) : Expr := .op .not [a]
 def add (a b : Expr) : Expr := .op .add [a, b]
 def sub (a b : Expr) : Expr := .op .sub [a, b]
 def mul (a b : Expr) : Expr := .op .mul [a, b]
+def mod (a b : Expr) : Expr := .op .mod [a, b]
 def eq (a b : Expr) : Expr := .op .eq [a, b]
 def lt_u (a b : Expr) : Expr := .op .lt_u [a, b]
 def lt_s (a b : Expr) : Expr := .op .lt_s [a, b]
@@ -186,13 +202,16 @@ def mux (cond then_ else_ : Expr) : Expr := .op .mux [cond, then_, else_]
 
 /-- Convert expression to string (for debugging) -/
 partial def toString : Expr → String
+  | constDim v w => s!"{v}#{w}"
   | const v w => s!"{v}#{w}"
+  | dimension value => s!"dim({value})"
   | ref name => name
   | op operator args =>
       let argStr := String.intercalate ", " (args.map toString)
       s!"{operator}({argStr})"
   | concat args => s!"\{{String.intercalate ", " (args.map toString)}}"
   | slice e hi lo => s!"{toString e}[{hi}:{lo}]"
+  | sliceDim e hi lo => s!"{toString e}[{hi}:{lo}]"
   | index arr idx => s!"{toString arr}[{toString idx}]"
 
 instance : ToString Expr where
@@ -210,6 +229,13 @@ end Expr
 -/
 inductive Stmt where
   | assign (lhs : String) (rhs : Expr) : Stmt
+  | assignExpr (lhs rhs : Expr) : Stmt
+  | generateFor
+      (label : String)
+      (index : String)
+      (start stop : DimExpr)
+      (body : List Stmt)
+      : Stmt
   | cdc
       (output : String)
       (sourceDomain : DomainId)
@@ -222,12 +248,12 @@ inductive Stmt where
       (domain : DomainId)    -- Owning clock domain
       (reset : RegisterReset)-- Reset behavior for this register
       (input : Expr)         -- Input expression
-      (initValue : Int)      -- Reset/initial value
+      (initValue : Expr)     -- Reset/initial value, including packed literals
       : Stmt
   | memory
       (name : String)         -- Memory instance name
-      (addrWidth : Nat)       -- Address width (size = 2^addrWidth)
-      (dataWidth : Nat)       -- Data width
+      (addrWidth : DimExpr)   -- Address width (size = 2^addrWidth)
+      (dataWidth : DimExpr)   -- Data width
       (domain : DomainId)     -- Owning clock domain
       (writeAddr : Expr)      -- Write address port
       (writeData : Expr)      -- Write data port
@@ -240,6 +266,7 @@ inductive Stmt where
       (moduleName : String)   -- Name of module to instantiate
       (instName : String)     -- Instance name
       (connections : List (String × Expr))  -- Port connections
+      (parameterBindings : List (String × DimExpr) := [])
       (domainMap : List (DomainId × DomainId) := []) -- Child domain -> parent domain
       : Stmt
   deriving Repr, BEq
@@ -247,8 +274,12 @@ inductive Stmt where
 namespace Stmt
 
 /-- Convert statement to string (for debugging) -/
-def toString : Stmt → String
+partial def toString : Stmt → String
   | assign lhs rhs => s!"{lhs} := {rhs}"
+  | assignExpr lhs rhs => s!"{lhs} := {rhs}"
+  | generateFor label index start stop body =>
+      let bodyStr := String.intercalate "; " (body.map toString)
+      s!"generate {label}: for {index} in [{start}, {stop}): {bodyStr}"
   | cdc output sourceDomain destDomain input kind =>
       s!"cdc[{kind}] {output}: {sourceDomain} -> {destDomain} <= {input}"
   | register output domain reset input initValue =>
@@ -257,11 +288,15 @@ def toString : Stmt → String
       let readKind := if comboRead then "combo_read" else "read"
       s!"memory {name}[2^{addrWidth}][{dataWidth}] @domain({domain}) " ++
       s!"write({writeAddr}, {writeData}, {writeEnable}) {readKind}({readAddr}) => {readData}"
-  | inst modName instName conns domainMap =>
+  | inst modName instName conns parameterBindings domainMap =>
+      let parameterStr := if parameterBindings.isEmpty then "" else
+        let bindings := parameterBindings.map fun (name, value) => s!".{name}({value})"
+        s!" #({String.intercalate ", " bindings})"
       let connStr := String.intercalate ", " (conns.map fun (p, e) => s!".{p}({e})")
-      let domainStr := String.intercalate ", "
-        (domainMap.map fun (child, parent) => s!"{child}->{parent}")
-      s!"{modName} {instName}({connStr}) domains[{domainStr}]"
+      let domainStr := if domainMap.isEmpty then "" else
+        let mappings := domainMap.map fun (child, parent) => s!"{child}->{parent}"
+        s!" domains[{String.intercalate ", " mappings}]"
+      s!"{modName}{parameterStr} {instName}({connStr}){domainStr}"
 
 instance : ToString Stmt where
   toString := Stmt.toString
@@ -278,6 +313,7 @@ end Stmt
 -/
 structure Module where
   name        : String
+  parameters  : List Parameter := []
   inputs      : List Port
   outputs     : List Port
   wires       : List Port    -- Internal wires (ignored for primitives)
@@ -292,6 +328,7 @@ namespace Module
 /-- Create an empty module -/
 def empty (name : String) : Module :=
   { name := name
+  , parameters := []
   , inputs := []
   , outputs := []
   , wires := []
@@ -303,6 +340,7 @@ def empty (name : String) : Module :=
 /-- Create a primitive (blackbox) module with specified interface -/
 def primitive (name : String) (inputs : List Port) (outputs : List Port) : Module :=
   { name := name
+  , parameters := []
   , inputs := inputs
   , outputs := outputs
   , wires := []
@@ -310,6 +348,10 @@ def primitive (name : String) (inputs : List Port) (outputs : List Port) : Modul
   , clockDomains := []
   , isPrimitive := true
   }
+
+/-- Add a retained module parameter. -/
+def addParameter (m : Module) (parameter : Parameter) : Module :=
+  { m with parameters := m.parameters ++ [parameter] }
 
 /-- Add an input port -/
 def addInput (m : Module) (p : Port) : Module :=
@@ -338,12 +380,15 @@ def addStmt (m : Module) (s : Stmt) : Module :=
 
 /-- Convert module to string (for debugging) -/
 def toString (m : Module) : String :=
+  let parameterStr := String.intercalate ", "
+    (m.parameters.map fun p => s!"{p.name}={p.defaultValue}")
   let inputStr := String.intercalate ", " (m.inputs.map fun p => s!"{p.name}: {p.ty}")
   let outputStr := String.intercalate ", " (m.outputs.map fun p => s!"{p.name}: {p.ty}")
   let wireStr := String.intercalate ", " (m.wires.map fun p => s!"{p.name}: {p.ty}")
   let domainStr := String.intercalate ", " (m.clockDomains.map fun d => s!"{d.id}:{d.clock}")
   let bodyStr := String.intercalate "\n  " (m.body.map Stmt.toString)
   s!"module {m.name}\n" ++
+  s!"  parameters: {parameterStr}\n" ++
   s!"  domains: {domainStr}\n" ++
   s!"  inputs:  {inputStr}\n" ++
   s!"  outputs: {outputStr}\n" ++

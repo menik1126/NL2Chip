@@ -129,8 +129,8 @@ private def hierarchyChild : Module :=
       , { name := "destination_reg", ty := .bitVector 8, domain := some "destination" }
       ]
   , body :=
-      [ .register "source_reg" "source" .domain (.ref "source_data") 0
-      , .register "destination_reg" "destination" .domain (.ref "destination_data") 0
+      [ .register "source_reg" "source" .domain (.ref "source_data") (.const 0 8)
+      , .register "destination_reg" "destination" .domain (.ref "destination_data") (.const 0 8)
       , .assign "source_q" (.ref "source_reg")
       , .assign "destination_q" (.ref "destination_reg")
       ]
@@ -166,6 +166,7 @@ private def hierarchyTop : Module :=
           , ("source_q", .ref "child_source_q")
           , ("destination_q", .ref "child_destination_q")
           ]
+          []
           [("source", "source"), ("destination", "destination")]
       , .assign "source_q" (.ref "child_source_q")
       , .assign "destination_q" (.ref "child_destination_q")
