@@ -68,7 +68,57 @@ design into unrelated single-clock JIT modules is not completion.
 
 ## Current status
 
-Phase 1 is in progress. The core IR, compatibility builder path, Verilog domain
-resolution, DRC, and initial two-domain lowering test are implemented on the
-feature branch. Typed elaboration and independent CppSim/JIT scheduling remain
-required before claiming true multi-domain support.
+All five phases are implemented for the audited CDC protocols used by the CVDP
+targets in this plan.
+
+| Requirement | Evidence |
+|---|---|
+| First-class domains | Registers and memories carry stable `DomainId` ownership; legacy single-clock designs use the compatibility domain. |
+| Domain safety | DRC rejects missing/duplicate domains, missing clock/reset ports, unmarked combinational crossings, same-domain CDC markers, and incomplete hierarchy maps. |
+| Typed elaboration | Concrete `Signal dom T` binders preserve their physical domain; heterogeneous outputs use `Circuit`. |
+| CDC library | Level, pulse, vector-pulse, reset synchronizer, and power-of-two asynchronous FIFO primitives lower to audited IR. |
+| Verilog | Every state element uses the owning domain's clock edge and reset contract. Async FIFO storage has a write-domain event control and FWFT read. |
+| CppSim/JIT | `tickDomain`, `evalTickDomain`, domain discovery, deterministic independent-period scheduling, hierarchy forwarding, and async-memory introspection are implemented. |
+| Parameters | Multi-domain designs retain symbolic widths and FIFO depth in native parameterized Verilog; CppSim specializes explicit parameter values. |
+| CVDP adapter | Multiple physical clock ports, heterogeneous outputs, core parameter forwarding, parameter-derived port widths, and observed internal reset outputs are preserved. |
+
+### Validation
+
+Local regression results:
+
+- `lake env lean Tests/MultiDomainIR.lean`
+- `lake exe multidomain-ir-test`: level/pulse/vector CDC, heterogeneous outputs,
+  hierarchy, and deterministic scheduling passed.
+- `lake exe async-fifo-ir-test`: 8x8 and 4x17 FIFO JIT/FWFT behavior passed.
+- `lake env lean Tests/AsyncFifoParameterizedEmit.lean`: native symbolic FIFO
+  Verilog and specialized CppSim emitted successfully.
+- `lake exe verilog-tests`, `Tests/SymbolicParameterSim.lean`,
+  `Tests/IndexedParameterSim.lean`, and `Tests/SignedHelpers.lean` passed.
+- Python prompt/adapter regression on H20: 25 tests passed.
+
+H20 simulator results:
+
+- Independent 8 ns write and 12 ns read clocks:
+  `ASYNC_FIFO_MULTICLOCK_SV_PASS` with Icarus.
+- Formal `cktarchon.run --eval-only --no-repl` CVDP replay on 2026-08-30:
+  3/3 compile, lint, and simulation pass for
+  `cvdp_copilot_cdc_pulse_synchronizer_0004`,
+  `cvdp_copilot_cdc_pulse_synchronizer_0013`, and
+  `cvdp_copilot_fifo_async_0001`.
+- This was an evaluator-only replay, so agent iterations, input tokens, and
+  output tokens were all zero. Per-task evaluator wall-clock times were
+  1.108 s, 1.743 s, and 1.095 s respectively, or 3.946 s total.
+- Standard result directory:
+  `/tmp/nl2chip_multidomain_evaluator_results_final_20260830/cktarchon_run_20260830_025833`.
+
+The CVDP replay entry files live under `Tests/CVDPEvalEntries`; copy them to
+`Generated/` with the `.fixture` suffix removed before an eval-only run. The
+authoritative problem list is `Tests/cvdp_multidomain_problem_ids.txt`.
+
+### Scope boundary
+
+This completion claim covers first-class multi-domain structure and the audited
+CDC protocols above. It does not claim analog metastability simulation,
+arbitrary unsynchronized multi-bit crossings, non-power-of-two FIFO depths, or
+automatic inference of an unknown CDC protocol from unconstrained logic. Such
+crossings remain rejected or require a new explicit primitive.

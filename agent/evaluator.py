@@ -693,6 +693,30 @@ def _cvdp_type_mentions_parameter(typ: str, params: set[str]) -> bool:
     return any(re.search(rf"\b{re.escape(param)}\b", typ or "") for param in params)
 
 
+def _cvdp_classify_local_failure(output: str, sim_logs: str = "") -> tuple[str, str]:
+    """Classify local cocotb failures before pytest's generic FAILED marker."""
+    diagnostic = output + "\n" + sim_logs
+    if re.search(
+        r"(?:command not found|No such file or directory|exit status 127|"
+        r"Unable to get version|cannot load .*shared object|failed to load|"
+        r"(?:^|\s)(?:sh|bash):[^\n]*: not found)",
+        diagnostic,
+        re.IGNORECASE | re.MULTILINE,
+    ):
+        return "sim_error", "CVDP local simulator/tool error"
+    if re.search(
+        r"(?:iverilog[^\n]*(?:syntax error|error:)|"
+        r"Command '\['iverilog'[^\n]*returned non-zero exit status|"
+        r"Unable to find the root module)",
+        diagnostic,
+        re.IGNORECASE,
+    ):
+        return "sim_error", "CVDP local Verilog compile error"
+    if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
+        return "sim_fail", "CVDP local harness failed"
+    return "sim_error", "CVDP local harness error"
+
+
 def _cvdp_expr_signal_name(expr: str) -> str | None:
     """Return the signal identifier at the root of a simple SV expression."""
     text = expr.strip()
@@ -918,6 +942,7 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
         "inputs": inputs & ports,
         "outputs": outputs,
         "params": params,
+        "assigned": assigned & ports,
     }
 
 
@@ -1064,10 +1089,34 @@ def generate_cvdp_wrapper(
             typ = sp_outputs[0][1]
         else:
             typ = "logic"
-        direction = "input" if name in usage["inputs"] else "output"
+        if name in usage["assigned"]:
+            direction = "input"
+        elif sp_match:
+            direction = sp_match[0]
+        else:
+            direction = "input" if name in usage["inputs"] else "output"
         port = (direction, _cvdp_normalize_type(typ), name)
         by_name[name] = port
         expected_ports.append(port)
+
+    parameterized_port_type_overrides: list[str] = []
+    reconciled_ports: list[tuple[str, str, str]] = []
+    for direction, typ, name in expected_ports:
+        sp_match = _cvdp_match_port(name, sparkle_ports, direction=direction)
+        if (
+            name in usage["ports"]
+            and sp_match is not None
+            and _cvdp_numeric_width(typ) == 1
+            and _cvdp_type_mentions_parameter(sp_match[1], usage["params"])
+        ):
+            core_type = _cvdp_normalize_type(sp_match[1])
+            reconciled_ports.append((direction, core_type, name))
+            parameterized_port_type_overrides.append(
+                f"benchmark port {name} inherits parameterized core type {core_type}"
+            )
+        else:
+            reconciled_ports.append((direction, typ, name))
+    expected_ports = reconciled_ports
 
     if bundled_type_by_output:
         expected_ports = [
@@ -1080,12 +1129,34 @@ def generate_cvdp_wrapper(
 
     expected_inputs = [(d, t, n) for d, t, n in expected_ports if d == "input"]
     expected_outputs = [(d, t, n) for d, t, n in expected_ports if d == "output"]
-    param_decls = _cvdp_parse_module_parameters(ref_code, usage["params"])
+    def parameter_name(decl: str) -> str | None:
+        m = re.search(r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)", decl)
+        return m.group(1) if m else None
+
+    ref_param_decls = _cvdp_parse_module_parameters(ref_code, set())
+    core_param_decls = _cvdp_parse_module_parameters(sv_code, set())
+    core_param_by_name = {
+        name: decl
+        for decl in core_param_decls
+        if (name := parameter_name(decl)) is not None
+    }
+    param_by_name = {
+        name: decl
+        for decl in ref_param_decls
+        if (name := parameter_name(decl)) is not None
+    }
+    for name in sorted(usage["params"]):
+        param_by_name.setdefault(
+            name,
+            core_param_by_name.get(name, f"parameter {name} = 1"),
+        )
+    param_decls = list(param_by_name.values())
     param_names = set(usage["params"])
     for decl in param_decls:
-        m = re.search(r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)", decl)
-        if m:
-            param_names.add(m.group(1))
+        if name := parameter_name(decl):
+            param_names.add(name)
+    core_param_names = set(core_param_by_name)
+    forwarded_params = sorted(param_names & core_param_names)
 
     wrapper_notes: list[str] = []
     if param_names:
@@ -1093,6 +1164,7 @@ def generate_cvdp_wrapper(
             "benchmark parameters exposed by wrapper: "
             + ", ".join(sorted(param_names))
         )
+    wrapper_notes.extend(parameterized_port_type_overrides)
 
     def note_fixed_width_core_port(
         sp_port: tuple[str, str, str],
@@ -1147,7 +1219,12 @@ def generate_cvdp_wrapper(
     if sp_outputs:
         lines.append("")
 
-    lines.append(f"    {sparkle_mod_name} sparkle_dut (")
+    if forwarded_params:
+        lines.append(f"    {sparkle_mod_name} #(")
+        lines.append(",\n".join(f"        .{name}({name})" for name in forwarded_params))
+        lines.append("    ) sparkle_dut (")
+    else:
+        lines.append(f"    {sparkle_mod_name} sparkle_dut (")
     inst_conns = []
     for d, _, sn in sparkle_ports:
         if d == "output":
@@ -1854,9 +1931,18 @@ class Evaluator:
         tail = "\n".join(output.splitlines()[-40:])
         if proc.returncode == 0:
             return "sim_pass", 0, "CVDP local harness passed"
-        if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
-            return "sim_fail", -1, f"CVDP local harness failed:\n{tail[:1200]}"
-        return "sim_error", -1, f"CVDP local harness error:\n{tail[:1200]}"
+
+        sim_logs = []
+        for log_path in rundir.glob("**/sim.log"):
+            try:
+                sim_logs.append(log_path.read_text(errors="replace"))
+            except OSError:
+                pass
+        diagnostic = output + "\n" + "\n".join(sim_logs)
+        diagnostic_tail = "\n".join(diagnostic.splitlines()[-40:])
+        status, label = _cvdp_classify_local_failure(output, "\n".join(sim_logs))
+        failure_tail = diagnostic_tail if status == "sim_error" else tail
+        return status, -1, f"{label}:\n{failure_tail[:1200]}"
 
     def _run_sim_resbench(
         self, prob_id: str, sv_code: str,

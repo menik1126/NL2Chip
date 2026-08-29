@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "agent"))
 
 from dataset import ProblemInfo  # noqa: E402
-from evaluator import generate_cvdp_wrapper  # noqa: E402
+from evaluator import _cvdp_classify_local_failure, generate_cvdp_wrapper  # noqa: E402
 from search import format_benchmark_interface_contract  # noqa: E402
 
 
@@ -188,3 +188,189 @@ def test_cvdp_wrapper_notes_fixed_width_core_for_parameterized_port():
     assert wrapper is not None
     assert "Sparkle core port _gen_data_in has fixed type logic [7:0]" in wrapper
     assert "benchmark port data_in is parameterized as logic [WIDTH-1:0]" in wrapper
+
+
+def test_cvdp_wrapper_forwards_parameters_supported_by_core():
+    wrapper = generate_cvdp_wrapper(
+        design_name="dut",
+        sparkle_mod_name="sparkle_inner",
+        sparkle_ports=[
+            ("input", "logic [WIDTH-1:0]", "_gen_data_in"),
+            ("output", "logic [WIDTH-1:0]", "data_out"),
+        ],
+        ref_code="""
+        module dut #(
+            parameter WIDTH = 8,
+            parameter DEPTH = 4
+        ) (
+            input logic [WIDTH-1:0] data_in,
+            output logic [WIDTH-1:0] data_out
+        );
+        endmodule
+        """,
+        harness_files={
+            "src/test.py": """
+            runner.build(parameters={"WIDTH": WIDTH, "DEPTH": DEPTH})
+            dut.data_in.value = 0
+            assert int(dut.data_out.value) == 0
+            """,
+        },
+        sv_code="""
+        module sparkle_inner #(
+            parameter integer WIDTH = 8,
+            parameter integer DEPTH = 4
+        ) (
+            input logic [WIDTH-1:0] _gen_data_in,
+            output logic [WIDTH-1:0] data_out
+        );
+        endmodule
+        """,
+    )
+
+    assert wrapper is not None
+    assert "sparkle_inner #(\n" in wrapper
+    assert ".DEPTH(DEPTH)" in wrapper
+    assert ".WIDTH(WIDTH)" in wrapper
+
+
+def test_cvdp_wrapper_inherits_missing_parameter_default_from_core():
+    wrapper = generate_cvdp_wrapper(
+        design_name="fifo_async",
+        sparkle_mod_name="sparkle_fifo",
+        sparkle_ports=[
+            ("input", "logic [DATA_WIDTH-1:0]", "_gen_w_data"),
+            ("output", "logic [DATA_WIDTH-1:0]", "r_data"),
+        ],
+        ref_code="module fifo_async(input logic w_data, output logic r_data); endmodule",
+        harness_files={
+            "src/test.py": """
+            runner.build(parameters={"DATA_WIDTH": DATA_WIDTH, "DEPTH": DEPTH})
+            dut.w_data.value = 0
+            assert int(dut.r_data.value) == 0
+            """,
+        },
+        sv_code="""
+        module sparkle_fifo #(
+            parameter integer DATA_WIDTH = 32,
+            parameter integer DEPTH = 8
+        ) (
+            input logic [DATA_WIDTH-1:0] _gen_w_data,
+            output logic [DATA_WIDTH-1:0] r_data
+        );
+        endmodule
+        """,
+    )
+
+    assert wrapper is not None
+    assert "parameter DATA_WIDTH = 32" in wrapper
+    assert "parameter DEPTH = 8" in wrapper
+
+
+def test_cvdp_wrapper_inherits_parameterized_width_for_scalar_reference_port():
+    wrapper = generate_cvdp_wrapper(
+        design_name="cdc_pulse_synchronizer",
+        sparkle_mod_name="sparkle_cdc",
+        sparkle_ports=[
+            ("input", "logic [NUM_CHANNELS-1:0]", "_gen_src_pulse"),
+            ("input", "logic", "src_clock"),
+            ("input", "logic", "des_clock"),
+            ("input", "logic", "rst_in"),
+            ("output", "logic [NUM_CHANNELS-1:0]", "des_pulse"),
+        ],
+        ref_code="""
+        module cdc_pulse_synchronizer(
+            input logic src_clock,
+            input logic des_clock,
+            input logic rst_in,
+            input logic src_pulse,
+            output logic des_pulse
+        );
+        endmodule
+        """,
+        harness_files={
+            "src/test_runner.py": """
+            def test_runner(NUM_CHANNELS=4):
+                runner.build(parameters={"NUM_CHANNELS": NUM_CHANNELS})
+                dut.src_pulse.value = 1 << (NUM_CHANNELS - 1)
+                assert int(dut.des_pulse.value) >= 0
+            """,
+        },
+        sv_code="""
+        module sparkle_cdc #(
+            parameter integer NUM_CHANNELS = 8
+        ) (
+            input logic [NUM_CHANNELS-1:0] _gen_src_pulse,
+            input logic src_clock,
+            input logic des_clock,
+            input logic rst_in,
+            output logic [NUM_CHANNELS-1:0] des_pulse
+        );
+        endmodule
+        """,
+    )
+
+    assert wrapper is not None
+    assert "input logic [NUM_CHANNELS-1:0] src_pulse" in wrapper
+    assert "output logic [NUM_CHANNELS-1:0] des_pulse" in wrapper
+    assert ".NUM_CHANNELS(NUM_CHANNELS)" in wrapper
+    assert "benchmark port src_pulse inherits parameterized core type" in wrapper
+
+
+def test_cvdp_local_failure_classification_separates_infra_and_semantics():
+    tool_status, tool_label = _cvdp_classify_local_failure(
+        "FAILED test_runner.py::test_runner",
+        "sh: /toolcache/ivl/ivlpp: not found\nexit status 127",
+    )
+    compile_status, compile_label = _cvdp_classify_local_failure(
+        "Command '['iverilog', 'dut.sv']' returned non-zero exit status 1",
+        "dut.sv:12: syntax error",
+    )
+    functional_status, functional_label = _cvdp_classify_local_failure(
+        "FAILED test_runner.py::test_runner\nAssertionError: expected 3, got 2"
+    )
+
+    assert (tool_status, tool_label) == (
+        "sim_error",
+        "CVDP local simulator/tool error",
+    )
+    assert (compile_status, compile_label) == (
+        "sim_error",
+        "CVDP local Verilog compile error",
+    )
+    assert (functional_status, functional_label) == (
+        "sim_fail",
+        "CVDP local harness failed",
+    )
+
+
+def test_cvdp_wrapper_treats_observed_internal_reset_as_core_output():
+    wrapper = generate_cvdp_wrapper(
+        design_name="cdc",
+        sparkle_mod_name="sparkle_cdc",
+        sparkle_ports=[
+            ("input", "logic", "rst_in"),
+            ("output", "logic", "rst_src_sync"),
+        ],
+        ref_code="""
+        module cdc(input logic rst_in);
+          logic rst_src_sync;
+        endmodule
+        """,
+        harness_files={
+            "src/test.py": """
+            dut.rst_in.value = 1
+            await FallingEdge(dut.rst_src_sync)
+            """,
+        },
+        sv_code="""
+        module sparkle_cdc(
+            input logic rst_in,
+            output logic rst_src_sync
+        );
+        endmodule
+        """,
+    )
+
+    assert wrapper is not None
+    assert "output logic rst_src_sync" in wrapper
+    assert "assign rst_src_sync = rst_src_sync_wire;" in wrapper

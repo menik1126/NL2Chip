@@ -128,6 +128,20 @@ partial def specializeStmt
       (← specializeExpr bindings indices writeEnable)
       (← specializeExpr bindings indices readAddr)
       readData comboRead]
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData
+      writeEnable readDomain readAddr readData => do
+    let concreteAddr ← requireDimension bindings
+      s!"async memory '{name}' address width" addrWidth
+    let concreteData ← requireDimension bindings
+      s!"async memory '{name}' data width" dataWidth
+    if concreteAddr == 0 || concreteData == 0 then
+      throw s!"async memory '{name}' specializes to a zero dimension"
+    return [.asyncMemory name (.literal concreteAddr) (.literal concreteData)
+      writeDomain
+      (← specializeExpr bindings indices writeAddr)
+      (← specializeExpr bindings indices writeData)
+      (← specializeExpr bindings indices writeEnable)
+      readDomain (← specializeExpr bindings indices readAddr) readData]
   | .inst moduleName instName connections parameterBindings domainMap => do
     for (name, dimension) in parameterBindings do
       let _ ← requireDimension bindings s!"instance '{instName}' parameter '{name}'" dimension

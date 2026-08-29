@@ -21,6 +21,7 @@ def findDriver (body : List Stmt) (wireName : String) : Option Stmt :=
     | .cdc output .. => output == wireName
     | .register output .. => output == wireName
     | .memory (readData := rd) .. => rd == wireName
+    | .asyncMemory (readData := rd) .. => rd == wireName
     | .inst _ instName _ _ _ => instName == wireName
 
 private def declaredDomain? (m : Module) (name : String) : Option DomainId :=
@@ -42,6 +43,7 @@ partial def inferExprDomains (m : Module) (expr : Expr)
           | some (.cdc _ _ destDomain _ _) => [destDomain]
           | some (.register _ domain _ _ _) => [domain]
           | some (.memory (domain := domain) ..) => [domain]
+          | some (.asyncMemory (readDomain := domain) ..) => [domain]
           | _ => []
         (declared ++ driven).eraseDups
   | .op _ args | .concat args =>
@@ -94,6 +96,12 @@ def checkDomainFlows (m : Module) : List String :=
         expectedDomainIssues m s!"memory '{name}' write data" domain writeData ++
         expectedDomainIssues m s!"memory '{name}' write enable" domain writeEnable ++
         expectedDomainIssues m s!"memory '{name}' read address" domain readAddr
+    | .asyncMemory name _ _ writeDomain writeAddr writeData writeEnable
+        readDomain readAddr _ =>
+        expectedDomainIssues m s!"async memory '{name}' write address" writeDomain writeAddr ++
+        expectedDomainIssues m s!"async memory '{name}' write data" writeDomain writeData ++
+        expectedDomainIssues m s!"async memory '{name}' write enable" writeDomain writeEnable ++
+        expectedDomainIssues m s!"async memory '{name}' read address" readDomain readAddr
     | .inst .. => []
   bodyIssues.eraseDups
 
@@ -109,6 +117,8 @@ def checkClockDomains (m : Module) : List String :=
       | .cdc _ sourceDomain destDomain _ _ => [sourceDomain, destDomain]
       | .register _ domain _ _ _ => [domain]
       | .memory _ _ _ domain _ _ _ _ _ _ => [domain]
+      | .asyncMemory _ _ _ writeDomain _ _ _ readDomain _ _ =>
+          [writeDomain, readDomain]
       | _ => []
     domains.filterMap fun domain =>
       if m.findClockDomain? domain |>.isSome then none
@@ -118,6 +128,10 @@ def checkClockDomains (m : Module) : List String :=
     | .cdc _ sourceDomain destDomain _ _ =>
         if sourceDomain == destDomain then
           some s!"[DRC] Module '{m.name}': CDC source and destination are both '{sourceDomain}'"
+        else none
+    | .asyncMemory name _ _ writeDomain _ _ _ readDomain _ _ =>
+        if writeDomain == readDomain then
+          some s!"[DRC] Module '{m.name}': async memory '{name}' uses the same write/read domain '{writeDomain}'"
         else none
     | _ => none
   let ports := m.inputs ++ m.outputs
@@ -211,7 +225,7 @@ def checkInstanceDomains (design : Design) : List String :=
 def checkDesignClockDomains (design : Design) : List String :=
   (design.modules.flatMap checkClockDomains ++ checkInstanceDomains design).eraseDups
 
-/-- Check that all output ports are driven by registers or synchronous memory reads.
+/-- Check that all output ports are driven by registers or stateful memory primitives.
     Returns a list of warning strings for violations. -/
 def checkRegisteredOutputs (m : Module) : List String :=
   m.outputs.filterMap fun port =>
@@ -232,6 +246,7 @@ def checkRegisteredOutputs (m : Module) : List String :=
           match findDriver m.body wireName with
           | some (.register ..) => none  -- Registered output, pass
           | some (.memory (comboRead := false) ..) => none  -- Synchronous memory read, pass
+          | some (.asyncMemory ..) => none  -- Explicit FWFT async-memory read, pass
           | _ => some s!"[DRC] Module '{m.name}': output '{port.name}' is not driven by a register (driven by wire '{wireName}')"
         | _ => some s!"[DRC] Module '{m.name}': output '{port.name}' is driven by combinational logic"
       | _ => none  -- unreachable

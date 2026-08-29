@@ -262,6 +262,18 @@ inductive Stmt where
       (readData : String)     -- Read data output wire
       (comboRead : Bool := false) -- Combinational (same-cycle) read
       : Stmt
+  | asyncMemory
+      (name : String)             -- Shared storage instance name
+      (addrWidth : DimExpr)       -- Address width (depth = 2^addrWidth)
+      (dataWidth : DimExpr)       -- Packed word width
+      (writeDomain : DomainId)    -- Domain owning the write port
+      (writeAddr : Expr)
+      (writeData : Expr)
+      (writeEnable : Expr)
+      (readDomain : DomainId)     -- Domain owning read address/output provenance
+      (readAddr : Expr)
+      (readData : String)         -- Asynchronous/FWFT read output
+      : Stmt
   | inst
       (moduleName : String)   -- Name of module to instantiate
       (instName : String)     -- Instance name
@@ -288,6 +300,11 @@ partial def toString : Stmt → String
       let readKind := if comboRead then "combo_read" else "read"
       s!"memory {name}[2^{addrWidth}][{dataWidth}] @domain({domain}) " ++
       s!"write({writeAddr}, {writeData}, {writeEnable}) {readKind}({readAddr}) => {readData}"
+  | asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData writeEnable
+      readDomain readAddr readData =>
+      s!"async-memory {name}[2^{addrWidth}][{dataWidth}] " ++
+      s!"write@{writeDomain}({writeAddr}, {writeData}, {writeEnable}) " ++
+      s!"read@{readDomain}({readAddr}) => {readData}"
   | inst modName instName conns parameterBindings domainMap =>
       let parameterStr := if parameterBindings.isEmpty then "" else
         let bindings := parameterBindings.map fun (name, value) => s!".{name}({value})"

@@ -465,6 +465,46 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
           , s!"        {addrLatch} = 0;" ]
       , evalTickLocals := [] }
 
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData writeEnable
+      _readDomain readAddr readData =>
+    let addrWidth := requireConcreteDim "async memory address width" addrWidth
+    let dataWidth := requireConcreteDim "async memory data width" dataWidth
+    let memSize := 2 ^ addrWidth
+    let elemType := emitCppType (.bitVector dataWidth)
+    let memName := sanitizeName name
+    let rdName := sanitizeName readData
+    let writeAddrName := s!"{memName}_write_addr_next"
+    let writeDataName := s!"{memName}_write_data_next"
+    let writeEnableName := s!"{memName}_write_enable_next"
+    let addrType := emitCppType (.bitVector addrWidth)
+    let memDecl :=
+      "    std::array<" ++ elemType ++ ", " ++ toString memSize ++ "> " ++ memName ++ ";"
+    let rdInTypeMap := typeMap.any fun (n, _) => sanitizeName n == rdName
+    let rdDecl := if rdInTypeMap then [] else [s!"    {elemType} {rdName};"]
+    let writeStmt :=
+      s!"        if ({writeEnableName}) " ++
+      s!"{memName}[{writeAddrName}] = {writeDataName};"
+    { declarations := [memDecl] ++ rdDecl ++
+        [ s!"    {addrType} {writeAddrName};"
+        , s!"    {elemType} {writeDataName};"
+        , s!"    uint8_t {writeEnableName};"
+        ]
+    , evalBody :=
+        [ s!"        {writeAddrName} = {emitExpr typeMap writeAddr};"
+        , s!"        {writeDataName} = {emitExpr typeMap writeData};"
+        , s!"        {writeEnableName} = {emitExpr typeMap writeEnable};"
+        , s!"        {rdName} = {memName}[{emitExpr typeMap readAddr}];"
+        ]
+    , tickBody := [writeStmt]
+    , domainTicks := [(writeDomain, writeStmt)]
+    , resetBody :=
+        [ s!"        {memName}.fill(0);"
+        , s!"        {writeAddrName} = 0;"
+        , s!"        {writeDataName} = 0;"
+        , s!"        {writeEnableName} = 0;"
+        ]
+    , evalTickLocals := [] }
+
   | .inst moduleName instName connections parameterBindings domainMap =>
     if !parameterBindings.isEmpty then
       panic! s!"CppSim requires specialization of parameterized instance '{instName}'"
@@ -530,6 +570,10 @@ def collectTickRefWires (body : List Stmt) : List String :=
       -- Non-combo-read: tick() assigns rd and references readAddr exprs
       let refs := if !cr then refs ++ collectExprRefs ra ++ [rd] else refs
       acc ++ refs.map sanitizeName
+    | .asyncMemory _ _ _ _ wa wd we _ ra rd =>
+      let refs := collectExprRefs wa ++ collectExprRefs wd ++ collectExprRefs we ++
+        collectExprRefs ra ++ [rd]
+      acc ++ refs.map sanitizeName
     | _ => acc
   ) []
 
@@ -573,7 +617,9 @@ def emitModule (m : Module) (design : Option Design := none)
           sn.startsWith "_gen_" || tickRefs.contains sn
     -- Collect memory names to avoid declaring them as local scalars
     let memoryNames := m.body.filterMap fun s => match s with
-      | .memory name _ _ _ _ _ _ _ _ _ => some (sanitizeName name) | _ => none
+      | .memory name _ _ _ _ _ _ _ _ _ => some (sanitizeName name)
+      | .asyncMemory name .. => some (sanitizeName name)
+      | _ => none
     let localWires := match observableWires with
       | some ws => internalWires.filter fun (w : Port) =>
           let sn := sanitizeName w.name
@@ -710,6 +756,9 @@ private def collectMemories (body : List Stmt) : List (String × Nat × Nat) :=
     | .memory name addrWidth dataWidth .. =>
       some (name, requireConcreteDim "memory address width" addrWidth,
         requireConcreteDim "memory data width" dataWidth)
+    | .asyncMemory name addrWidth dataWidth .. =>
+      some (name, requireConcreteDim "async memory address width" addrWidth,
+        requireConcreteDim "async memory data width" dataWidth)
     | _ => none
 
 /-- Collect (sanitizedName, width) for all registers ≤64 bits -/
@@ -744,11 +793,9 @@ private def emitRegNameSwitch (regs : List (String × Nat)) : String :=
     s!"            case {i}: return \"{sName}\";"
   String.intercalate "\n" cases
 
-/-- Generate set_input switch cases from Module.inputs (skip clk only) -/
+/-- Generate set_input switch cases from the already-filtered user inputs. -/
 private def emitSetInputSwitch (inputs : List Port) : String :=
-  let userInputs := inputs.filter fun (p : Port) =>
-    p.name != "clk"
-  let indexed := (List.range userInputs.length).zip userInputs
+  let indexed := (List.range inputs.length).zip inputs
   let cases := indexed.map fun (i, p) =>
     let sName := sanitizeName p.name
     let cppType := emitCppType p.ty
@@ -852,7 +899,7 @@ def toCppSimJIT (d : Design)
       !domainPortNames.contains p.name
     let numInputs := userInputs.length
     let numOutputs := countOutputSlots m.outputs
-    let setInputCases := emitSetInputSwitch m.inputs
+    let setInputCases := emitSetInputSwitch userInputs
     let getOutputCases := emitGetOutputSwitch m.outputs
     let (wireSwitch, numWires) := emitGetWireSwitch m.wires observableWires
     let wireNameSwitch := emitWireNameSwitch m.wires observableWires

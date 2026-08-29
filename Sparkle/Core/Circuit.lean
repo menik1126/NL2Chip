@@ -22,12 +22,24 @@ inductive Output where
 /-- A synthesizable top-level interface with independently-owned outputs. -/
 structure Circuit where
   outputs : List Output
+  deriving Inhabited
 
 namespace Circuit
 
 def empty : Circuit := { outputs := [] }
 
 def ofOutputs (outputs : List Output) : Circuit := { outputs }
+
+/-- A first-class asynchronous FIFO component. Synthesis lowers this marker to
+    binary/Gray pointers, audited pointer synchronizers, independent write/read
+    state, and an explicit dual-domain asynchronous-read memory. `depth` must
+    be a power of two of at least two. -/
+opaque asyncFifo {writeDomain readDomain : DomainConfig} {dataWidth : Nat}
+    (depth : Nat)
+    (writeFullName readDataName readEmptyName : String)
+    (writeIncrement : Signal writeDomain Bool)
+    (writeData : Signal writeDomain (BitVec dataWidth))
+    (readIncrement : Signal readDomain Bool) : Circuit
 
 end Circuit
 

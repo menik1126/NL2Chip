@@ -191,6 +191,8 @@ partial def countAllUses (stmts : List Stmt)
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
+    | .asyncMemory _ _ _ _ wa wd we _ ra _ =>
+      [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
     | .inst _ _ conns _ _ =>
       conns.foldl (fun acc (_, e) => countExprUses e acc) counts
   ) initial
@@ -209,6 +211,10 @@ partial def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
     .memory name aw dw clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
       (optimizeExpr dm wm we) (optimizeExpr dm wm ra) rd cr
+  | .asyncMemory name aw dw writeDomain wa wd we readDomain ra rd =>
+    .asyncMemory name aw dw writeDomain
+      (optimizeExpr dm wm wa) (optimizeExpr dm wm wd) (optimizeExpr dm wm we)
+      readDomain (optimizeExpr dm wm ra) rd
   | .inst modName instName conns parameterBindings domainMap =>
     .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e))
       parameterBindings domainMap
@@ -249,6 +255,12 @@ partial def substituteStmt (dm : DefMap) (inlinable : HashMap String Bool) : Stm
     .memory name aw dw clk
       (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
       (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
+  | .asyncMemory name aw dw writeDomain wa wd we readDomain ra rd =>
+    .asyncMemory name aw dw writeDomain
+      (substituteExpr dm inlinable 100 wa)
+      (substituteExpr dm inlinable 100 wd)
+      (substituteExpr dm inlinable 100 we)
+      readDomain (substituteExpr dm inlinable 100 ra) rd
   | .inst modName instName conns parameterBindings domainMap =>
     .inst modName instName
       (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
@@ -271,6 +283,7 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
   let memoryReadData := body.foldl (fun s stmt =>
     match stmt with
     | .memory _ _ _ _ _ _ _ _ rd _ => s.insert rd true
+    | .asyncMemory _ _ _ _ _ _ _ _ _ rd => s.insert rd true
     | _ => s
   ) ({} : HashMap String Bool)
 

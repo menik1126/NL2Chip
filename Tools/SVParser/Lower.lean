@@ -1602,6 +1602,14 @@ partial def prefixStmtNames (pfx : String) (nameSet : List String) : Stmt → St
         (prefixExprNames pfx nameSet writeEnable)
         (prefixExprNames pfx nameSet readAddr)
         s!"{pfx}_{readData}" comboRead
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData
+      writeEnable readDomain readAddr readData =>
+      .asyncMemory s!"{pfx}_{name}" addrWidth dataWidth s!"{pfx}_{writeDomain}"
+        (prefixExprNames pfx nameSet writeAddr)
+        (prefixExprNames pfx nameSet writeData)
+        (prefixExprNames pfx nameSet writeEnable)
+        s!"{pfx}_{readDomain}" (prefixExprNames pfx nameSet readAddr)
+        s!"{pfx}_{readData}"
 
 /-- Flatten a design: inline all sub-module instantiations into a single module.
     The optional `svDesign` parameter provides access to the original SV AST
@@ -1658,7 +1666,9 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
           -- Collect all internal names in sub-module (including memory names)
           let memNames := effectiveSubMod.body.filterMap fun s => match s with
-            | .memory n _ _ _ _ _ _ _ _ _ => some n | _ => none
+            | .memory n _ _ _ _ _ _ _ _ _ => some n
+            | .asyncMemory n .. => some n
+            | _ => none
           let subNames := effectiveSubMod.wires.map (·.name) ++
                           effectiveSubMod.inputs.map (·.name) ++
                           effectiveSubMod.outputs.map (·.name) ++
@@ -1706,7 +1716,9 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
     let regNames := flatBody.filterMap fun s => match s with
       | .register n _ _ _ _ => some n | _ => none
     let memNames := flatBody.filterMap fun s => match s with
-      | .memory n _ _ _ _ _ _ _ _ _ => some n | _ => none
+      | .memory n _ _ _ _ _ _ _ _ _ => some n
+      | .asyncMemory n .. => some n
+      | _ => none
     let internalWireNames := flatWires.map (·.name) |>.filter fun n =>
       !(portNames.any (· == n)) && !(regNames.any (· == n)) && !(memNames.any (· == n))
     let addGen (n : String) : String :=
@@ -1761,6 +1773,13 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
             (genExprRefs wireNames writeData)
             (genExprRefs wireNames writeEnable)
             (genExprRefs wireNames readAddr) readData comboRead
+      | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData
+          writeEnable readDomain readAddr readData =>
+          .asyncMemory name addrWidth dataWidth writeDomain
+            (genExprRefs wireNames writeAddr)
+            (genExprRefs wireNames writeData)
+            (genExprRefs wireNames writeEnable)
+            readDomain (genExprRefs wireNames readAddr) readData
 
 /-- Lower a full SV design to Sparkle IR -/
 def lowerDesign (svDesign : SVDesign) : Except String Design := do

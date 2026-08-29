@@ -1622,6 +1622,7 @@ def build_sim_feedback(
         "### Repair Guidance",
         "- If Lean compile failed, fix the Lean type/API error first.",
         "- If Verilog compile failed, inspect generated module names, ports, widths, signedness, and reset/clock wiring.",
+        "- If the benchmark has multiple physical clocks, use concrete DomainConfig values, a Circuit top, and audited CDC primitives; do not model clocks as ordinary Signal inputs or collapse domains.",
         "- If RTL simulation mismatched, compare the current behavior against the natural language spec, reference/interface context, and testbench expectations.",
         "- Keep the target module interface stable. Do not edit benchmark testbenches or reference files.",
         "- Stop when the candidate compiles, extracts SystemVerilog, and passes RTL simulation.",

@@ -134,6 +134,9 @@ def test_system_prompt_contains_sparkle_hazard_rules():
     assert "avoid Lean `||` and `&&` over signals" in prompt
     assert "do not destructure with `let (a, b) := ...`" in prompt
     assert "Do not use `bundleAll!` to build a packed bit-vector result" in prompt
+    assert "Signal.synchronizePulse" in prompt
+    assert "Circuit.asyncFifo" in prompt
+    assert "#synthesizeParameterizedVerilog" in prompt
 
 
 def test_clear_generated_target_backs_up_stale_file(tmp_path: Path):

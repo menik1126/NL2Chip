@@ -1,0 +1,6 @@
+import Tests.CVDPMultiDomainTargets
+import Sparkle.Compiler.Elab
+
+#synthesizeParameterizedVerilog
+  Tests.CVDPMultiDomainTargets.fifoAsync0001
+  [DATA_WIDTH := 32, DEPTH := 8]

@@ -29,6 +29,7 @@ import Sparkle.Compiler.Elab
 
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
+open Sparkle.Core.Circuit
 open Sparkle.Library.RTL
 
 /-- <one-line description> -/
@@ -44,6 +45,13 @@ def <target_module> {dom : DomainConfig}
 - `Signal dom Bool` is a hardware condition signal.
 - Clock/reset are implicit in `DomainConfig`; do not add clock/reset ports unless the benchmark spec has explicit user-visible ports.
 - Multi-output Sparkle functions return tuple signals, e.g. `Signal dom (BitVec 8 × BitVec 1)` with `bundle2`.
+
+## First-Class Multi-Domain Circuits
+- If the specification has two or more physical clocks, define one concrete `DomainConfig` per clock. Set `clockName`, `resetName`, `activeEdge`, and `resetKind` to the benchmark contract. Do not pass clocks as ordinary `Signal` arguments and do not collapse them into one domain.
+- Return `Circuit` when public outputs belong to different domains. Name outputs with `Circuit.ofOutputs`, `.bool`, and `.bits`; these names become SystemVerilog ports.
+- Use audited crossings only: `Signal.synchronizeLevel`, `Signal.synchronizePulse`, `Signal.synchronizePulseVector`, and `Signal.resetSynchronizer`.
+- For a power-of-two asynchronous FIFO, use `Circuit.asyncFifo DEPTH "w_full" "r_data" "r_empty" w_inc w_data r_inc`; it lowers to Gray pointers, two-stage pointer CDC, and dual-domain FWFT storage.
+- For retained parameters, use `#synthesizeParameterizedVerilog <target> [WIDTH := <legal-default>, DEPTH := <legal-default>]`. Do not specialize a parameter sweep to one fixed width.
 
 ## Stable Sparkle Operators
 - Bitwise/arithmetic: `~~~a`, `a &&& b`, `a ||| b`, `a ^^^ b`, `a + b`, `a - b`, `a * b`.
@@ -167,7 +175,7 @@ def build_system_prompt(skill: str, prob_id: str, info: Any | None = None) -> st
     if design_name:
         design_rule = (
             f"- The output file is `Generated/{prob_id}.lean`, but the Lean function/top module must be `{design_name}`.\n"
-            f"- Use `#synthesizeVerilog {design_name}`. Do not name the synthesized function `{prob_id}` unless the problem explicitly says that is the target module.\n"
+            f"- Use `#synthesizeVerilog {design_name}`, or `#synthesizeParameterizedVerilog {design_name} [...]` when retaining benchmark parameters. Do not name the synthesized function `{prob_id}` unless the problem explicitly says that is the target module.\n"
         )
     return (
         COMPACT_SPARKLE_GENERATION_SKILL.rstrip()
@@ -179,6 +187,7 @@ def build_system_prompt(skill: str, prob_id: str, info: Any | None = None) -> st
         + "- For CVDP parameters, inspect the listed sweep values and make the implementation work across those values; do not create fake Verilog parameters around a fixed-width Sparkle core.\n"
         + "- Match benchmark output names exactly. If you must return a packed output internally, construct an explicit named MSB-to-LSB concat so the CVDP wrapper can recover each output field.\n"
         + "- Preserve benchmark clock, reset polarity, and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
+        + "- If the contract lists multiple clocks, use first-class multi-domain `DomainConfig`/`Circuit` and audited CDC primitives. Never represent physical clocks as ordinary data Signals or put both domains under one implicit clock.\n"
         + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available.\n"
         + "- Keep repository exploration short: read at most three examples, then write a complete candidate and iterate from compiler feedback.\n"
         + "- This H20 host may not have `rg`; use `grep` and `find` for repository searches.\n"

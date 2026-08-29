@@ -305,6 +305,25 @@ def emitMemoryComboRead (hint : String) (addrWidth : Nat) (dataWidth : Nat) (clo
   emitMemoryComboReadDim hint (.literal addrWidth) (.literal dataWidth) clock
     writeAddr writeData writeEnable readAddr named
 
+/-- Emit shared storage with a write port in one domain and an asynchronous
+    first-word-fall-through read port owned by another domain. -/
+def emitAsyncMemory (hint : String) (addrWidth dataWidth : DimExpr)
+    (writeDomain : ClockDomain) (writeAddr writeData writeEnable : Expr)
+    (readDomain : ClockDomain) (readAddr : Expr)
+    (named : Bool := false) : CircuitM String := do
+  addClockDomain writeDomain
+  addClockDomain readDomain
+  let memName ← freshName (sanitizeName hint) named
+  let readDataName ← freshName (sanitizeName s!"{hint}_rdata") named
+  let m ← getModule
+  let m := m.addWire
+    { name := readDataName, ty := hwTypeFromDim dataWidth, domain := some readDomain.id }
+  let m := m.addStmt (.asyncMemory memName addrWidth dataWidth
+    writeDomain.id writeAddr writeData writeEnable
+    readDomain.id readAddr readDataName)
+  setModule m
+  return readDataName
+
 /--
   Emit a module instantiation.
 -/

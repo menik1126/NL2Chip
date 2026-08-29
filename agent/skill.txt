@@ -25,6 +25,7 @@ import Sparkle.Compiler.Elab
 
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
+open Sparkle.Core.Circuit
 open Sparkle.Library.RTL
 
 /-- <one-line docstring> -/
@@ -44,6 +45,35 @@ def <func_name> {dom : DomainConfig}
 - `Signal dom Bool` — 1-bit boolean signal (used for conditions)
 - `Signal dom (BitVec M × BitVec N)` — bundled multi-output (use `bundle2`)
 - Clock and reset are IMPLICIT in `DomainConfig` — do NOT add clk/reset as inputs unless the problem has an explicit user-controlled reset signal
+
+## First-Class Multi-Domain Circuits
+
+When a specification names two or more physical clocks, the single `{dom : DomainConfig}` template does not apply:
+
+- Define one concrete `DomainConfig` per clock, with the exact `clockName`, `resetName`, edge, and reset kind.
+- Clocks and domain resets are emitted from those configs; never model them as ordinary `Signal` data inputs and never collapse two clocks into one domain.
+- Use `Signal.synchronizeLevel`, `Signal.synchronizePulse`, or `Signal.synchronizePulseVector` for audited CDC crossings. Use `Signal.resetSynchronizer` for asynchronous assertion and two-cycle synchronous deassertion.
+- Return `Circuit` when outputs belong to different domains. Use `Circuit.ofOutputs` with `.bool`/`.bits` so benchmark output names remain explicit.
+- Use `Circuit.asyncFifo DEPTH "w_full" "r_data" "r_empty" w_inc w_data r_inc` for a power-of-two asynchronous FIFO with Gray pointers and FWFT read data.
+- Retain hardware parameters with `#synthesizeParameterizedVerilog target [WIDTH := 8, DEPTH := 16]`; the listed values are legal defaults, not specialization constants.
+
+Minimal multi-clock shape:
+
+```lean
+def srcDom : DomainConfig :=
+  { name := "src", clockName := "src_clock", resetName := "rst_in",
+    period := 10000, activeEdge := .rising, resetKind := .asynchronous }
+
+def dstDom : DomainConfig :=
+  { name := "dst", clockName := "des_clock", resetName := "rst_in",
+    period := 12000, activeEdge := .rising, resetKind := .asynchronous }
+
+def cdc_pulse_synchronizer (src_pulse : Signal srcDom Bool) : Circuit :=
+  let des : Signal dstDom Bool := Signal.synchronizePulse src_pulse
+  Circuit.ofOutputs [.bool "des_pulse" dstDom des]
+
+#synthesizeVerilog cdc_pulse_synchronizer
+```
 
 ## Core Operators (Signal-level, lifted)
 | Op | Meaning |
@@ -148,7 +178,7 @@ def myFSM {dom : DomainConfig}
 
 ## Critical Rules
 1. NEVER use `if ... then ... else` — use `Signal.mux` instead
-2. Clock is implicit — do NOT add `clk` as an input parameter
+2. Clock is implicit in each domain — for multiple physical clocks, define multiple concrete domains
 3. `Signal.mux cond trueVal falseVal` — true branch first, false second
 4. `Signal.loop` body MUST end with `Signal.register`
 5. For multi-output, return `Signal dom (T1 × T2)` with `bundle2`

@@ -1,0 +1,6 @@
+import Tests.CVDPMultiDomainTargets
+import Sparkle.Compiler.Elab
+
+#synthesizeParameterizedVerilog
+  Tests.CVDPMultiDomainTargets.cdcPulseSynchronizer0013
+  [NUM_CHANNELS := 8]

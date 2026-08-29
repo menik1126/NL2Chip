@@ -94,6 +94,55 @@ def explicitCrossingModule : Module :=
 
 #guard checkClockDomains explicitCrossingModule == []
 
+def asyncMemoryModule : Module :=
+  { testModule with
+    name := "multi_domain_async_memory"
+    inputs := testModule.inputs ++
+      [ { name := "wr_addr", ty := .bitVector 3, domain := some "write" }
+      , { name := "wr_enable", ty := .bit, domain := some "write" }
+      , { name := "rd_addr", ty := .bitVector 3, domain := some "read" }
+      ]
+    wires := testModule.wires ++
+      [{ name := "storage_data", ty := .bitVector 8, domain := some "read" }]
+    body :=
+      [ .asyncMemory "dual_domain_storage" (.literal 3) (.literal 8)
+          "write" (.ref "wr_addr") (.ref "wr_data") (.ref "wr_enable")
+          "read" (.ref "rd_addr") "storage_data"
+      ]
+  }
+
+#guard checkClockDomains asyncMemoryModule == []
+
+def asyncMemoryVerilog : String := toVerilog asyncMemoryModule
+
+#guard asyncMemoryVerilog.contains "logic [7:0] dual_domain_storage [0:7]"
+#guard asyncMemoryVerilog.contains "assign storage_data = dual_domain_storage[rd_addr]"
+#guard asyncMemoryVerilog.contains "always_ff @(posedge wr_clk)"
+
+def sameDomainAsyncMemoryModule : Module :=
+  { asyncMemoryModule with
+    body :=
+      [ .asyncMemory "dual_domain_storage" (.literal 3) (.literal 8)
+          "write" (.ref "wr_addr") (.ref "wr_data") (.ref "wr_enable")
+          "write" (.ref "wr_addr") "storage_data"
+      ]
+  }
+
+#guard (checkClockDomains sameDomainAsyncMemoryModule).any
+  (fun issue => issue.contains "uses the same write/read domain")
+
+def invalidAsyncMemoryFlowModule : Module :=
+  { asyncMemoryModule with
+    body :=
+      [ .asyncMemory "dual_domain_storage" (.literal 3) (.literal 8)
+          "write" (.ref "wr_addr") (.ref "rd_data") (.ref "wr_enable")
+          "read" (.ref "rd_addr") "storage_data"
+      ]
+  }
+
+#guard (checkClockDomains invalidAsyncMemoryFlowModule).any
+  (fun issue => issue.contains "write data" && issue.contains "belongs to domain 'write'")
+
 def hierarchyConnections : List (String × Expr) :=
   [ ("wr_clk", .ref "wr_clk")
   , ("wr_rst", .ref "wr_rst")

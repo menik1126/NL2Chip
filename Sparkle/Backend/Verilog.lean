@@ -252,6 +252,29 @@ partial def emitStmt (stmt : Stmt) (domains : List ClockDomain)
           else ""
         memDecl ++ assignRead ++ "\n" ++ alwaysBlock
 
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData writeEnable
+      _readDomain readAddr readData =>
+    let lastAddress := match addrWidth.toNat? with
+      | some width => s!"{(2 ^ width) - 1}"
+      | none => s!"((2 ** {emitDimExpr addrWidth}) - 1)"
+    let memDecl :=
+      s!"{indent}{emitType (hwTypeFromDim dataWidth)} {sanitizeName name} [0:{lastAddress}];"
+    let asyncRead :=
+      s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
+    match domains.find? (fun domain => domain.id == writeDomain) with
+    | none =>
+        memDecl ++ "\n" ++ asyncRead ++ "\n" ++
+        s!"{indent}/* ERROR: unknown async-memory write domain '{writeDomain}' */"
+    | some domain =>
+        let edge := emitDomainEdge domain
+        let writeBlock :=
+          s!"{indent}always_ff @({edge}) begin\n" ++
+          s!"{indent}    if ({emitExpr writeEnable}) begin\n" ++
+          s!"{indent}        {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
+          s!"{indent}    end\n" ++
+          s!"{indent}end"
+        memDecl ++ "\n" ++ asyncRead ++ "\n" ++ writeBlock
+
   | .inst moduleName instName connections parameterBindings _domainMap =>
     let parameterOverrides := if parameterBindings.isEmpty then "" else
       let bindings := parameterBindings.map fun (name, value) =>

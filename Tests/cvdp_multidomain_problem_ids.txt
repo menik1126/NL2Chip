@@ -1,0 +1,3 @@
+cvdp_copilot_cdc_pulse_synchronizer_0004
+cvdp_copilot_cdc_pulse_synchronizer_0013
+cvdp_copilot_fifo_async_0001

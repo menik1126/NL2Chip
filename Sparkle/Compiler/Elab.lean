@@ -250,6 +250,17 @@ def emitMemoryComboReadDim (hint : String) (addrWidth dataWidth : DimExpr) (clk 
   set cs'
   return name
 
+def emitAsyncMemory (hint : String) (addrWidth dataWidth : DimExpr)
+    (writeDomain : ClockDomain)
+    (writeAddr writeData writeEnable : Sparkle.IR.AST.Expr)
+    (readDomain : ClockDomain) (readAddr : Sparkle.IR.AST.Expr)
+    (named : Bool := false) : CompilerM String := do
+  let cs ← get
+  let (name, cs') := CircuitM.emitAsyncMemory hint addrWidth dataWidth
+    writeDomain writeAddr writeData writeEnable readDomain readAddr named cs
+  set cs'
+  return name
+
 def emitInstance (moduleName : String) (instName : String)
     (connections : List (String × Sparkle.IR.AST.Expr))
     (domainMap : List (Sparkle.IR.AST.DomainId × Sparkle.IR.AST.DomainId) := [])
@@ -2639,6 +2650,155 @@ mutual
       | .const name _ => return name
       | _ => CompilerM.liftMetaM $ throwError s!"Could not identify primitive in lambda body: {e}"
 
+  /-- Lower the first-class asynchronous FIFO component to ordinary domain
+      registers, audited Gray-pointer crossings, and an async-memory IR node. -/
+  partial def translateAsyncFifoCircuit (args : Array Lean.Expr) : CompilerM Unit := do
+    if args.size < 7 then
+      CompilerM.liftMetaM $ throwError "Circuit.asyncFifo has malformed arguments"
+    let depthExpr := args[args.size - 7]!
+    let writeFullName ← extractStringLiteral args[args.size - 6]!
+    let readDataName ← extractStringLiteral args[args.size - 5]!
+    let readEmptyName ← extractStringLiteral args[args.size - 4]!
+    let writeIncrement := args[args.size - 3]!
+    let writeData := args[args.size - 2]!
+    let readIncrement := args.back!
+
+    let depth ← extractDimExpr depthExpr
+    let compilerState ← CompilerM.getCompilerState
+    let defaultDepth ← match depth.evaluate compilerState.parameterDefaults with
+      | some value => pure value
+      | none => CompilerM.liftMetaM $ throwError
+          s!"Cannot evaluate the default async FIFO depth '{depth}'"
+    if defaultDepth < 2 || !Nat.isPowerOfTwo defaultDepth then
+      CompilerM.liftMetaM $ throwError
+        s!"Circuit.asyncFifo depth must be a power of two of at least two, got {defaultDepth}"
+
+    let writeIncrementType ← CompilerM.liftMetaM (inferType writeIncrement)
+    let writeDataType ← CompilerM.liftMetaM (inferType writeData)
+    let readIncrementType ← CompilerM.liftMetaM (inferType readIncrement)
+    let writeDomain ← inferClockDomainFromSignal writeIncrementType
+    let writeDataDomain ← inferClockDomainFromSignal writeDataType
+    let readDomain ← inferClockDomainFromSignal readIncrementType
+    if writeDomain.id != writeDataDomain.id then
+      CompilerM.liftMetaM $ throwError
+        "Circuit.asyncFifo write increment and write data must share one domain"
+    if writeDomain.id == readDomain.id then
+      CompilerM.liftMetaM $ throwError
+        "Circuit.asyncFifo requires distinct write and read domains"
+
+    let dataType ← inferHWTypeFromSignal writeDataType
+    let dataWidth := dataType.bitWidthDim
+    let addrWidth : DimExpr := match depth.toNat? with
+      | some value =>
+          .literal (if value ≤ 1 then 0 else Nat.log2 (value - 1) + 1)
+      | none => .clog2 depth
+    let ptrWidth := DimExpr.mkAdd addrWidth (.literal 1)
+    let ptrType := hwTypeFromDim ptrWidth
+
+    let writeIncrementWire ← translateExprToWire writeIncrement "async_fifo_write_increment"
+    let writeDataWire ← translateExprToWire writeData "async_fifo_write_data"
+    let readIncrementWire ← translateExprToWire readIncrement "async_fifo_read_increment"
+
+    let writeBin ← CompilerM.makeWire (writeFullName ++ "_binary") ptrType
+      (domain := some writeDomain.id)
+    let writeGray ← CompilerM.makeWire (writeFullName ++ "_gray") ptrType
+      (domain := some writeDomain.id)
+    let writeFull ← CompilerM.makeWire (writeFullName ++ "_state") .bit
+      (domain := some writeDomain.id)
+    let readBin ← CompilerM.makeWire (readEmptyName ++ "_binary") ptrType
+      (domain := some readDomain.id)
+    let readGray ← CompilerM.makeWire (readEmptyName ++ "_gray") ptrType
+      (domain := some readDomain.id)
+    let readEmpty ← CompilerM.makeWire (readEmptyName ++ "_state") .bit
+      (domain := some readDomain.id)
+
+    let writeFire ← CompilerM.makeWire "async_fifo_write_fire" .bit
+      (domain := some writeDomain.id)
+    CompilerM.emitAssign writeFire (.op .and
+      [.ref writeIncrementWire, .op .not [.ref writeFull]])
+    let writeBinNext ← CompilerM.makeWire "async_fifo_write_binary_next" ptrType
+      (domain := some writeDomain.id)
+    CompilerM.emitAssign writeBinNext (.op .mux
+      [ .ref writeFire
+      , .op .add [.ref writeBin, .constDim 1 ptrWidth]
+      , .ref writeBin
+      ])
+    let writeGrayNext ← CompilerM.makeWire "async_fifo_write_gray_next" ptrType
+      (domain := some writeDomain.id)
+    CompilerM.emitAssign writeGrayNext (.op .xor
+      [ .ref writeBinNext
+      , .op .shr [.ref writeBinNext, .constDim 1 ptrWidth]
+      ])
+
+    let readFire ← CompilerM.makeWire "async_fifo_read_fire" .bit
+      (domain := some readDomain.id)
+    CompilerM.emitAssign readFire (.op .and
+      [.ref readIncrementWire, .op .not [.ref readEmpty]])
+    let readBinNext ← CompilerM.makeWire "async_fifo_read_binary_next" ptrType
+      (domain := some readDomain.id)
+    CompilerM.emitAssign readBinNext (.op .mux
+      [ .ref readFire
+      , .op .add [.ref readBin, .constDim 1 ptrWidth]
+      , .ref readBin
+      ])
+    let readGrayNext ← CompilerM.makeWire "async_fifo_read_gray_next" ptrType
+      (domain := some readDomain.id)
+    CompilerM.emitAssign readGrayNext (.op .xor
+      [ .ref readBinNext
+      , .op .shr [.ref readBinNext, .constDim 1 ptrWidth]
+      ])
+
+    let readGrayCrossing ← CompilerM.emitCdc "async_fifo_read_gray_crossing"
+      readDomain writeDomain (.ref readGray) .asyncFifo ptrType
+    let readGraySync1 ← CompilerM.emitRegisterInDomain "async_fifo_read_gray_sync1"
+      writeDomain .domain (.ref readGrayCrossing) 0 ptrType
+    let readGraySync2 ← CompilerM.emitRegisterInDomain "async_fifo_read_gray_sync2"
+      writeDomain .domain (.ref readGraySync1) 0 ptrType
+
+    let writeGrayCrossing ← CompilerM.emitCdc "async_fifo_write_gray_crossing"
+      writeDomain readDomain (.ref writeGray) .asyncFifo ptrType
+    let writeGraySync1 ← CompilerM.emitRegisterInDomain "async_fifo_write_gray_sync1"
+      readDomain .domain (.ref writeGrayCrossing) 0 ptrType
+    let writeGraySync2 ← CompilerM.emitRegisterInDomain "async_fifo_write_gray_sync2"
+      readDomain .domain (.ref writeGraySync1) 0 ptrType
+
+    let fullShiftWidth := DimExpr.mkSub ptrWidth (.literal 2)
+    let fullShift : Sparkle.IR.AST.Expr := match fullShiftWidth.toNat? with
+      | some amount => .const (Int.ofNat amount) 32
+      | none => .dimension fullShiftWidth
+    let invertedReadGray : Sparkle.IR.AST.Expr := .op .xor
+      [ .ref readGraySync2
+      , .op .shl [.constDim 3 ptrWidth, fullShift]
+      ]
+    let writeFullNext ← CompilerM.makeWire "async_fifo_write_full_next" .bit
+      (domain := some writeDomain.id)
+    CompilerM.emitAssign writeFullNext
+      (.op .eq [.ref writeGrayNext, invertedReadGray])
+    let readEmptyNext ← CompilerM.makeWire "async_fifo_read_empty_next" .bit
+      (domain := some readDomain.id)
+    CompilerM.emitAssign readEmptyNext
+      (.op .eq [.ref readGrayNext, .ref writeGraySync2])
+
+    CompilerM.emitRegisterAt writeBin writeDomain .domain (.ref writeBinNext) 0
+    CompilerM.emitRegisterAt writeGray writeDomain .domain (.ref writeGrayNext) 0
+    CompilerM.emitRegisterAt writeFull writeDomain .domain (.ref writeFullNext) 0
+    CompilerM.emitRegisterAt readBin readDomain .domain (.ref readBinNext) 0
+    CompilerM.emitRegisterAt readGray readDomain .domain (.ref readGrayNext) 0
+    CompilerM.emitRegisterAt readEmpty readDomain .domain (.ref readEmptyNext) 1
+
+    let writeAddr := makeSliceFromStartLength (.ref writeBin) (.literal 0) addrWidth
+    let readAddr := makeSliceFromStartLength (.ref readBin) (.literal 0) addrWidth
+    let readDataWire ← CompilerM.emitAsyncMemory "async_fifo_storage"
+      addrWidth dataWidth writeDomain writeAddr (.ref writeDataWire) (.ref writeFire)
+      readDomain readAddr
+
+    CompilerM.addOutput writeFullName .bit (some writeDomain.id)
+    CompilerM.emitAssign writeFullName (.ref writeFull)
+    CompilerM.addOutput readDataName dataType (some readDomain.id)
+    CompilerM.emitAssign readDataName (.ref readDataWire)
+    CompilerM.addOutput readEmptyName .bit (some readDomain.id)
+    CompilerM.emitAssign readEmptyName (.ref readEmpty)
+
   /-- Compile one heterogeneous top-level output descriptor. -/
   partial def translateCircuitOutput (outputExpr : Lean.Expr) : CompilerM Unit := do
     let outputExpr ← CompilerM.liftMetaM (withTransparency .reducible $ whnf outputExpr)
@@ -2731,7 +2891,9 @@ mutual
         else
           let fn := reduced.getAppFn
           let args := reduced.getAppArgs
-          if (fn.isConstOf ``Sparkle.Core.Circuit.Circuit.mk ||
+          if fn.isConstOf ``Sparkle.Core.Circuit.Circuit.asyncFifo then
+            translateAsyncFifoCircuit args
+          else if (fn.isConstOf ``Sparkle.Core.Circuit.Circuit.mk ||
               fn.isConstOf ``Sparkle.Core.Circuit.Circuit.ofOutputs) && !args.isEmpty then
             translateCircuitOutputList args.back!
           else
@@ -2917,6 +3079,31 @@ elab_rules : command
           IO.println s!"// {warning}"
       IO.println (toVerilogDesign design)
       IO.println "\n// Native parameterized Verilog design successfully generated."
+
+syntax (name := writeParameterizedVerilogDesign)
+  "#writeParameterizedVerilogDesign " ident " [" sparkleParameterBinding,* "]" str : command
+
+/-- Write a native parameterized design to a SystemVerilog file without
+    specializing away retained dimensions. -/
+elab_rules : command
+  | `(#writeParameterizedVerilogDesign $id:ident [$bindings:sparkleParameterBinding,*]
+      $path:str) => do
+    let mut parameters : List (String × Nat) := []
+    for binding in bindings.getElems do
+      match binding with
+      | `(sparkleParameterBinding| $name:ident := $value:num) =>
+        parameters := parameters ++ [(name.getId.toString, value.getNat)]
+      | _ => throwUnsupportedSyntax
+    let declName ← Lean.Elab.Command.liftCoreM do
+      Lean.resolveGlobalConstNoOverload id
+    Lean.Elab.Command.liftTermElabM do
+      let design ← synthesizeHierarchicalWithParameters declName parameters
+      runDesignDRC design
+      let outputPath := path.getString
+      if let some dir := (System.FilePath.mk outputPath).parent then
+        IO.FS.createDirAll dir
+      IO.FS.writeFile outputPath (toVerilogDesign design)
+      IO.println s!"Written native parameterized Verilog to {outputPath}"
 
 syntax (name := writeParameterizedCppSimDesign)
   "#writeParameterizedCppSimDesign " ident " [" sparkleParameterBinding,* "]" str : command

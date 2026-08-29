@@ -1,0 +1,5 @@
+import Tests.CVDPMultiDomainTargets
+import Sparkle.Compiler.Elab
+
+#synthesizeVerilog
+  Tests.CVDPMultiDomainTargets.cdcPulseSynchronizer0004
