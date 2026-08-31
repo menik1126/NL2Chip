@@ -10,7 +10,12 @@ from cktarchon.codex_runner import CodexAgentHarnessRunner
 from cktarchon.env import model_alias
 from cktarchon.harness import PathGuard
 from cktarchon.logs import append_jsonl, parse_agent_log
-from cktarchon.run import already_done, build_system_prompt, clear_generated_target
+from cktarchon.run import (
+    agent_visible_problem_info,
+    already_done,
+    build_system_prompt,
+    clear_generated_target,
+)
 from cktarchon.responses_chat_proxy import (
     chat_response_to_responses_events,
     events_to_sse,
@@ -28,6 +33,27 @@ def test_path_guard_allows_only_problem_outputs(tmp_path: Path):
     assert guard.is_write_allowed("cktarchon_work/prob_a/notes.json")
     assert not guard.is_write_allowed("Generated/prob_b.lean")
     assert not guard.is_write_allowed("agent/search.py")
+
+
+def test_public_only_anthropic_runner_omits_bash_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from cktarchon.harness import AnthropicHarnessRunner
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    runner = AnthropicHarnessRunner(
+        project_root=tmp_path,
+        prob_id="prob_a",
+        model="test-model",
+        role="ckt-generator",
+        log_base=tmp_path / "logs" / "generate",
+        system_prompt="system",
+        allow_bash_tool=False,
+    )
+
+    assert "bash" not in {tool["name"] for tool in runner._model_tools()}
+    assert "lean_check" in {tool["name"] for tool in runner._model_tools()}
 
 
 def test_parse_agent_log(tmp_path: Path):
@@ -152,6 +178,36 @@ def test_clear_generated_target_backs_up_stale_file(tmp_path: Path):
     assert not target.exists()
     assert Path(backup).read_text(encoding="utf-8") == "old generated code"
     assert str(run_dir / "preexisting_generated") in backup
+
+
+def test_agent_visible_problem_info_hides_cvdp_harness_and_golden_output():
+    info = SimpleNamespace(
+        ref_code="golden output implementation",
+        metadata={
+            "dataset": "cvdp",
+            "harness_files": {"src/tb.py": "assert dut.out.value == 7"},
+            "cvdp_row": {"output": {"context": {"solution.sv": "golden"}}},
+            "verilog_sources": ["secret_solution.sv"],
+            "input_context_files": {"rtl/buggy.sv": "module public_input; endmodule"},
+            "categories": ["hard"],
+        },
+    )
+
+    public_info = agent_visible_problem_info(info, hide_cvdp_harness=True)
+
+    assert public_info is not info
+    assert "public_input" in public_info.ref_code
+    assert "golden output implementation" not in public_info.ref_code
+    assert "harness_files" not in public_info.metadata
+    assert "cvdp_row" not in public_info.metadata
+    assert "verilog_sources" not in public_info.metadata
+    assert public_info.metadata["categories"] == ["hard"]
+    assert public_info.metadata["agent_input_policy"] == "cvdp-public-only"
+
+
+def test_agent_visible_problem_info_preserves_legacy_mode():
+    info = SimpleNamespace(metadata={"dataset": "cvdp"}, ref_code="legacy")
+    assert agent_visible_problem_info(info, hide_cvdp_harness=False) is info
 
 
 def test_resume_completed_treats_budget_exceeded_as_done(tmp_path: Path):

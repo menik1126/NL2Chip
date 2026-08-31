@@ -212,6 +212,7 @@ class AnthropicHarnessRunner:
     max_tokens: int = 16384
     lean_repl: Any | None = None
     api_timeout: float | None = 300.0
+    allow_bash_tool: bool = True
     extra_write_globs: tuple[str, ...] = ()
     tool_counts: dict[str, int] = field(default_factory=dict)
     compile_checks: int = 0
@@ -254,7 +255,7 @@ class AnthropicHarnessRunner:
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=self.system_prompt,
-                tools=TOOLS,
+                tools=self._model_tools(),
                 messages=messages,
             )
             usage = {
@@ -317,6 +318,11 @@ class AnthropicHarnessRunner:
             "elapsed_seconds": round(time.monotonic() - started, 3),
         })
         return stats
+
+    def _model_tools(self) -> list[dict[str, Any]]:
+        if self.allow_bash_tool:
+            return TOOLS
+        return [tool for tool in TOOLS if tool.get("name") != "bash"]
 
     def _create_message_with_retries(self, **kwargs: Any) -> Any:
         last_exc: Exception | None = None
