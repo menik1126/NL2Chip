@@ -172,6 +172,27 @@ def responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:
     return out
 
 
+def injected_workspace_tools() -> list[dict[str, Any]]:
+    """Minimal Chat-Completions view of Codex's workspace command tool."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "description": "Run a shell command in the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string", "description": "Shell command to run."}
+                    },
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
 def responses_request_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
     request: dict[str, Any] = {
         "model": body.get("model"),
@@ -183,6 +204,8 @@ def responses_request_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
         "stream": False,
     }
     tools = responses_tools_to_chat_tools(body.get("tools"))
+    if not tools and _truthy_env("CKTARCHON_INJECT_CODEX_CHAT_TOOLS"):
+        tools = injected_workspace_tools()
     if tools:
         request["tools"] = tools
         tool_choice = body.get("tool_choice")

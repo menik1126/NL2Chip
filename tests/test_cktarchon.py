@@ -1254,6 +1254,18 @@ def test_responses_request_omits_parallel_tools_without_tools():
     assert "parallel_tool_calls" not in chat
 
 
+def test_responses_request_injects_workspace_tool_for_codex_gateway(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CKTARCHON_INJECT_CODEX_CHAT_TOOLS", "1")
+
+    chat = responses_request_to_chat_request(
+        {"model": "gpt-5.6-sol", "input": "write the candidate"}
+    )
+
+    assert chat["tool_choice"] == "required"
+    assert chat["tools"][0]["function"]["name"] == "exec_command"
+    assert chat["tools"][0]["function"]["parameters"]["required"] == ["cmd"]
+
+
 def test_responses_request_requires_an_initial_workspace_tool_call():
     body = {
         "model": "gpt-5.6-sol",
