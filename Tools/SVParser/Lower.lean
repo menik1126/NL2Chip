@@ -1326,6 +1326,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
 
   -- Build body statements
   let mut body : List Stmt := []
+  let mut clockDomains : List ClockDomain := []
   -- All always @* blocks now use MUX mode (SSA handles loop dependencies)
 
   -- Emit parameter values as constant assigns (with overrides applied)
@@ -1376,6 +1377,17 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
           | _ => none
       | none => pure ()
 
+      let hasReset := resetCheck.isSome
+      let domain : ClockDomain :=
+        { id := clock
+        , clock := clock
+        , reset := if hasReset then some resetName else none
+        , activeEdge := .rising
+        , resetKind := .asynchronous
+        }
+      if !clockDomains.any (fun existing => existing.id == domain.id) then
+        clockDomains := clockDomains ++ [domain]
+
       -- Extract blocking assigns as combinational intermediates (from full always body)
       let blockingNames := (collectBlockNamesTop stmts).eraseDups
       for sigName in blockingNames do
@@ -1394,9 +1406,10 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
           | some (_, v) => .const (Int.ofNat v) initWidth
           | none => .const 0 initWidth
         let dataExpr := stmtsToMuxExpr regName stmts
-        body := body ++ [.register regName clock resetName dataExpr initVal]
+        body := body ++
+          [.register regName domain.id (if hasReset then .domain else .none) dataExpr initVal]
         if !(wireExists wires regName) then
-          wires := wires ++ [{ name := regName, ty := hwTy }]
+          wires := wires ++ [{ name := regName, ty := hwTy, domain := some domain.id }]
 
     | .alwaysBlock .star stmts =>
       -- Sequential SSA: process statements top-to-bottom, creating SSA wires
@@ -1464,7 +1477,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
       let irParams := paramOvr.filterMap fun (name, value) =>
         (evalConstExpr paramVals value).map fun concrete =>
           (name, DimExpr.literal concrete)
-      body := body ++ [.inst modName instName irConns irParams]
+      body := body ++ [.inst modName instName irConns irParams []]
     | _ => pure ()
 
   -- Deduplicate wires
@@ -1552,6 +1565,7 @@ def lowerModule (svMod : SVModule) (paramOverrides : List (String × Nat) := [])
     outputs := outputs
     wires := dedupWires
     body := topoSortBody dedupBody
+    clockDomains := clockDomains
     assertions := assertions
     isPrimitive := false
   }
@@ -1613,26 +1627,42 @@ partial def prefixStmtNames
       (prefixDimExprNames dimRenames lhsWidth)
       (prefixDimExprNames dimRenames rhsWidth)
       (prefixDimExprNames dimRenames resultWidth)
-  | .register output clock reset input initValue =>
-    .register s!"{pfx}_{output}" s!"{pfx}_{clock}" s!"{pfx}_{reset}"
+  | .cdc output sourceDomain destDomain input kind =>
+    .cdc s!"{pfx}_{output}" s!"{pfx}_{sourceDomain}" s!"{pfx}_{destDomain}"
+      (prefixExprNamesWithDims pfx nameSet dimRenames input) kind
+  | .register output domain reset input initValue =>
+    .register s!"{pfx}_{output}" s!"{pfx}_{domain}" reset
       (prefixExprNamesWithDims pfx nameSet dimRenames input)
       (prefixExprNamesWithDims pfx nameSet dimRenames initValue)
-  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
+  | .memory name addrWidth dataWidth domain writeAddr writeData writeEnable readAddr readData comboRead =>
     .memory s!"{pfx}_{name}"
       (prefixDimExprNames dimRenames addrWidth)
       (prefixDimExprNames dimRenames dataWidth)
-      s!"{pfx}_{clock}"
+      s!"{pfx}_{domain}"
       (prefixExprNamesWithDims pfx nameSet dimRenames writeAddr)
       (prefixExprNamesWithDims pfx nameSet dimRenames writeData)
       (prefixExprNamesWithDims pfx nameSet dimRenames writeEnable)
       (prefixExprNamesWithDims pfx nameSet dimRenames readAddr)
       s!"{pfx}_{readData}" comboRead
-  | .inst moduleName instName connections parameterBindings =>
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData
+      writeEnable readDomain readAddr readData =>
+    .asyncMemory s!"{pfx}_{name}"
+      (prefixDimExprNames dimRenames addrWidth)
+      (prefixDimExprNames dimRenames dataWidth)
+      s!"{pfx}_{writeDomain}"
+      (prefixExprNamesWithDims pfx nameSet dimRenames writeAddr)
+      (prefixExprNamesWithDims pfx nameSet dimRenames writeData)
+      (prefixExprNamesWithDims pfx nameSet dimRenames writeEnable)
+      s!"{pfx}_{readDomain}"
+      (prefixExprNamesWithDims pfx nameSet dimRenames readAddr)
+      s!"{pfx}_{readData}"
+  | .inst moduleName instName connections parameterBindings domainMap =>
     .inst moduleName s!"{pfx}_{instName}"
       (connections.map fun (portName, expr) =>
         (portName, prefixExprNamesWithDims pfx nameSet dimRenames expr))
       (parameterBindings.map fun (name, value) =>
         (name, prefixDimExprNames dimRenames value))
+      (domainMap.map fun (child, parent) => (child, s!"{pfx}_{parent}"))
 
 /-- Rename an internal flattened wire without changing public ports or registers. -/
 def renameInternalName (wireNames : List String) (name : String) : String :=
@@ -1665,19 +1695,29 @@ partial def prefixInternalStmtRefs (wireNames : List String) : Stmt → Stmt
     .signedDot (renameInternalName wireNames output)
       (prefixInternalExprRefs wireNames lhs) (prefixInternalExprRefs wireNames rhs)
       laneCount lhsWidth rhsWidth resultWidth
-  | .register output clock reset input initValue =>
-    .register (renameInternalName wireNames output) clock reset
+  | .cdc output sourceDomain destDomain input kind =>
+    .cdc (renameInternalName wireNames output) sourceDomain destDomain
+      (prefixInternalExprRefs wireNames input) kind
+  | .register output domain reset input initValue =>
+    .register (renameInternalName wireNames output) domain reset
       (prefixInternalExprRefs wireNames input) (prefixInternalExprRefs wireNames initValue)
-  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
-    .memory (renameInternalName wireNames name) addrWidth dataWidth clock
+  | .memory name addrWidth dataWidth domain writeAddr writeData writeEnable readAddr readData comboRead =>
+    .memory (renameInternalName wireNames name) addrWidth dataWidth domain
       (prefixInternalExprRefs wireNames writeAddr) (prefixInternalExprRefs wireNames writeData)
       (prefixInternalExprRefs wireNames writeEnable) (prefixInternalExprRefs wireNames readAddr)
       (renameInternalName wireNames readData) comboRead
-  | .inst moduleName instName connections parameterBindings =>
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData writeEnable
+      readDomain readAddr readData =>
+    .asyncMemory (renameInternalName wireNames name) addrWidth dataWidth writeDomain
+      (prefixInternalExprRefs wireNames writeAddr)
+      (prefixInternalExprRefs wireNames writeData)
+      (prefixInternalExprRefs wireNames writeEnable) readDomain
+      (prefixInternalExprRefs wireNames readAddr) (renameInternalName wireNames readData)
+  | .inst moduleName instName connections parameterBindings domainMap =>
     .inst moduleName instName
       (connections.map fun (portName, expr) =>
         (portName, prefixInternalExprRefs wireNames expr))
-      parameterBindings
+      parameterBindings domainMap
 
 /-- Flatten a design: inline all sub-module instantiations into a single module.
     The optional `svDesign` parameter provides access to the original SV AST
@@ -1692,7 +1732,7 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
     for stmt in top.body do
       match stmt with
-      | .inst modName instName conns _parameterBindings =>
+      | .inst modName instName conns _parameterBindings _domainMap =>
         -- Find the sub-module
         match moduleMap.find? fun (m : Module) => m.name == modName with
         | none =>
@@ -1734,7 +1774,9 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
 
           -- Collect all internal names in sub-module (including memory names)
           let memNames := effectiveSubMod.body.filterMap fun s => match s with
-            | .memory n _ _ _ _ _ _ _ _ _ => some n | _ => none
+            | .memory n _ _ _ _ _ _ _ _ _ => some n
+            | .asyncMemory n .. => some n
+            | _ => none
           let subNames := effectiveSubMod.wires.map (·.name) ++
                           effectiveSubMod.inputs.map (·.name) ++
                           effectiveSubMod.outputs.map (·.name) ++
@@ -1782,7 +1824,9 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
     let regNames := flatBody.filterMap fun s => match s with
       | .register n _ _ _ _ => some n | _ => none
     let memNames := flatBody.filterMap fun s => match s with
-      | .memory n _ _ _ _ _ _ _ _ _ => some n | _ => none
+      | .memory n _ _ _ _ _ _ _ _ _ => some n
+      | .asyncMemory n .. => some n
+      | _ => none
     let internalWireNames := flatWires.map (·.name) |>.filter fun n =>
       !(portNames.any (· == n)) && !(regNames.any (· == n)) && !(memNames.any (· == n))
     let addGen (n : String) : String :=
@@ -1798,6 +1842,8 @@ def flattenDesign (design : Design) (svDesign : SVDesign := { modules := [] }) :
       outputs := top.outputs
       wires := genWires
       body := topoSortBody genBody
+      clockDomains := top.clockDomains
+      assertions := top.assertions
       isPrimitive := false
     }
     return { topModule := design.topModule, modules := [flatModule] }

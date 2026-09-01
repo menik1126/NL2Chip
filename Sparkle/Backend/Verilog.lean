@@ -159,11 +159,16 @@ partial def emitExpr (e : Expr) : String :=
         s!"({emitExpr arg1} {emitOperator operator} {emitExpr arg2})"
     | _ => s!"/* ERROR: operator {operator} with wrong arity */"
 
-/-- Emit a single statement.
-    The optional `wires` parameter provides wire declarations for register
-    reset value width lookup. -/
-partial def emitStmt (stmt : Stmt) (indent : String := "    ")
-    (wires : List Port := []) : String :=
+/-- Render the active edge expression for a physical clock domain. -/
+def emitDomainEdge (domain : ClockDomain) : String :=
+  let edge := match domain.activeEdge with
+    | .rising => "posedge"
+    | .falling => "negedge"
+  s!"{edge} {sanitizeName domain.clock}"
+
+/-- Emit a single statement using the module's explicit clock-domain table. -/
+partial def emitStmt (stmt : Stmt) (domains : List ClockDomain)
+    (indent : String := "    ") (wires : List Port := []) : String :=
   match stmt with
   | .assign lhs rhs =>
     s!"{indent}assign {sanitizeName lhs} = {emitExpr rhs};"
@@ -174,7 +179,8 @@ partial def emitStmt (stmt : Stmt) (indent : String := "    ")
   | .generateFor label index start stop body =>
     let indexName := sanitizeName index
     let bodyIndent := indent ++ "        "
-    let bodyCode := String.intercalate "\n" (body.map (emitStmt · bodyIndent wires))
+    let bodyCode := String.intercalate "\n"
+      (body.map (emitStmt · domains bodyIndent wires))
     s!"{indent}genvar {indexName};\n" ++
       s!"{indent}generate\n" ++
       s!"{indent}    for ({indexName} = {emitDimExpr start}; " ++
@@ -206,30 +212,32 @@ partial def emitStmt (stmt : Stmt) (indent : String := "    ")
       s!"{indent}    {outputName} = {accumName};\n" ++
       s!"{indent}end"
 
-  | .register output clock reset input initValue =>
-    -- Generate always_ff block for register
-    let resetValue := emitExpr initValue
-    -- If clock name ends with "__neg", emit negedge trigger (no reset for negedge regs)
-    if clock.endsWith "__neg" then
-      let baseClock := clock.dropRight 5
-      s!"{indent}always_ff @(negedge {sanitizeName baseClock}) begin\n" ++
-      s!"{indent}    {sanitizeName output} <= {emitExpr input};\n" ++
-      s!"{indent}end"
-    -- If clock name ends with "__norst", emit posedge trigger without reset
-    else if clock.endsWith "__norst" then
-      let baseClock := clock.dropRight 7
-      s!"{indent}always_ff @(posedge {sanitizeName baseClock}) begin\n" ++
-      s!"{indent}    {sanitizeName output} <= {emitExpr input};\n" ++
-      s!"{indent}end"
-    else
-      s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge {sanitizeName reset}) begin\n" ++
-      s!"{indent}    if ({sanitizeName reset})\n" ++
-      s!"{indent}        {sanitizeName output} <= {resetValue};\n" ++
-      s!"{indent}    else\n" ++
-      s!"{indent}        {sanitizeName output} <= {emitExpr input};\n" ++
-      s!"{indent}end"
+  | .cdc output _sourceDomain _destDomain input kind =>
+    s!"{indent}/* CDC: {kind} */ assign {sanitizeName output} = {emitExpr input};"
 
-  | .memory name addrWidth dataWidth clock writeAddr writeData writeEnable readAddr readData comboRead =>
+  | .register output domainId registerReset input initValue =>
+    match domains.find? (fun domain => domain.id == domainId) with
+    | none => s!"{indent}/* ERROR: unknown clock domain '{domainId}' */"
+    | some domain =>
+      let edge := emitDomainEdge domain
+      let emitWithoutReset :=
+        s!"{indent}always_ff @({edge}) begin\n" ++
+        s!"{indent}    {sanitizeName output} <= {emitExpr input};\n" ++
+        s!"{indent}end"
+      match registerReset, domain.reset with
+      | .none, _ | .domain, none => emitWithoutReset
+      | .domain, some reset =>
+          let event := match domain.resetKind with
+            | .synchronous => edge
+            | .asynchronous => s!"{edge} or posedge {sanitizeName reset}"
+          s!"{indent}always_ff @({event}) begin\n" ++
+          s!"{indent}    if ({sanitizeName reset})\n" ++
+          s!"{indent}        {sanitizeName output} <= {emitExpr initValue};\n" ++
+          s!"{indent}    else\n" ++
+          s!"{indent}        {sanitizeName output} <= {emitExpr input};\n" ++
+          s!"{indent}end"
+
+  | .memory name addrWidth dataWidth domainId writeAddr writeData writeEnable readAddr readData comboRead =>
     -- Generate memory array and always_ff block
     let lastAddress := match addrWidth.toNat? with
       | some width => s!"{(2 ^ width) - 1}"
@@ -238,40 +246,68 @@ partial def emitStmt (stmt : Stmt) (indent : String := "    ")
     let memDecl :=
       s!"{indent}{emitType (hwTypeFromDim dataWidth)} {sanitizeName name} [0:{lastAddress}];\n" ++
       s!"{indent}integer {resetIndex};"
-    let resetMemory :=
-      s!"{indent}        for ({resetIndex} = 0; {resetIndex} <= {lastAddress}; " ++
-      s!"{resetIndex} = {resetIndex} + 1) begin\n" ++
-      s!"{indent}            {sanitizeName name}[{resetIndex}] <= '0;\n" ++
-      s!"{indent}        end"
-    if comboRead then
-      -- Combinational read: assign readData = mem[readAddr]
-      let assignRead := s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
-      let alwaysBlock :=
-        s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge rst) begin\n" ++
-        s!"{indent}    if (rst) begin\n" ++
-        resetMemory ++ "\n" ++
-        s!"{indent}    end else if ({emitExpr writeEnable}) begin\n" ++
-        s!"{indent}        {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
-        s!"{indent}    end\n" ++
-        s!"{indent}end"
-      memDecl ++ "\n" ++ assignRead ++ "\n" ++ alwaysBlock
-    else
-      -- Registered read: readData latched inside always_ff
-      let alwaysBlock :=
-        s!"{indent}always_ff @(posedge {sanitizeName clock} or posedge rst) begin\n" ++
-        s!"{indent}    if (rst) begin\n" ++
-        resetMemory ++ "\n" ++
-        s!"{indent}        {sanitizeName readData} <= '0;\n" ++
-        s!"{indent}    end else begin\n" ++
-        s!"{indent}        if ({emitExpr writeEnable}) begin\n" ++
-        s!"{indent}            {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
-        s!"{indent}        end\n" ++
-        s!"{indent}        {sanitizeName readData} <= {sanitizeName name}[{emitExpr readAddr}];\n" ++
-        s!"{indent}    end\n" ++
-        s!"{indent}end"
-      memDecl ++ "\n" ++ alwaysBlock
+    match domains.find? (fun domain => domain.id == domainId) with
+      | none => memDecl ++ "\n" ++ s!"{indent}/* ERROR: unknown clock domain '{domainId}' */"
+      | some domain =>
+        let edge := emitDomainEdge domain
+        let writeAndRead :=
+          s!"{indent}        if ({emitExpr writeEnable}) begin\n" ++
+          s!"{indent}            {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
+          s!"{indent}        end" ++
+          (if comboRead then "" else
+            "\n" ++ s!"{indent}        {sanitizeName readData} <= {sanitizeName name}[{emitExpr readAddr}];")
+        let resetMemory :=
+          s!"{indent}        for ({resetIndex} = 0; {resetIndex} <= {lastAddress}; " ++
+          s!"{resetIndex} = {resetIndex} + 1) begin\n" ++
+          s!"{indent}            {sanitizeName name}[{resetIndex}] <= '0;\n" ++
+          s!"{indent}        end" ++
+          (if comboRead then "" else
+            "\n" ++ s!"{indent}        {sanitizeName readData} <= '0;")
+        let alwaysBlock := match domain.reset with
+          | none =>
+              s!"{indent}always_ff @({edge}) begin\n" ++
+              writeAndRead ++ "\n" ++
+              s!"{indent}end"
+          | some reset =>
+              let event := match domain.resetKind with
+                | .synchronous => edge
+                | .asynchronous => s!"{edge} or posedge {sanitizeName reset}"
+              s!"{indent}always_ff @({event}) begin\n" ++
+              s!"{indent}    if ({sanitizeName reset}) begin\n" ++
+              resetMemory ++ "\n" ++
+              s!"{indent}    end else begin\n" ++
+              writeAndRead ++ "\n" ++
+              s!"{indent}    end\n" ++
+              s!"{indent}end"
+        let assignRead := if comboRead then
+          "\n" ++ s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
+          else ""
+        memDecl ++ assignRead ++ "\n" ++ alwaysBlock
 
-  | .inst moduleName instName connections parameterBindings =>
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData writeEnable
+      _readDomain readAddr readData =>
+    let lastAddress := match addrWidth.toNat? with
+      | some width => s!"{(2 ^ width) - 1}"
+      | none => s!"((2 ** {emitDimExpr addrWidth}) - 1)"
+    let memDecl :=
+      s!"{indent}{emitType (hwTypeFromDim dataWidth)} {sanitizeName name} [0:{lastAddress}];"
+    let asyncRead :=
+      s!"{indent}assign {sanitizeName readData} = {sanitizeName name}[{emitExpr readAddr}];"
+    match domains.find? (fun domain => domain.id == writeDomain) with
+    | none =>
+        memDecl ++ "\n" ++ asyncRead ++ "\n" ++
+        s!"{indent}/* ERROR: unknown async-memory write domain '{writeDomain}' */"
+    | some domain =>
+        let edge := emitDomainEdge domain
+        let writeBlock :=
+          s!"{indent}always_ff @({edge}) begin\n" ++
+          s!"{indent}    if ({emitExpr writeEnable}) begin\n" ++
+          s!"{indent}        {sanitizeName name}[{emitExpr writeAddr}] <= {emitExpr writeData};\n" ++
+          s!"{indent}    end\n" ++
+          s!"{indent}end"
+        memDecl ++ "\n" ++ asyncRead ++ "\n" ++ writeBlock
+
+  | .inst moduleName instName connections parameterBindings _domainMap =>
     let parameterOverrides := if parameterBindings.isEmpty then "" else
       let bindings := parameterBindings.map fun (name, value) =>
         s!".{sanitizeName name}({emitDimExpr value})"
@@ -338,7 +374,7 @@ def emitModule (m : Module) : String :=
     let body := if m.body.isEmpty then
       ""
     else
-      let stmts := m.body.map (emitStmt · "    " m.wires)
+      let stmts := m.body.map (emitStmt · m.clockDomains "    " m.wires)
       "\n" ++ String.intercalate "\n\n" stmts ++ "\n"
 
     let footer := "\nendmodule\n"

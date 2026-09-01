@@ -146,7 +146,9 @@ def emitSignedValue (value : String) (width : Nat) : String :=
 partial def inferExprWidth (typeMap : List (String × HWType)) : Expr → Nat
   | .const _ w => w
   | .constDim _ width =>
-    panic! s!"CppSim requires a concrete constant width, found {width}"
+    match width.toNat? with
+    | some concreteWidth => concreteWidth
+    | none => panic! s!"CppSim requires a concrete constant width, found {width}"
   | .dimension value =>
     panic! s!"CppSim requires specialization of generate-time value {value}"
   | .ref name => lookupWidth typeMap name
@@ -186,8 +188,10 @@ partial def emitExpr (typeMap : List (String × HWType)) (e : Expr) : String :=
       s!"({cppType})0x{Nat.toDigits 16 unsigned.toNat |> String.ofList}ULL"
     else
       s!"({cppType}){value}ULL"
-  | .constDim _ width =>
-    panic! s!"CppSim requires a concrete constant width, found {width}"
+  | .constDim value width =>
+    match width.toNat? with
+    | some concreteWidth => emitExpr typeMap (.const value concreteWidth)
+    | none => panic! s!"CppSim requires a concrete constant width, found {width}"
   | .dimension value =>
     panic! s!"CppSim requires specialization of generate-time value {value}"
 
@@ -300,6 +304,7 @@ structure StmtParts where
   declarations    : List String
   evalBody        : List String
   tickBody        : List String
+  domainTicks     : List (DomainId × String)
   resetBody       : List String
   evalTickLocals  : List String   -- _next local decls for evalTick()
   deriving Inhabited
@@ -309,11 +314,13 @@ instance : Append StmtParts where
     { declarations := a.declarations ++ b.declarations
     , evalBody := a.evalBody ++ b.evalBody
     , tickBody := a.tickBody ++ b.tickBody
+    , domainTicks := a.domainTicks ++ b.domainTicks
     , resetBody := a.resetBody ++ b.resetBody
     , evalTickLocals := a.evalTickLocals ++ b.evalTickLocals }
 
 def StmtParts.empty : StmtParts :=
-  { declarations := [], evalBody := [], tickBody := [], resetBody := [], evalTickLocals := [] }
+  { declarations := [], evalBody := [], tickBody := [], domainTicks := []
+  , resetBody := [], evalTickLocals := [] }
 
 /-- Emit one concrete bit update produced by an unrolled Signal.mapBits loop. -/
 def emitGeneratedBitAssignment (typeMap : List (String × HWType))
@@ -328,6 +335,7 @@ def emitGeneratedBitAssignment (typeMap : List (String × HWType))
   { declarations := []
   , evalBody := [s!"        {targetName} = {masked};"]
   , tickBody := []
+  , domainTicks := []
   , resetBody := []
   , evalTickLocals := [] }
 
@@ -353,6 +361,7 @@ def emitGeneratedSliceAssignment (typeMap : List (String × HWType))
     { declarations := []
     , evalBody := [s!"        {targetName} = {masked};"]
     , tickBody := []
+    , domainTicks := []
     , resetBody := []
     , evalTickLocals := [] }
 
@@ -367,6 +376,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       { declarations := []
       , evalBody := [s!"        // skipped: {sanitizeName lhs} ({width}-bit wide assign)"]
       , tickBody := []
+      , domainTicks := []
       , resetBody := []
       , evalTickLocals := [] }
     else
@@ -381,6 +391,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       { declarations := []
       , evalBody := [s!"        {sanitizeName lhs} = {masked};"]
       , tickBody := []
+      , domainTicks := []
       , resetBody := []
       , evalTickLocals := [] }
 
@@ -431,10 +442,29 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       { declarations := []
       , evalBody := [body]
       , tickBody := []
+      , domainTicks := []
       , resetBody := []
       , evalTickLocals := [] }
 
-  | .register output _clock _reset input initValue =>
+  | .cdc output _sourceDomain _destDomain input _kind =>
+    let width := lookupWidth typeMap output
+    if width > 64 then
+      { declarations := []
+      , evalBody := [s!"        // skipped CDC: {sanitizeName output} ({width}-bit wide assign)"]
+      , tickBody := []
+      , domainTicks := []
+      , resetBody := []
+      , evalTickLocals := [] }
+    else
+      let expr := emitExpr typeMap input
+      let masked := if exprIsMasked width input then expr else applyMask expr width
+      { declarations := []
+      , evalBody := [s!"        {sanitizeName output} = {masked};"]
+      , tickBody := []
+      , domainTicks := []
+      , resetBody := []
+      , evalTickLocals := [] }
+  | .register output domain _reset input initValue =>
     let width := lookupWidth typeMap output
     let cppType := emitCppType (.bitVector width)
     let outName := sanitizeName output
@@ -446,10 +476,11 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
     { declarations := [s!"    {cppType} {outName};", s!"    {cppType} {nextName};"]
     , evalBody := [s!"        {nextName} = {inputExpr};"]
     , tickBody := [s!"        {outName} = {nextName};"]
+    , domainTicks := [(domain, s!"        {outName} = {nextName};")]
     , resetBody := [s!"        {outName} = {initExpr};"]
     , evalTickLocals := [s!"        {cppType} {nextName};"] }
 
-  | .memory name addrWidth dataWidth _clock writeAddr writeData writeEnable readAddr readData comboRead =>
+  | .memory name addrWidth dataWidth domain writeAddr writeData writeEnable readAddr readData comboRead =>
     let addrWidth := requireConcreteDim "memory address width" addrWidth
     let dataWidth := requireConcreteDim "memory data width" dataWidth
     let memSize := 2 ^ addrWidth
@@ -465,6 +496,7 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       { declarations := [memDecl] ++ rdDecl
       , evalBody := [s!"        {rdName} = {memName}[{emitExpr typeMap readAddr}];"]
       , tickBody := [s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};"]
+      , domainTicks := [(domain, s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};")]
       , resetBody := [s!"        {memName}.fill(0);"]
       , evalTickLocals := [] }
     else
@@ -475,13 +507,56 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
       , tickBody :=
           [ s!"        {rdName} = {memName}[{addrLatch}];"
           , s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};" ]
+      , domainTicks :=
+          [ (domain, s!"        {rdName} = {memName}[{addrLatch}];")
+          , (domain, s!"        if ({emitExpr typeMap writeEnable}) {memName}[{emitExpr typeMap writeAddr}] = {emitExpr typeMap writeData};") ]
       , resetBody :=
           [ s!"        {memName}.fill(0);"
           , s!"        {rdName} = 0;"
           , s!"        {addrLatch} = 0;" ]
       , evalTickLocals := [] }
 
-  | .inst moduleName instName connections parameterBindings =>
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData writeEnable
+      _readDomain readAddr readData =>
+    let addrWidth := requireConcreteDim "async memory address width" addrWidth
+    let dataWidth := requireConcreteDim "async memory data width" dataWidth
+    let memSize := 2 ^ addrWidth
+    let elemType := emitCppType (.bitVector dataWidth)
+    let memName := sanitizeName name
+    let rdName := sanitizeName readData
+    let writeAddrName := s!"{memName}_write_addr_next"
+    let writeDataName := s!"{memName}_write_data_next"
+    let writeEnableName := s!"{memName}_write_enable_next"
+    let addrType := emitCppType (.bitVector addrWidth)
+    let memDecl :=
+      "    std::array<" ++ elemType ++ ", " ++ toString memSize ++ "> " ++ memName ++ ";"
+    let rdInTypeMap := typeMap.any fun (n, _) => sanitizeName n == rdName
+    let rdDecl := if rdInTypeMap then [] else [s!"    {elemType} {rdName};"]
+    let writeStmt :=
+      s!"        if ({writeEnableName}) " ++
+      s!"{memName}[{writeAddrName}] = {writeDataName};"
+    { declarations := [memDecl] ++ rdDecl ++
+        [ s!"    {addrType} {writeAddrName};"
+        , s!"    {elemType} {writeDataName};"
+        , s!"    uint8_t {writeEnableName};"
+        ]
+    , evalBody :=
+        [ s!"        {writeAddrName} = {emitExpr typeMap writeAddr};"
+        , s!"        {writeDataName} = {emitExpr typeMap writeData};"
+        , s!"        {writeEnableName} = {emitExpr typeMap writeEnable};"
+        , s!"        {rdName} = {memName}[{emitExpr typeMap readAddr}];"
+        ]
+    , tickBody := [writeStmt]
+    , domainTicks := [(writeDomain, writeStmt)]
+    , resetBody :=
+        [ s!"        {memName}.fill(0);"
+        , s!"        {writeAddrName} = 0;"
+        , s!"        {writeDataName} = 0;"
+        , s!"        {writeEnableName} = 0;"
+        ]
+    , evalTickLocals := [] }
+
+  | .inst moduleName instName connections parameterBindings domainMap =>
     if !parameterBindings.isEmpty then
       panic! s!"CppSim requires specialization of parameterized instance '{instName}'"
     else
@@ -510,9 +585,19 @@ def emitStmt (stmt : Stmt) (typeMap : List (String × HWType))
             some s!"        {sanitizeName wireName} = {applyMask updated width};"
           | _ => none
         else none
+      let childDomainTicks := match subModule with
+        | some sm =>
+            ((List.range sm.clockDomains.length).zip sm.clockDomains).filterMap
+              fun (childIndex, childDomain) =>
+                match domainMap.find? (fun (child, _) => child == childDomain.id) with
+                | some (_, parentDomain) =>
+                    some (parentDomain, s!"        {iName}.tickDomain({childIndex});")
+                | none => none
+        | none => []
       { declarations := [s!"    {className} {iName};"]
       , evalBody := inputConns ++ [s!"        {iName}.eval();"] ++ outputConns
       , tickBody := [s!"        {iName}.tick();"]
+      , domainTicks := childDomainTicks
       , resetBody := [s!"        {iName}.reset();"]
       , evalTickLocals := [] }
 
@@ -535,6 +620,10 @@ def collectTickRefWires (body : List Stmt) : List String :=
       let refs := collectExprRefs wa ++ collectExprRefs wd ++ collectExprRefs we
       -- Non-combo-read: tick() assigns rd and references readAddr exprs
       let refs := if !cr then refs ++ collectExprRefs ra ++ [rd] else refs
+      acc ++ refs.map sanitizeName
+    | .asyncMemory _ _ _ _ wa wd we _ ra rd =>
+      let refs := collectExprRefs wa ++ collectExprRefs wd ++ collectExprRefs we ++
+        collectExprRefs ra ++ [rd]
       acc ++ refs.map sanitizeName
     | _ => acc
   ) []
@@ -579,7 +668,9 @@ def emitModule (m : Module) (design : Option Design := none)
           sn.startsWith "_gen_" || tickRefs.contains sn
     -- Collect memory names to avoid declaring them as local scalars
     let memoryNames := m.body.filterMap fun s => match s with
-      | .memory name _ _ _ _ _ _ _ _ _ => some (sanitizeName name) | _ => none
+      | .memory name _ _ _ _ _ _ _ _ _ => some (sanitizeName name)
+      | .asyncMemory name .. => some (sanitizeName name)
+      | _ => none
     let localWires := match observableWires with
       | some ws => internalWires.filter fun (w : Port) =>
           let sn := sanitizeName w.name
@@ -601,6 +692,7 @@ def emitModule (m : Module) (design : Option Design := none)
     -- Eval/tick/reset bodies
     let evalBody := allParts.foldl (fun acc p => acc ++ p.evalBody) []
     let tickBody := allParts.foldl (fun acc p => acc ++ p.tickBody) []
+    let domainTicks := allParts.foldl (fun acc p => acc ++ p.domainTicks) []
     let resetBody := allParts.foldl (fun acc p => acc ++ p.resetBody) []
     let evalTickLocals := allParts.foldl (fun acc p => acc ++ p.evalTickLocals) []
 
@@ -638,6 +730,41 @@ def emitModule (m : Module) (design : Option Design := none)
       (if tickBody.isEmpty then "" else String.intercalate "\n" tickBody ++ "\n") ++
       "    }\n\n"
 
+    let indexedDomains := (List.range m.clockDomains.length).zip m.clockDomains
+    let domainTickCases := indexedDomains.map fun (index, domain) =>
+      let statements := domainTicks.filterMap fun (domainId, statement) =>
+        if domainId == domain.id then some statement else none
+      s!"        case {index}:\n" ++
+      (if statements.isEmpty then "" else String.intercalate "\n" statements ++ "\n") ++
+      "            break;"
+    let domainNameCases := indexedDomains.map fun (index, domain) =>
+      s!"        case {index}: return \"{domain.id}\";"
+    let domainPeriodCases := indexedDomains.map fun (index, domain) =>
+      s!"        case {index}: return {domain.periodPs}ULL;"
+    let domainMethods :=
+      "    void tickDomain(uint32_t domain) {\n" ++
+      "        switch (domain) {\n" ++
+      (if domainTickCases.isEmpty then "" else String.intercalate "\n" domainTickCases ++ "\n") ++
+      "        }\n" ++
+      "    }\n\n" ++
+      "    void evalTickDomain(uint32_t domain) {\n" ++
+      "        eval();\n" ++
+      "        tickDomain(domain);\n" ++
+      "    }\n\n" ++
+      s!"    static uint32_t numDomains() {ob} return {m.clockDomains.length}; {cb}\n" ++
+      "    static const char* domainName(uint32_t domain) {\n" ++
+      "        switch (domain) {\n" ++
+      (if domainNameCases.isEmpty then "" else String.intercalate "\n" domainNameCases ++ "\n") ++
+      "        }\n" ++
+      "        return \"\";\n" ++
+      "    }\n\n" ++
+      "    static uint64_t domainPeriodPs(uint32_t domain) {\n" ++
+      "        switch (domain) {\n" ++
+      (if domainPeriodCases.isEmpty then "" else String.intercalate "\n" domainPeriodCases ++ "\n") ++
+      "        }\n" ++
+      "        return 0;\n" ++
+      "    }\n\n"
+
     let evalTickMethod :=
       "    void evalTick() {\n" ++
       (if evalTickLocals.isEmpty then "" else
@@ -652,7 +779,7 @@ def emitModule (m : Module) (design : Option Design := none)
 
     header ++ classOpen ++ inputSection ++ outputSection ++ wireSection ++
     stmtDeclSection ++ constructor ++ resetMethod ++ evalMethod ++ tickMethod ++
-    evalTickMethod ++ classClose
+    domainMethods ++ evalTickMethod ++ classClose
 
 /-- Convert a single module to C++ simulation code with includes -/
 def toCppSim (m : Module) : String :=
@@ -680,6 +807,9 @@ private def collectMemories (body : List Stmt) : List (String × Nat × Nat) :=
     | .memory name addrWidth dataWidth .. =>
       some (name, requireConcreteDim "memory address width" addrWidth,
         requireConcreteDim "memory data width" dataWidth)
+    | .asyncMemory name addrWidth dataWidth .. =>
+      some (name, requireConcreteDim "async memory address width" addrWidth,
+        requireConcreteDim "async memory data width" dataWidth)
     | _ => none
 
 /-- Collect (sanitizedName, width) for all registers ≤64 bits -/
@@ -714,11 +844,9 @@ private def emitRegNameSwitch (regs : List (String × Nat)) : String :=
     s!"            case {i}: return \"{sName}\";"
   String.intercalate "\n" cases
 
-/-- Generate set_input switch cases from Module.inputs (skip clk only) -/
+/-- Generate set_input switch cases from the already-filtered user inputs. -/
 private def emitSetInputSwitch (inputs : List Port) : String :=
-  let userInputs := inputs.filter fun (p : Port) =>
-    p.name != "clk"
-  let indexed := (List.range userInputs.length).zip userInputs
+  let indexed := (List.range inputs.length).zip inputs
   let cases := indexed.map fun (i, p) =>
     let sName := sanitizeName p.name
     let cppType := emitCppType p.ty
@@ -816,11 +944,13 @@ def toCppSimJIT (d : Design)
   | none => classCode ++ "\n// ERROR: top module not found\n"
   | some m =>
     let className := sanitizeName m.name
+    let domainPortNames := m.clockDomains.flatMap fun domain =>
+      domain.clock :: match domain.reset with | some reset => [reset] | none => []
     let userInputs := m.inputs.filter fun (p : Port) =>
-      p.name != "clk"
+      !domainPortNames.contains p.name
     let numInputs := userInputs.length
     let numOutputs := countOutputSlots m.outputs
-    let setInputCases := emitSetInputSwitch m.inputs
+    let setInputCases := emitSetInputSwitch userInputs
     let getOutputCases := emitGetOutputSwitch m.outputs
     let (wireSwitch, numWires) := emitGetWireSwitch m.wires observableWires
     let wireNameSwitch := emitWireNameSwitch m.wires observableWires
@@ -845,6 +975,11 @@ def toCppSimJIT (d : Design)
     s!"void  jit_eval(void* ctx)  {ob} static_cast<{className}*>(ctx)->eval(); {cb}\n" ++
     s!"void  jit_tick(void* ctx)  {ob} static_cast<{className}*>(ctx)->tick(); {cb}\n" ++
     s!"void  jit_eval_tick(void* ctx) {ob} static_cast<{className}*>(ctx)->evalTick(); {cb}\n\n" ++
+    s!"void  jit_tick_domain(void* ctx, uint32_t domain) {ob} static_cast<{className}*>(ctx)->tickDomain(domain); {cb}\n" ++
+    s!"void  jit_eval_tick_domain(void* ctx, uint32_t domain) {ob} static_cast<{className}*>(ctx)->evalTickDomain(domain); {cb}\n" ++
+    s!"uint32_t jit_num_domains() {ob} return {className}::numDomains(); {cb}\n" ++
+    s!"const char* jit_domain_name(uint32_t domain) {ob} return {className}::domainName(domain); {cb}\n" ++
+    s!"uint64_t jit_domain_period_ps(uint32_t domain) {ob} return {className}::domainPeriodPs(domain); {cb}\n\n" ++
     s!"void jit_set_input(void* ctx, uint32_t idx, uint64_t val) {ob}\n" ++
     s!"    auto* s = static_cast<{className}*>(ctx);\n" ++
     s!"    switch (idx) {ob}\n" ++

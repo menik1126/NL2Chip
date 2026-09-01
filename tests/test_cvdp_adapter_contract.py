@@ -19,12 +19,32 @@ import evaluator as evaluator_module  # noqa: E402
 from evaluator import (  # noqa: E402
     Evaluator,
     _classify_cvdp_local_timeout,
+    _cvdp_classify_local_failure,
     _cvdp_case_random_seed,
     _cvdp_collected_case_ids,
     _simulation_diagnostic_stage,
     generate_cvdp_wrapper,
     parse_module_ports,
 )
+
+
+def test_cvdp_local_failure_classification_separates_infra_and_semantics():
+    tool_status, tool_label = _cvdp_classify_local_failure(
+        "FAILED test_runner.py::test_runner",
+        "/bin/sh: iverilog: not found",
+    )
+    semantic_status, semantic_label = _cvdp_classify_local_failure(
+        "FAILED test_runner.py::test_runner - AssertionError: mismatch"
+    )
+
+    assert (tool_status, tool_label) == (
+        "sim_error",
+        "CVDP local simulator/tool error",
+    )
+    assert (semantic_status, semantic_label) == (
+        "sim_fail",
+        "CVDP local harness failed",
+    )
 from search import (  # noqa: E402
     build_sim_feedback,
     compact_repair_feedback,

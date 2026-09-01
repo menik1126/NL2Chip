@@ -79,11 +79,16 @@ inductive ResetKind where
   - period: Clock period in picoseconds (e.g., 10000 for 100MHz)
   - activeEdge: Whether to trigger on rising or falling edge
   - resetKind: Synchronous or asynchronous reset
+  - name: Stable identity used by the hardware IR
+  - clockName/resetName: Public module ports for this physical domain
 -/
 structure DomainConfig where
   period      : Nat
   activeEdge  : ActiveEdge
   resetKind   : ResetKind
+  name        : String := ""
+  clockName   : String := ""
+  resetName   : String := ""
   deriving Repr, BEq, DecidableEq
 
 /--
@@ -116,6 +121,9 @@ def defaultDomain : DomainConfig :=
   { period := 10000         -- 10ns = 100MHz
   , activeEdge := .rising
   , resetKind := .synchronous
+  , name := "default"
+  , clockName := "clk"
+  , resetName := "rst"
   }
 
 /-- Common 50MHz domain -/
@@ -123,6 +131,9 @@ def domain50MHz : DomainConfig :=
   { period := 20000         -- 20ns = 50MHz
   , activeEdge := .rising
   , resetKind := .synchronous
+  , name := "clk50"
+  , clockName := "clk50"
+  , resetName := "rst50"
   }
 
 /-- Common 200MHz domain -/
@@ -130,6 +141,9 @@ def domain200MHz : DomainConfig :=
   { period := 5000          -- 5ns = 200MHz
   , activeEdge := .rising
   , resetKind := .synchronous
+  , name := "clk200"
+  , clockName := "clk200"
+  , resetName := "rst200"
   }
 
 end Sparkle.Core.Domain

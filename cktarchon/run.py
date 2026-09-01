@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import json
@@ -45,6 +46,7 @@ import Sparkle.Compiler.Elab
 
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
+open Sparkle.Core.Circuit
 open Sparkle.Library.RTL
 
 /-- <one-line description> -/
@@ -60,6 +62,13 @@ def <target_module> {dom : DomainConfig}
 - `Signal dom Bool` is a hardware condition signal.
 - Clock/reset are implicit in `DomainConfig`; do not add clock/reset ports unless the benchmark spec has explicit user-visible ports.
 - Multi-output Sparkle functions return tuple signals, e.g. `Signal dom (BitVec 8 × BitVec 1)` with `bundle2`.
+
+## First-Class Multi-Domain Circuits
+- If the specification has two or more physical clocks, define one concrete `DomainConfig` per clock. Set `clockName`, `resetName`, `activeEdge`, and `resetKind` to the benchmark contract. Do not pass clocks as ordinary `Signal` arguments and do not collapse them into one domain.
+- Return `Circuit` when public outputs belong to different domains. Name outputs with `Circuit.ofOutputs`, `.bool`, and `.bits`; these names become SystemVerilog ports.
+- Use audited crossings only: `Signal.synchronizeLevel`, `Signal.synchronizePulse`, `Signal.synchronizePulseVector`, and `Signal.resetSynchronizer`.
+- For a power-of-two asynchronous FIFO, use `Circuit.asyncFifo DEPTH "w_full" "r_data" "r_empty" w_inc w_data r_inc`; it lowers to Gray pointers, two-stage pointer CDC, and dual-domain FWFT storage.
+- For retained parameters, use `#synthesizeParameterizedVerilog <target> [WIDTH := <legal-default>, DEPTH := <legal-default>]`. Do not specialize a parameter sweep to one fixed width.
 
 ## Stable Sparkle Operators
 - Bitwise/arithmetic: `~~~a`, `a &&& b`, `a ||| b`, `a ^^^ b`, `a + b`, `a - b`, `a * b`.
@@ -130,6 +139,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume-mode", choices=["passed", "completed"], default="completed")
     p.add_argument("--no-repl", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="Skip agent generation and only evaluate existing Generated/<prob_id>.lean files.")
+    p.add_argument(
+        "--hide-cvdp-harness-from-agent",
+        action="store_true",
+        help=(
+            "Expose only CVDP input.prompt/input.context to generation and repair agents. "
+            "The evaluator still receives the complete benchmark row and hidden harness."
+        ),
+    )
     parameter_mode = p.add_mutually_exclusive_group()
     parameter_mode.add_argument(
         "--finite-parameter-specialization",
@@ -314,6 +331,31 @@ def clear_generated_target(project_root: Path, run_dir: Path, prob_id: str) -> s
     shutil.copy2(target, backup)
     target.unlink()
     return str(backup)
+
+
+def agent_visible_problem_info(info: Any, *, hide_cvdp_harness: bool) -> Any:
+    """Return a public-only CVDP view for every model-facing prompt."""
+    metadata = dict(getattr(info, "metadata", {}) or {})
+    if not hide_cvdp_harness or metadata.get("dataset") != "cvdp":
+        return info
+
+    public_info = copy.copy(info)
+    input_context = metadata.get("input_context_files", {}) or {}
+    public_ref_chunks = []
+    if isinstance(input_context, dict):
+        for rel_path, code in input_context.items():
+            if str(code).strip():
+                public_ref_chunks.append(f"// Context file: {rel_path}\n{code}")
+    public_info.ref_code = (
+        "\n\n".join(public_ref_chunks)
+        if public_ref_chunks
+        else "(no public reference Verilog available)"
+    )
+    for private_key in ("harness_files", "cvdp_row", "verilog_sources"):
+        metadata.pop(private_key, None)
+    metadata["agent_input_policy"] = "cvdp-public-only"
+    public_info.metadata = metadata
+    return public_info
 
 
 def evaluate_with_infrastructure_retries(
@@ -515,6 +557,9 @@ def make_runner(
         max_tokens=args.max_tokens,
         lean_repl=repl,
         api_timeout=args.api_timeout,
+        allow_bash_tool=not bool(
+            args.hide_cvdp_harness_from_agent and args.dataset == "cvdp"
+        ),
         required_verilog_modules=required_modules,
     )
 
@@ -784,6 +829,10 @@ def process_problem_guided(
         finite_enabled=bool(getattr(args, "finite_parameter_specialization", False)),
         native_enabled=bool(getattr(args, "native_parameter_sweep", False)),
     )
+    agent_info = agent_visible_problem_info(
+        info,
+        hide_cvdp_harness=bool(args.hide_cvdp_harness_from_agent),
+    )
     has_repl = repl is not None
     generated_target = PROJECT_ROOT / "Generated" / f"{prob_id}.lean"
     preexisting_generated_backup = clear_generated_target(PROJECT_ROOT, run_dir, prob_id)
@@ -799,8 +848,8 @@ def process_problem_guided(
     sim_feedback_iterations = 0
     sim_feedback_success = False
 
-    interface_contract = search.format_benchmark_interface_contract(info)
-    public_context = search.format_context_files(info)
+    interface_contract = search.format_benchmark_interface_contract(agent_info)
+    public_context = search.format_context_files(agent_info)
     fallback_plan = (
         "Derive expected behavior only from the natural-language specification and the interface contract. "
         "Check reset polarity, cycle latency, boundary values, state transitions, output ordering, and every listed parameter setting."
@@ -864,7 +913,7 @@ def process_problem_guided(
     base_user_message = search.build_user_message(
         prob_id,
         has_repl=has_repl,
-        info=info,
+        info=agent_info,
         dataset_name=evaluator.dataset_name,
         condition_sv=None,
     ) + (("\n\n" + full_guide_text) if full_guide_text else "")
@@ -886,7 +935,7 @@ def process_problem_guided(
             role="ckt-generator-candidate-1",
             log_base=log_base,
             skill=skill,
-            info=info,
+            info=agent_info,
             repl=repl,
         )
         generation_t0 = time.monotonic()
@@ -996,7 +1045,7 @@ def process_problem_guided(
             prompt = build_fresh_candidate_prompt(
                 search=search,
                 prob_id=prob_id,
-                info=info,
+                info=agent_info,
                 dataset_name=evaluator.dataset_name,
                 has_repl=has_repl,
                 candidate_id=next_candidate,
@@ -1043,7 +1092,7 @@ def process_problem_guided(
                 repair_instruction = "Use the evaluator diagnostics and the public-spec test plan/TB guidance to repair the Lean source. "
             prompt = search.build_compact_repair_prompt(
                 prob_id=prob_id,
-                info=info,
+                info=agent_info,
                 dataset_name=evaluator.dataset_name,
                 has_repl=has_repl,
                 phase=("Lean generation/compile repair" if continuing_generation else "guided semantic repair"),
@@ -1070,7 +1119,7 @@ def process_problem_guided(
             role=role,
             log_base=log_base,
             skill=skill,
-            info=info,
+            info=agent_info,
             repl=repl,
         )
         attempt_error: str | None = None
@@ -1137,7 +1186,7 @@ def process_problem_guided(
                 iteration=sim_feedback_iterations,
                 history=search_history,
                 run_dir=run_dir,
-                info=info,
+                info=agent_info,
             )
             if self_test_enabled:
                 self_test_history.append({
@@ -1273,6 +1322,20 @@ def process_problem_guided(
         "elapsed_seconds": round(time.monotonic() - problem_t0, 3),
         "harness": args.harness,
         "model": model_alias(args.model),
+        "agent_input_policy": (
+            "cvdp-public-only"
+            if args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+            else "legacy"
+        ),
+        "cvdp_harness_hidden_from_agent": bool(
+            args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+        ),
+        "cvdp_output_context_hidden_from_agent": bool(
+            args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+        ),
+        "agent_bash_tool_enabled": not bool(
+            args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+        ),
         "timestamp": datetime.now().isoformat(),
     }
     if preexisting_generated_backup:
@@ -1315,6 +1378,10 @@ def process_problem(
         finite_enabled=bool(getattr(args, "finite_parameter_specialization", False)),
         native_enabled=bool(getattr(args, "native_parameter_sweep", False)),
     )
+    agent_info = agent_visible_problem_info(
+        info,
+        hide_cvdp_harness=bool(args.hide_cvdp_harness_from_agent),
+    )
     has_repl = repl is not None
     agent_stats = AgentStats()
     repair_stats_total = AgentStats()
@@ -1332,7 +1399,7 @@ def process_problem(
         user_message = search.build_user_message(
             prob_id,
             has_repl=has_repl,
-            info=info,
+            info=agent_info,
             dataset_name=evaluator.dataset_name,
             condition_sv=None,
         )
@@ -1343,7 +1410,7 @@ def process_problem(
             role="ckt-generator",
             log_base=log_base,
             skill=skill,
-            info=info,
+            info=agent_info,
             repl=repl,
         )
         try:
@@ -1415,7 +1482,7 @@ def process_problem(
                 iteration=sim_iter - 1,
                 history=sim_feedback_history,
                 run_dir=run_dir,
-                info=info,
+                info=agent_info,
             )
             continuing_generation = not bool(result.get("compile_pass"))
             if not current_code.strip():
@@ -1430,7 +1497,7 @@ def process_problem(
                 repair_instruction = "Use the Verilog simulation diagnostics to repair the Lean source. "
             compact_prompt = search.build_compact_repair_prompt(
                 prob_id=prob_id,
-                info=info,
+                info=agent_info,
                 dataset_name=evaluator.dataset_name,
                 has_repl=has_repl,
                 phase=("Lean generation/compile repair" if continuing_generation else "RTL simulation feedback"),
@@ -1450,7 +1517,7 @@ def process_problem(
                 role="ckt-sim-repair",
                 log_base=repair_log_base,
                 skill=skill,
-                info=info,
+                info=agent_info,
                 repl=repl,
             )
             try:
@@ -1587,6 +1654,20 @@ def process_problem(
         "elapsed_seconds": round(time.monotonic() - problem_t0, 3),
         "harness": args.harness,
         "model": model_alias(args.model),
+        "agent_input_policy": (
+            "cvdp-public-only"
+            if args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+            else "legacy"
+        ),
+        "cvdp_harness_hidden_from_agent": bool(
+            args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+        ),
+        "cvdp_output_context_hidden_from_agent": bool(
+            args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+        ),
+        "agent_bash_tool_enabled": not bool(
+            args.hide_cvdp_harness_from_agent and evaluator.dataset_name == "cvdp"
+        ),
         "timestamp": datetime.now().isoformat(),
     }
     if preexisting_generated_backup:
@@ -1602,6 +1683,11 @@ def process_problem(
 
 def main() -> None:
     args = parse_args()
+    if args.hide_cvdp_harness_from_agent and args.harness != "anthropic-api":
+        raise SystemExit(
+            "--hide-cvdp-harness-from-agent currently requires --harness anthropic-api "
+            "so model tool reads can be confined to the project snapshot"
+        )
     os.environ["CVDP_HARNESS_PROFILE"] = args.cvdp_harness_profile
     load_env_file(Path(args.key_env))
     ensure_runtime_env()
@@ -1761,6 +1847,11 @@ def main() -> None:
         "model": model_alias(args.model),
         "harness": args.harness,
         "cvdp_harness_profile": args.cvdp_harness_profile,
+        "agent_input_policy": (
+            "cvdp-public-only"
+            if args.hide_cvdp_harness_from_agent and args.dataset == "cvdp"
+            else "legacy"
+        ),
         "run_dir": str(run_dir),
     })
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

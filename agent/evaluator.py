@@ -293,13 +293,7 @@ def _classify_cvdp_case_result(
         return status, detail
     if returncode == 0:
         return "sim_pass", "CVDP case passed"
-    if re.search(
-        r"AssertionError|assert .*failed|\bFAILED\b|Failed \d+ of \d+ tests",
-        output,
-        re.IGNORECASE,
-    ):
-        return "sim_fail", "CVDP case failed"
-    return "sim_error", "CVDP case execution error"
+    return _cvdp_classify_local_failure(output)
 
 
 def _iverilog_failure_stage(output: str) -> str:
@@ -1012,6 +1006,30 @@ def _cvdp_type_mentions_parameter(typ: str, params: set[str]) -> bool:
     return any(re.search(rf"\b{re.escape(param)}\b", typ or "") for param in params)
 
 
+def _cvdp_classify_local_failure(output: str, sim_logs: str = "") -> tuple[str, str]:
+    """Classify local cocotb failures before pytest's generic FAILED marker."""
+    diagnostic = output + "\n" + sim_logs
+    if re.search(
+        r"(?:command not found|No such file or directory|exit status 127|"
+        r"Unable to get version|cannot load .*shared object|failed to load|"
+        r"(?:^|\s)(?:/bin/)?(?:sh|bash):[^\n]*: not found)",
+        diagnostic,
+        re.IGNORECASE | re.MULTILINE,
+    ):
+        return "sim_error", "CVDP local simulator/tool error"
+    if re.search(
+        r"(?:iverilog[^\n]*(?:syntax error|error:)|"
+        r"Command '\['iverilog'[^\n]*returned non-zero exit status|"
+        r"Unable to find the root module)",
+        diagnostic,
+        re.IGNORECASE,
+    ):
+        return "sim_error", "CVDP local Verilog compile error"
+    if re.search(r"(AssertionError|assert .*failed|FAILED|failed)", output, re.IGNORECASE):
+        return "sim_fail", "CVDP local harness failed"
+    return "sim_error", "CVDP local harness error"
+
+
 def _cvdp_expr_signal_name(expr: str) -> str | None:
     """Return the signal identifier at the root of a simple SV expression."""
     text = expr.strip()
@@ -1496,6 +1514,7 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
         "inputs": inputs & ports,
         "outputs": outputs,
         "params": params,
+        "assigned": assigned & ports,
     }
 
 
@@ -1680,10 +1699,34 @@ def generate_cvdp_wrapper(
             typ = sp_outputs[0][1]
         else:
             typ = "logic"
-        direction = "input" if name in usage["inputs"] else "output"
+        if name in usage["assigned"]:
+            direction = "input"
+        elif sp_match:
+            direction = sp_match[0]
+        else:
+            direction = "input" if name in usage["inputs"] else "output"
         port = (direction, _cvdp_normalize_type(typ), name)
         by_name[name] = port
         expected_ports.append(port)
+
+    parameterized_port_type_overrides: list[str] = []
+    reconciled_ports: list[tuple[str, str, str]] = []
+    for direction, typ, name in expected_ports:
+        sp_match = _cvdp_match_port(name, sparkle_ports, direction=direction)
+        if (
+            name in usage["ports"]
+            and sp_match is not None
+            and _cvdp_numeric_width(typ) == 1
+            and _cvdp_type_mentions_parameter(sp_match[1], usage["params"])
+        ):
+            core_type = _cvdp_normalize_type(sp_match[1])
+            reconciled_ports.append((direction, core_type, name))
+            parameterized_port_type_overrides.append(
+                f"benchmark port {name} inherits parameterized core type {core_type}"
+            )
+        else:
+            reconciled_ports.append((direction, typ, name))
+    expected_ports = reconciled_ports
 
     if bundled_type_by_output:
         expected_ports = [
@@ -1803,6 +1846,7 @@ def generate_cvdp_wrapper(
             "benchmark parameters exposed by wrapper: "
             + ", ".join(sorted(param_names))
         )
+    wrapper_notes.extend(parameterized_port_type_overrides)
 
     def note_fixed_width_core_port(
         sp_port: tuple[str, str, str],

@@ -122,6 +122,9 @@ partial def specializeStmt
       (← specializeExpr bindings indices rhs)
       (.literal concreteLanes) (.literal concreteLhsWidth)
       (.literal concreteRhsWidth) (.literal concreteResultWidth)]
+  | .cdc output sourceDomain destDomain input kind =>
+    return [.cdc output sourceDomain destDomain
+      (← specializeExpr bindings indices input) kind]
   | .register output clock reset input initValue =>
     return [.register output clock reset
       (← specializeExpr bindings indices input)
@@ -138,7 +141,21 @@ partial def specializeStmt
       (← specializeExpr bindings indices writeEnable)
       (← specializeExpr bindings indices readAddr)
       readData comboRead]
-  | .inst moduleName instName connections parameterBindings => do
+  | .asyncMemory name addrWidth dataWidth writeDomain writeAddr writeData
+      writeEnable readDomain readAddr readData => do
+    let concreteAddr ← requireDimension bindings
+      s!"async memory '{name}' address width" addrWidth
+    let concreteData ← requireDimension bindings
+      s!"async memory '{name}' data width" dataWidth
+    if concreteAddr == 0 || concreteData == 0 then
+      throw s!"async memory '{name}' specializes to a zero dimension"
+    return [.asyncMemory name (.literal concreteAddr) (.literal concreteData)
+      writeDomain
+      (← specializeExpr bindings indices writeAddr)
+      (← specializeExpr bindings indices writeData)
+      (← specializeExpr bindings indices writeEnable)
+      readDomain (← specializeExpr bindings indices readAddr) readData]
+  | .inst moduleName instName connections parameterBindings domainMap => do
     for (name, dimension) in parameterBindings do
       let _ ← requireDimension bindings s!"instance '{instName}' parameter '{name}'" dimension
     let concreteConnections ← connections.mapM fun (name, expression) => do
@@ -146,7 +163,7 @@ partial def specializeStmt
     let suffix := indices.foldl (fun acc (index, value) =>
       acc ++ "_" ++ index ++ "_" ++ toString value
     ) ""
-    return [.inst moduleName (instName ++ suffix) concreteConnections []]
+    return [.inst moduleName (instName ++ suffix) concreteConnections [] domainMap]
 
 
 def collectInstanceBindings (design : Design) (initial : Bindings) : Except String Bindings := do
@@ -157,7 +174,7 @@ def collectInstanceBindings (design : Design) (initial : Bindings) : Except Stri
     for module in design.modules do
       for statement in module.body do
         match statement with
-        | .inst _ _instName _ parameterBindings =>
+        | .inst _ _instName _ parameterBindings _domainMap =>
           for (name, dimension) in parameterBindings do
             match dimension.evaluate bindings with
             | some value => bindings ← bindValue bindings name value

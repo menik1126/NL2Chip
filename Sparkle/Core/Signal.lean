@@ -119,6 +119,10 @@ def pure (x : α) : Signal dom α :=
 def clock {dom : DomainConfig} : Signal dom Bool :=
   ⟨fun t => t % 2 == 1⟩
 
+/-- Expose the physical active-high reset port for this signal domain. -/
+def reset {dom : DomainConfig} : Signal dom Bool :=
+  ⟨fun t => t == 0⟩
+
 /-- Map a function over a signal (combinational logic) -/
 def map (f : α → β) (s : Signal dom α) : Signal dom β :=
   ⟨fun t => f (s.val t)⟩
@@ -331,6 +335,29 @@ def registerWithEnable (init : α) (en : Signal dom Bool) (input : Signal dom α
   ⟨fun t => match t with
     | 0 => init
     | n + 1 => if en.val n then input.val n else go n init⟩
+
+/-- Asynchronous assertion and two-cycle synchronous reset deassertion. -/
+def resetSynchronizer {dom : DomainConfig} : Signal dom Bool :=
+  register true (register true (pure false))
+
+/--
+  Synchronize a stable Boolean level into another physical clock domain.
+
+  The two destination-domain registers model the standard two-flop
+  synchronizer. Synthesis recognizes this definition as an audited CDC
+  primitive and records the crossing explicitly in the netlist IR.
+
+  This primitive is for levels that remain stable long enough to be sampled.
+  Pulses and multi-bit payloads require their dedicated CDC primitives.
+-/
+def synchronizeLevel {src dst : DomainConfig}
+    (input : Signal src Bool) : Signal dst Bool :=
+  let sampled : Signal dst Bool :=
+    ⟨fun dstTick =>
+      let sourcePeriod := max 1 src.period
+      let sourceTick := (dstTick * dst.period) / sourcePeriod
+      input.val sourceTick⟩
+  register false (register false sampled)
 
 /-- Helper to create a signal from a stream -/
 def fromStream (s : Stream α) : Signal dom α := ⟨s⟩
@@ -959,6 +986,37 @@ where
 
 @[implemented_by loopImpl]
 opaque loop {dom : DomainConfig} {α : Type} [Inhabited α] (f : Signal dom α → Signal dom α) : Signal dom α
+
+/--
+  Transfer a one-cycle source-domain pulse into a destination domain.
+
+  A source toggle preserves pulses even when the destination clock is slower.
+  The toggle crosses through a two-flop synchronizer and is converted back to
+  a one-cycle destination pulse by change detection.
+-/
+def synchronizePulse {src dst : DomainConfig}
+    (pulse : Signal src Bool) : Signal dst Bool :=
+  let toggle : Signal src Bool := Signal.loop fun state =>
+    let next := Signal.mux pulse (Signal.map Bool.not state) state
+    Signal.register false next
+  let synchronized : Signal dst Bool := synchronizeLevel toggle
+  let previous := Signal.register false synchronized
+  synchronized ^^^ previous
+
+/-- Multi-channel toggle pulse synchronizer. Each asserted bit is independent. -/
+def synchronizePulseVector {src dst : DomainConfig} {width : Nat}
+    (pulse : Signal src (BitVec width)) : Signal dst (BitVec width) :=
+  let toggle : Signal src (BitVec width) := Signal.loop fun state =>
+    Signal.register (BitVec.zero width) (state ^^^ pulse)
+  let sampled : Signal dst (BitVec width) :=
+    ⟨fun dstTick =>
+      let sourcePeriod := max 1 src.period
+      let sourceTick := (dstTick * dst.period) / sourcePeriod
+      toggle.val sourceTick⟩
+  let sync1 := Signal.register (BitVec.zero width) sampled
+  let sync2 := Signal.register (BitVec.zero width) sync1
+  let previous := Signal.register (BitVec.zero width) sync2
+  sync2 ^^^ previous
 
 /--
   Memoized fixed-point combinator for feedback loops (IO variant).

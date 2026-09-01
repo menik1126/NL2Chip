@@ -8,6 +8,11 @@ CVDP-style RTL translation under a small turn budget.
 
 - The benchmark interface contract is authoritative: match the requested top
   function name, port order/names, widths, reset polarity, and latency.
+- For multiple physical clocks, define one concrete `DomainConfig` per clock
+  and return a `Circuit`. Never model clocks as ordinary `Signal` inputs or
+  collapse domains. Use `Signal.synchronizeLevel`, `Signal.synchronizePulse`,
+  `Signal.synchronizePulseVector`, or `Signal.resetSynchronizer` for audited
+  crossings. Use `Circuit.asyncFifo` for power-of-two asynchronous FIFOs.
 - `Signal dom (BitVec W)` is a W-bit wire; `Signal dom Bool` is a condition.
   Use `boolToBV1`/`bv1ToBool` only when crossing these representations.
 - Hardware-dependent choices must be `Signal.mux cond whenTrue whenFalse`.

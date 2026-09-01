@@ -189,10 +189,13 @@ partial def countAllUses (stmts : List Stmt)
     | .generateFor _ _ _ _ body => countAllUses body counts
     | .signedDot _ lhs rhs _ _ _ _ =>
       countExprUses rhs (countExprUses lhs counts)
+    | .cdc _ _ _ input _ => countExprUses input counts
     | .register _ _ _ input _ => countExprUses input counts
     | .memory _ _ _ _ wa wd we ra _ _ =>
       [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
-    | .inst _ _ conns _ =>
+    | .asyncMemory _ _ _ _ wa wd we _ ra _ =>
+      [wa, wd, we, ra].foldl (fun acc e => countExprUses e acc) counts
+    | .inst _ _ conns _ _ =>
       conns.foldl (fun acc (_, e) => countExprUses e acc) counts
   ) initial
 
@@ -205,15 +208,21 @@ partial def optimizeStmt (dm : DefMap) (wm : WidthMap) : Stmt → Stmt
   | .signedDot output lhs rhs laneCount lhsWidth rhsWidth resultWidth =>
     .signedDot output (optimizeExpr dm wm lhs) (optimizeExpr dm wm rhs)
       laneCount lhsWidth rhsWidth resultWidth
+  | .cdc output sourceDomain destDomain input kind =>
+    .cdc output sourceDomain destDomain (optimizeExpr dm wm input) kind
   | .register output clock reset input initValue =>
     .register output clock reset (optimizeExpr dm wm input) (optimizeExpr dm wm initValue)
   | .memory name aw dw clk wa wd we ra rd cr =>
     .memory name aw dw clk
       (optimizeExpr dm wm wa) (optimizeExpr dm wm wd)
       (optimizeExpr dm wm we) (optimizeExpr dm wm ra) rd cr
-  | .inst modName instName conns parameterBindings =>
+  | .asyncMemory name aw dw writeDomain wa wd we readDomain ra rd =>
+    .asyncMemory name aw dw writeDomain
+      (optimizeExpr dm wm wa) (optimizeExpr dm wm wd) (optimizeExpr dm wm we)
+      readDomain (optimizeExpr dm wm ra) rd
+  | .inst modName instName conns parameterBindings domainMap =>
     .inst modName instName (conns.map fun (p, e) => (p, optimizeExpr dm wm e))
-      parameterBindings
+      parameterBindings domainMap
 
 /-- Recursively substitute inlinable references with their defining expressions -/
 partial def substituteExpr (dm : DefMap) (inlinable : HashMap String Bool)
@@ -247,6 +256,8 @@ partial def substituteStmt (dm : DefMap) (inlinable : HashMap String Bool) : Stm
       (substituteExpr dm inlinable 100 lhs)
       (substituteExpr dm inlinable 100 rhs)
       laneCount lhsWidth rhsWidth resultWidth
+  | .cdc output sourceDomain destDomain input kind =>
+    .cdc output sourceDomain destDomain (substituteExpr dm inlinable 100 input) kind
   | .register output clock reset input initValue =>
     .register output clock reset (substituteExpr dm inlinable 100 input)
       (substituteExpr dm inlinable 100 initValue)
@@ -254,10 +265,16 @@ partial def substituteStmt (dm : DefMap) (inlinable : HashMap String Bool) : Stm
     .memory name aw dw clk
       (substituteExpr dm inlinable 100 wa) (substituteExpr dm inlinable 100 wd)
       (substituteExpr dm inlinable 100 we) (substituteExpr dm inlinable 100 ra) rd cr
-  | .inst modName instName conns parameterBindings =>
+  | .asyncMemory name aw dw writeDomain wa wd we readDomain ra rd =>
+    .asyncMemory name aw dw writeDomain
+      (substituteExpr dm inlinable 100 wa)
+      (substituteExpr dm inlinable 100 wd)
+      (substituteExpr dm inlinable 100 we)
+      readDomain (substituteExpr dm inlinable 100 ra) rd
+  | .inst modName instName conns parameterBindings domainMap =>
     .inst modName instName
       (conns.map fun (p, e) => (p, substituteExpr dm inlinable 100 e))
-      parameterBindings
+      parameterBindings domainMap
 
 /-- Inline single-use wires: replace references with their defining expressions
     and remove the now-dead assign statements. -/
@@ -276,6 +293,7 @@ def inlineSingleUseWires (m : Module) (body : List Stmt)
   let memoryReadData := body.foldl (fun s stmt =>
     match stmt with
     | .memory _ _ _ _ _ _ _ _ rd _ => s.insert rd true
+    | .asyncMemory _ _ _ _ _ _ _ _ _ rd => s.insert rd true
     | _ => s
   ) ({} : HashMap String Bool)
 

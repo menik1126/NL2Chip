@@ -13,6 +13,7 @@ from cktarchon.env import ensure_runtime_env, model_alias
 from cktarchon.harness import AnthropicHarnessRunner, PathGuard
 from cktarchon.logs import append_jsonl, normalize_token_usage, parse_agent_log
 from cktarchon.run import (
+    agent_visible_problem_info,
     already_done,
     build_fresh_candidate_prompt,
     build_system_prompt,
@@ -36,6 +37,42 @@ from cktarchon.responses_chat_proxy import (
     events_to_sse,
     responses_request_to_chat_request,
 )
+
+
+def test_public_only_problem_info_removes_private_cvdp_context():
+    info = SimpleNamespace(
+        metadata={
+            "dataset": "cvdp",
+            "input_context_files": {"public.sv": "module public_input; endmodule"},
+            "harness_files": {"test.py": "golden output implementation"},
+            "cvdp_row": {"private": True},
+            "verilog_sources": ["hidden.sv"],
+            "categories": ["hard"],
+        },
+        ref_code="golden output implementation",
+    )
+
+    public_info = agent_visible_problem_info(info, hide_cvdp_harness=True)
+
+    assert public_info is not info
+    assert "public_input" in public_info.ref_code
+    assert "golden output implementation" not in public_info.ref_code
+    assert "harness_files" not in public_info.metadata
+    assert "cvdp_row" not in public_info.metadata
+    assert "verilog_sources" not in public_info.metadata
+    assert public_info.metadata["categories"] == ["hard"]
+    assert public_info.metadata["agent_input_policy"] == "cvdp-public-only"
+
+
+def test_public_only_anthropic_runner_omits_bash_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = _anthropic_runner(tmp_path, monkeypatch)
+    runner.allow_bash_tool = False
+
+    assert "bash" not in {tool["name"] for tool in runner._model_tools()}
+    assert "lean_check" in {tool["name"] for tool in runner._model_tools()}
 
 
 def test_skill_requires_outputs_outside_signal_loop():
