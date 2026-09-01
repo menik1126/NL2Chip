@@ -1254,6 +1254,35 @@ def test_responses_request_omits_parallel_tools_without_tools():
     assert "parallel_tool_calls" not in chat
 
 
+def test_responses_request_requires_an_initial_workspace_tool_call():
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": "write the candidate",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "run command",
+                "parameters": {"type": "object"},
+            }
+        ],
+        "tool_choice": "auto",
+    }
+
+    initial = responses_request_to_chat_request(body)
+    assert initial["tool_choice"] == "required"
+
+    body["input"] = [
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "candidate written",
+        }
+    ]
+    continued = responses_request_to_chat_request(body)
+    assert continued["tool_choice"] == "auto"
+
+
 def test_responses_request_user_assistant_only_mode(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CKTARCHON_CHAT_USER_ASSISTANT_ONLY", "1")
     body = {

@@ -190,6 +190,20 @@ def responses_request_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
             request["tool_choice"] = tool_choice
         elif isinstance(tool_choice, dict):
             request["tool_choice"] = tool_choice
+        has_tool_output = any(
+            isinstance(item, dict)
+            and item.get("type") in {
+                "function_call_output",
+                "custom_tool_call_output",
+                "mcp_tool_call_output",
+            }
+            for item in (body.get("input") if isinstance(body.get("input"), list) else [])
+        )
+        if request.get("tool_choice") in {None, "auto"} and not has_tool_output:
+            # The Codex worker must perform a workspace action before it can
+            # return a useful answer. Avoid provider-specific planning-only
+            # initial turns while leaving post-tool turns free to finish.
+            request["tool_choice"] = "required"
     if tools and body.get("parallel_tool_calls") is not None:
         request["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
     if body.get("temperature") is not None:
