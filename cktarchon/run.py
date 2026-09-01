@@ -546,6 +546,9 @@ def make_runner(
             auto_chat_proxy=not args.no_codex_chat_proxy,
             chat_proxy_timeout_s=args.api_timeout,
             required_verilog_modules=required_modules,
+            public_only=bool(
+                args.hide_cvdp_harness_from_agent and args.dataset == "cvdp"
+            ),
         )
     return AnthropicHarnessRunner(
         project_root=PROJECT_ROOT,
@@ -1683,10 +1686,20 @@ def process_problem(
 
 def main() -> None:
     args = parse_args()
-    if args.hide_cvdp_harness_from_agent and args.harness != "anthropic-api":
+    if (
+        args.hide_cvdp_harness_from_agent
+        and args.harness == "codex-agent"
+        and args.codex_sandbox != "workspace-write"
+    ):
         raise SystemExit(
-            "--hide-cvdp-harness-from-agent currently requires --harness anthropic-api "
-            "so model tool reads can be confined to the project snapshot"
+            "Codex public-only CVDP runs require --codex-sandbox workspace-write"
+        )
+    if args.hide_cvdp_harness_from_agent and args.harness not in {
+        "anthropic-api",
+        "codex-agent",
+    }:
+        raise SystemExit(
+            "--hide-cvdp-harness-from-agent requires --harness anthropic-api or codex-agent"
         )
     os.environ["CVDP_HARNESS_PROFILE"] = args.cvdp_harness_profile
     load_env_file(Path(args.key_env))

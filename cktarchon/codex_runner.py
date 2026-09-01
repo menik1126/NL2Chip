@@ -45,6 +45,7 @@ class CodexAgentHarnessRunner:
     chat_proxy_timeout_s: float = 300.0
     required_verilog_modules: tuple[str, ...] = ()
     recover_usage_from_rollout: bool = True
+    public_only: bool = False
 
     @property
     def log_path(self) -> Path:
@@ -61,8 +62,7 @@ class CodexAgentHarnessRunner:
 
         use_proxy = self._should_auto_proxy()
         with auto_proxy_env(enabled=use_proxy, timeout_s=self.chat_proxy_timeout_s) as proxy_env:
-            env_overrides = os.environ.copy()
-            env_overrides.update(proxy_env)
+            env_overrides = self._build_agent_env(proxy_env)
             base_url_env = self.base_url_env or (DEFAULT_BASE_URL_ENV if use_proxy else None)
             key_env = self.key_env or (DEFAULT_KEY_ENV if use_proxy else None)
 
@@ -148,6 +148,17 @@ class CodexAgentHarnessRunner:
             })
             raise RuntimeError("official Archon CodexAgent returned non-zero")
         return stats
+
+    def _build_agent_env(self, proxy_env: dict[str, str]) -> dict[str, str]:
+        """Build the environment inherited by the model-facing Codex process."""
+        env_overrides = os.environ.copy()
+        env_overrides.update(proxy_env)
+        if self.public_only:
+            # The parent evaluator retains this location; the generation and
+            # repair subprocess must not receive a route to hidden CVDP data.
+            env_overrides.pop("CVDP_DATASET_FILE", None)
+            env_overrides.pop("CVDP_HARNESS_PROFILE", None)
+        return env_overrides
 
     def _recover_rollout_usage(self, env: dict[str, str]) -> None:
         """Recover usage after a strict-budget stop, then remove the rollout.
@@ -383,8 +394,14 @@ class CodexAgentHarnessRunner:
             ".venv/bin/python -m cktarchon.tools lean-check "
             f"Generated/{self.prob_id}.lean{required_args}"
         )
+        public_only_note = (
+            "- Public-only evaluation is enabled. Hidden CVDP harnesses, expected traces, and evaluator data are not available to you; do not attempt to locate them.\n"
+            if self.public_only
+            else ""
+        )
         return (
             self.system_prompt.rstrip()
+            + public_only_note
             + "\n\n## Codex-agent execution notes\n"
             + f"- Target action budget: about {max_turns} tool/model steps; stop once `Generated/{self.prob_id}.lean` compiles.\n"
             + f"- Only edit `Generated/{self.prob_id}.lean` and scratch files under `cktarchon_work/{self.prob_id}/`.\n"

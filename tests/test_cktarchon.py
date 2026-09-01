@@ -760,6 +760,27 @@ def test_codex_prompt_points_to_lean_check(tmp_path: Path):
     assert "Do not run simulation, pytest, cocotb, or a final `lake build` after lean-check succeeds" in prompt
 
 
+def test_codex_public_only_mode_scrubs_cvdp_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CVDP_DATASET_FILE", "/private/cvdp.jsonl")
+    monkeypatch.setenv("CVDP_HARNESS_PROFILE", "race-safe-v1")
+    runner = CodexAgentHarnessRunner(
+        project_root=tmp_path,
+        prob_id="prob_a",
+        model="gpt-5.6-sol",
+        role="ckt-generator",
+        log_base=tmp_path / "logs" / "generate",
+        system_prompt="system",
+        public_only=True,
+    )
+
+    env = runner._build_agent_env({"PROXY_ONLY": "1"})
+
+    assert "CVDP_DATASET_FILE" not in env
+    assert "CVDP_HARNESS_PROFILE" not in env
+    assert env["PROXY_ONLY"] == "1"
+    assert "Hidden CVDP harnesses" in runner._codex_prompt("problem", max_turns=1)
+
+
 def test_codex_budget_watcher_sets_cancel(tmp_path: Path):
     runner = CodexAgentHarnessRunner(
         project_root=tmp_path,
