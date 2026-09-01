@@ -229,6 +229,11 @@ def responses_request_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
             request["tool_choice"] = "required"
     if tools and body.get("parallel_tool_calls") is not None:
         request["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
+    tool_reasoning_effort = os.environ.get(
+        "CKTARCHON_CHAT_TOOL_REASONING_EFFORT", ""
+    ).strip()
+    if tools and tool_reasoning_effort:
+        request["reasoning_effort"] = tool_reasoning_effort
     if body.get("temperature") is not None:
         request["temperature"] = body.get("temperature")
     if body.get("max_output_tokens") is not None:
