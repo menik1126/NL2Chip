@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import shlex
 import sys
@@ -46,6 +47,7 @@ class CodexAgentHarnessRunner:
     required_verilog_modules: tuple[str, ...] = ()
     recover_usage_from_rollout: bool = True
     public_only: bool = False
+    execution_user: str | None = None
 
     @property
     def log_path(self) -> Path:
@@ -56,6 +58,7 @@ class CodexAgentHarnessRunner:
         self.project_root = self.project_root.resolve()
         self._ensure_archon_importable()
         codex_bin = self._resolve_codex_bin()
+        codex_bin = self._wrap_codex_bin_for_execution_user(codex_bin)
 
         from archon.agents.codex import CodexAgent
         from archon.commands.tooling.project_config import HarnessDescriptor
@@ -329,6 +332,33 @@ class CodexAgentHarnessRunner:
             "codex-agent harness requested, but no `codex` CLI is installed or exposed via ARCHON_CODEX_BIN. "
             "Install Codex CLI/Node on this host, or use --harness anthropic-api for Claude API runs."
         )
+
+    def _wrap_codex_bin_for_execution_user(self, codex_bin: str) -> str:
+        if not self.execution_user:
+            return codex_bin
+        try:
+            account = pwd.getpwnam(self.execution_user)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Codex execution user '{self.execution_user}' does not exist"
+            ) from exc
+        runuser = shutil.which("runuser")
+        if not runuser:
+            raise RuntimeError(
+                "--codex-agent-user requires the local runuser executable"
+            )
+        wrapper = self.log_path.parent / f".codex-run-as-{self.execution_user}"
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"export HOME={shlex.quote(account.pw_dir)}\n"
+            f"export XDG_CACHE_HOME={shlex.quote(account.pw_dir + '/.cache')}\n"
+            f"exec {shlex.quote(runuser)} --preserve-environment --user "
+            f"{shlex.quote(self.execution_user)} -- {shlex.quote(codex_bin)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        return str(wrapper)
 
     def _budget_exceeded_logged(self) -> bool:
         try:

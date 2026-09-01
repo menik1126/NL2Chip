@@ -212,6 +212,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--codex-bin", default=None, help="Optional absolute path to the codex CLI for --harness codex-agent.")
     p.add_argument("--codex-effort", default=None, help="Optional model_reasoning_effort passed to codex exec.")
     p.add_argument("--codex-sandbox", default="danger-full-access", help="Codex sandbox mode.")
+    p.add_argument(
+        "--codex-agent-user",
+        default=None,
+        help="Optional unprivileged OS user used to execute Codex tool calls.",
+    )
     p.add_argument("--codex-idle-timeout", type=float, default=900.0, help="Seconds of no JSONL activity before Archon restarts codex.")
     p.add_argument("--codex-max-attempts", type=int, default=3, help="Archon CodexAgent retry attempts after idle timeouts.")
     p.add_argument("--codex-base-url-env", default=None, help="Env var containing a Codex-compatible gateway base URL.")
@@ -549,6 +554,7 @@ def make_runner(
             public_only=bool(
                 args.hide_cvdp_harness_from_agent and args.dataset == "cvdp"
             ),
+            execution_user=args.codex_agent_user,
         )
     return AnthropicHarnessRunner(
         project_root=PROJECT_ROOT,
@@ -1686,13 +1692,21 @@ def process_problem(
 
 def main() -> None:
     args = parse_args()
+    codex_public_only_sandbox = (
+        args.codex_sandbox == "workspace-write"
+        or (
+            args.codex_sandbox == "danger-full-access"
+            and bool(args.codex_agent_user)
+        )
+    )
     if (
         args.hide_cvdp_harness_from_agent
         and args.harness == "codex-agent"
-        and args.codex_sandbox != "workspace-write"
+        and not codex_public_only_sandbox
     ):
         raise SystemExit(
-            "Codex public-only CVDP runs require --codex-sandbox workspace-write"
+            "Codex public-only CVDP runs require --codex-sandbox workspace-write "
+            "or --codex-sandbox danger-full-access with --codex-agent-user"
         )
     if args.hide_cvdp_harness_from_agent and args.harness not in {
         "anthropic-api",

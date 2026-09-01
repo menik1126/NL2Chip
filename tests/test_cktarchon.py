@@ -760,6 +760,25 @@ def test_codex_prompt_points_to_lean_check(tmp_path: Path):
     assert "Do not run simulation, pytest, cocotb, or a final `lake build` after lean-check succeeds" in prompt
 
 
+def test_codex_runner_wraps_cli_for_execution_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("cktarchon.codex_runner.shutil.which", lambda _: "/usr/sbin/runuser")
+    runner = CodexAgentHarnessRunner(
+        project_root=tmp_path,
+        prob_id="prob_a",
+        model="gpt-5.6-sol",
+        role="ckt-generator",
+        log_base=tmp_path / "logs" / "generate",
+        system_prompt="system",
+        execution_user="root",
+    )
+
+    wrapper = Path(runner._wrap_codex_bin_for_execution_user("/usr/local/bin/codex"))
+    script = wrapper.read_text(encoding="utf-8")
+
+    assert wrapper.is_file()
+    assert "--user root -- /usr/local/bin/codex" in script
+
+
 def test_codex_public_only_mode_scrubs_cvdp_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CVDP_DATASET_FILE", "/private/cvdp.jsonl")
     monkeypatch.setenv("CVDP_HARNESS_PROFILE", "race-safe-v1")
