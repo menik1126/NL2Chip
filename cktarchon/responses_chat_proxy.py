@@ -190,7 +190,7 @@ def responses_request_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
             request["tool_choice"] = tool_choice
         elif isinstance(tool_choice, dict):
             request["tool_choice"] = tool_choice
-    if body.get("parallel_tool_calls") is not None:
+    if tools and body.get("parallel_tool_calls") is not None:
         request["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
     if body.get("temperature") is not None:
         request["temperature"] = body.get("temperature")

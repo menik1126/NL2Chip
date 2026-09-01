@@ -1241,6 +1241,19 @@ def test_responses_request_to_chat_request():
     assert chat["tools"][0]["function"]["parameters"]["type"] == "object"
 
 
+def test_responses_request_omits_parallel_tools_without_tools():
+    chat = responses_request_to_chat_request(
+        {
+            "model": "gpt-5.6-sol",
+            "input": "continue",
+            "parallel_tool_calls": True,
+        }
+    )
+
+    assert "tools" not in chat
+    assert "parallel_tool_calls" not in chat
+
+
 def test_responses_request_user_assistant_only_mode(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CKTARCHON_CHAT_USER_ASSISTANT_ONLY", "1")
     body = {
