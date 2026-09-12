@@ -52,7 +52,6 @@ class CodexAgentHarnessRunner:
     execution_user: str | None = None
     direct_verilog: bool = False
     native_login_only: bool = False
-    interface_prompt_policy: str = "legacy"
 
     @property
     def log_path(self) -> Path:
@@ -507,26 +506,16 @@ class CodexAgentHarnessRunner:
             if self.public_only
             else ""
         )
-        compiler_tool_note = (
-            "- The Lean compiler entry point is the CLI command below; check the saved complete candidate file.\n"
-            if self.interface_prompt_policy == "public-spec-v2" else
-            "- In this Codex path there is no direct `lean_check` function tool. Ignore instructions that say to pass code to `lean_check`.\n"
-        )
-        search_note = (
-            "- Use the available `grep` and `find` commands for permitted source searches.\n"
-            if self.interface_prompt_policy == "public-spec-v2" else
-            "- Use `grep`/`find` rather than `rg`; `rg` is not installed on this H20 image.\n"
-        )
         return (
             self.system_prompt.rstrip()
             + public_only_note
             + "\n\n## Codex-agent execution notes\n"
             + f"- Target action budget: about {max_turns} tool/model steps; stop once `Generated/{self.prob_id}.lean` compiles.\n"
             + f"- Only edit `Generated/{self.prob_id}.lean` and scratch files under `cktarchon_work/{self.prob_id}/`.\n"
-            + compiler_tool_note
+            + "- In this Codex path there is no direct `lean_check` function tool. Ignore instructions that say to pass code to `lean_check`.\n"
             + f"- For Lean feedback, run `{lean_check_command}` from the repository root.\n"
             + "- `cktarchon.tools lean-check` checks the file path argument only; it does not read candidate code from stdin. Write the target file before checking it.\n"
-            + search_note
+            + "- Use `grep`/`find` rather than `rg`; `rg` is not installed on this H20 image.\n"
             + "- Never read prior benchmark candidates or run artifacts, including `experiments/p3_replay_candidates`, `results*`, `preexisting_generated`, candidate snapshots, or another task's `Generated/cvdp_*` file. They are evaluation leakage, not examples.\n"
             + "- Leave benchmark, Sparkle, evaluator, and harness files unchanged.\n"
             + "- Do not run simulation, pytest, cocotb, or a final `lake build` after lean-check succeeds; the outer evaluator does that.\n\n"

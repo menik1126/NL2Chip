@@ -510,35 +510,20 @@ def build_system_prompt(
             "#synthesizeParameterizedVerilog (or its Design form for hierarchy) for parameterized designs; "
             "use #synthesizeVerilog for non-parameterized designs. Derive defaults only from public input.\n"
         )
-    generation_skill = COMPACT_SPARKLE_GENERATION_SKILL
-    if public_spec:
-        generation_skill = generation_skill.replace("parameter contract", "public parameter requirements").replace(
-            "benchmark contract", "public specification"
-        ).replace(
-            "Read at most two small examples", "Read at most three small examples"
-        )
-    compiler_and_search_rules = (
-        "- Use the prescribed Lean compiler command on the complete candidate file, including the appropriate synthesis command. A check is successful only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
-        "- Keep repository exploration short: read at most three examples, then write a complete candidate and iterate from compiler feedback.\n"
-        "- Use only the search and compiler commands available in the execution notes. Do not search other tasks' artifacts.\n"
-        if public_spec else
-        "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and the contract-appropriate synthesis command; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
-        "- Keep repository exploration short: read at most three examples, then write a complete candidate and iterate from compiler feedback.\n"
-        "- Use the guarded `grep`, `glob`, and `list_directory` tools for repository searches; shell file-discovery commands are blocked so concurrent tasks cannot see each other's artifacts.\n"
-        "- If you need a directory listing, use `list_directory`; do not call `read_file` on directories.\n"
-    )
     return (
-        generation_skill.rstrip()
+        COMPACT_SPARKLE_GENERATION_SKILL.rstrip()
         + skill_section
         + "\n\n## CktArchon harness rules\n"
         + f"- You are running under the Archon-style CktArchon harness for `{prob_id}`.\n"
-        + (f"- Write only `Generated/{prob_id}.lean`.\n" if public_spec else
-           f"- Write only `Generated/{prob_id}.lean` using the `write_file`/`edit_file` tools.\n")
+        + f"- Write only `Generated/{prob_id}.lean` using the `write_file`/`edit_file` tools.\n"
         + design_rule
         + contract_rules
         + "- Match benchmark output names exactly. If you must return a packed output internally, construct an explicit named MSB-to-LSB concat so the CVDP wrapper can recover each output field.\n"
         + "- Preserve benchmark clock, reset polarity, and cycle latency exactly; the cocotb harness checks protocol timing, not just combinational truth tables.\n"
-        + compiler_and_search_rules
+        + "- Use `lean_check` frequently; it uses the persistent Lean REPL when available. Every inline `code` check must include the complete module body and the contract-appropriate synthesis command; a check is usable only when it also returns `Generated Verilog`. The harness automatically saves the latest such compile-safe candidate.\n"
+        + "- Keep repository exploration short: read at most three examples, then write a complete candidate and iterate from compiler feedback.\n"
+        + "- Use the guarded `grep`, `glob`, and `list_directory` tools for repository searches; shell file-discovery commands are blocked so concurrent tasks cannot see each other's artifacts.\n"
+        + "- If you need a directory listing, use `list_directory`; do not call `read_file` on directories.\n"
         + "- The key Sparkle synthesis rules are included below. Do not `cat` all of `docs/Troubleshooting_Synthesis.md`; if you need more detail, use `grep` for a narrow pattern.\n"
         + "- Prefer simple `Signal dom ... -> Signal dom ...` combinational helpers. Avoid pure helper functions with `match`, `if`, tuples, or recursion when their result depends on hardware signals.\n"
         + "- Use `Signal.mux` for all data-dependent choices. Sparkle cannot synthesize Lean `if`/`match`/`ite` over signal-derived values or inside `Signal.map` lambdas.\n"
@@ -627,7 +612,6 @@ def make_runner(
                 args.hide_cvdp_harness_from_agent and args.dataset == "cvdp"
             ),
             execution_user=args.codex_agent_user,
-            interface_prompt_policy=getattr(args, "interface_prompt_policy", "legacy"),
         )
     return AnthropicHarnessRunner(
         project_root=PROJECT_ROOT,
@@ -1519,9 +1503,9 @@ def process_problem(
 ) -> dict[str, Any]:
     use_public_prompt = getattr(args, "interface_prompt_policy", "legacy") == public_prompt.POLICY
     if use_public_prompt and (getattr(args, "guided_search", False) or args.feedback_mode != "compile-only"):
-        raise ValueError("public-spec-v2 supports ordinary compile-only generation/repair, not guided search")
+        raise ValueError("public-spec-v1 supports ordinary compile-only generation/repair, not guided search")
     if use_public_prompt and (getattr(args, "finite_parameter_specialization", False) or not args.hide_cvdp_harness_from_agent):
-        raise ValueError("public-spec-v2 requires hidden harnesses and does not support finite specialization")
+        raise ValueError("public-spec-v1 requires hidden harnesses and does not support finite specialization")
     if getattr(args, "guided_search", False) and not args.eval_only:
         return process_problem_guided(
             prob_id,

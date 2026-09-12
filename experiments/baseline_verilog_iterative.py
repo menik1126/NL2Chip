@@ -235,22 +235,33 @@ def call_model(
 def is_compile_feedback_failure(result: dict) -> bool:
     status = str(result.get("sim_status") or "")
     detail = str(result.get("detail") or "").lower()
+    infrastructure_markers = (
+        "simulator/tool error",
+        "iverilog executable not found",
+        "iverilog not found",
+        "command not found",
+        "error while loading shared libraries",
+        "missing src/.env",
+    )
+    if any(marker in detail for marker in infrastructure_markers):
+        return False
     if status in {"gen_error", "compile_fail"}:
         return True
-    if not result.get("compile_pass"):
-        return True
     compile_markers = (
+        "verilog compile error",
         "compile failed",
-        "iverilog",
         "syntax error",
         "elaboration",
         "unable to bind",
         "unknown module",
         "module not found",
+        "unable to find the root module",
         "no module...endmodule",
         "failed to build",
     )
-    return status == "sim_error" and any(marker in detail for marker in compile_markers)
+    return (
+        status == "sim_error" or result.get("compile_pass") is False
+    ) and any(marker in detail for marker in compile_markers)
 
 
 def eval_direct_verilog(
@@ -321,7 +332,24 @@ def eval_direct_verilog(
     result["sim_status"] = sim_status
     result["sim_mismatches"] = mismatches
     result["detail"] = detail
-    result["compile_pass"] = sim_status not in ("gen_error", "compile_fail", "sim_error") or "failed" not in detail.lower()
+    # CVDP reports candidate syntax/elaboration failures as sim_error. Seed the
+    # post-evaluation state as compiled so the classifier relies on the explicit
+    # diagnostic instead of the result dictionary's initial False value.
+    result["compile_pass"] = True
+    if is_compile_feedback_failure(result):
+        result["compile_pass"] = False
+    elif sim_status == "sim_error" and any(
+        marker in detail.lower()
+        for marker in (
+            "simulator/tool error",
+            "iverilog executable not found",
+            "iverilog not found",
+            "command not found",
+            "error while loading shared libraries",
+            "missing src/.env",
+        )
+    ):
+        result["compile_pass"] = False
     return result
 
 

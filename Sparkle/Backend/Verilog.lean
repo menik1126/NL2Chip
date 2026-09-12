@@ -40,7 +40,7 @@ partial def emitDimExpr : DimExpr → String
 def emitType (ty : HWType) : String :=
   match ty with
   | .bit => "logic"
-  | .bitVector 1 => "logic"
+  | .bitVector 1 => "logic [0:0]"
   | .bitVector w => s!"logic [{w-1}:0]"
   | .bitVectorDim width => s!"logic [{emitDimExpr width}-1:0]"
   | .array size elemType =>
@@ -166,9 +166,38 @@ def emitDomainEdge (domain : ClockDomain) : String :=
     | .falling => "negedge"
   s!"{edge} {sanitizeName domain.clock}"
 
+/-- A known scalar's bit zero is the scalar itself. Do not erase vector slices
+    or out-of-range selections based only on the result being one bit wide. -/
+partial def lowerScalarSelections (expr : Expr) (signals : List Port)
+    (generateValues : List (String × Nat) := []) : Expr :=
+  let scalarRef := fun value => match value with
+    | .ref name => signals.any (fun port => port.name == name && port.ty == .bit)
+    | _ => false
+  let zeroIndex := fun (value : DimExpr) => value.evaluate generateValues == some 0
+  match expr with
+  | .slice value hi lo =>
+    let value := lowerScalarSelections value signals generateValues
+    if hi == 0 && lo == 0 && scalarRef value then value else .slice value hi lo
+  | .sliceDim value hi lo =>
+    let value := lowerScalarSelections value signals generateValues
+    if zeroIndex hi && zeroIndex lo && scalarRef value then value
+    else .sliceDim value hi lo
+  | .index value index =>
+    let value := lowerScalarSelections value signals generateValues
+    let index := lowerScalarSelections index signals generateValues
+    match index with
+    | .const 0 _ => if scalarRef value then value else .index value index
+    | .dimension dim => if zeroIndex dim && scalarRef value then value else .index value index
+    | _ => .index value index
+  | .op op args => .op op (args.map (lowerScalarSelections · signals generateValues))
+  | .concat args => .concat (args.map (lowerScalarSelections · signals generateValues))
+  | _ => expr
+
 /-- Emit a single statement using the module's explicit clock-domain table. -/
 partial def emitStmt (stmt : Stmt) (domains : List ClockDomain)
-    (indent : String := "    ") (wires : List Port := []) : String :=
+    (indent : String := "    ") (wires : List Port := [])
+    (generateValues : List (String × Nat) := []) : String :=
+  let emitExpr := fun expr => emitExpr (lowerScalarSelections expr wires generateValues)
   match stmt with
   | .assign lhs rhs =>
     s!"{indent}assign {sanitizeName lhs} = {emitExpr rhs};"
@@ -179,8 +208,15 @@ partial def emitStmt (stmt : Stmt) (domains : List ClockDomain)
   | .generateFor label index start stop body =>
     let indexName := sanitizeName index
     let bodyIndent := indent ++ "        "
+    -- Only a statically single-iteration loop proves its genvar constant.
+    -- Never use retained module parameters' default values for this rewrite.
+    let outerValues := generateValues.filter (fun binding => binding.1 != index)
+    let bodyValues := match start, stop with
+      | .literal first, .literal last =>
+          if last == first + 1 then (index, first) :: outerValues else outerValues
+      | _, _ => outerValues
     let bodyCode := String.intercalate "\n"
-      (body.map (emitStmt · domains bodyIndent wires))
+      (body.map (emitStmt · domains bodyIndent wires bodyValues))
     s!"{indent}genvar {indexName};\n" ++
       s!"{indent}generate\n" ++
       s!"{indent}    for ({indexName} = {emitDimExpr start}; " ++
@@ -374,7 +410,7 @@ def emitModule (m : Module) : String :=
     let body := if m.body.isEmpty then
       ""
     else
-      let stmts := m.body.map (emitStmt · m.clockDomains "    " m.wires)
+      let stmts := m.body.map (emitStmt · m.clockDomains "    " (m.inputs ++ m.outputs ++ m.wires))
       "\n" ++ String.intercalate "\n\n" stmts ++ "\n"
 
     let footer := "\nendmodule\n"

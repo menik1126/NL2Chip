@@ -3157,12 +3157,16 @@ elab "#synthesizeVerilog" id:ident : command => do
   let declName ← Lean.Elab.Command.liftCoreM do
     Lean.resolveGlobalConstNoOverload id
   Lean.Elab.Command.liftTermElabM do
-    let (module, _) ← synthesizeCombinational declName
+    let (module, design) ← synthesizeCombinational declName
     let warnings := Sparkle.Compiler.DRC.checkClockDomains module ++
       Sparkle.Compiler.DRC.checkRegisteredOutputs module
     for w in warnings do
       Lean.logWarning m!"{w}"
-    let verilog := toVerilog module
+    -- Keep the entry module first for consumers selecting the first module,
+    -- but do not discard submodules already synthesized for its instances.
+    let completeDesign := { design with
+      modules := module :: design.modules.filter (·.name != module.name) }
+    let verilog := toVerilogDesign completeDesign
     IO.println verilog
     IO.println "\n-- Verilog successfully generated!"
 
@@ -3171,7 +3175,7 @@ syntax ident " := " num : sparkleParameterBinding
 syntax (name := synthesizeParameterizedVerilog)
   "#synthesizeParameterizedVerilog " ident " [" sparkleParameterBinding,* "]" : command
 
-/-- Emit one native parameterized module. The defaults select legal values for
+/-- Emit a native parameterized entry module and its dependencies. The defaults select legal values for
     diagnostics and downstream tools; they do not specialize the IR. -/
 elab_rules : command
   | `(#synthesizeParameterizedVerilog $id:ident [$bindings:sparkleParameterBinding,*]) => do
@@ -3184,11 +3188,13 @@ elab_rules : command
     let declName ← Lean.Elab.Command.liftCoreM do
       Lean.resolveGlobalConstNoOverload id
     Lean.Elab.Command.liftTermElabM do
-      let (module, _) ← synthesizeCombinationalWithParameters declName parameters
+      let (module, design) ← synthesizeCombinationalWithParameters declName parameters
       let warnings := Sparkle.Compiler.DRC.checkRegisteredOutputs module
       for warning in warnings do
         IO.println s!"// {warning}"
-      IO.println (toVerilog module)
+      let completeDesign := { design with
+        modules := module :: design.modules.filter (·.name != module.name) }
+      IO.println (toVerilogDesign completeDesign)
       IO.println "\n// Native parameterized Verilog successfully generated."
 
 def synthesizeHierarchicalWithParameters (declName : Name)

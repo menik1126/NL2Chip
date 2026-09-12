@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="gpt-5.6-sol")
     p.add_argument("--max-turns", type=int, default=80)
     p.add_argument("--max-tokens", type=int, default=16384)
-    p.add_argument("--interface-prompt-policy", choices=["legacy", "public-spec-v2"], default="legacy")
+    p.add_argument("--interface-prompt-policy", choices=["legacy", "public-spec-v1"], default="legacy")
     p.add_argument("--results-dir", type=str, required=True)
     p.add_argument("--key-env", default=None, help="Optional non-model environment file; native Codex credentials are read from the Codex login.")
     p.add_argument("--resume", action="store_true")
@@ -179,27 +179,18 @@ def load_mage_rtl_examples(path: Path) -> str:
 
 def build_system_prompt(prob_id: str, info: Any, args: argparse.Namespace) -> str:
     from . import public_prompt
-    public_spec = public_prompt.enabled(info)
-    generation_skill = VERILOG_ARCHON_SKILL
-    if public_spec:
-        generation_skill = generation_skill.replace("benchmark interface contract", "full public specification and context").replace(
-            "benchmark contract", "public specification"
-        ).replace(" with the `write_file` or `edit_file` tool", "").replace(
-            "simulator/compile diagnostics", "candidate compiler diagnostics allowed by compile-only mode"
-        )
     contract_rules = public_prompt.PUBLIC_SPEC_RULES if public_prompt.enabled(info) else (
         "- Treat the Benchmark Interface Contract as authoritative over guesses from examples or file names.\n"
     )
     prompt = (
-        generation_skill.rstrip()
+        VERILOG_ARCHON_SKILL.rstrip()
         + "\n\n## Harness Rules\n"
         + f"- Problem ID: `{prob_id}`.\n"
         + f"- Required candidate path: `cktarchon_work/{prob_id}/candidate.sv`.\n"
         + f"- Required top module name: `{info.design_name}`.\n"
         + contract_rules
         + "- The outer evaluator will run the official compile/simulation harness after you stop.\n"
-        + ("- Use the available `grep` and `find` commands for permitted source searches.\n" if public_spec else
-           "- This H20 host may not have `rg`; use `grep` and `find` if you need searches.\n")
+        + "- This H20 host may not have `rg`; use `grep` and `find` if you need searches.\n"
     )
     if args.prompt_profile == "mage-aligned":
         examples = load_mage_rtl_examples(Path(args.mage_prompts_file))
@@ -391,7 +382,6 @@ def make_runner(args: argparse.Namespace, prob_id: str, role: str, log_base: Pat
         direct_verilog=True,
         native_login_only=True,
         execution_user=getattr(args, "codex_agent_user", None),
-        interface_prompt_policy=getattr(args, "interface_prompt_policy", "legacy"),
     )
 
 
@@ -402,7 +392,7 @@ def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir:
     info = ds.load_problem(prob_id)
     use_public_prompt = getattr(args, "interface_prompt_policy", "legacy") == public_prompt.POLICY
     if use_public_prompt and args.feedback_mode != "compile-only":
-        raise ValueError("public-spec-v2 currently requires compile-only feedback")
+        raise ValueError("public-spec-v1 currently requires compile-only feedback")
     agent_info = public_prompt.public_problem_info(info) if use_public_prompt else info
     t_problem = time.monotonic()
     work_path = candidate_path(prob_id)

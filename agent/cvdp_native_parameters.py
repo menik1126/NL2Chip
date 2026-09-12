@@ -84,6 +84,9 @@ def _parse_parameters(parameter_text: str) -> tuple[tuple[str, str | None], ...]
     in_parameter_declaration = False
     for raw_entry in _split_commas(parameter_text):
         entry = raw_entry.strip()
+        if re.match(r"^localparam\b", entry):
+            in_parameter_declaration = False
+            continue
         if re.match(r"^parameter\b", entry):
             in_parameter_declaration = True
             entry = re.sub(r"^parameter\b", "", entry, count=1).strip()

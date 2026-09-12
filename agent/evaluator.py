@@ -396,18 +396,21 @@ def _module_records(sv_code: str) -> list[tuple[str, str, str]]:
         module_start = search_from + m.start()
         mod_name = m.group(1)
         idx = search_from + m.end()
+        candidate_end = idx
         while idx < len(sv_code) and sv_code[idx].isspace():
             idx += 1
         if idx < len(sv_code) and sv_code[idx] == "#":
             idx += 1
             while idx < len(sv_code) and sv_code[idx].isspace():
                 idx += 1
-            if idx < len(sv_code) and sv_code[idx] == "(":
-                end = _matching_paren(sv_code, idx)
-                if end == -1:
-                    search_from = idx + 1
-                    continue
-                idx = end + 1
+            if idx >= len(sv_code) or sv_code[idx] != "(":
+                search_from = candidate_end
+                continue
+            end = _matching_paren(sv_code, idx)
+            if end == -1:
+                search_from = candidate_end
+                continue
+            idx = end + 1
         while idx < len(sv_code) and sv_code[idx].isspace():
             idx += 1
 
@@ -416,10 +419,18 @@ def _module_records(sv_code: str) -> list[tuple[str, str, str]]:
         if idx < len(sv_code) and sv_code[idx] == "(":
             end = _matching_paren(sv_code, idx)
             if end == -1:
-                search_from = idx + 1
+                search_from = candidate_end
                 continue
             header_text = sv_code[idx + 1:end]
             header_end = end + 1
+
+        while header_end < len(sv_code) and sv_code[header_end].isspace():
+            header_end += 1
+        # Context can contain Markdown prose mentioning "module", not just SV.
+        if header_end >= len(sv_code) or sv_code[header_end] != ";":
+            search_from = candidate_end
+            continue
+        header_end += 1
 
         end_match = re.search(r"\bendmodule\b", sv_code[header_end:])
         if end_match:
@@ -639,28 +650,19 @@ def _parse_ref_module_ports(
     preferred_port_names. Returns [(direction, width_str, name), ...] in module
     declaration order, or None.
     """
-    module_matches = list(re.finditer(
-        r"module\s+(\w+)\s*(?:#\s*\((?:[^)(]+|\([^)(]*\))*\)\s*)?\((.*?)\)\s*;(.*?)endmodule",
-        ref_code,
-        re.DOTALL,
-    ))
-    if not module_matches:
+    module_records = _module_records(ref_code)
+    if not module_records:
         return None
 
     preferred = set(preferred_port_names or [])
     candidates: list[tuple[int, int, list[tuple[str, str, str]]]] = []
 
-    for mod_match in module_matches:
-        header = re.sub(r"//.*", "", mod_match.group(2))
-        header = re.sub(r"/\*.*?\*/", "", header, flags=re.DOTALL)
-        body = re.sub(r"//.*", "", mod_match.group(3))
-        body = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
-
+    for _, header, body in module_records:
         ports = []
         if re.search(r"\b(?:input|output)\b", header):
             current_direction = None
             current_width = ""
-            for entry in [p.strip() for p in header.split(",") if p.strip()]:
+            for entry in _split_sv_commas(header):
                 m = re.match(
                     r"^(?:(input|output)\s+)?(?:(?:reg|logic|wire)\s*)?(?:signed\s*)?(\[[^\]]+\])?\s*([A-Za-z_]\w*)$",
                     entry,
@@ -676,7 +678,7 @@ def _parse_ref_module_ports(
                     continue
                 ports.append((current_direction, current_width, m.group(3)))
         else:
-            raw_names = [p.strip().split()[-1] for p in header.split(",")]
+            raw_names = [p.split()[-1] for p in _split_sv_commas(header) if p.strip()]
             clean_names = [n for n in raw_names if re.match(r"\w+$", n)]
             if not clean_names:
                 continue
@@ -1518,33 +1520,46 @@ def _cvdp_parse_harness_usage(harness_files: dict) -> dict[str, set[str]]:
     }
 
 
+def _cvdp_parameter_decl_name(declaration: str) -> str | None:
+    match = re.match(r"^(?:localparam|parameter)\b([^=]+)", declaration.strip())
+    if match is None:
+        return None
+    names = re.findall(r"[A-Za-z_]\w*", match.group(1))
+    return names[-1] if names else None
+
+
 def _cvdp_parse_module_parameters(
     ref_code: str,
     usage_params: set[str],
     fallback_defaults: dict[str, int] | None = None,
+    *,
+    module_name: str | None = None,
 ) -> list[str]:
-    """Parse parameter declarations from the reference/context module header."""
-    text = re.sub(r"//.*", "", ref_code)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    """Preserve header parameters and derived localparams, including nesting."""
     params: dict[str, str] = {}
-    module_re = re.compile(
-        r"module\s+\w+\s*#\s*\((?P<params>(?:[^)(]+|\([^)(]*\))*)\)\s*\(",
-        re.DOTALL,
-    )
-    for match in module_re.finditer(text):
-        for entry in _cvdp_split_commas(match.group("params")):
-            m = re.search(
-                r"\bparameter\b\s+(?:(?:integer|int|logic|bit)\s+)?"
-                r"(?:\[[^\]]+\]\s*)?(?P<name>[A-Za-z_]\w*)"
-                r"(?:\s*=\s*(?P<expr>.+))?$",
-                entry,
-                re.DOTALL,
-            )
-            if not m:
+    modules = parse_native_modules(ref_code)
+    if module_name is not None:
+        modules = [module for module in modules if module.name == module_name]
+    for module in modules:
+        kind = None
+        inherited_type = ""
+        for entry in _split_sv_commas(module.parameter_text):
+            match = re.match(r"^(localparam|parameter)\b\s*(.*)$", entry, re.DOTALL)
+            if match:
+                kind, entry = match.groups()
+                name = _cvdp_parameter_decl_name(f"{kind} {entry}")
+                left = entry.partition("=")[0]
+                inherited_type = left[:left.rfind(name)].strip() if name else ""
+            elif inherited_type:
+                entry = f"{inherited_type} {entry}"
+            if kind is None:
                 continue
-            name = m.group("name")
-            expr = (m.group("expr") or "1").strip()
-            params.setdefault(name, f"parameter {name} = {expr}")
+            declaration = f"{kind} {entry.strip()}"
+            name = _cvdp_parameter_decl_name(declaration)
+            if name:
+                if "=" not in entry:
+                    declaration += " = 1"
+                params.setdefault(name, declaration)
 
     defaults = fallback_defaults or {}
     for name in sorted(usage_params):
@@ -1638,6 +1653,17 @@ def generate_cvdp_wrapper(
 ) -> str | None:
     """Generate a CVDP top wrapper matching cocotb's expected DUT interface."""
     usage = _cvdp_parse_harness_usage(harness_files)
+    public_declarations = _cvdp_parse_module_parameters(
+        ref_code, set(), module_name=design_name
+    )
+    declared_constants = {
+        name for decl in public_declarations
+        if (name := _cvdp_parameter_decl_name(decl)) is not None
+    }
+    # Reading dut.PARAM.value observes a constant, not a missing output port.
+    usage["params"].update(declared_constants)
+    for key in ("ports", "inputs", "outputs", "assigned"):
+        usage[key].difference_update(declared_constants)
     preferred_names = sorted(usage["ports"] | usage["params"])
     raw_ref_ports = (
         expected_ports_override
@@ -1774,6 +1800,7 @@ def generate_cvdp_wrapper(
             ref_code,
             set(usage["params"]) if public_case_defaults else set(),
             fallback_defaults=public_case_defaults,
+            module_name=design_name,
         )
         if expose_parameters else []
     )
@@ -1782,14 +1809,8 @@ def generate_cvdp_wrapper(
             typ for _, typ, _ in [*expected_ports, *sparkle_ports]
         )
         declared_public_parameters = {
-            match.group(1)
-            for decl in param_decls
-            if (
-                match := re.search(
-                    r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)",
-                    decl,
-                )
-            )
+            name for decl in param_decls
+            if (name := _cvdp_parameter_decl_name(decl)) is not None
         }
         for name, default in core_module.parameters:
             if name in declared_public_parameters:
@@ -1815,11 +1836,7 @@ def generate_cvdp_wrapper(
         rewritten_decls = []
         declared_derived: set[str] = set()
         for decl in param_decls:
-            match = re.search(
-                r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)",
-                decl,
-            )
-            name = match.group(1) if match else None
+            name = _cvdp_parameter_decl_name(decl)
             if name in derived_expressions:
                 rewritten_decls.append(
                     f"localparam integer {name} = {derived_expressions[name]}"
@@ -1835,9 +1852,9 @@ def generate_cvdp_wrapper(
         param_decls = rewritten_decls
     param_names = set(usage["params"]) if expose_parameters else set()
     for decl in param_decls:
-        m = re.search(r"\bparameter\b\s+(?:\w+\s+)?(?:\[[^\]]+\]\s*)?([A-Za-z_]\w*)", decl)
-        if m:
-            param_names.add(m.group(1))
+        name = _cvdp_parameter_decl_name(decl)
+        if name:
+            param_names.add(name)
     param_names.update(derived_expressions)
 
     wrapper_notes: list[str] = []

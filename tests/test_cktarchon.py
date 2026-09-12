@@ -20,10 +20,18 @@ from cktarchon.run import (
     candidate_delivery_guard,
     clear_generated_target,
     evaluate_with_infrastructure_retries,
+    feedback_turn_budget_after_generation,
     finalize_guided_candidate,
+    generation_turn_limit,
+    is_feedback_repairable as is_main_feedback_repairable,
     parse_args,
+    runner_turn_limit,
 )
-from cktarchon.run_verilog import parse_args as parse_verilog_args
+from cktarchon.run_verilog import (
+    is_feedback_repairable,
+    make_runner as make_verilog_runner,
+    parse_args as parse_verilog_args,
+)
 from cktarchon.search_strategy import (
     CandidateTracker,
     TurnBudget,
@@ -165,6 +173,205 @@ def test_sim_feedback_rewrite_is_opt_in(monkeypatch: pytest.MonkeyPatch):
 
     assert not args.guided_search
     assert not args.disable_guided_self_test
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            {
+                "compile_pass": False,
+                "sim_status": "compile_fail",
+                "detail": "iverilog compile failed: syntax error",
+            },
+            True,
+        ),
+        (
+            {
+                "compile_pass": True,
+                "sim_status": "sim_error",
+                "detail": "CVDP local Verilog compile error",
+            },
+            True,
+        ),
+        (
+            {
+                "compile_pass": True,
+                "sim_status": "sim_fail",
+                "detail": "got=0 expected=1",
+            },
+            False,
+        ),
+        (
+            {
+                "compile_pass": True,
+                "sim_status": "sim_error",
+                "detail": "simulation timeout",
+            },
+            False,
+        ),
+        (
+            {
+                "compile_pass": False,
+                "sim_status": "sim_error",
+                "detail": "CVDP local simulator/tool error: iverilog executable not found",
+            },
+            False,
+        ),
+    ],
+)
+def test_direct_verilog_compile_only_feedback_filter(result: dict, expected: bool):
+    assert is_feedback_repairable(result, "compile-only") is expected
+
+
+def test_direct_verilog_compile_only_cli(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(sys, "argv", [
+        "run_verilog.py",
+        "--results-dir",
+        "out",
+        "--sim-feedback",
+        "--feedback-mode",
+        "compile-only",
+    ])
+
+    args = parse_verilog_args()
+
+    assert args.sim_feedback
+    assert args.feedback_mode == "compile-only"
+    assert args.model == "gpt-5.6-sol"
+    assert args.codex_effort == "ultra"
+    assert args.key_env is None
+
+
+def test_direct_verilog_runner_uses_native_codex(tmp_path: Path):
+    args = SimpleNamespace(
+        model="gpt-5.6-sol",
+        prompt_profile="archon",
+        archon_src=str(tmp_path / "archon"),
+        codex_bin=None,
+        codex_effort="ultra",
+        codex_sandbox="danger-full-access",
+        codex_idle_timeout=900.0,
+        codex_max_attempts=3,
+        api_timeout=300.0,
+        dataset="cvdp",
+    )
+    info = SimpleNamespace(design_name="dut")
+
+    runner = make_verilog_runner(
+        args,
+        "prob_a",
+        "verilog-generator",
+        tmp_path / "generate",
+        info,
+    )
+
+    assert isinstance(runner, CodexAgentHarnessRunner)
+    assert runner.model == "gpt-5.6-sol"
+    assert runner.effort == "ultra"
+    assert runner.direct_verilog
+    assert runner.native_login_only
+    assert runner.public_only
+    assert not runner.auto_chat_proxy
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            {"failure_stage": "lean_elaboration", "compile_pass": False, "sim_status": "not_run"},
+            True,
+        ),
+        (
+            {"failure_stage": "parameter_contract", "compile_pass": True, "sim_status": "not_run"},
+            True,
+        ),
+        (
+            {"failure_stage": "verilog_elaboration", "compile_pass": True, "sim_status": "sim_error"},
+            True,
+        ),
+        (
+            {"failure_stage": "simulation_mismatch", "compile_pass": True, "sim_status": "sim_fail"},
+            False,
+        ),
+        (
+            {"failure_stage": "simulation_error", "compile_pass": True, "sim_status": "sim_error"},
+            False,
+        ),
+        (
+            {"failure_stage": "infrastructure", "compile_pass": False, "sim_status": "sim_error"},
+            False,
+        ),
+    ],
+)
+def test_main_compile_only_feedback_filter(result: dict, expected: bool):
+    assert is_main_feedback_repairable(result, "compile-only") is expected
+
+
+def test_main_compile_only_cli(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(sys, "argv", [
+        "run.py",
+        "--results-dir",
+        "out",
+        "--sim-feedback",
+        "--feedback-mode",
+        "compile-only",
+        "--total-turn-budget",
+        "100",
+        "--generation-turn-cap",
+        "40",
+    ])
+
+    args = parse_args()
+
+    assert args.sim_feedback
+    assert args.feedback_mode == "compile-only"
+
+
+def test_shared_total_turn_budget_reserves_repair_capacity(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(sys, "argv", [
+        "run.py",
+        "--results-dir",
+        "out",
+        "--harness",
+        "codex-agent",
+        "--sim-feedback",
+        "--total-turn-budget",
+        "100",
+        "--generation-turn-cap",
+        "40",
+        "--sim-feedback-turns-per-iter",
+        "10",
+    ])
+
+    args = parse_args()
+
+    assert generation_turn_limit(args) == 40
+    assert runner_turn_limit(args, generation_turn_limit(args)) == 39
+    assert runner_turn_limit(args, 10) == 9
+    assert runner_turn_limit(args, 1) == 0
+    assert feedback_turn_budget_after_generation(args, generation_turns=18) == 82
+    assert feedback_turn_budget_after_generation(args, generation_turns=40) == 60
+
+
+def test_shared_total_turn_budget_rejects_conflicting_legacy_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(sys, "argv", [
+        "run.py",
+        "--results-dir",
+        "out",
+        "--sim-feedback",
+        "--total-turn-budget",
+        "100",
+        "--generation-turn-cap",
+        "40",
+        "--sim-feedback-turn-budget",
+        "90",
+    ])
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_cvdp_harness_profile_defaults_and_official_ablation(
@@ -798,6 +1005,53 @@ def test_codex_public_only_mode_scrubs_cvdp_environment(tmp_path: Path, monkeypa
     assert "CVDP_HARNESS_PROFILE" not in env
     assert env["PROXY_ONLY"] == "1"
     assert "Hidden CVDP harnesses" in runner._codex_prompt("problem", max_turns=1)
+
+
+def test_codex_native_direct_verilog_prompt_and_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    for name in (
+        "CKTARCHON_CODEX_BASE_URL",
+        "CKTARCHON_CODEX_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+    ):
+        monkeypatch.setenv(name, "must-not-reach-codex")
+    runner = CodexAgentHarnessRunner(
+        project_root=tmp_path,
+        prob_id="prob_a",
+        model="gpt-5.6-sol",
+        role="verilog-generator",
+        log_base=tmp_path / "logs" / "generate",
+        system_prompt="direct system prompt",
+        public_only=True,
+        direct_verilog=True,
+        native_login_only=True,
+    )
+
+    prompt = runner._codex_prompt("problem", max_turns=10)
+    env = runner._build_agent_env({})
+
+    assert "cktarchon_work/prob_a/candidate.sv" in prompt
+    assert "Generated/prob_a.lean" not in prompt
+    assert "lean-check" not in prompt
+    assert "Do not run simulation, pytest, cocotb" in prompt
+    assert "only feedback allowed by the selected feedback mode" in prompt
+    assert not runner._should_auto_proxy()
+    for name in (
+        "CKTARCHON_CODEX_BASE_URL",
+        "CKTARCHON_CODEX_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+    ):
+        assert name not in env
 
 
 def test_codex_budget_watcher_sets_cancel(tmp_path: Path):
