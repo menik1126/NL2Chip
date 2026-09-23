@@ -7,6 +7,7 @@
 
 import Sparkle.Core.Domain
 import Sparkle.Core.Signal
+import Sparkle.Core.Circuit
 import Sparkle.Core.StateMacro
 import Sparkle.Core.Vector
 import Sparkle.Core.OptimizedSim
@@ -25,3 +26,4 @@ import Sparkle.Core.JIT
 import Sparkle.Core.JITLoop
 import Sparkle.Core.Oracle
 import Sparkle.Utils.HexLoader
+import Sparkle.Library.RTL

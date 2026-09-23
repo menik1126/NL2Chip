@@ -32,8 +32,7 @@ CVDP_DATA = Path(
     "cvdp_v1.1.0_nonagentic_code_generation_no_commercial.jsonl"
 )
 
-WORKERS = int(os.environ.get("DIRECT_WORKERS", "2"))
-DIRECT_ONLY = os.environ.get("DIRECT_ONLY")
+WORKERS = int(os.environ.get("DIRECT_WORKERS", "4"))
 DATASETS = (
     ("verilogeval", 156, None),
     ("rtllm", 50, None),
@@ -166,14 +165,6 @@ def spec_for(dataset: str, prob_id: str) -> dict:
     }
 
 
-def apply_eval_env() -> None:
-    env = environment()
-    os.environ["PATH"] = env["PATH"]
-    os.environ["PYTHONPATH"] = env["PYTHONPATH"]
-    os.environ.setdefault("CVDP_HARNESS_PROFILE", "race-safe-v1")
-    os.environ.setdefault("CVDP_DATASET_FILE", str(CVDP_DATA))
-
-
 def generate_one(dataset: str, prob_id: str, task_dir: Path) -> dict:
     spec = spec_for(dataset, prob_id)
     name = spec["func_name"]
@@ -185,12 +176,11 @@ def generate_one(dataset: str, prob_id: str, task_dir: Path) -> dict:
     cmd = [
         str(WRAPPER),
         "exec",
-        "--json",
         "--skip-git-repo-check",
-        "--ignore-user-config",
+        "--ephemeral",
+        "--ignore-rules",
+        "-s", "read-only",
         "-m", "gpt-5.6-sol",
-        "-c", 'model_reasoning_effort="ultra"',
-        "--sandbox", "read-only",
         "-o", str(last),
         prompt,
     ]
@@ -211,7 +201,6 @@ def generate_one(dataset: str, prob_id: str, task_dir: Path) -> dict:
 
 
 def evaluate_one(dataset: str, prob_id: str, task_dir: Path, gen: dict) -> dict:
-    apply_eval_env()
     sys.path[:0] = [str(PROJECT), str(PROJECT / "agent")]
     from evaluator import Evaluator
     row = dict(gen)
@@ -256,11 +245,7 @@ def run_dataset(dataset: str, expected: int, problem_file: Path | None) -> None:
         for line in jsonl.read_text().splitlines():
             if line.strip():
                 row = json.loads(line)
-                if (
-                    row.get("prob_id")
-                    and row.get("candidate")
-                    and row.get("sim_status") not in {"gen_error", "agent_error", "not_run"}
-                ):
+                if row.get("prob_id") and not row.get("worker_error"):
                     done.add(row["prob_id"])
     todo = [pid for pid in ids if pid not in done]
     log(f"{dataset} todo {len(todo)}/{expected}")
@@ -270,25 +255,7 @@ def run_dataset(dataset: str, expected: int, problem_file: Path | None) -> None:
         task_dir = ds_out / "tasks" / pid
         task_dir.mkdir(parents=True, exist_ok=True)
         try:
-            cand = task_dir / "candidate.lean"
-            last = task_dir / "last_message.txt"
-            if cand.exists() or (last.exists() and last.stat().st_size > 0):
-                spec = spec_for(dataset, pid)
-                if not cand.exists() and last.exists():
-                    lean = extract_lean(last.read_text(errors="replace"), spec["func_name"])
-                    if lean:
-                        cand.write_text(lean)
-                gen = {
-                    "prob_id": pid,
-                    "dataset": dataset,
-                    "func_name": spec["func_name"],
-                    "generate_rc": 0,
-                    "candidate": cand.exists(),
-                    "last_chars": last.stat().st_size if last.exists() else 0,
-                    "reused_generation": True,
-                }
-            else:
-                gen = generate_one(dataset, pid, task_dir)
+            gen = generate_one(dataset, pid, task_dir)
             return evaluate_one(dataset, pid, task_dir, gen)
         except Exception as exc:
             return {
@@ -307,7 +274,6 @@ def run_dataset(dataset: str, expected: int, problem_file: Path | None) -> None:
 
 
 def main() -> int:
-    apply_eval_env()
     subprocess.check_call(["bash", "/home/sgli/work/codex_jing_chatgpt_probe/ensure_socks.sh"])
     PRIVATE.mkdir(parents=True, exist_ok=True)
     os.chmod(PRIVATE, 0o700)
@@ -318,8 +284,6 @@ def main() -> int:
     if not WRAPPER.exists() and src.exists():
         pass
     for dataset, n, pf in DATASETS:
-        if DIRECT_ONLY and dataset != DIRECT_ONLY:
-            continue
         subprocess.check_call(["bash", "/home/sgli/work/codex_jing_chatgpt_probe/ensure_socks.sh"])
         run_dataset(dataset, n, pf)
     log("direct sparkle finished")

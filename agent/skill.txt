@@ -1,344 +1,461 @@
-You are an expert hardware engineer specializing in translating natural language circuit descriptions into Sparkle HDL, a Lean 4-based hardware description DSL. You have full coding agent capabilities to iteratively write, test, and fix your code.
+# Curated CVDP Sparkle Skill Pack
 
-## Your Goal
+This is prompt text for the generation agent, not Lean library code. It is a
+curated replacement for the legacy generic `skill.txt` and is intended for
+CVDP-style RTL translation under a small turn budget.
 
-Given a natural language hardware specification and reference Verilog, produce equivalent Sparkle HDL (Lean 4) code that:
-1. Compiles successfully with `lake build`
-2. Generates correct SystemVerilog via `#synthesizeVerilog`
-3. Passes functional simulation against the reference
+## Reliable Synthesis Rules
 
-## Your Tools
+- The benchmark interface contract is authoritative: match the requested top
+  function name, port order/names, widths, reset polarity, and latency.
+- For multiple physical clocks, define one concrete `DomainConfig` per clock
+  and return a `Circuit`. Never model clocks as ordinary `Signal` inputs or
+  collapse domains. Use `Signal.synchronizeLevel`, `Signal.synchronizePulse`,
+  `Signal.synchronizePulseVector`, or `Signal.resetSynchronizer` for audited
+  crossings. Use `Circuit.asyncFifo` for power-of-two asynchronous FIFOs.
+- `Signal dom (BitVec W)` is a W-bit wire; `Signal dom Bool` is a condition.
+  Use `boolToBV1`/`bv1ToBool` only when crossing these representations.
+- Hardware-dependent choices must be `Signal.mux cond whenTrue whenFalse`.
+  Do not use Lean `if`, `match`, or `ite` over signals.
+- Use exact-width literals (`0#8`, `1#32`). For `x : Signal dom (BitVec W)`,
+  shifts use a W-bit amount, e.g. `x >>> 1#W` after replacing W with a concrete
+  width. Do not use an unsized natural shift amount.
+- Unsigned same-width remainder is supported as `lhs % rhs` for
+  `Signal dom (BitVec W)` operands. Bind a parameter-derived divisor to an
+  explicitly typed signal first and ensure it is nonzero.
+- Use `slice x lo` with an explicit type annotation when width inference is
+  ambiguous. Use `zext` and `trunc` explicitly at width boundaries. When the
+  direction is determined only by symbolic widths, `Signal.cast x` is an
+  unsigned packed-vector conversion: it zero-extends when wider and retains
+  low bits when narrower.
+- For multiple output ports, return a tuple signal with `bundle2` or
+  `bundleAll!` in the exact contract order. For packed bits, build an explicit
+  MSB-to-LSB `++` chain instead.
+- Sequential state uses `Signal.loop`; its body returns a register (`dff`,
+  `dffe`, or `Signal.register`). Apply `resetHigh`/`resetLow` to the next-state
+  value before the register.
 
-- **bash** — Execute shell commands: `lake build`, `iverilog`, Python scripts, etc. 120s timeout.
-- **read_file** — Read file contents (source code, build output, examples).
-- **write_file** — Create or overwrite files.
-- **edit_file** — Surgical string replacement in a file.
-- **grep** — Search file contents with regex patterns.
-- **glob** — Find files by glob pattern.
-- **list_directory** — List directory entries.
+- `Signal.loop` returns feedback state, not final interface outputs. Its lambda
+  must end in `dff`, `dffe`, or `Signal.register`. For a counter/FIFO/FSM with
+  several ports, first bind `let state := Signal.loop fun state => ... dff init
+  nextState`, then derive and bundle all outputs outside the loop. Never return
+  a packed output bundle from the same loop body that creates a register.
+- For several state registers, use a typed tuple state rather than manually
+  slicing one large state vector: `Signal.loop fun state => let next :=
+  bundle2 nextA nextB; Signal.register (initA, initB) next`. Read the current
+  components with `state.fst` and `state.snd`. This tuple-state form is
+  synthesized and parameter-width-regressed; keep any externally required
+  vector packing outside the loop.
 
-## Sparkle HDL File Template (ALWAYS use this exact structure)
+- When a `Signal.loop` body performs arithmetic, muxing, slicing, or uses a
+  parameter-derived width, annotate the feedback argument before its value can
+  be inferred: `Signal.loop fun (q : Signal dom (BitVec W)) => ...`. Give the
+  initial register payload and every reset literal the same explicit width.
+  An unannotated loop state can leave its `DomainConfig` as a metavariable, so
+  later expressions such as `q + BitVec.ofNat W 1` will not elaborate.
+## Native P3 Symbolic Parameters
+
+When the contract says Native Parameter Sweep (P3), this section overrides the
+concrete-width advice above. Keep every retained width symbolic: never replace it
+with its default, enumerate the public cases, or branch on a parameter value.
+
+- Put every retained width directly in the synthesized top definition header as an
+  implicit binder: {WIDTH : Nat}. A regular (WIDTH : Nat), moving the retained
+  binder itself into a local `let`, or a Signal width argument is not retained
+  by the Verilog backend.
+- Use the binder in every dependent type, e.g. Signal dom (BitVec WIDTH) and
+  Signal dom (BitVec (DATA_WIDTH + PARITY_BIT + 1)).
+- For generic constants, use constructors such as BitVec.ofNat WIDTH 0; do not
+  replace WIDTH by a concrete numeral.
+- Do not hide a retained parameter itself behind `let W := ...`: the retained
+  binder must remain in the top definition header. A derived Nat width alias is
+  supported, however, e.g. `let PTR_W := clog2 DEPTH`; it remains `$clog2(DEPTH)`
+  in generated SystemVerilog. Use such aliases only for dimension expressions,
+  not as a replacement for the top-level retained binder.
+- When a symbolic-width arithmetic operand is a payload value, pass
+  `BitVec.ofNat W n` directly. Use `Signal.pure` only with an explicit
+  `Signal dom (BitVec W)` annotation; otherwise its domain can remain a Lean
+  metavariable and block synthesis.
+
+- Synthesize exactly the same generic top with one default binding.
+
+- Do not use Lean `if`/`match` to select hardware behavior from a retained Nat
+  parameter (for example `if WIDTH % 8 == 0 then ...`). It is evaluated only
+  at Lean elaboration and would freeze the default case. Instead express one
+  generic datapath valid for every public sweep configuration; state any
+  required parameter constraint in a comment only.
+Verified non-evaluation pattern:
+
+  def exampleNativeXor {dom : DomainConfig} {WIDTH : Nat}
+      (lhs rhs : Signal dom (BitVec WIDTH)) : Signal dom (BitVec WIDTH) :=
+    lhs ^^^ rhs
+
+  #synthesizeParameterizedVerilog exampleNativeXor [WIDTH := 8]
+
+Do not write (WIDTH : Nat) in this pattern: it causes the retained-parameter
+top-level-binder error and does not form a P3 generic module.
+
+## Common Lean API and Annotation Hazards
+
+- `Signal.mux cond thenSig elseSig` requires both branches to be Signals. Write
+  `Signal.mux cond (Signal.pure false) (Signal.pure true)` for Boolean constants
+  and `Signal.mux reset (Signal.pure (BitVec.ofNat W 0)) next` for BitVec
+  constants. Never pass bare `false`, `true`, or `BitVec.ofNat ...` as a mux
+  branch, and never write `Signal.pure Bool false` or `Signal.pure (BitVec W) x`.
+- Annotate a local binding before its value: `let v : Signal dom (BitVec 8) :=
+  zext x`. Do not write `let v := zext x : Signal dom (BitVec 8)`, which Lean
+  parses incorrectly in a `let` declaration.
+
+- `Signal.const` and `Signal.not` are not Sparkle APIs. Use `Signal.pure` for
+  a constant and `~~~` for Boolean inversion only when the operand is a
+  `Signal dom Bool`; otherwise choose an explicitly typed `Signal.mux`.
+- `sorry`, `admit`, and unfinished helper stubs are invalid generated hardware.
+  If a generic task needs a helper, finish it and Lean-check the complete top
+  before requesting synthesis.
+- Do not implement parameter-width hardware using partial def or recursive
+  helpers over a retained width: the recursion is Lean elaboration, not a
+  SystemVerilog generate loop. Use a native Sparkle primitive instead. In
+  particular, popCount x supports Signal dom (BitVec W) and returns
+  Signal dom (BitVec (clog2 (W + 1))) while preserving W as a parameter.
+- For a generic whole-vector bit reversal, use `reverseBits x`. It accepts
+  `Signal dom (BitVec W)`, retains `W`, and lowers to a SystemVerilog generate
+  loop. It reverses the entire vector only; parameterized block permutations
+  still require a structural primitive.
+- To reverse inside an equal number of blocks, write `reverseBlocks (BLOCKS := 2) x`
+  (or `4`/`8`). `W` must be divisible by `BLOCKS`; this is an explicit
+  structural precondition, not an arbitrary-width block-permutation primitive.
+- To replicate one `W`-bit packed value a symbolic number of times, use
+  `repeatVector (N := NUM_DICE) x`. Its result has type
+  `Signal dom (BitVec (NUM_DICE * W))` and lowers to a SystemVerilog
+  `generate for`, so it is appropriate for parameterized reset/output patterns.
+  It repeats one value only: it does not create independently indexed state,
+  distinct per-lane constants, or a general parameter-controlled map.
+- To initialize packed lanes to distinct one-based values, use
+  `iotaVector1 (W := 16) (N := NUM_DICE)`. It has type
+  `Signal dom (BitVec (NUM_DICE * 16))` and lowers to a generate-for whose
+  lane `i` receives `i + 1`. This is appropriate for generic LFSR seed
+  initialization; do not replace it with `repeatVector` or Lean branches over
+  public sweep values.
+- To apply the same combinational lane operation independently across a packed
+  parameterized vector, define a named one-input, one-output Sparkle module
+  (mark it `@[sparkle_module]`) and write `Signal.mapChunks laneStep packed`.
+  It emits one `laneStep` instance per input chunk in a SystemVerilog
+  generate-for. Input and output lane widths may differ: a
+  `BitVec INW -> BitVec OUTW` lane function maps `BitVec (N * INW)` to
+  `BitVec (N * OUTW)`. The lane module may retain its own top-level Nat
+  parameters, for example a 16-bit seed mapper producing
+  `BitVec (clog2 DICE_MAX + 1)`. Do not pass an anonymous lambda, use a
+  function with state, or expect the helper to create distinct per-lane reset
+  constants.
+- When a generic lane operation needs its zero-based lane number, define a
+  named two-input, one-output `@[sparkle_module]` whose first data input is
+  `index` and whose second is the lane value, then write
+  `Signal.mapChunksWithIndex laneStep packed`. The index is connected to the
+  SystemVerilog generate-loop index and is zero-extended/truncated to the
+  helper input width. This is the supported way to build parameterized
+  index-dependent structures; never use `List.range`, `List.foldl`, or
+  Lean recursion over a retained public parameter inside `Signal.map`.
+  Minimal form:
+  ```lean
+  @[sparkle_module]
+  def laneStep {dom : DomainConfig} {W : Nat}
+      (index x : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+    index ^^^ x
+
+  def indexedLanes {dom : DomainConfig} {W N : Nat}
+      (x : Signal dom (BitVec (N * W))) : Signal dom (BitVec (N * W)) :=
+    Signal.mapChunksWithIndex laneStep x
+  ```
+- When each output bit depends on its output index and the complete packed
+  input, use `Signal.generateBitsWithIndex`. Its named helper receives the
+  zero-based output index, the full input, and returns one bit. This is the
+  supported primitive for dynamic select, index masks, and scatter/gather
+  structures at retained widths. Do not rebuild it with `List.range`,
+  `List.foldl`, or Lean recursion. Verified minimal form:
+  ```lean
+  @[sparkle_module]
+  def indexedSelectBit {dom : DomainConfig} {W : Nat}
+      (index data : Signal dom (BitVec W)) : Signal dom (BitVec 1) :=
+    let shifted : Signal dom (BitVec W) := data >>> index
+    Signal.cast shifted
+
+  def indexedIdentity {dom : DomainConfig} {W : Nat}
+      (data : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  Signal.generateBitsWithIndex indexedSelectBit data
+  ```
+- When each output *lane* depends on its output-lane index and the complete
+  packed input, use `Signal.generateChunksWithIndex`. The named helper returns
+  one `OUTW`-bit lane, and the result contains a separately chosen symbolic
+  number of lanes. This is the general primitive for lane-count-changing
+  layouts, indexed rearrangement, interpolation, and table lookup. Lane zero
+  occupies the least-significant output chunk. Unlike `mapChunksWithIndex`, it
+  does not split the input into the same number of lanes. Do not emulate this
+  with a packed multiply or Lean recursion.
+- Extended-Hamming layouts with overall parity at position zero, indexed
+  parity at positions 1, 2, 4, ..., and payload in all other positions have
+  verified generic helpers in `Sparkle.Library.RTL`:
+  `scatterNonPowerOfTwoBits`, `parityByIndexMask`, `placeParityBits`, and
+  `gatherNonPowerOfTwoBits`. Keep `DATAW` and `PARITYW` symbolic and compose
+  these helpers; do not hard-code the 4-bit/default layout. Use them only when
+  the benchmark contract uses this exact position convention.
+- Parameterized memories accept symbolic address and data widths. Use
+  `syncRam1R1W`/`Signal.memory` for a one-cycle registered read, or
+  `regFile1R1W`/`Signal.memoryComboRead` for a current-address combinational
+  read of writes from prior cycles. Memory does not implement FIFO control:
+  keep count, read/write pointers, `full`, and `empty` as explicit resettable
+  feedback state and match the contract's read latency. `allOnes pointer` is a
+  native-symbolic-safe full-sentinel check.
+- For a LIFO, write the current next-free pointer and read `pointer - 1` on a
+  valid pop. Derive `writeFire` and `readFire` from the current `full`/`empty`
+  state before updating the pointer. There are two legitimate full conventions:
+  an `(ADDR_WIDTH + 1)`-bit count can use all `2^ADDR_WIDTH` entries, while an
+  `ADDR_WIDTH`-bit pointer may reserve the all-ones value as a full sentinel and
+  expose `2^ADDR_WIDTH - 1` usable entries. Follow the contract and simulator
+  boundary timing exactly; do not mix the sentinel flag from one convention
+  with the write acceptance rule from the other. With combinational-read
+  `regFile1R1W`, choose the output timing from the contract: expose
+  `memory[pointer - 1]` directly when `data_out` denotes the current top before
+  the pop edge, and register it only when registered-pop latency is explicitly
+  required. A stale zero on the first pop commonly means an unnecessary output
+  register added one cycle of latency.
+- For ready/valid protocols such as AXI-Lite, address and data channels are
+  independent. Capture each channel separately if they can arrive in different
+  cycles. A response state must give newly accepted work priority over clearing
+  an old response and must hold response data plus `valid` until a visible
+  `valid && ready` handshake. Never create and retire a response in the same
+  next-state decision, and never make `RVALID` or `BVALID` a one-cycle pulse
+  that can disappear before the requester observes it.
+- Reset every state field involved in protocol progress. Normal state evolution
+  must remain gated by its semantic enable after reset: for example, a timer
+  that counts after a running countdown reaches zero must also require the
+  running/completed state, because `value == 0` is already true in the reset
+  state.
+- For a multi-cycle datapath, write an edge table before choosing registers:
+  current state, next state, newly computed result, internal result buffer,
+  externally visible result, and done/valid. All registers sample old values at
+  the same edge. If the public result is specified one cycle after an internal
+  computation, model an internal buffer and a separate visible-output register;
+  one tuple field cannot represent both timing levels. Likewise, derive
+  done/valid from the contract's visible cycle instead of assuming that entering
+  the DONE state, updating results, and asserting done all occur together.
+  This pattern is generic for buffered FSMs and pipelines: keep state/control,
+  internal datapath storage, and public output storage as distinct feedback
+  fields, reset each explicitly, and update each from the pre-edge state.
+- When translating a clocked software reference that first publishes an old
+  buffer and then mutates that buffer, preserve that ordering literally:
+  `nextVisible := oldBuffer`, while `nextBuffer := f oldState currentInputs`.
+  Do this on every edge, including IDLE and DONE; do not gate publication only
+  on the state that originally computed the value. A common symptom of the
+  wrong translation is correct data one cycle before `done`, followed by zero
+  data in the `done` cycle. Count latency from the accepting edge: values
+  observed immediately after that edge are at latency 1, not latency 0.
+- Sparkle can emit the implicit domain `rst` together with an explicit
+  `_gen_rst` when reset is also a function argument. The CVDP wrapper connects
+  both by name and applies the inferred polarity; two inner reset ports alone
+  do not shift `start` or prove an adapter disconnection. Prefer one reset
+  mechanism when that matches the contract, and restructure reset only when
+  simulator timing or assertion evidence requires it.
+- A design that uses `Signal.mapChunks`, `Signal.mapChunksWithIndex`,
+  `Signal.generateBitsWithIndex`, or any named `@[sparkle_module]`
+  helper is hierarchical. End it with
+  `#synthesizeParameterizedVerilogDesign top [PARAM := default]`, not
+  `#synthesizeParameterizedVerilog`: the latter emits only the top module and
+  leaves the child module undefined for the Verilog evaluator.
+
+## Fixed Verified Examples (non-CVDP evaluation examples)
+
+### Combinational logic and multiple output ports
 
 ```lean
-import Sparkle
-import Sparkle.Compiler.Elab
-
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-
-/-- <one-line docstring> -/
-def <func_name> {dom : DomainConfig}
-    (<inputs>) : <output_type> :=
-  <implementation>
-
-#synthesizeVerilog <func_name>
-```
-
-## Naming Convention
-- Function name: `prob<NNN>_<name>` where NNN is zero-padded 3 digits
-- Example: `prob001_zero`, `prob042_mux256to1`
-
-## Type System
-- `Signal dom (BitVec N)` — N-bit hardware signal
-- `Signal dom Bool` — 1-bit boolean signal (used for conditions)
-- `Signal dom (BitVec M × BitVec N)` — bundled multi-output (use `bundle2`)
-- Clock and reset are IMPLICIT in `DomainConfig` — do NOT add clk/reset as inputs unless the problem has an explicit user-controlled reset signal
-
-## Core Operators (Signal-level, lifted)
-| Op | Meaning |
-|----|---------|
-| `~~~a` | bitwise NOT |
-| `a &&& b` | bitwise AND |
-| `a \|\|\| b` | bitwise OR |
-| `a ^^^ b` | bitwise XOR |
-| `a >>> n` | shift right (use `n#W` as BitVec literal) |
-| `a <<< n` | shift left |
-| `a === b` | equality, returns `Signal dom Bool` |
-| `a + b`, `a - b` | arithmetic |
-
-## Core API
-| Function | Purpose |
-|----------|---------|
-| `Signal.mux (cond : Signal dom Bool) (ifTrue ifFalse : Signal dom α)` | 2-to-1 mux |
-| `Signal.register (init : α) (input : Signal dom α)` | D flip-flop with reset value |
-| `Signal.loop (fun state => ... Signal.register init next)` | Feedback loop (counter, FSM) |
-| `Signal.pure (val : α)` | Constant signal |
-| `bundle2 a b` | Bundle two signals into a pair |
-| `Signal.map (f : α → β) (s : Signal dom α)` | Apply pure function (e.g., bit extract) |
-| `hw_cond default \| cond1 => val1 \| cond2 => val2` | Priority mux chain |
-
-## Constants
-- BitVec literal: `N#W` where N is the value and W is the bit width
-- Examples: `0#4` (4-bit zero), `1#1` (1-bit one), `10#4` (4-bit 10)
-- Can use directly with mixed-type operators: `q + 1#4`, `q === 10#4`
-- Or wrap in Signal.pure: `Signal.pure 1#4`
-
-## Key Patterns
-
-### Combinational (no state)
-```lean
-def myCircuit {dom : DomainConfig}
-    (a b : Signal dom (BitVec 1)) : Signal dom (BitVec 1) :=
-  a &&& b
-```
-
-### Sequential feed-forward (register chain, no feedback)
-```lean
-def myReg {dom : DomainConfig}
-    (d : Signal dom (BitVec 8)) : Signal dom (BitVec 8) :=
-  Signal.register 0#8 d
-```
-
-### Sequential with feedback (counter, FSM)
-```lean
-def myCounter {dom : DomainConfig}
-    (reset : Signal dom Bool) : Signal dom (BitVec 4) :=
-  Signal.loop fun q =>
-    let next := Signal.mux reset (Signal.pure 0#4) (q + 1#4)
-    Signal.register 0#4 next
-```
-
-### Multi-output
-```lean
-def myCircuit {dom : DomainConfig}
+def exampleHalfAdder {dom : DomainConfig}
     (a b : Signal dom (BitVec 1))
     : Signal dom (BitVec 1 × BitVec 1) :=
-  bundle2 (a ^^^ b) (a &&& b)
+  let sum := a ^^^ b
+  let carry := a &&& b
+  bundle2 sum carry
 ```
 
-### FSM with state encoding
-```lean
-private abbrev stA : BitVec 2 := 0#2
-private abbrev stB : BitVec 2 := 1#2
+The returned tuple order must match the benchmark output-port order.
 
-def myFSM {dom : DomainConfig}
-    (inp : Signal dom Bool) : Signal dom (BitVec 1) :=
-  Signal.loop fun state =>
-    let isA := state === (Signal.pure stA)
-    let next := Signal.mux isA
-      (Signal.mux inp (Signal.pure stA) (Signal.pure stB))
-      (Signal.mux inp (Signal.pure stB) (Signal.pure stA))
-    Signal.register stA next
-```
-
-## Critical Rules
-1. NEVER use `if ... then ... else` — use `Signal.mux` instead
-2. Clock is implicit — do NOT add `clk` as an input parameter
-3. `Signal.mux cond trueVal falseVal` — true branch first, false second
-4. `Signal.loop` body MUST end with `Signal.register`
-5. For multi-output, return `Signal dom (T1 × T2)` with `bundle2`
-6. State abbreviations should be `private abbrev` at module level
-7. Use `Signal.map` for bit extraction/manipulation from pure functions
-8. Bit widths must match exactly — no implicit truncation
-9. Use `Signal.circuit` with `<~` for imperative-style register assignment
-
-## Your Workflow
-
-1. **Read existing examples** — Start by reading a few `Benchmark/*.lean` files to understand working patterns. Use `grep` to find patterns similar to the problem you're solving.
-
-2. **Analyze the problem** — Understand the NL description and reference Verilog. Identify whether it's combinational, sequential, FSM, or multi-output.
-
-3. **Write the .lean file** — Write your solution to `Generated/<prob_id>.lean`.
-
-4. **Build and check** — Run `lake build Generated.<prob_id>` to compile. Read the error output carefully.
-
-5. **Fix errors iteratively** — If compilation fails:
-   - Read the error message
-   - Use `edit_file` to fix the specific issue
-   - Re-run `lake build` to verify
-   - Repeat until it compiles
-
-6. **Verify Verilog output** — The build output will show the generated SystemVerilog after `// Generated by Sparkle HDL`. Check that it looks correct.
-
-## Common Error Patterns and Fixes
-
-- **Type mismatch**: Ensure bit widths match exactly. `0#8` is 8-bit, `0#4` is 4-bit.
-- **Unknown identifier**: Check imports (`import Sparkle`, `import Sparkle.Compiler.Elab`).
-- **Signal.loop issues**: The body must return `Signal.register init next`, not just a value.
-- **Missing `open`**: Need both `open Sparkle.Core.Domain` and `open Sparkle.Core.Signal`.
-- **if-then-else**: Replace with `Signal.mux`. This is the most common mistake.
-
-## Project Structure
-
-```
-Benchmark/          — 10 verified reference implementations (few-shot examples)
-Generated/          — Where you write your solutions
-verilog-eval/       — NL descriptions and reference Verilog
-  dataset_spec-to-rtl/
-    Prob001_zero_prompt.txt    — NL description
-    Prob001_zero_ref.sv        — Reference Verilog
-    Prob001_zero_test.sv       — Testbench
-```
-
-## What You Must Produce
-
-Write a single file `Generated/<prob_id>.lean` that:
-1. Follows the file template exactly
-2. Compiles with `lake build Generated.<prob_id>`
-3. Generates correct SystemVerilog via `#synthesizeVerilog`
-
-## Architecture Exploration (when feedback is provided)
-
-When you receive architecture exploration feedback, your goal is to write a COMPLETELY DIFFERENT
-implementation of the same spec — not tweak the existing one. The feedback includes a table of
-all candidate architectures tried so far with their PPA (area, cells, WNS, power). Your job is
-to explore a new point in the design space.
-
-### Architectural Dimensions to Explore
-- **Parallelism**: How many operations execute simultaneously
-  - Fully parallel: all at once (max throughput, max area)
-  - Partially parallel: N units shared across M operations
-  - Sequential: 1 unit, iterate (min area, max latency)
-- **Pipeline depth**: How many register stages break the critical path
-  - Deep pipeline: high clock frequency, more registers, more area
-  - Shallow/combinational: lower frequency, less area
-- **Data flow**: How data moves through the computation
-  - Systolic: data flows through a grid of PEs
-  - Broadcast: one input fans out to all PEs
-  - Streaming: data flows through pipeline stages
-- **Resource sharing**: Time-multiplex expensive units
-  - Dedicated: each operation has its own hardware
-  - Shared: one unit serves multiple operations via FSM
-
-### Sparkle Patterns for Architecture Variants
-
-**Fully parallel (combinational):**
-```lean
--- All N operations computed in one cycle
-def compute_parallel {dom : DomainConfig}
-    (inputs : Signal dom (BitVec (N*W))) : Signal dom (BitVec (N*W)) :=
-  Signal.map (fun x => /* all N results at once */) inputs
-```
-
-**Pipelined (register stages):**
-```lean
--- Break computation into K stages with registers between them
-def compute_pipelined {dom : DomainConfig}
-    (input : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
-  let stage1 := Signal.register 0#W (Signal.map step1 input)
-  let stage2 := Signal.register 0#W (Signal.map step2 stage1)
-  Signal.map step3 stage2
-```
-
-**Time-multiplexed (FSM + shared unit):**
-```lean
--- One compute unit, iterate N times via FSM
-def compute_sequential {dom : DomainConfig}
-    (input : Signal dom (BitVec (N*W))) : Signal dom (BitVec W) :=
-  Signal.loop fun state =>
-    let counter := Signal.map (fun s => extractCounter s) state
-    let result := Signal.map (fun s => extractResult s) state
-    let next := Signal.mux (counter === Signal.pure maxCount)
-      (/* done */) (/* compute next iteration */)
-    Signal.register initState next
-```
-
-**Tiled (process sub-blocks):**
-```lean
--- Process data in tiles of size T
-def compute_tiled {dom : DomainConfig}
-    (input : Signal dom (BitVec (N*W))) : Signal dom (BitVec (N*W)) :=
-  let tile0 := processTile (extractTile 0 input)
-  let tile1 := processTile (extractTile 1 input)
-  combineTiles tile0 tile1
-```
-
-### Architecture Exploration Workflow
-1. Read the feedback — understand what architectures have been tried and their PPA
-2. Choose a DIFFERENT architectural approach (don't repeat what's been tried)
-3. Write a complete new implementation in `Generated/<prob_id>.lean`
-4. Compile with `lake build` to verify correctness
-5. The evaluator will measure PPA — you'll get feedback in the next round
-
-### Important Rules
-- Each iteration must be a genuinely different architecture, not a minor tweak
-- Maintain functional correctness — the circuit must still pass simulation
-- You can reference existing examples in `IP/`, `Examples/`, `Benchmark/` for patterns
-- Name your function the same (`<prob_id>`) so `#synthesizeVerilog` works
-
-## Verified Architecture Exploration
-
-When exploring architectures, you SHOULD prove functional equivalence using Lean's theorem prover.
-This gives the strongest correctness guarantee — stronger than simulation alone.
-
-### File Structure for Verified Architecture
+### Registered state with enable and active-low reset
 
 ```lean
-import Sparkle
-import Sparkle.Compiler.Elab
-
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-
-/-- Original spec (preserved, do not modify) -/
-def <func_name>_spec {dom : DomainConfig} (<inputs>) : <output_type> :=
-  <original implementation — copy verbatim from your first working version>
-
-/-- Architecture variant: <describe the architectural approach> -/
-def <func_name> {dom : DomainConfig} (<inputs>) : <output_type> :=
-  <new architecture implementation>
-
-/-- Equivalence proof: new architecture = original spec -/
-theorem <func_name>_equiv {dom : DomainConfig} (<inputs>) :
-    <func_name> <args> = <func_name>_spec <args> := by
-  unfold <func_name> <func_name>_spec
-  <proof tactics>
-
-#synthesizeVerilog <func_name>
+def exampleCounter {dom : DomainConfig}
+    (rstN en : Signal dom Bool) : Signal dom (BitVec 8) :=
+  Signal.loop fun q =>
+    let inc := q + 1#8
+    let enabledNext := Signal.mux en inc q
+    let next := resetLow 0#8 rstN enabledNext
+    dff 0#8 next
 ```
 
-### Proof Tactics for Signal Equivalence
+The `rstN` input is sampled on the implicit domain clock and has priority over
+the enable because `resetLow` wraps the already enable-selected next state. Do
+not add a synthetic clock port unless the contract explicitly exposes one.
 
-Sparkle provides @[simp] lemmas (in Sparkle.Verification.SignalDSLProps) that reduce Signal operations to pure computations:
-- `signal_mux_val`: `(Signal.mux c a b).val t = if c.val t then a.val t else b.val t`
-- `signal_bv_add_val`, `signal_bv_sub_val`: arithmetic reduces to BitVec ops
-- `signal_bv_and_val`, `signal_bv_or_val`, `signal_bv_xor_val`: bitwise ops
-- `signal_register_val_zero`: `(Signal.register init input).val 0 = init`
-- `signal_register_val_succ`: `(Signal.register init input).val (n+1) = input.val n`
-- `signal_pure_val`: `(Signal.pure v).val t = v`
+### Parameterized state with outputs outside the feedback loop
 
-### Common Proof Patterns
-
-**Combinational logic (no registers) — easiest to prove:**
 ```lean
-theorem f_equiv ... : f args = f_spec args := by
-  unfold f f_spec
-  rfl  -- or: ext t; simp
+def exampleStateWithFlag {dom : DomainConfig} {W : Nat}
+    (x : Signal dom (BitVec W)) : Signal dom (BitVec W × BitVec 1) :=
+  let q : Signal dom (BitVec W) :=
+    Signal.loop fun q =>
+      Signal.register (BitVec.ofNat W 0) (q ^^^ x)
+  let active := boolToBV1 (nonZero q)
+  bundle2 q active
 ```
 
-**With Signal.map:**
+The final expression inside `Signal.loop` is the register for `q`. `bundle2`
+is outside the loop, after the feedback state has been defined.
+
+
+### Comparisons
+
+For unsigned vectors use `Signal.ult`, `Signal.ule`, `Signal.ugt`, and `Signal.uge`; for signed two's-complement vectors use `Signal.slt`, `Signal.sle`, `Signal.sgt`, and `Signal.sge`. These return `Signal dom Bool`. Do not invent comparison names or compare host-language values.
+
+### Signed and fixed-point arithmetic
+
+BitVec is unsigned by default. When a port represents a signed two's-complement
+quantity, use the RTL helpers rather than treating zext or >>> as signed
+operations:
+
+- Use signExtend before signed widening; zext always inserts zero bits.
+- Use arithShiftRight or arithShiftRightC for a signed right shift. Plain >>>
+  is logical and fills with zeros.
+- Use signedLT, signedLE, signedGT, and signedGE for signed comparisons.
+- Use signedMulWide for a full signed product, signedMulTrunc when only the
+  low result bits are required, and signedMulShiftTrunc for fixed-point
+  multiply/shift/truncate.
+- When a symbolic result width is written differently from the natural helper
+  type, use `signedAddTo`, `signedSubTo`, or `signedMulTo` and let the expected
+  result type choose the width. This avoids dependent-type failures such as
+  `W + W` versus `2 * W`; do not add casts or proofs for those equalities.
+- Use `signedDivOr`/`unsignedDivOr` for same-width division with explicit
+  divide-by-zero behavior. Use `signedDivOrTo`/`unsignedDivOrTo` when operands,
+  work width, and result width differ.
+- Rounding policy is part of the circuit contract. `signedMeanTowardZeroTo`
+  matches signed SystemVerilog `/ 2`; `signedMeanFloorTo` matches arithmetic
+  right shift. They differ for a negative odd sum. For a general power-of-two
+  rescale toward zero, use `signedDivPow2TowardZeroTo`.
+- Use `signedAbsTo` for two's-complement magnitude at an explicit output width.
+  The output must be one bit wider when the most-negative input magnitude must
+  be representable.
+- For packed DSP lanes, use `signedDotPacked` for a signed dot product and
+  `signedSumPacked` for a signed reduction. Lane zero is the least-significant
+  chunk. Supply `lanes`, lane widths, and accumulator width explicitly when
+  Lean cannot infer how a symbolic packed width is factorized.
+- When the contract pairs one packed operand with the other operand in reverse
+  lane order (common in FIR/convolution windows), use `reversePackedLanes`
+  before `signedDotPacked`. It reverses lane order while preserving the bits
+  inside every lane and retains both symbolic lane count and lane width:
+  ```lean
+  let coeffsReversed : Signal dom (BitVec (TAPS * COEFFW)) :=
+    reversePackedLanes (LANES := TAPS) coeffs
+  let sum : Signal dom (BitVec ACCW) :=
+    signedDotPacked (lanes := TAPS) (lhsW := DATAW)
+      (rhsW := COEFFW) samples coeffsReversed
+  ```
+  Do not use whole-vector `reverseBits` alone for lane reversal: that also
+  reverses every coefficient's internal bit order.
+- Use signedSaturate or signedSaturateC to clamp a signed value before a
+  narrowing truncation. Bounds must have the same width as the value and be
+  encoded in two's complement.
+
+Before coding a fixed-point datapath, write a short width ledger in comments:
+for every input, product, accumulator, scaled value, and output, record its
+signedness, total width, fractional-bit count, rounding rule, and narrowing
+point. Build the Lean types from that ledger. Do not silently use `zext`, a
+logical shift, or low-bit truncation where the ledger requires signed widening,
+toward-zero division, saturation, or a wider accumulator.
+
+For registered symbolic-width DSP, keep the derived widths in every state
+field; never replace them with the default parameter value. A stable pattern
+is:
 ```lean
-theorem f_equiv ... : f args = f_spec args := by
-  unfold f f_spec
-  congr 1; ext t; simp [Signal.map]
+let product : Signal dom (BitVec (2 * W)) := signedMulTo lhs rhs
+let lhsWide : Signal dom (BitVec (W + 1)) := signExtend lhs
+let biasWide : Signal dom (BitVec (W + 1)) := signExtend bias
+let shifted := arithShiftRightC lhsWide (BitVec.ofNat (W + 1) 2)
+let sum : Signal dom (BitVec (W + 1)) := biasWide + shifted
+Signal.loop fun state =>
+  let heldProduct := Signal.mux enable product state.fst
+  let heldSum := Signal.mux enable sum state.snd.fst
+  Signal.register
+    (BitVec.ofNat (2 * W) 0, BitVec.ofNat (W + 1) 0)
+    (bundle2 heldProduct heldSum)
 ```
+If `W` or a lane count comes from the public contract, retain it with the
+parameterized synthesis command; a fixed `BitVec 16` core behind a wrapper
+parameter is not parameterized hardware.
 
-**Sequential logic (with registers):**
+~~~lean
+def exampleQ4Multiply {dom : DomainConfig}
+    (lhs rhs : Signal dom (BitVec 8)) : Signal dom (BitVec 8) :=
+  let product : Signal dom (BitVec 16) := signedMulWide lhs rhs
+  let scaled : Signal dom (BitVec 16) :=
+    arithShiftRightC product (BitVec.ofNat 16 4)
+  let clamped : Signal dom (BitVec 16) :=
+    signedSaturateC scaled (BitVec.ofNat 16 65408) (BitVec.ofNat 16 127)
+  trunc clamped
+~~~
+
+This example treats the inputs as signed Q4 values, preserves the sign through
+the 16-bit product and arithmetic shift, clamps to signed 8-bit range, then
+keeps the low 8 bits. Do not replace the helper calls with host-language Int
+conversion, direct BitVec.sshiftRight, or an unsigned comparison.
+
+### Derived symbolic width alias
+
 ```lean
-theorem f_equiv ... : f args = f_spec args := by
-  unfold f f_spec
-  ext t; induction t <;> simp [*]
+def exampleNativePointer {dom : DomainConfig} {DEPTH : Nat}
+    (x : Signal dom (BitVec (clog2 DEPTH))) : Signal dom (BitVec (clog2 DEPTH)) :=
+  let PTR_W := clog2 DEPTH
+  let q : Signal dom (BitVec PTR_W) :=
+    Signal.loop fun q => Signal.register (BitVec.ofNat PTR_W 0) (q ^^^ x)
+  q
 ```
 
-**BitVec arithmetic:**
-Use `omega`, `bv_omega`, `decide`, or `native_decide` for concrete computations.
+`PTR_W` is a derived dimension, while `DEPTH` stays as the retained top-level
+parameter. The emitter preserves this as `$clog2(DEPTH)` rather than freezing
+the default elaboration width.
 
-### Equivalence Across Architecture Types
+### Slicing and multiple output ports
 
-- **Combinational ↔ Combinational**: Direct equivalence, usually provable with `rfl` or `simp`
-- **Same-latency variants** (e.g., different mux tree structures): Provable — same cycle behavior
-- **Different-latency variants** (e.g., combinational vs pipelined): Harder — the pipelined version has register delays. You may need to prove steady-state equivalence or per-stage correctness instead of direct `=`
-
-When architectures have different latency, focus on proving the combinational logic is correct:
 ```lean
-/-- Prove the combinational core is equivalent, ignoring pipeline registers -/
-theorem f_core_equiv ... : f_core args = f_spec_core args := by ...
+def exampleSplit {dom : DomainConfig}
+    (x : Signal dom (BitVec 16))
+    : Signal dom (BitVec 8 × BitVec 8 × BitVec 1) :=
+  let lo : Signal dom (BitVec 8) := slice x 0
+  let hi : Signal dom (BitVec 8) := slice x 8
+  let nonzero := boolToBV1 (nonZero x)
+  bundleAll! [hi, lo, nonzero]
 ```
 
-### Critical Rules
-- Try to prove equivalence WITHOUT `sorry` — a proof without `sorry` means the architecture is formally verified
-- If you cannot prove full equivalence, you may use `sorry` — the architecture will still be evaluated via simulation but marked as "unverified"
-- Do NOT skip writing the architecture just because you can't prove it — an unverified but sim-passing candidate is still valuable
-- `#synthesizeVerilog` must reference the new `<func_name>`, not `<func_name>_spec`
-- The `_spec` function is only for verification — it will not be synthesized
-- Keep `_spec` identical across all architecture iterations — it is the fixed reference
+### Feedback state, synchronous reset, and same-width shift
+
+```lean
+def exampleLfsr5 {dom : DomainConfig}
+    (reset : Signal dom Bool) : Signal dom (BitVec 5) :=
+  Signal.loop fun q =>
+    let shifted := q >>> 1#5
+    let lsb := q &&& (1#5 : BitVec 5)
+    let feedback := lsb === (1#5 : BitVec 5)
+    let advanced := Signal.mux feedback (shifted ^^^ 20#5) shifted
+    let next := Signal.mux reset (Signal.pure 1#5) advanced
+    Signal.register 1#5 next
+```
+
+`Signal.loop` describes feedback. Here the high-active reset chooses the next
+state before the register; it does not create a separate combinational reset.
+
+## Lean-Check Repair Playbook
+
+1. Fix the first type/elaboration error before changing functionality.
+2. A width mismatch means add an annotation, `zext`, `trunc`, or use a literal
+   with the correct width. Never paper over it with a constant output.
+3. If a compiler error follows tuple destructuring or a signal-level lambda,
+   rewrite with `.fst`/`.snd`/`projN!` and direct Signal operators.
+4. Once Lean check says `Generated Verilog`, inspect the intended latency,
+   reset path, output order, and concat order before submitting the candidate.
+5. Simulator feedback is behavioral evidence. Change the faulty state/logic,
+   run Lean check again, and keep the module compilable after every repair.

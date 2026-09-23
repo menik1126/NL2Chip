@@ -119,9 +119,152 @@ def pure (x : α) : Signal dom α :=
 def clock {dom : DomainConfig} : Signal dom Bool :=
   ⟨fun t => t % 2 == 1⟩
 
+/-- Expose the physical active-high reset port for this signal domain. -/
+def reset {dom : DomainConfig} : Signal dom Bool :=
+  ⟨fun t => t == 0⟩
+
 /-- Map a function over a signal (combinational logic) -/
 def map (f : α → β) (s : Signal dom α) : Signal dom β :=
   ⟨fun t => f (s.val t)⟩
+
+/-- Unsigned packed-vector width conversion. When `outW` is wider this
+    zero-extends; when it is narrower it keeps the least-significant bits.
+    This is the same hardware semantics as SystemVerilog assignment between
+    unsigned packed vectors and remains valid for retained symbolic widths. -/
+def cast {inW outW : Nat}
+    (s : Signal dom (BitVec inW)) : Signal dom (BitVec outW) :=
+  s.map (fun value => value.zeroExtend outW)
+
+/-- Simulation implementation for signed packed-vector width conversion. -/
+private def signExtendImpl {inW outW : Nat}
+    (s : Signal dom (BitVec inW)) : Signal dom (BitVec outW) :=
+  s.map (fun value => value.signExtend outW)
+
+/-- Signed packed-vector width conversion. When outW is wider this preserves
+    the two's-complement sign bit; when it is narrower it keeps the
+    least-significant bits. The compiler lowers this as a dedicated hardware
+    intrinsic so BitVec.signExtend is not unfolded into host-level integer
+    arithmetic during synthesis. -/
+@[implemented_by signExtendImpl]
+opaque signExtend {inW outW : Nat}
+    (s : Signal dom (BitVec inW)) : Signal dom (BitVec outW)
+
+/-- Apply a Boolean function independently to every bit of a packed signal.
+    Synthesis retains `W` as a SystemVerilog generate-loop bound. -/
+def mapBits {W : Nat} (f : Bool → Bool)
+    (s : Signal dom (BitVec W)) : Signal dom (BitVec W) :=
+  s.map fun value =>
+    BitVec.ofNat W <| (List.range W).foldl (fun result index =>
+      if f (value.getLsbD index) then result + 2 ^ index else result) 0
+
+/-- Simulation implementation for parameterized packed-lane mapping. -/
+private def mapChunksImpl {INW OUTW N : Nat}
+    (f : Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec (N * INW))) : Signal dom (BitVec (N * OUTW)) :=
+  let lanes := (List.range N).map fun index =>
+    f ⟨fun t => BitVec.ofNat INW (s.val t).toNat / 2 ^ (index * INW)⟩
+  ⟨fun t => BitVec.ofNat (N * OUTW) <|
+    (List.range N).zip lanes |>.foldl (fun acc (index, lane) =>
+      acc + (lane.val t).toNat * 2 ^ (index * OUTW)
+    ) 0⟩
+
+/-- Apply a named single-lane Sparkle module to every packed `W`-bit chunk.
+    Synthesis lowers this intrinsic to a SystemVerilog generate-for containing
+    one child-module instance per lane; its implementation above preserves the
+    same independent per-lane stream semantics for Lean simulation. -/
+@[implemented_by mapChunksImpl]
+opaque mapChunks {INW OUTW N : Nat}
+    (f : Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec (N * INW))) : Signal dom (BitVec (N * OUTW))
+
+/-- Simulation implementation for parameterized packed-lane mapping where the
+    lane function also receives its zero-based lane index. -/
+private def mapChunksWithIndexImpl {INDEXW INW OUTW N : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec (N * INW))) : Signal dom (BitVec (N * OUTW)) :=
+  let lanes := (List.range N).map fun index =>
+    f ⟨fun _ => BitVec.ofNat INDEXW index⟩
+      ⟨fun t => BitVec.ofNat INW (s.val t).toNat / 2 ^ (index * INW)⟩
+  ⟨fun t => BitVec.ofNat (N * OUTW) <|
+    (List.range N).zip lanes |>.foldl (fun acc (index, lane) =>
+      acc + (lane.val t).toNat * 2 ^ (index * OUTW)
+    ) 0⟩
+
+/-- Apply a named two-input Sparkle module to every packed INW-bit chunk,
+    supplying its first input with the zero-based lane index. Synthesis lowers
+    this intrinsic to a SystemVerilog generate-for and connects the genvar
+    index to each child instance. This is the structural alternative to trying
+    to use Lean List recursion over a retained symbolic lane count. -/
+@[implemented_by mapChunksWithIndexImpl]
+opaque mapChunksWithIndex {INDEXW INW OUTW N : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec (N * INW))) : Signal dom (BitVec (N * OUTW))
+
+/-- Simulation implementation for a signed packed-lane dot product. Lane zero
+    occupies the least-significant chunk in each packed input. -/
+private def signedDotChunksImpl {LHSW RHSW ACCW N : Nat}
+    (lhs : Signal dom (BitVec (N * LHSW)))
+    (rhs : Signal dom (BitVec (N * RHSW))) : Signal dom (BitVec ACCW) :=
+  ⟨fun t =>
+    let total := (List.range N).foldl (fun acc index =>
+      let lhsLane := BitVec.extractLsb' (index * LHSW) LHSW (lhs.val t)
+      let rhsLane := BitVec.extractLsb' (index * RHSW) RHSW (rhs.val t)
+      acc + lhsLane.toInt * rhsLane.toInt
+    ) (0 : Int)
+    BitVec.ofInt ACCW total⟩
+
+/-- Signed dot product over two packed lane vectors. Products and the running
+    sum use two's-complement semantics, and the final sum wraps at `ACCW` bits.
+    Synthesis lowers this intrinsic to a parameterized SystemVerilog loop. -/
+@[implemented_by signedDotChunksImpl]
+opaque signedDotChunks {LHSW RHSW ACCW N : Nat}
+    (lhs : Signal dom (BitVec (N * LHSW)))
+    (rhs : Signal dom (BitVec (N * RHSW))) : Signal dom (BitVec ACCW)
+
+/-- Simulation implementation for index-driven bit generation. -/
+private def generateBitsWithIndexImpl {INDEXW INW OUTW : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec 1))
+    (s : Signal dom (BitVec INW)) : Signal dom (BitVec OUTW) :=
+  ⟨fun time =>
+    BitVec.ofNat OUTW <|
+      (List.range OUTW).foldl (fun result index =>
+        let indexSignal : Signal dom (BitVec INDEXW) :=
+          ⟨fun _ => BitVec.ofNat INDEXW index⟩
+        if (f indexSignal s).val time |>.getLsbD 0
+        then result + 2 ^ index
+        else result
+      ) 0⟩
+
+/-- Generate every output bit with a named Sparkle module that receives the
+    zero-based output index and the complete packed input. Unlike
+    `mapChunksWithIndex`, this primitive does not split the input into lanes;
+    it supports indexed select, mask construction, and other position-aware
+    structures at retained symbolic widths. -/
+@[implemented_by generateBitsWithIndexImpl]
+opaque generateBitsWithIndex {INDEXW INW OUTW : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec 1))
+    (s : Signal dom (BitVec INW)) : Signal dom (BitVec OUTW)
+
+/-- Simulation implementation for index-driven packed-lane generation. -/
+private def generateChunksWithIndexImpl {INDEXW INW OUTW N : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec INW)) : Signal dom (BitVec (N * OUTW)) :=
+  let lanes := (List.range N).map fun index =>
+    f ⟨fun _ => BitVec.ofNat INDEXW index⟩ s
+  ⟨fun time => BitVec.ofNat (N * OUTW) <|
+    (List.range N).zip lanes |>.foldl (fun result (index, lane) =>
+      result + (lane.val time).toNat * 2 ^ (index * OUTW)
+    ) 0⟩
+
+/-- Generate every packed output lane with a named Sparkle module that receives
+    the zero-based output-lane index and the complete packed input. Unlike
+    `mapChunksWithIndex`, the input is not split and the number of output lanes
+    is independent of the input layout. Lane zero occupies the least-significant
+    output chunk. -/
+@[implemented_by generateChunksWithIndexImpl]
+opaque generateChunksWithIndex {INDEXW INW OUTW N : Nat}
+    (f : Signal dom (BitVec INDEXW) → Signal dom (BitVec INW) → Signal dom (BitVec OUTW))
+    (s : Signal dom (BitVec INW)) : Signal dom (BitVec (N * OUTW))
 
 /-- Apply a signal of functions to a signal of values -/
 def ap (sf : Signal dom (α → β)) (s : Signal dom α) : Signal dom β :=
@@ -164,6 +307,20 @@ def registerNeg (init : α) (input : Signal dom α) : Signal dom α :=
     | n + 1 => input.val n⟩
 
 /--
+  Positive-edge-triggered D flip-flop without a reset port.
+
+  Semantically identical to `register` (same single-cycle delay model),
+  but the compiler emits `always_ff @(posedge clk)` with NO reset port
+  in the generated SystemVerilog.
+
+  Use this when the target module interface has no reset signal.
+-/
+def registerNoReset (init : α) (input : Signal dom α) : Signal dom α :=
+  ⟨fun t => match t with
+    | 0 => init
+    | n + 1 => input.val n⟩
+
+/--
   Register with enable signal.
 
   When enable is true: register updates normally
@@ -178,6 +335,29 @@ def registerWithEnable (init : α) (en : Signal dom Bool) (input : Signal dom α
   ⟨fun t => match t with
     | 0 => init
     | n + 1 => if en.val n then input.val n else go n init⟩
+
+/-- Asynchronous assertion and two-cycle synchronous reset deassertion. -/
+def resetSynchronizer {dom : DomainConfig} : Signal dom Bool :=
+  register true (register true (pure false))
+
+/--
+  Synchronize a stable Boolean level into another physical clock domain.
+
+  The two destination-domain registers model the standard two-flop
+  synchronizer. Synthesis recognizes this definition as an audited CDC
+  primitive and records the crossing explicitly in the netlist IR.
+
+  This primitive is for levels that remain stable long enough to be sampled.
+  Pulses and multi-bit payloads require their dedicated CDC primitives.
+-/
+def synchronizeLevel {src dst : DomainConfig}
+    (input : Signal src Bool) : Signal dst Bool :=
+  let sampled : Signal dst Bool :=
+    ⟨fun dstTick =>
+      let sourcePeriod := max 1 src.period
+      let sourceTick := (dstTick * dst.period) / sourcePeriod
+      input.val sourceTick⟩
+  register false (register false sampled)
 
 /-- Helper to create a signal from a stream -/
 def fromStream (s : Stream α) : Signal dom α := ⟨s⟩
@@ -216,6 +396,9 @@ instance : HSub (Signal dom (BitVec n)) (Signal dom (BitVec n)) (Signal dom (Bit
 
 instance : HMul (Signal dom (BitVec n)) (Signal dom (BitVec n)) (Signal dom (BitVec n)) where
   hMul a b := (· * ·) <$> a <*> b
+
+instance : HMod (Signal dom (BitVec n)) (Signal dom (BitVec n)) (Signal dom (BitVec n)) where
+  hMod a b := (· % ·) <$> a <*> b
 
 instance : HAnd (Signal dom (BitVec n)) (Signal dom (BitVec n)) (Signal dom (BitVec n)) where
   hAnd a b := (· &&& ·) <$> a <*> b
@@ -259,6 +442,11 @@ instance : HMul (Signal dom (BitVec n)) (BitVec n) (Signal dom (BitVec n)) where
   hMul a b := (· * ·) <$> a <*> Signal.pure b
 instance : HMul (BitVec n) (Signal dom (BitVec n)) (Signal dom (BitVec n)) where
   hMul a b := (· * ·) <$> Signal.pure a <*> b
+
+instance : HMod (Signal dom (BitVec n)) (BitVec n) (Signal dom (BitVec n)) where
+  hMod a b := (· % ·) <$> a <*> Signal.pure b
+instance : HMod (BitVec n) (Signal dom (BitVec n)) (Signal dom (BitVec n)) where
+  hMod a b := (· % ·) <$> Signal.pure a <*> b
 
 instance : HAnd (Signal dom (BitVec n)) (BitVec n) (Signal dom (BitVec n)) where
   hAnd a b := (· &&& ·) <$> a <*> Signal.pure b
@@ -340,9 +528,44 @@ def Signal.sle (a b : Signal dom (BitVec n)) : Signal dom Bool :=
 def Signal.ule (a b : Signal dom (BitVec n)) : Signal dom Bool :=
   (BitVec.ule · ·) <$> a <*> b
 
+/-- Signed greater-than on BitVec signals. -/
+def Signal.sgt (a b : Signal dom (BitVec n)) : Signal dom Bool :=
+  Signal.slt b a
+
+/-- Unsigned greater-than on BitVec signals. -/
+def Signal.ugt (a b : Signal dom (BitVec n)) : Signal dom Bool :=
+  Signal.ult b a
+
+/-- Signed greater-or-equal on BitVec signals. -/
+def Signal.sge (a b : Signal dom (BitVec n)) : Signal dom Bool :=
+  Signal.sle b a
+
+/-- Unsigned greater-or-equal on BitVec signals. -/
+def Signal.uge (a b : Signal dom (BitVec n)) : Signal dom Bool :=
+  Signal.ule b a
+
 /-- Arithmetic shift right on BitVec signals. -/
 def Signal.ashr (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
   (fun x y => BitVec.sshiftRight x y.toNat) <$> a <*> b
+
+/-- Simulation implementation for unsigned packed-vector division. -/
+private def udivImpl (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
+  (BitVec.udiv · ·) <$> a <*> b
+
+/-- Unsigned packed-vector division. Division by zero follows Lean's BitVec
+    convention and returns zero. Prefer a `*DivOr` library helper when the
+    zero-denominator behavior is part of the circuit contract. -/
+@[implemented_by udivImpl]
+opaque Signal.udiv (a b : Signal dom (BitVec n)) : Signal dom (BitVec n)
+
+/-- Simulation implementation for signed two's-complement division. -/
+private def sdivImpl (a b : Signal dom (BitVec n)) : Signal dom (BitVec n) :=
+  (BitVec.sdiv · ·) <$> a <*> b
+
+/-- Signed two's-complement division with truncation toward zero. Division by
+    zero follows Lean's BitVec convention and returns zero. -/
+@[implemented_by sdivImpl]
+opaque Signal.sdiv (a b : Signal dom (BitVec n)) : Signal dom (BitVec n)
 
 -- Mixed constant variants for slt/ult/ashr
 def Signal.sltC (a : Signal dom (BitVec n)) (b : BitVec n) : Signal dom Bool :=
@@ -533,8 +756,10 @@ opaque memory {addrWidth dataWidth : Nat}
   previous cycle), `memoryComboRead` reads `readAddr` from the current cycle.
   Writes from previous cycles (0..t-1) are visible; the write at cycle t is not.
 
-  Use this for register files where reads must be combinational.
-  NOT synthesizable — use `memory` for synthesis targets.
+  Use this for register files where reads must be combinational. The Sparkle
+  Verilog backend synthesizes it as a clocked-write memory with an asynchronous
+  read port; the implementation below provides matching Lean simulation
+  semantics. Use `memory` instead when a one-cycle registered read is required.
 -/
 -- HashMap-backed sparse memory with combinational (same-cycle) reads.
 -- For large address spaces (addrWidth > 20) where a flat Array would be too large.
@@ -761,6 +986,37 @@ where
 
 @[implemented_by loopImpl]
 opaque loop {dom : DomainConfig} {α : Type} [Inhabited α] (f : Signal dom α → Signal dom α) : Signal dom α
+
+/--
+  Transfer a one-cycle source-domain pulse into a destination domain.
+
+  A source toggle preserves pulses even when the destination clock is slower.
+  The toggle crosses through a two-flop synchronizer and is converted back to
+  a one-cycle destination pulse by change detection.
+-/
+def synchronizePulse {src dst : DomainConfig}
+    (pulse : Signal src Bool) : Signal dst Bool :=
+  let toggle : Signal src Bool := Signal.loop fun state =>
+    let next := Signal.mux pulse (Signal.map Bool.not state) state
+    Signal.register false next
+  let synchronized : Signal dst Bool := synchronizeLevel toggle
+  let previous := Signal.register false synchronized
+  synchronized ^^^ previous
+
+/-- Multi-channel toggle pulse synchronizer. Each asserted bit is independent. -/
+def synchronizePulseVector {src dst : DomainConfig} {width : Nat}
+    (pulse : Signal src (BitVec width)) : Signal dst (BitVec width) :=
+  let toggle : Signal src (BitVec width) := Signal.loop fun state =>
+    Signal.register (BitVec.zero width) (state ^^^ pulse)
+  let sampled : Signal dst (BitVec width) :=
+    ⟨fun dstTick =>
+      let sourcePeriod := max 1 src.period
+      let sourceTick := (dstTick * dst.period) / sourcePeriod
+      toggle.val sourceTick⟩
+  let sync1 := Signal.register (BitVec.zero width) sampled
+  let sync2 := Signal.register (BitVec.zero width) sync1
+  let previous := Signal.register (BitVec.zero width) sync2
+  sync2 ^^^ previous
 
 /--
   Memoized fixed-point combinator for feedback loops (IO variant).

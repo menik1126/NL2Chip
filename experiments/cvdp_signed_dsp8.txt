@@ -1,0 +1,10 @@
+# CVDP72 signed/DSP slice used in the original 2/8 failure analysis.
+# Keep this list fixed for before/after signed-helper comparison.
+cvdp_copilot_16qam_mapper_0001
+cvdp_copilot_16qam_mapper_0006
+cvdp_copilot_comparator_0001
+cvdp_copilot_complex_multiplier_0001
+cvdp_copilot_configurable_digital_low_pass_filter_0001
+cvdp_copilot_configurable_digital_low_pass_filter_0014
+cvdp_copilot_sobel_filter_0011
+cvdp_copilot_cont_adder_0023

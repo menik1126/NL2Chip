@@ -7,4 +7,6 @@ dependencies = [
     "anthropic>=0.89.0",
     "rich>=13.0",
     "fastapi[standard]>=0.115",
+    "pytest>=9.0",
+    "cocotb==2.0.1",
 ]
