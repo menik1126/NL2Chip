@@ -22,9 +22,12 @@ sys.path.insert(0, str(HERE))
 from tmp_contract_validate import (  # noqa: E402
     extract_lean,
     lean_check,
+    lean_field_name,
     parse_ref_ports,
     validate_contract,
+    normalize_contract,
 )
+from tmp_toklens_llm import chat as toklens_chat  # noqa: E402
 
 PROJECT = Path("/home/sgli/work/NL2Chip_openlux_repair_state_20260914")
 PRIVATE = Path("/home/sgli/work/nl2chip_contract_gen_private_20260923")
@@ -137,7 +140,7 @@ def load_problem(prob_id: str) -> dict:
     for direction, ty, name in ports:
         iface_lines.append(f"  {direction} {name} : {ty}")
         if name.lower() not in {"clk", "clock"}:
-            fields.append(f"  {name} : {ty}")
+            fields.append(f"  {lean_field_name(name)} : {ty}")
     return {
         "prob_id": prob_id,
         "nl": prompt.strip(),
@@ -171,35 +174,37 @@ def build_prompt(spec: dict, *, feedback: str | None = None) -> str:
     return prompt
 
 
-def generate_one(prob_id: str, task_dir: Path, prompt: str, it: int) -> dict:
+def generate_one(prob_id: str, task_dir: Path, prompt: str, it: int, *, cycle_fields: str | None = None) -> dict:
     last = task_dir / "last_message.txt"
-    env = environment()
-    env["NL2CHIP_TASK_ID"] = re.sub(r"[^A-Za-z0-9_-]", "_", f"contract_{prob_id}")[:80]
     prompt_path = task_dir / f"generate_{it:02d}.prompt.txt"
     prompt_path.write_text(prompt)
     logp = task_dir / f"generate_{it:02d}.log"
-    cmd = [
-        str(WRAPPER),
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "-m", "gpt-5.6-sol",
-        "-c", 'model_reasoning_effort="ultra"',
-        "--sandbox", "read-only",
-        "-o", str(last),
-        "-",
-    ]
-    with logp.open("ab") as fh, prompt_path.open("rb") as pin:
-        rc = subprocess.call(cmd, env=env, cwd="/tmp", stdin=pin, stdout=fh, stderr=subprocess.STDOUT)
-    text = last.read_text(errors="replace") if last.exists() else ""
-    lean = extract_lean(text)
+    try:
+        result = toklens_chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=8192,
+            timeout=180,
+        )
+        text = result["text"]
+        last.write_text(text)
+        logp.write_text(json.dumps({"ok": True, "model": result.get("model")}, ensure_ascii=False) + "\n")
+        rc = 0
+    except Exception as exc:
+        text = ""
+        logp.write_text(f"toklens_error: {exc}\n")
+        rc = 1
+    lean = None
+    if cycle_fields:
+        lean = normalize_contract(text, prob_id=prob_id, cycle_fields=cycle_fields)
+    if lean is None:
+        lean = extract_lean(text)
     if lean:
         (task_dir / "candidate.lean").write_text(lean)
     return {
         "generate_rc": rc,
         "candidate": bool(lean),
         "last_chars": len(text),
+        "backend": "toklens",
     }
 
 
@@ -262,10 +267,8 @@ def main() -> int:
         + os.environ.get("PATH", "")
     )
     os.environ["LAKE_DIR"] = str(PROJECT)
-    subprocess.check_call(["bash", "/home/sgli/work/codex_jing_chatgpt_probe/ensure_socks.sh"])
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "contracts").mkdir(exist_ok=True)
-    prepare_wrapper()
     jsonl = OUT / "results.jsonl"
     done = set()
     if jsonl.exists():

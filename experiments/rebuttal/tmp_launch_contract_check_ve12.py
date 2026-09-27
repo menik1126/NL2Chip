@@ -18,12 +18,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from tmp_contract_checkers import check_contract  # noqa: E402
 from tmp_launch_contract_gen_ve12 import (  # noqa: E402
-    PROBLEMS, PROJECT, WRAPPER, environment, load_problem, log, utc_now,
-    prepare_wrapper,
+    PROBLEMS, PROJECT, environment, load_problem, log, utc_now,
 )
 
 SRC = Path("/home/sgli/work/NL2Chip_rebuttal_artifacts/2026-09-23/formal_contract_gen_ve12")
-OUT = Path("/home/sgli/work/NL2Chip_rebuttal_artifacts/2026-09-23/formal_contract_check_ve12")
+OUT = Path("/home/sgli/work/NL2Chip_rebuttal_artifacts/2026-09-24/formal_contract_check_ve12")
 WORKERS = int(os.environ.get("CONTRACT_CHECK_WORKERS", "2"))
 JUDGE = os.environ.get("CONTRACT_JUDGE", "1") != "0"
 
@@ -37,8 +36,6 @@ def main() -> int:
         + os.environ.get("PATH", "")
     )
     os.environ["LAKE_DIR"] = str(PROJECT)
-    subprocess.check_call(["bash", "/home/sgli/work/codex_jing_chatgpt_probe/ensure_socks.sh"])
-    prepare_wrapper()
     OUT.mkdir(parents=True, exist_ok=True)
     jsonl = OUT / "results.jsonl"
     lock = threading.Lock()
@@ -55,7 +52,7 @@ def main() -> int:
             ref_sv=(PROJECT / "verilog-eval" / "dataset_spec-to-rtl" / f"{pid}_ref.sv").read_text(),
             nl=spec["nl"],
             work=work,
-            wrapper=WRAPPER if JUDGE else None,
+            wrapper=None,
             run_llm_judge=JUDGE,
         )
         row["timestamp"] = utc_now()

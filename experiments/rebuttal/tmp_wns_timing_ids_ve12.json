@@ -1,0 +1,42 @@
+{
+  "experiment": "wns_timing_ve12_v3_select",
+  "n": 12,
+  "criteria": {
+    "seed": "semantic fourds VerilogEval sim_pass",
+    "clock": "named clk in Lean/SV",
+    "period_min_ns_min": 1.2,
+    "exclude": "tiny FSM / FF-limited paths (pmin ~0.6-0.9 ns)"
+  },
+  "ids": [
+    {"id": "Prob144_conwaylife", "family": "cellular_automata", "period_min_ns": 3.92, "area_um2": 47695.7, "note": "deepest path; P&R will be slow"},
+    {"id": "Prob141_count_clock", "family": "counter", "period_min_ns": 2.25, "area_um2": 1497.7, "ppa_area_drop_pct": 31.5},
+    {"id": "Prob080_timer", "family": "timer", "period_min_ns": 1.72, "cells": 63, "area_um2": 610.6, "note": "only keep from previous WNS-12"},
+    {"id": "Prob068_countbcd", "family": "counter", "period_min_ns": 1.68, "cells": 99, "area_um2": 955.9, "ppa_area_drop_pct": 10.1},
+    {"id": "Prob146_fsm_serialdata", "family": "fsm_datapath", "period_min_ns": 1.58, "cells": 58, "area_um2": 565.5, "ppa_area_drop_pct": 30.1},
+    {"id": "Prob037_review2015_count1k", "family": "counter", "period_min_ns": 1.57, "cells": 52, "area_um2": 518.0},
+    {"id": "Prob155_lemmings4", "family": "fsm_datapath", "period_min_ns": 1.52, "cells": 48, "area_um2": 457.9, "ppa_area_drop_pct": 31.1},
+    {"id": "Prob115_shift18", "family": "shift", "period_min_ns": 1.44, "area_um2": 4926.0, "ppa_area_drop_pct": 8.9},
+    {"id": "Prob063_review2015_shiftcount", "family": "shift_counter", "period_min_ns": 1.32, "cells": 26, "area_um2": 224.0},
+    {"id": "Prob035_count1to10", "family": "counter", "period_min_ns": 1.26, "cells": 21, "area_um2": 202.7},
+    {"id": "Prob067_countslow", "family": "counter", "period_min_ns": 1.22, "cells": 25, "area_um2": 239.0, "ppa_area_drop_pct": 9.9},
+    {"id": "Prob124_rule110", "family": "cellular_automata", "period_min_ns": 1.01, "area_um2": 29612.2, "note": "borderline pmin; included for wide datapath diversity"}
+  ],
+  "not_selected_combo_need_virtual_clock": [
+    {"id": "Prob097_mux9to1v", "reason": "no clk; wide mux tree, would need create_clock on outputs"},
+    {"id": "Prob030_popcount255", "reason": "no clk; 255-bit reduction tree"},
+    {"id": "Prob123_bugs_addsubz", "reason": "no clk; arithmetic"}
+  ],
+  "dropped_from_old_wns12": [
+    "Prob079_fsm3onehot",
+    "Prob082_lfsr32",
+    "Prob095_review2015_fsmshift",
+    "Prob096_review2015_fsmseq",
+    "Prob107_fsm1s",
+    "Prob109_fsm1",
+    "Prob119_fsm3",
+    "Prob127_lemmings1",
+    "Prob128_fsm_ps2",
+    "Prob137_fsm_serial",
+    "Prob140_fsm_hdlc"
+  ]
+}

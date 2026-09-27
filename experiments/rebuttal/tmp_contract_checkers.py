@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 
 from tmp_contract_validate import parse_ref_ports, validate_contract
+from tmp_toklens_llm import chat as toklens_chat
 
 PROJECT = Path(os.environ.get("LAKE_DIR", "/home/sgli/work/NL2Chip_openlux_repair_state_20260914"))
 DS_DIR = PROJECT / "verilog-eval" / "dataset_spec-to-rtl"
@@ -108,61 +109,271 @@ GOLD: dict[str, list[dict[str, str]]] = {
     ],
 }
 
-MUTANTS: dict[str, list[tuple[str, str, str]]] = {
+# Each mutant: SV search/replace plus NL-facing diagnostics for the generator.
+MUTANTS: dict[str, list[dict]] = {
     "Prob035_count1to10": [
-        ("wrap11", "q == 10", "q == 11"),
-        ("reset0", "reset || q == 10)\n      q <= 1;", "reset || q == 10)\n      q <= 0;"),
+        {
+            "id": "wrap11",
+            "old": "q == 10",
+            "new": "q == 11",
+            "bullet": "wrap",
+            "violation": "After q=10 the circuit goes to 11 instead of wrapping to 1.",
+            "suggest": "¬pre.reset ∧ pre.q = 10#4 → post.q = 1#4",
+        },
+        {
+            "id": "reset0",
+            "old": "reset || q == 10)\n      q <= 1;",
+            "new": "reset || q == 10)\n      q <= 0;",
+            "bullet": "reset1",
+            "violation": "Synchronous reset (and the wrap path) now writes q=0 instead of q=1.",
+            "suggest": "pre.reset = true → post.q = 1#4",
+        },
     ],
     "Prob037_review2015_count1k": [
-        ("wrap1023", "q == 999", "q == 1023"),
-        ("reset1", "q <= 0;", "q <= 1;"),
+        {
+            "id": "wrap1023",
+            "old": "q == 999",
+            "new": "q == 1023",
+            "bullet": "wrap",
+            "violation": "q wraps at 1023 instead of after 999; 1000 is now a reachable next value.",
+            "suggest": "¬pre.reset ∧ pre.q = 999#10 → post.q = 0#10",
+        },
+        {
+            "id": "reset1",
+            "old": "q <= 0;",
+            "new": "q <= 1;",
+            "bullet": "reset0",
+            "violation": "Synchronous reset writes q=1 instead of 0.",
+            "suggest": "pre.reset = true → post.q = 0#10",
+        },
     ],
     "Prob063_review2015_shiftcount": [
-        ("shift_msb", "q <= { q[2:0], data };", "q <= { data, q[3:1] };"),
-        ("count_up", "q <= q - 1'b1;", "q <= q + 1'b1;"),
-        ("no_hold", "else if (count_ena)\n      q <= q - 1'b1;", "q <= q - 1'b1;"),
+        {
+            "id": "shift_msb",
+            "old": "q <= { q[2:0], data };",
+            "new": "q <= { data, q[3:1] };",
+            "bullet": "shift_msb",
+            "violation": "shift_ena=1 now shifts LSB-first instead of inserting data as the new MSB.",
+            "suggest": "pre.shift_ena = true → post.q = pre.q <<< 1 | pre.data",
+        },
+        {
+            "id": "count_up",
+            "old": "q <= q - 1'b1;",
+            "new": "q <= q + 1'b1;",
+            "bullet": "count",
+            "violation": "When counting (shift_ena=0, count_ena=1) q increments instead of decrementing.",
+            "suggest": "¬pre.shift_ena ∧ pre.count_ena = true → post.q = pre.q - 1#4",
+        },
+        {
+            "id": "no_hold",
+            "old": "else if (count_ena)\n      q <= q - 1'b1;",
+            "new": "q <= q - 1'b1;",
+            "bullet": "hold",
+            "violation": "Both enables 0 no longer hold: the circuit still decrements.",
+            "suggest": "¬pre.shift_ena ∧ ¬pre.count_ena → post.q = pre.q",
+        },
     ],
     "Prob067_countslow": [
-        ("ignore_slowena", "else if (slowena) begin", "else begin"),
-        ("wrap10", "q == 9", "q == 10"),
+        {
+            "id": "ignore_slowena",
+            "old": "else if (slowena) begin",
+            "new": "else begin",
+            "bullet": "pause",
+            "violation": "slowena=0 is ignored: q still increments instead of holding.",
+            "suggest": "¬pre.reset ∧ pre.slowena = false → post.q = pre.q",
+        },
+        {
+            "id": "wrap10",
+            "old": "q == 9",
+            "new": "q == 10",
+            "bullet": "wrap",
+            "violation": "With slowena, q goes 0..10 and wraps from 10, not after 9.",
+            "suggest": "¬pre.reset ∧ pre.slowena = true ∧ pre.q = 9#4 → post.q = 0#4",
+        },
     ],
     "Prob068_countbcd": [
-        ("binary_inc", "q[i*4 +:4] == 9 && enable[i]", "1'b0"),
-        ("ena_stuck0", "assign ena = enable[3:1];", "assign ena = 3'b000;"),
+        {
+            "id": "binary_inc",
+            "old": "q[i*4 +:4] == 9 && enable[i]",
+            "new": "1'b0",
+            "bullet": "ones",
+            "violation": "Digits never wrap at 9: the whole q increments as binary, not BCD.",
+            "suggest": "ones digit: ¬pre.reset ∧ pre.q[3:0]=9 → post.q[3:0]=0 (carry into tens), else +1 on ones only",
+        },
+        {
+            "id": "ena_stuck0",
+            "old": "assign ena = enable[3:1];",
+            "new": "assign ena = 3'b000;",
+            "bullet": "ena",
+            "violation": "ena[1]/ena[2]/ena[3] are tied to 0 even when a higher digit should increment.",
+            "suggest": "ena[1]=1 iff ones wrap (pre ones=9 and that digit is enabled); similarly for hundreds/thousands",
+        },
     ],
     "Prob080_timer": [
-        ("no_decrement", "else if(count_value != 0) count_value <= count_value - 1;", ""),
-        ("wrap", "else if(count_value != 0) count_value <= count_value - 1;", "else count_value <= count_value - 1;"),
-        ("tc_tied_load", "assign tc = count_value == 0;", "assign tc = load;"),
+        {
+            "id": "no_decrement",
+            "old": "else if(count_value != 0) count_value <= count_value - 1;",
+            "new": "",
+            "bullet": "dec",
+            "violation": "When load=0 the internal count no longer decrements.",
+            "suggest": "¬pre.load ∧ hidden_count≠0 → next count is count-1, and tc stays 0 until it hits 0",
+        },
+        {
+            "id": "wrap",
+            "old": "else if(count_value != 0) count_value <= count_value - 1;",
+            "new": "else count_value <= count_value - 1;",
+            "bullet": "stay",
+            "violation": "At 0 the counter wraps instead of staying 0 until the next load.",
+            "suggest": "¬pre.load ∧ tc already 1 → post.tc = true (stay at 0)",
+        },
+        {
+            "id": "tc_tied_load",
+            "old": "assign tc = count_value == 0;",
+            "new": "assign tc = load;",
+            "bullet": "tc",
+            "violation": "tc is tied to load instead of (internal count == 0).",
+            "suggest": "post.tc = true ↔ the count after this cycle is 0, independent of pre.load",
+        },
     ],
     "Prob115_shift18": [
-        ("logical_shr1", "q <= {q[63], q[63:1]};", "q <= {1'b0, q[63:1]};"),
-        ("logical_shr8", "q <= {{8{q[63]}}, q[63:8]};", "q <= {8'b0, q[63:8]};"),
-        ("swap_amt", "2'b00: q <= {q[62:0], 1'b0};", "2'b00: q <= {q[63], q[63:1]};"),
+        {
+            "id": "logical_shr1",
+            "old": "q <= {q[63], q[63:1]};",
+            "new": "q <= {1'b0, q[63:1]};",
+            "bullet": "asr1",
+            "violation": "amount=10 does a logical right shift by 1 (zero-fill) instead of arithmetic (sign-fill).",
+            "suggest": "¬pre.load ∧ pre.ena ∧ pre.amount=2#2 → post.q = pre.q >>> 1 (sign bit copied)",
+        },
+        {
+            "id": "logical_shr8",
+            "old": "q <= {{8{q[63]}}, q[63:8]};",
+            "new": "q <= {8'b0, q[63:8]};",
+            "bullet": "asr8",
+            "violation": "amount=11 zero-fills the top 8 bits instead of repeating q[63].",
+            "suggest": "¬pre.load ∧ pre.ena ∧ pre.amount=3#2 → post.q = pre.q >>> 8 (sign-fill)",
+        },
+        {
+            "id": "swap_amt",
+            "old": "2'b00: q <= {q[62:0], 1'b0};",
+            "new": "2'b00: q <= {q[63], q[63:1]};",
+            "bullet": "shl1",
+            "violation": "amount=00 now arithmetic-shifts right instead of shifting left by 1.",
+            "suggest": "¬pre.load ∧ pre.ena ∧ pre.amount=0#2 → post.q = pre.q <<< 1",
+        },
     ],
     "Prob124_rule110": [
-        ("hold", "q <=\n      ~((q[$bits(q)-1:1] & q[$bits(q)-1:0] & {q[$bits(q)-2:0], 1'b0}) |\n      (~q[$bits(q)-1:1] & ~q[$bits(q)-1:0] & ~{q[$bits(q)-2:0], 1'b0}) |\n      (q[$bits(q)-1:1] & ~q[$bits(q)-1:0] & ~{q[$bits(q)-2:0], 1'b0}) )\n      ;", "q <= q;"),
-        ("invert", "~((q[$bits(q)-1:1]", "(q[$bits(q)-1:1]"),
+        {
+            "id": "hold",
+            "old": "q <=\n      ~((q[$bits(q)-1:1] & q[$bits(q)-1:0] & {q[$bits(q)-2:0], 1'b0}) |\n      (~q[$bits(q)-1:1] & ~q[$bits(q)-1:0] & ~{q[$bits(q)-2:0], 1'b0}) |\n      (q[$bits(q)-1:1] & ~q[$bits(q)-1:0] & ~{q[$bits(q)-2:0], 1'b0}) )\n      ;",
+            "new": "q <= q;",
+            "bullet": "advance",
+            "violation": "Without load, q holds instead of taking one Rule-110 step.",
+            "suggest": "¬pre.load → post.q is Rule 110 of pre.q (do NOT write ∀i if decide cannot check it; constrain a few concrete neighbor triples)",
+        },
+        {
+            "id": "invert",
+            "old": "~((q[$bits(q)-1:1]",
+            "new": "(q[$bits(q)-1:1]",
+            "bullet": "table",
+            "violation": "The Rule-110 table is inverted: neighbor patterns map to the wrong next bit.",
+            "suggest": "Encode the 8-row Rule 110 table on three neighboring bits (111→0, 110→1, 101→1, 100→0, 011→1, 010→1, 001→1, 000→0)",
+        },
     ],
     "Prob141_count_clock": [
-        ("binary_ss", "ss[3:0] == 9", "1'b0"),
-        ("no_pm_toggle", "if (enable[6]) pm <= ~pm;", ""),
-        ("reset_00", "{pm,hh,mm,ss} <= 25'h0120000;", "{pm,hh,mm,ss} <= 25'h0000000;"),
+        {
+            "id": "binary_ss",
+            "old": "ss[3:0] == 9",
+            "new": "1'b0",
+            "bullet": "bcd",
+            "violation": "ss ones digit no longer wraps at 9; seconds increment as binary, not BCD 00-59.",
+            "suggest": "¬pre.reset ∧ pre.ena ∧ pre.ss[3:0]=9 → post.ss[3:0]=0 and ss tens +1; never ss=0x0A",
+        },
+        {
+            "id": "no_pm_toggle",
+            "old": "if (enable[6]) pm <= ~pm;",
+            "new": "",
+            "bullet": "pm",
+            "violation": "pm never toggles on the 11:59:59 → 12:00 wrap.",
+            "suggest": "rolling 11:59:59 AM/PM with ena → post.hh=0x12, mm=ss=0, post.pm = ¬pre.pm",
+        },
+        {
+            "id": "reset_00",
+            "old": "{pm,hh,mm,ss} <= 25'h0120000;",
+            "new": "{pm,hh,mm,ss} <= 25'h0000000;",
+            "bullet": "reset",
+            "violation": "Reset goes to 00:00 instead of 12:00 AM (hh=0x12, mm=ss=0, pm=0).",
+            "suggest": "pre.reset = true → post.hh = 0x12#8 ∧ post.mm = 0 ∧ post.ss = 0 ∧ post.pm = false",
+        },
     ],
     "Prob144_conwaylife": [
-        ("b3s4", ") == 3'h3;", ") == 3'h4;"),
-        ("no_load", "if (load)\n      q <= data;", ""),
+        {
+            "id": "b3s4",
+            "old": ") == 3'h3;",
+            "new": ") == 3'h4;",
+            "bullet": "b3s23",
+            "violation": "Birth/survival uses 4 neighbors instead of 3 (not B3/S23).",
+            "suggest": "¬pre.load: 0-1 neighbors die; 2 stay; 3 become alive; 4+ die. Constrain a few concrete cells, not a huge ∀ if decide times out.",
+        },
+        {
+            "id": "no_load",
+            "old": "if (load)\n      q <= data;",
+            "new": "",
+            "bullet": "load",
+            "violation": "load=1 no longer copies data into q.",
+            "suggest": "pre.load = true → post.q = pre.data",
+        },
     ],
     "Prob146_fsm_serialdata": [
-        ("ignore_stop", "STOP: next = in ? DONE : ERR;", "STOP: next = DONE;"),
-        ("done_idle", "assign done = (state==DONE);", "assign done = (state==START);"),
-        ("no_reset", "if (reset) state <= START;", "if (1'b0) state <= START;"),
+        {
+            "id": "ignore_stop",
+            "old": "STOP: next = in ? DONE : ERR;",
+            "new": "STOP: next = DONE;",
+            "bullet": "bad_stop",
+            "violation": "A 0 stop bit is accepted as a valid frame; done still pulses.",
+            "suggest": "start=0, 8 data bits, stop=0 → post.done = false (wait until line=1 before next start hunt)",
+        },
+        {
+            "id": "done_idle",
+            "old": "assign done = (state==DONE);",
+            "new": "assign done = (state==START);",
+            "bullet": "done",
+            "violation": "done is high in the idle/start-hunt state instead of only after a valid frame.",
+            "suggest": "post.done = true only on the cycle a full start+8data+stop=1 frame just completed",
+        },
+        {
+            "id": "no_reset",
+            "old": "if (reset) state <= START;",
+            "new": "if (1'b0) state <= START;",
+            "bullet": "reset",
+            "violation": "Synchronous reset is ignored; done/out_byte can stick through reset.",
+            "suggest": "pre.reset = true → post.done = false",
+        },
     ],
     "Prob155_lemmings4": [
-        ("splat5", "fall_counter >= 20", "fall_counter >= 5"),
-        ("never_splat", "fall_counter >= 20 ? DEAD", "1'b0 ? DEAD"),
-        ("prio_bump", "if (!ground) next = FALLL;\n        else if (dig) next = DIGL;\n        else if (bump_left) next = WR;",
-         "if (bump_left) next = WR;\n        else if (!ground) next = FALLL;\n        else if (dig) next = DIGL;"),
+        {
+            "id": "splat5",
+            "old": "fall_counter >= 20",
+            "new": "fall_counter >= 5",
+            "bullet": "splat",
+            "violation": "Splat after falling >5 cycles instead of >20.",
+            "suggest": "aaah then land with fall length 6..20 → NOT splat (resume walk). Only fall>20 then ground ⇒ all outputs 0",
+        },
+        {
+            "id": "never_splat",
+            "old": "fall_counter >= 20 ? DEAD",
+            "new": "1'b0 ? DEAD",
+            "bullet": "splat",
+            "violation": "Splat never happens no matter how long the fall.",
+            "suggest": "ground=0 for 21 consecutive walk/fall cycles then ground=1 → post.walk_left=post.walk_right=post.aaah=post.digging=false",
+        },
+        {
+            "id": "prio_bump",
+            "old": "if (!ground) next = FALLL;\n        else if (dig) next = DIGL;\n        else if (bump_left) next = WR;",
+            "new": "if (bump_left) next = WR;\n        else if (!ground) next = FALLL;\n        else if (dig) next = DIGL;",
+            "bullet": "prio",
+            "violation": "Bump/direction change is checked before fall, so ground=0 no longer has highest priority.",
+            "suggest": "walking and ground=0 → post.aaah = true even if bump_left/bump_right=1",
+        },
     ],
 }
 
@@ -235,7 +446,7 @@ def directed_sv(prob_id: str, names: dict[str, str]) -> str:
     if prob_id == "Prob037_review2015_count1k":
         return f"""
     {n('reset')} = 1; @(negedge clk);
-    {n('reset')} = 0; repeat (40) @(negedge clk);
+    {n('reset')} = 0; repeat (1005) @(negedge clk);
     {n('reset')} = 1; @(negedge clk); {n('reset')} = 0;
 """
     if prob_id == "Prob063_review2015_shiftcount":
@@ -262,12 +473,10 @@ def directed_sv(prob_id: str, names: dict[str, str]) -> str:
     if prob_id == "Prob080_timer":
         return f"""
     {n('load')}=1; {n('data')}=10'd3; @(negedge clk);
-    {n('load')}=0; repeat (8) @(negedge clk);
+    {n('load')}=0; repeat (5) @(negedge clk);
     {n('load')}=1; {n('data')}=10'd0; @(negedge clk);
     {n('load')}=0; repeat (2) @(negedge clk);
-    {n('load')}=1; {n('data')}=10'd7; @(negedge clk);
-    {n('load')}=0; repeat (4) @(negedge clk);
-    {n('load')}=1; {n('data')}=10'd2; @(negedge clk);
+    {n('load')}=1; {n('data')}=10'd4; @(negedge clk);
     {n('load')}=0; repeat (6) @(negedge clk);
 """
     if prob_id == "Prob115_shift18":
@@ -515,7 +724,10 @@ def eval_props_on_traces(
             )
         checks.append("\n".join(insts))
     if not eval_names:
+        result["ok"] = False
+        result["checker_error"] = True
         result["detail"] = "all props mention ghost state"
+        result["skipped_ghost"] = skipped_ghost
         return result
 
     decls = []
@@ -575,6 +787,76 @@ def apply_mutant(src: str, old: str, new: str) -> str | None:
     return src.replace(old, new, 1)
 
 
+def gold_text(prob_id: str, bullet_id: str | None) -> str:
+    if not bullet_id:
+        return ""
+    for b in GOLD.get(prob_id, []):
+        if b.get("id") == bullet_id:
+            return b.get("text") or ""
+    return ""
+
+
+def mutant_lookup(prob_id: str, mid: str) -> dict:
+    for m in MUTANTS.get(prob_id, []):
+        if m.get("id") == mid:
+            return m
+    return {}
+
+
+def _prop_names_by_status(mrow: dict, status: str) -> list[str]:
+    return [k for k, v in (mrow.get("props") or {}).items() if (v or {}).get("status") == status]
+
+
+def observable_trace(traces: list[dict[str, str]], ghost: list[str]) -> tuple:
+    skip = {g.strip("«»") for g in ghost}
+    snaps = []
+    for rec in traces:
+        items = tuple(sorted(
+            (k.strip("«»"), (v or "").lower())
+            for k, v in rec.items()
+            if k.strip("«»") not in skip
+        ))
+        snaps.append(items)
+    return tuple(snaps)
+
+
+def traces_distinguished(
+    ref_traces: list[dict[str, str]],
+    mut_traces: list[dict[str, str]],
+    ghost: list[str],
+) -> bool:
+    """True iff mutant I/O dumps differ from ref on this stimulus (NL-visible fork)."""
+    if not ref_traces or not mut_traces:
+        return False
+    return observable_trace(ref_traces, ghost) != observable_trace(mut_traces, ghost)
+
+
+def mutant_issue_kind(mrow: dict) -> str:
+    """Classify a completeness row: scored unkilled vs unknown vs killed."""
+    if mrow.get("kind"):
+        return mrow["kind"]
+    detail = mrow.get("detail") or ""
+    if mrow.get("killed"):
+        return "killed"
+    if not mrow.get("applied"):
+        return "not_applied"
+    if mrow.get("distinguished") is False:
+        return "not_distinguished"
+    markers = (
+        ("sim fail", "sim_fail"),
+        ("lean checker error", "lean_error"),
+        ("no concrete pre/post", "no_pairs"),
+        ("all props mention ghost", "ghost_skip"),
+        ("lean timeout", "lean_error"),
+        ("pattern not found", "not_applied"),
+        ("traces match ref", "not_distinguished"),
+    )
+    for needle, kind in markers:
+        if needle in detail:
+            return kind
+    return "unkilled"
+
+
 def check_completeness(
     contract: str,
     fields: dict[str, str],
@@ -584,46 +866,103 @@ def check_completeness(
     ports,
     prob_id: str,
     work: Path,
+    ref_traces: list[dict[str, str]] | None = None,
 ) -> dict:
     mutants = MUTANTS.get(prob_id, [])
     rows = []
     n_applied = 0
     n_killed = 0
-    for mid, old, new in mutants:
+    n_scored = 0
+    n_weak = 0
+    n_unknown = 0
+    if ref_traces is None:
+        ref_traces, _ = simulate(ref_sv, ports, prob_id, work / "refsim_c", "ref")
+
+    def finish_row(base: dict) -> dict:
+        kind = mutant_issue_kind(base)
+        base["kind"] = kind
+        return base
+
+    for spec in mutants:
+        mid, old, new = spec["id"], spec["old"], spec["new"]
+        meta = {
+            "bullet": spec.get("bullet"),
+            "violation": spec.get("violation"),
+            "suggest": spec.get("suggest"),
+        }
         mut = apply_mutant(ref_sv, old, new)
         if mut is None:
-            rows.append({"id": mid, "applied": False, "killed": False, "detail": "pattern not found"})
+            n_unknown += 1
+            rows.append(finish_row({
+                "id": mid, "applied": False, "killed": False, "scored": False,
+                "detail": "pattern not found", "kind": "not_applied", **meta,
+            }))
             continue
         n_applied += 1
         traces, err = simulate(mut, ports, prob_id, work / "mut" / mid, "mut")
         if not traces:
-            rows.append({"id": mid, "applied": True, "killed": False, "detail": f"sim fail {err[-400:]}"})
+            n_unknown += 1
+            rows.append(finish_row({
+                "id": mid, "applied": True, "killed": False, "scored": False,
+                "detail": f"sim fail {err[-400:]}", "kind": "sim_fail", **meta,
+            }))
+            continue
+        distinguished = traces_distinguished(ref_traces, traces, ghost)
+        if not distinguished:
+            n_unknown += 1
+            rows.append(finish_row({
+                "id": mid, "applied": True, "killed": False, "scored": False,
+                "distinguished": False,
+                "detail": "traces match ref on this stimulus (mutant not exercised)",
+                "kind": "not_distinguished", **meta,
+            }))
             continue
         ev = eval_props_on_traces(contract, fields, props, traces, ghost, work / "mut" / mid / "lean", timeout=90)
-        if ev.get("checker_error"):
-            rows.append({
-                "id": mid, "applied": True, "killed": False,
-                "detail": "lean checker error: " + (ev.get("detail") or "")[:300],
-                "props": ev.get("props"),
-            })
+        if ev.get("checker_error") or "no concrete pre/post" in (ev.get("detail") or "") or "lean timeout" in (ev.get("detail") or "") or "all props mention ghost" in (ev.get("detail") or ""):
+            kind = "lean_error"
+            d = ev.get("detail") or ""
+            if "no concrete" in d:
+                kind = "no_pairs"
+            elif "ghost" in d:
+                kind = "ghost_skip"
+            n_unknown += 1
+            rows.append(finish_row({
+                "id": mid, "applied": True, "killed": False, "scored": False,
+                "distinguished": True,
+                "detail": (("lean checker error: " if kind == "lean_error" else "") + d)[:400],
+                "props": ev.get("props"), "kind": kind, **meta,
+            }))
             continue
         killed = (not ev.get("ok")) and "violations" in (ev.get("detail") or "")
+        n_scored += 1
         if killed:
             n_killed += 1
-        rows.append({
+            kind = "killed"
+        else:
+            n_weak += 1
+            kind = "unkilled"
+        rows.append(finish_row({
             "id": mid,
             "applied": True,
             "killed": killed,
+            "scored": True,
+            "distinguished": True,
             "detail": ev.get("detail", "")[:400],
             "props": ev.get("props"),
-        })
-    ok = n_applied > 0 and n_killed == n_applied
-    weak = n_applied > 0 and n_killed < n_applied
+            "kind": kind,
+            **meta,
+        }))
+    # Hard fail only on scored unkilled mutants (case 1). Unknown (2/3) does not fail.
+    ok = n_weak == 0
     return {
         "ok": ok,
-        "weak": weak,
+        "weak": n_weak > 0,
+        "vacuous": n_scored == 0,
         "n_applied": n_applied,
         "n_killed": n_killed,
+        "n_scored": n_scored,
+        "n_weak": n_weak,
+        "n_unknown": n_unknown,
         "mutants": rows,
     }
 
@@ -644,42 +983,50 @@ Return ONLY JSON:
 """
 
 
-def run_judge(prob_id: str, nl: str, ports_txt: str, contract: str, wrapper: Path, last_path: Path, log_path: Path) -> dict:
+def run_judge(prob_id: str, nl: str, ports_txt: str, contract: str, wrapper: Path | None, last_path: Path, log_path: Path) -> dict:
     bullets = GOLD.get(prob_id, [])
     prompt = (
-        JUDGE_SYS
-        + f"\nProblem: {prob_id}\n\nNatural language:\n{nl}\n\nPorts:\n{ports_txt}\n\n"
+        f"Problem: {prob_id}\n\nNatural language:\n{nl}\n\nPorts:\n{ports_txt}\n\n"
         + "Gold requirement bullets (coverage checklist):\n"
         + json.dumps(bullets, ensure_ascii=False)
         + "\n\nLean contract:\n```lean\n"
         + contract
         + "\n```\n"
     )
-    env = os.environ.copy()
-    env["NL2CHIP_ISOLATION_ROOT"] = str(wrapper.parent / "agent_state")
-    env["NL2CHIP_TASK_ID"] = "contract_judge_" + re.sub(r"[^A-Za-z0-9_]", "_", prob_id)[:40]
-    for name in ("OPENLUX_API_KEY", "OPENLUX_BASE_URL", "CODEX_GATEWAY_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
-        env.pop(name, None)
-    cmd = [
-        str(wrapper), "exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
-        "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"',
-        "--sandbox", "read-only", "-o", str(last_path), "-",
-    ]
-    prompt_path = last_path.with_suffix(".prompt.txt")
-    prompt_path.write_text(prompt)
-    with log_path.open("ab") as fh, prompt_path.open("rb") as pin:
-        rc = subprocess.call(cmd, env=env, cwd="/tmp", stdin=pin, stdout=fh, stderr=subprocess.STDOUT)
-    text = last_path.read_text(errors="replace") if last_path.exists() else ""
-    m = re.search(r"\{[\s\S]*\}", text)
+    last_path.with_suffix(".prompt.txt").write_text(JUDGE_SYS + "\n" + prompt)
+    try:
+        result = toklens_chat(
+            [
+                {"role": "system", "content": JUDGE_SYS},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=2048,
+            timeout=120,
+        )
+        text = result["text"]
+        last_path.write_text(text)
+        log_path.write_text(json.dumps({"ok": True, "model": result.get("model")}, ensure_ascii=False) + "\n")
+        rc = 0
+    except Exception as exc:
+        text = ""
+        log_path.write_text(f"toklens_error: {exc}\n")
+        rc = 1
     parsed = {}
-    if m:
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
         try:
-            parsed = json.loads(m.group(0))
+            obj, _end = decoder.raw_decode(text[i:])
         except json.JSONDecodeError:
-            parsed = {"parse_error": True, "raw": text[-1500:]}
-    else:
+            continue
+        if isinstance(obj, dict) and "verdict" in obj:
+            parsed = obj
+            break
+    if not parsed:
         parsed = {"parse_error": True, "raw": text[-1500:]}
     parsed["judge_rc"] = rc
+    parsed["backend"] = "toklens"
     verdict = parsed.get("verdict")
     parsed["ok"] = verdict == "aligned" and not parsed.get("uncovered_bullet_ids")
     parsed["aux_ok"] = verdict in {"aligned", "partial"}
@@ -696,6 +1043,9 @@ def summarize_row(syntax, sound, complete, judge) -> dict:
         "syntax_ok": syntax_ok,
         "sound_ok": sound_ok,
         "complete_ok": complete_ok,
+        "complete_scored": int(complete.get("n_scored") or 0),
+        "complete_weak": int(complete.get("n_weak") or 0),
+        "complete_unknown": int(complete.get("n_unknown") or 0),
         "judge_ok": judge_ok,
         "accept": accept,
         "hard_gate_ok": accept,
@@ -722,9 +1072,11 @@ def check_contract(
     sound = eval_props_on_traces(contract, fields, props, traces, ghost, work / "reflean") if traces else {
         "ok": False, "detail": sim_err[-1500:] or "no traces", "props": {}, "n_traces": 0, "n_pairs": 0,
     }
-    complete = check_completeness(contract, fields, props, ghost, ref_sv, ports, prob_id, work)
+    complete = check_completeness(
+        contract, fields, props, ghost, ref_sv, ports, prob_id, work, ref_traces=traces,
+    )
     judge = {}
-    if run_llm_judge and wrapper and wrapper.exists():
+    if run_llm_judge:
         iface = "\n".join(f"  {d} {n} : {t}" for d, t, n in ports)
         judge = run_judge(
             prob_id, nl, iface, contract, wrapper,
@@ -742,37 +1094,123 @@ def check_contract(
     return row
 
 
+FEEDBACK_LIMIT = 6000
+
+
+def _format_completeness_mutant(prob_id: str, mrow: dict) -> str:
+    mid = mrow.get("id") or "?"
+    meta = mutant_lookup(prob_id, mid)
+    bullet = mrow.get("bullet") or meta.get("bullet")
+    nl_req = gold_text(prob_id, bullet)
+    violation = mrow.get("violation") or meta.get("violation") or ""
+    suggest = mrow.get("suggest") or meta.get("suggest") or ""
+    kind = mutant_issue_kind(mrow)
+    holds = _prop_names_by_status(mrow, "hold")
+    fails = _prop_names_by_status(mrow, "fail")
+    ghosts = _prop_names_by_status(mrow, "skipped_ghost")
+    kind_help = {
+        "unkilled": (
+            "UNKILLED: this broken circuit still satisfies every evaluated Prop. "
+            "The contract is too weak on the NL requirement below."
+        ),
+        "sim_fail": (
+            "CHECKER: mutant Verilog did not simulate. Do not add ghost Cycle fields for this. "
+            "Keep port-only observational constraints; the next run will retry."
+        ),
+        "lean_error": (
+            "CHECKER: Lean could not `decide` this mutant (∀/timeout/undecidable). "
+            "Rewrite the relevant Prop as a finite Boolean/BitVec implication, not ∀ over 512 bits."
+        ),
+        "no_pairs": (
+            "CHECKER: no concrete PRE/POST pairs (X in the dump). "
+            "Constrain only 0/1 ports such as done/reset; do not mention X-valued buses unless they are defined."
+        ),
+        "ghost_skip": (
+            "CHECKER: every Prop mentions ghost Cycle fields, so completeness was skipped. "
+            "Add port-only Props that `decide` can run; do not add more ghost fields."
+        ),
+        "not_applied": (
+            "CHECKER: mutant search/replace did not match RefModule. Not a contract bug."
+        ),
+        "not_distinguished": (
+            "UNKNOWN: mutant I/O matches the reference on this testbench, so we never saw the NL violation. "
+            "Not a contract failure."
+        ),
+        "killed": "KILLED (ok).",
+    }.get(kind, kind)
+    lines = [
+        f"- [{kind}] {mid}",
+        f"  What the mutant did: {violation}" if violation else f"  mutant id: {mid}",
+        f"  NL requirement ({bullet}): {nl_req}" if nl_req else "",
+        f"  {kind_help}",
+        f"  Props still HOLD on this mutant: {', '.join(holds)}" if holds else "",
+        f"  Props that FAIL (good): {', '.join(fails)}" if fails else "",
+        f"  Props skipped (ghost): {', '.join(ghosts)}" if ghosts else "",
+        f"  Add a Prop that this mutant must violate, e.g.: {suggest}" if suggest and kind == "unkilled" else "",
+    ]
+    return "\n".join(x for x in lines if x)
+
+
 def feedback_from_row(row: dict) -> str:
     parts = []
+    pid = row.get("prob_id") or ""
     syn = row.get("syntax") or {}
     if not syn.get("ok"):
         parts.append("Syntax/style gate: " + "; ".join(syn.get("reasons") or [])[:1500])
     sound = row.get("soundness") or {}
     if not sound.get("ok"):
         fails = [k for k, v in (sound.get("props") or {}).items() if v.get("status") == "fail"]
-        parts.append(
-            "Soundness: the contract is FALSE on the reference circuit traces. "
-            "Wrong props: " + ", ".join(fails or [sound.get("detail", "")[:400]])
+        detail = sound.get("detail") or ""
+        checkerish = bool(sound.get("checker_error")) or any(
+            s in detail for s in (
+                "no concrete pre/post", "lean timeout", "all props mention ghost", "failed to",
+            )
         )
+        if checkerish and not fails:
+            parts.append(
+                "Soundness checker could not evaluate the contract on ref traces: "
+                + detail[:800]
+                + ". Keep port-only decidable Props (no huge ∀, no ghost-only contract)."
+            )
+        else:
+            parts.append(
+                "Soundness: the contract is FALSE on the reference circuit traces. "
+                "Those Props over-constrain the real DUT — relax or guard them with the correct reset/enable. "
+                "Wrong props: " + ", ".join(fails or [detail[:400]])
+            )
     comp = row.get("completeness") or {}
-    if not comp.get("ok"):
-        live = [m["id"] for m in comp.get("mutants") or [] if m.get("applied") and not m.get("killed")]
-        parts.append(
-            "Completeness: these NL-violating mutants still satisfy the contract: "
-            + ", ".join(live)
-            + ". Add observational constraints that those mutants break. "
-            "For hidden counters, declare extra Cycle fields (ghost state)."
-        )
+    if comp.get("mutants") is not None and not comp.get("ok"):
+        mutants = comp.get("mutants") or []
+        unkilled = [m for m in mutants if mutant_issue_kind(m) == "unkilled"]
+        blocked = [m for m in mutants if mutant_issue_kind(m) not in {"unkilled", "killed"}]
+        killed = [m for m in mutants if m.get("killed")]
+        header = [
+            "Completeness failed: "
+            f"{comp.get('n_weak', 0)} distinguished mutant(s) still satisfy the contract "
+            f"(killed {comp.get('n_killed', 0)}/{comp.get('n_scored', 0)} scored; "
+            f"{comp.get('n_unknown', 0)} unknown not counted against you).",
+            "Do NOT declare extra Cycle ghost fields unless a Prop must mention hidden state; "
+            "prefer observational constraints on existing ports.",
+        ]
+        if unkilled:
+            header.append("The following mutants still satisfy the contract — add the suggested Props:")
+            header.extend(_format_completeness_mutant(pid, m) for m in unkilled)
+        if blocked:
+            header.append("These mutants were not a clean kill because of the checker, not because you should dump ghost state:")
+            header.extend(_format_completeness_mutant(pid, m) for m in blocked)
+        if killed:
+            header.append("Already killed (keep these constraints): " + ", ".join(m.get("id", "?") for m in killed))
+        parts.append("\n".join(header))
     judge = row.get("judge") or {}
     if judge:
         if judge.get("missing"):
-            parts.append("Judge missing: " + "; ".join(map(str, judge["missing"])[:8]))
+            parts.append("Judge missing: " + "; ".join(str(x) for x in list(judge["missing"])[:8]))
         if judge.get("errors"):
-            parts.append("Judge errors: " + "; ".join(map(str, judge["errors"])[:8]))
+            parts.append("Judge errors: " + "; ".join(str(x) for x in list(judge["errors"])[:8]))
         if judge.get("uncovered_bullet_ids"):
-            parts.append("Uncovered gold bullets: " + ", ".join(map(str, judge["uncovered_bullet_ids"])))
+            parts.append("Uncovered gold bullets: " + ", ".join(str(x) for x in list(judge["uncovered_bullet_ids"])[:8]))
         if judge.get("tautologies"):
-            parts.append("Judge tautologies: " + "; ".join(map(str, judge["tautologies"])))
+            parts.append("Judge tautologies: " + "; ".join(str(x) for x in list(judge["tautologies"])[:8]))
         if judge.get("datapath_arithmetic"):
-            parts.append("Judge datapath: " + "; ".join(map(str, judge["datapath_arithmetic"])))
-    return "\n".join(parts)[:4000]
+            parts.append("Judge datapath: " + "; ".join(str(x) for x in list(judge["datapath_arithmetic"])[:8]))
+    return "\n".join(parts)[:FEEDBACK_LIMIT]

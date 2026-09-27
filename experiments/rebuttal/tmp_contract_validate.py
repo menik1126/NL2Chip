@@ -46,7 +46,16 @@ DEF_PROP = re.compile(
 
 NAMESPACE = re.compile(r"(?m)^namespace\s+(Contract\.([A-Za-z][\w']*))\s*$")
 STRUCTURE = re.compile(r"(?ms)^structure\s+Cycle\s+where\s*(.*?)(?=^def\s+|^end\b)")
-FIELD = re.compile(r"(?m)^\s*«?([A-Za-z][\w']*)»?\s*:\s*([^\n]+)")
+FIELD = re.compile(r"(?m)^\s*(«?[A-Za-z][\w']*»?)\s*:\s*([^\n]+)")
+
+# Lean keywords that cannot be structure field names unless escaped.
+LEAN_RESERVED = {
+    "in", "out", "end", "if", "then", "else", "match", "fun", "def", "lemma",
+    "theorem", "structure", "class", "where", "do", "let", "have", "show",
+    "from", "with", "open", "set", "prop", "type", "sort", "true", "false",
+    "forall", "exists", "namespace", "section", "import", "export", "axiom",
+    "constant", "instance", "inductive", "private", "protected",
+}
 
 
 def strip_comments(text: str) -> str:
@@ -55,23 +64,101 @@ def strip_comments(text: str) -> str:
     return text
 
 
+def lean_field_name(name: str) -> str:
+    raw = (name or "").strip().strip("«»")
+    if not raw:
+        return name
+    if raw.lower() in LEAN_RESERVED or not re.match(r"^[A-Za-z_]", raw):
+        return f"«{raw}»"
+    return raw
+
+
+def rewrite_reserved_projections(src: str) -> str:
+    """pre.in → pre.«in» (and other Lean-reserved port names)."""
+    for raw in sorted(LEAN_RESERVED, key=len, reverse=True):
+        esc = f"«{raw}»"
+        src = re.sub(rf"\b(pre|post)\.{re.escape(raw)}\b", rf"\1.{esc}", src)
+    return src
+
+
 def extract_lean(text: str) -> str | None:
     if not text:
         return None
     blocks = re.findall(r"```(?:lean)?\s*([\s\S]*?)```", text, flags=re.I)
+    scored = []
     for block in blocks:
-        if "namespace Contract" in block or "structure Cycle" in block:
-            return _close_namespace(block.strip() + "\n")
-    if "namespace Contract" in text and "structure Cycle" in text:
+        score = 0
+        if "namespace Contract" in block:
+            score += 3
+        if "structure Cycle" in block:
+            score += 3
+        if re.search(r"(?m)^def\s+", block):
+            score += 2
+        if "import Init" in block:
+            score += 1
+        if score:
+            scored.append((score, len(block), block))
+    if scored:
+        scored.sort(reverse=True)
+        return _close_namespace(scored[0][2].strip() + "\n")
+    if "namespace Contract" in text or "structure Cycle" in text:
         start = text.find("import ")
         if start < 0:
             start = text.find("namespace Contract")
+        if start < 0:
+            start = text.find("structure Cycle")
         rest = text[start:]
         ends = list(re.finditer(r"(?m)^end(?:\s+[A-Za-z][\w'.]*)*\s*$", rest))
         if ends:
             rest = rest[: ends[-1].end()]
         return _close_namespace(rest.strip() + "\n")
+    blob = extract_defs_blob(text)
+    if blob:
+        return blob
     return None
+
+
+def extract_defs_blob(text: str) -> str | None:
+    matches = list(re.finditer(r"(?m)^def\s+[A-Za-z][\w']*\s*\(\s*pre\s+post\s*:\s*Cycle\s*\)", text))
+    if not matches:
+        return None
+    blob = text[matches[0].start() :]
+    end = list(re.finditer(r"(?m)^end(?:\s+[A-Za-z][\w'.]*)*\s*$", blob))
+    if end:
+        blob = blob[: end[-1].end()]
+    return blob.strip() + "\n"
+
+
+def normalize_contract(text: str, *, prob_id: str, cycle_fields: str) -> str | None:
+    """Force import/namespace/port-only Cycle; keep helper defs and Cycle Props."""
+    raw = extract_lean(text)
+    if not raw:
+        return None
+    ns_want = "Contract." + re.sub(r"[^A-Za-z0-9_]", "_", prob_id)
+    first_def = re.search(r"(?m)^def\s+", raw)
+    if not first_def:
+        blob = extract_defs_blob(raw)
+        if not blob:
+            return _close_namespace(raw)
+        def_src = blob
+    else:
+        def_src = raw[first_def.start() :]
+    def_src = re.sub(r"(?m)^end(?:\s+\S+)*\s*$", "", def_src).strip() + "\n"
+    def_src = rewrite_reserved_projections(def_src)
+    fields = "\n".join(
+        f"  {lean_field_name(line.split(':', 1)[0].strip())} : {line.split(':', 1)[1].strip()}"
+        if ":" in line else line
+        for line in cycle_fields.splitlines()
+        if line.strip()
+    ) + "\n"
+    return (
+        "import Init\n\n"
+        f"namespace {ns_want}\n\n"
+        "structure Cycle where\n"
+        f"{fields}\n"
+        f"{def_src.rstrip()}\n\n"
+        f"end {ns_want}\n"
+    )
 
 
 def _close_namespace(src: str) -> str:
@@ -283,6 +370,7 @@ end Contract.Prob035_count1to10
 
 
 def selftest() -> None:
+    import re
     ports = [("input", "Bool", "clk"), ("input", "Bool", "reset"), ("output", "BitVec 4", "q")]
     good = validate_contract(GOOD_EXAMPLE, prob_id="Prob035_count1to10", ports=ports)
     assert good["ok"], good
@@ -290,7 +378,37 @@ def selftest() -> None:
     assert not bad1["ok"]
     bad2 = validate_contract(BAD_TRIVIAL, prob_id="Prob035_count1to10", ports=ports)
     assert not bad2["ok"]
-    print("selftest_ok", {"good_props": good["n_props"], "bad_circuit": bad1["reasons"][:3], "bad_trivial": bad2["reasons"][:3]})
+    blob = extract_lean("```\ndef foo (pre post : Cycle) : Prop :=\n  pre.reset = true → post.done = false\n```")
+    assert blob and "def foo" in blob
+    norm = normalize_contract(
+        "Here you go\n```lean\nnamespace Contract.X\nstructure Cycle where\n  d2 : Bool\n  reset : Bool\n  done : Bool\ndef reset_clears (pre post : Cycle) : Prop :=\n  pre.reset = true → post.done = false\nend\n```\n",
+        prob_id="Prob146_fsm_serialdata",
+        cycle_fields="  reset : Bool\n  done : Bool",
+    )
+    assert norm is not None
+    assert "d2" not in norm.split("def")[0]
+    assert "namespace Contract.Prob146_fsm_serialdata" in norm
+    assert "post.done" in norm
+    helpers = normalize_contract(
+        "```lean\nimport Init\nnamespace Contract.P\nstructure Cycle where\n  q : BitVec 16\n"
+        "def validDigit (q : BitVec 16) (base : Nat) : Prop := True\n"
+        "def digits (pre post : Cycle) : Prop :=\n  pre.reset = false → validDigit pre.q 0\nend\n```\n",
+        prob_id="Prob068_countbcd",
+        cycle_fields="  reset : Bool\n  q : BitVec 16",
+    )
+    assert helpers and "def validDigit" in helpers and "validDigit pre.q" in helpers
+    uart = normalize_contract(
+        "```lean\nstructure Cycle where\n  in : Bool\n  done : Bool\n"
+        "def reset_clears (pre post : Cycle) : Prop :=\n  pre.reset = true → post.done = false\n"
+        "def pin (pre post : Cycle) : Prop := pre.in = true → post.done = false\n```\n",
+        prob_id="Prob146_fsm_serialdata",
+        cycle_fields="  in : Bool\n  reset : Bool\n  done : Bool",
+    )
+    assert uart is not None
+    assert "«in» : Bool" in uart
+    assert "pre.«in»" in uart
+    assert re.search(r"(?m)^\s+in :", uart) is None
+    print("selftest_ok", {"good_props": good["n_props"], "helpers": True, "uart_escape": True})
 
 
 if __name__ == "__main__":
