@@ -1,15 +1,15 @@
-# Sparkle HDL
+# CKTLean
 
-[![Build](https://github.com/Verilean/sparkle/actions/workflows/build.yml/badge.svg)](https://github.com/Verilean/sparkle/actions/workflows/build.yml)
+[![Build](https://github.com/menik1126/NL2Chip/actions/workflows/build.yml/badge.svg)](https://github.com/menik1126/NL2Chip/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 **Write hardware in Lean 4. Prove it correct. Generate Verilog.**
 
 A type-safe hardware description language that brings the power of dependent types and theorem proving to hardware design.
 
-**Quick Start:** See the [Signal DSL Syntax Guide](docs/SignalDSL_Syntax.md) for writing hardware in Sparkle.
+**Quick Start:** See the [Signal DSL Syntax Guide](docs/SignalDSL_Syntax.md) for writing hardware in CKTLean.
 
-## The Sparkle Way: Verification-Driven Design
+## The CKTLean Way: Verification-Driven Design
 
 1. **Write a pure Lean spec** -- Define your hardware's behavior as pure functions
 2. **Prove properties** -- Safety, liveness, fairness via Lean's theorem prover
@@ -20,7 +20,7 @@ See the [Verification-Driven Design Framework](docs/Verification_Framework.md) f
 
 ## IP Catalog
 
-Sparkle ships with production-grade IP cores — each with pure Lean specs, formal proofs, and synthesizable Signal DSL implementations.
+CKTLean ships with production-grade IP cores — each with pure Lean specs, formal proofs, and synthesizable Signal DSL implementations.
 
 | IP | Description | Proofs | Synth | Details |
 |----|-------------|:------:|:-----:|---------|
@@ -28,13 +28,13 @@ Sparkle ships with production-grade IP cores — each with pure Lean specs, form
 | **[YOLOv8n-WorldV2](docs/YOLOv8.md)** | Open-vocabulary object detection. INT4/INT8 quantized, 15 modules, CLIP text embeddings | Golden validation | Full | Backbone + Neck + Head |
 | **[RV32IMA SoC](docs/RV32.md)** | RISC-V CPU — boots Linux 6.6.0. 4-stage pipeline, Sv32 MMU, UART, CLINT. JIT at 13M cyc/s (1.17x Verilator). 102 formal proofs including Signal DSL ↔ spec equivalence | 102 theorems | Full | 122 registers |
 | **[AXI4-Lite Bus](docs/RV32.md)** | Verified AXI4-Lite slave/master. Protocol compliance (valid persistence, deadlock-free), synthesizable | 14 theorems | Full | 23 sim tests |
-| **[SV→Sparkle Transpiler](docs/RV32.md#sv-transpiler)** | Parse Verilog → JIT + formal verification. `verilog!` macro, `assert` auto-proof via `bv_decide`. PicoRV32 M-ext (MUL/DIV/REM) operational. 34 CI-safe tests | 6+ theorems | JIT | 34 tests |
+| **[SV→CKTLean Transpiler](docs/RV32.md#sv-transpiler)** | Parse Verilog → JIT + formal verification. `verilog!` macro, `assert` auto-proof via `bv_decide`. PicoRV32 M-ext (MUL/DIV/REM) operational. 34 CI-safe tests | 6+ theorems | JIT | 34 tests |
 | **[H.264 Codec](docs/H264.md)** | Baseline Profile encoder + decoder. Hardware MP4 muxer produces playable files. 14 modules | 15+ theorems | Full | 709-byte MP4 output |
 | **[CDC Infrastructure](docs/CDC.md)** | Lock-free multi-clock simulation. SPSC queue (210M ops/sec), rollback mechanism, JIT.runCDC | 12 theorems | C++ | 2-thread Time-Warping |
 
 ---
 
-## Why Sparkle?
+## Why CKTLean?
 
 ```lean
 -- Write this in Lean...
@@ -72,11 +72,11 @@ endmodule
 2. **Synthesize** - Automatic compilation to clean, synthesizable SystemVerilog
 3. **Verify** - Formal correctness proofs using Lean's theorem prover
 
-## The Sparkle Advantage: Logical AND Physical Safety
+## The CKTLean Advantage: Logical AND Physical Safety
 
 Modern HDLs like Chisel have successfully solved many "logical" hardware bugs (like preventing unintended latches) using intermediate representations like FIRRTL. However, they completely ignore the "physical" realities of backend design, leaving engineers to struggle with timing closures (STA) or rely on million-dollar commercial linters like SpyGlass to enforce basic physical design rules.
 
-Sparkle is designed to guarantee both **Logical Safety** and **Physical/Timing Safety** out of the box, without external tools.
+CKTLean is designed to guarantee both **Logical Safety** and **Physical/Timing Safety** out of the box, without external tools.
 
 ### 1. Logical Safety (Zero Latches & Comb Loops)
 
@@ -87,7 +87,7 @@ Backed by Lean 4's rigorous type system:
 
 ### 2. Physical & Timing Safety (Built-in DRC)
 
-Sparkle includes a built-in Design Rule Check (DRC) compiler pass that enforces backend-friendly RTL structures (inspired by industry standards like the STARC guidelines).
+CKTLean includes a built-in Design Rule Check (DRC) compiler pass that enforces backend-friendly RTL structures (inspired by industry standards like the STARC guidelines).
 
 - **Registered Outputs Enforcement:** The compiler automatically checks that module outputs are driven directly by Flip-Flops (Registers) rather than combinational logic, preventing critical path explosion across module boundaries and making Static Timing Analysis (STA) predictable.
 
@@ -109,7 +109,7 @@ def registered (a : Signal Domain (BitVec 8)) : Signal Domain (BitVec 8) :=
 
 ### 3. Transparent, Readable Verilog
 
-Unlike Chisel, which shreds your design hierarchy into unreadable FIRRTL-generated Verilog, Sparkle's IR maintains a 1:1 structural correspondence with your Lean code. When the built-in DRC points out a timing issue, you can actually read the generated SystemVerilog to fix it.
+Unlike Chisel, which shreds your design hierarchy into unreadable FIRRTL-generated Verilog, CKTLean's IR maintains a 1:1 structural correspondence with your Lean code. When the built-in DRC points out a timing issue, you can actually read the generated SystemVerilog to fix it.
 
 ## Quick Start
 
@@ -117,8 +117,8 @@ Unlike Chisel, which shreds your design hierarchy into unreadable FIRRTL-generat
 
 ```bash
 # Clone the repository
-git clone https://github.com/Verilean/sparkle.git
-cd sparkle
+git clone https://github.com/menik1126/NL2Chip.git
+cd NL2Chip
 
 # Build the project
 lake build
@@ -174,7 +174,7 @@ def testSignalB : Signal Domain (BitVec 16) := ⟨fun t => (t * 2).toBitVec 16�
 Write high-level Lean code, get production-ready SystemVerilog:
 
 ```lean
--- Sparkle automatically handles:
+-- CKTLean automatically handles:
 -- ✓ Clock and reset signal insertion
 -- ✓ Proper register inference
 -- ✓ Type-safe bit width matching
@@ -205,7 +205,7 @@ theorem alu_add_assoc (a b c : BitVec 16) :
   apply BitVec.add_assoc
 ```
 
-**Real Example:** Our Sparkle-16 CPU includes **9 formally proven theorems** about ALU correctness!
+**Real Example:** Our CKTLean-16 CPU includes **9 formally proven theorems** about ALU correctness!
 
 ### ⏱️ Temporal Logic for Hardware Verification
 
@@ -345,7 +345,7 @@ def cpuRegisterFile
 
 ### 🎓 Complete CPU Example
 
-The **Sparkle-16** is a fully functional 16-bit RISC CPU demonstrating real-world hardware design:
+The **CKTLean-16** is a fully functional 16-bit RISC CPU demonstrating real-world hardware design:
 
 - **8 instructions**: LDI, ADD, SUB, AND, LD, ST, BEQ, JMP
 - **8 registers**: R0-R7 (R0 hardwired to zero)
@@ -363,7 +363,7 @@ lake env lean --run Examples/Sparkle16/ISAProofTests.lean
 
 **Output:**
 ```
-=== Sparkle-16 CPU Core ===
+=== CKTLean-16 CPU Core ===
 
 Program:
   LDI R1, 10
@@ -394,7 +394,7 @@ def myMemory : Module :=
   ]
 ```
 
-Sparkle generates proper module instantiations without defining internals.
+CKTLean generates proper module instantiations without defining internals.
 
 ## Examples
 
@@ -469,7 +469,7 @@ lake env lean --run Examples/LoopSynthesis.lean
 # Technology primitives
 lake env lean --run Examples/PrimitiveTest.lean
 
-# Sparkle-16 CPU
+# CKTLean-16 CPU
 lake env lean --run Examples/Sparkle16/ALU.lean
 lake env lean --run Examples/Sparkle16/RegisterFile.lean
 lake env lean --run Examples/Sparkle16/Core.lean
@@ -501,7 +501,7 @@ The generated documentation includes:
 - Verilog backend details
 - Verification framework (proofs, theorems, and temporal logic)
 - Temporal logic for hardware verification (LTL operators)
-- Sparkle-16 CPU architecture
+- CKTLean-16 CPU architecture
 
 **Verification-Driven Design:**
 - See [docs/Verification_Framework.md](docs/Verification_Framework.md) for the VDD framework guide
@@ -522,7 +522,7 @@ The generated documentation includes:
 
 ## How It Works
 
-### The Sparkle Pipeline
+### The CKTLean Pipeline
 
 ```
 ┌──────────────────┐
@@ -587,7 +587,7 @@ Tests include:
 - Array/Vector operations (27 tests)
 - Temporal Logic verification (33 tests)
 - Overflow/underflow behavior (26 tests)
-- Sparkle-16 CPU verification tests
+- CKTLean-16 CPU verification tests
 - **BitNet Signal DSL functional tests** — spec-vs-Signal exact match
 - **BitNet golden value validation (16 tests)** — validated against real bitnet.cpp model data
 - **BitNet RTL correctness (60+ proofs)**
@@ -610,7 +610,7 @@ Tests include:
 
 ## Comparison with Other HDLs
 
-| Feature | Sparkle | Clash | Chisel | Verilog |
+| Feature | CKTLean | Clash | Chisel | Verilog |
 |---------|---------|-------|--------|---------|
 | Language | Lean 4 | Haskell | Scala | Verilog |
 | Type System | Dependent Types | Strong | Strong | Weak |
@@ -622,13 +622,13 @@ Tests include:
 | Learning Curve | High | High | Medium | Low |
 | Proof Integration | **Seamless** | Separate | Separate | N/A |
 
-**Sparkle's Unique Advantage**: Logical safety (no latches, no comb loops) AND physical/timing safety (registered output DRC) AND formal verification — all in one language, no external tools.
+**CKTLean's Unique Advantage**: Logical safety (no latches, no comb loops) AND physical/timing safety (registered output DRC) AND formal verification — all in one language, no external tools.
 
 ## Project Structure
 
 ```
-sparkle/
-├── Sparkle/              # Core library
+NL2Chip/
+├── Sparkle/              # CKTLean core library (Lean package name)
 │   ├── Core/            # Signal semantics, domains, and vectors
 │   │   ├── Signal.lean  # Signal DSL: register, memory, loop, mux, ===, hw_cond
 │   │   ├── StateMacro.lean # declare_signal_state: named state accessors
@@ -737,7 +737,7 @@ sparkle/
 
 ## Contributing
 
-Sparkle is an educational project demonstrating:
+CKTLean is an educational project demonstrating:
 - Functional hardware description
 - Dependent type systems for hardware
 - Theorem proving for verification
@@ -807,7 +807,7 @@ Contributions welcome! Areas of interest:
 - [ ] **Verified Standard IP — N-way Arbiter** - Generalize 2-client round-robin arbiter to N clients
 - [ ] **Verified Standard IP — TileLink / AXI4 Interconnect** - Full AXI4 (bursts, IDs) and TileLink
 - [ ] **GPGPU / Vector Core** - Apply the Verification-Driven Design (VDD) framework to highly concurrent, memory-bound accelerator architectures
-- [ ] **FPGA Tape-out Flow** - End-to-end examples deploying Sparkle-generated Linux SoCs to physical FPGAs
+- [ ] **FPGA Tape-out Flow** - End-to-end examples deploying CKTLean-generated Linux SoCs to physical FPGAs
 
 ## Development History
 

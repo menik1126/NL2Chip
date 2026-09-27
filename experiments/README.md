@@ -26,7 +26,7 @@ python3 experiments/baseline_verilog.py
 python3 experiments/baseline_verilog_iterative.py
 ```
 
-## Sparkle / CktArchon (Lean → Verilog)
+## CKTLean / CktArchon (Lean → Verilog)
 
 ```bash
 python3 -m cktarchon.run --dataset verilogeval
