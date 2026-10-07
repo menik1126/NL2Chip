@@ -329,7 +329,7 @@ def upstream_api_key_from_env() -> str:
 
 
 def inherit_proxy_env_from_processes() -> int:
-    """Best-effort H20 helper: copy proxy vars from another same-user process.
+    """Best-effort helper: copy proxy vars from another same-user process.
 
     Batch runs are often launched by a non-login service that already has the
     proxy exported, while ad-hoc ssh commands do not. Values are never logged.

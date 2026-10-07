@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -408,8 +409,8 @@ def test_cvdp_harness_profile_defaults_and_official_ablation(
 
 
 def test_runtime_env_prioritizes_guarded_iverilog_wrapper(monkeypatch: pytest.MonkeyPatch):
-    raw_iverilog_bin = "/home/sgli/work/toolcache/iverilog_deb/extract/usr/bin"
-    guarded_bin = "/home/sgli/.local/bin"
+    raw_iverilog_bin = "/opt/toolcache/iverilog/usr/bin"
+    guarded_bin = str(Path.home() / ".local" / "bin")
     original_exists = Path.exists
     monkeypatch.setattr(
         "cktarchon.env.Path.exists",
@@ -449,7 +450,7 @@ def test_evaluator_retries_infrastructure_without_model_turns(
         def __init__(self):
             self.calls = 0
 
-        def evaluate(self, prob_id, run_dir, problem_info=None):
+        def evaluate(self, prob_id, run_dir, problem_info=None, skip_sim=False):
             self.calls += 1
             if self.calls < 3:
                 return {
@@ -501,7 +502,7 @@ def test_path_guard_hides_peer_artifacts_and_credentials(tmp_path: Path):
     assert not guard.is_read_allowed("cktarchon_work/prob_b/notes.txt")
     assert not guard.is_read_allowed("key.env")
     assert not guard.is_read_allowed(".git/config")
-    assert guard.is_read_allowed("docs/P3_SYMBOLIC_PARAMETERS.md")
+    assert guard.is_read_allowed("docs/SignalDSL_Syntax.md")
 
 
 def test_path_guard_blocks_shell_file_discovery_and_peer_modules(tmp_path: Path):
@@ -1423,6 +1424,8 @@ def test_guided_finalization_skips_replay_when_selected_source_was_evaluated_las
 
 
 def test_generated_self_test_runs_in_isolated_directory(tmp_path: Path):
+    if not (shutil.which("iverilog") and shutil.which("vvp")):
+        pytest.skip("Icarus Verilog is not installed")
     sim_dir = tmp_path / "cvdp_sim" / "prob_a"
     rtl_path = sim_dir / "src" / "dut.sv"
     rtl_path.parent.mkdir(parents=True)

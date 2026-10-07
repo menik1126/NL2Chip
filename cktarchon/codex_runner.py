@@ -17,7 +17,11 @@ from .env import ensure_runtime_env
 from .logs import AgentStats, append_jsonl, parse_agent_log
 from .responses_chat_proxy import DEFAULT_BASE_URL_ENV, DEFAULT_KEY_ENV, auto_proxy_env
 
-DEFAULT_ARCHON_SRC = Path("/home/sgli/work/archon-official/src")
+# Official Archon checkout; override with ARCHON_SRC or --archon-src.
+DEFAULT_ARCHON_SRC = Path(
+    os.environ.get("ARCHON_SRC")
+    or Path(__file__).resolve().parents[2] / "archon-official" / "src"
+)
 
 
 @dataclass

@@ -37,17 +37,19 @@ def model_alias(name: str) -> str:
 
 
 def ensure_runtime_env() -> None:
-    """Expose the local Lean/Lake runtime without assuming the H20 home path."""
+    """Expose the local Lean/Lake runtime without assuming a host-specific home path."""
     project_root = Path(__file__).resolve().parents[1]
+    toolchain_file = project_root / "lean-toolchain"
+    toolchain = toolchain_file.read_text().strip() if toolchain_file.is_file() else ""
+    # elan stores `leanprover/lean4:v4.x` under `leanprover--lean4---v4.x`.
+    toolchain_dir = toolchain.replace("/", "--").replace(":", "---")
     prefixes = [
         str(project_root / ".venv" / "bin"),
         str(Path.home() / ".elan" / "bin"),
         str(Path.home() / ".local" / "bin"),
         str(Path.home() / "toolcache" / "iverilog_deb" / "extract" / "usr" / "bin"),
-        "/home/sgli/.elan/bin",
-        "/home/sgli/.elan/toolchains/leanprover--lean4---v4.28.0-rc1/bin",
-        "/home/sgli/.local/bin",
-        "/home/sgli/.local/share/mamba/bin",
+        str(Path.home() / ".elan" / "toolchains" / toolchain_dir / "bin"),
+        str(Path.home() / ".local" / "share" / "mamba" / "bin"),
     ]
     current = os.environ.get("PATH", "")
     parts = current.split(os.pathsep) if current else []

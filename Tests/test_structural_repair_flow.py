@@ -62,7 +62,7 @@ def test_real_process_trigger_budget_and_hidden_outcome_independence(tmp_path, m
     monkeypatch.setattr(run, "make_runner", lambda **kw: Runner())
     evaluations = []
 
-    def evaluate(*unused):
+    def evaluate(*unused, **unused_kwargs):
         evaluations.append(True)
         sv_dir = tmp_path / "sv"
         sv_dir.mkdir(exist_ok=True)

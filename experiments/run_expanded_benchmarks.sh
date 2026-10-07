@@ -2,13 +2,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULTS_DIR="${RESULTS_DIR:-/home/sgli/work/nl2chip_results}"
+RESULTS_DIR="${RESULTS_DIR:-$ROOT/results/expanded_benchmarks}"
 MODEL="${MODEL:-claude-sonnet-4-5-20250929}"
 WORKERS="${WORKERS:-8}"
 BASELINE_WORKERS="${BASELINE_WORKERS:-4}"
 MAX_ITERS="${MAX_ITERS:-5}"
 
-export PATH="/home/sgli/.local/share/mamba/bin:$HOME/.elan/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/share/mamba/bin:$HOME/.elan/bin:$HOME/.local/bin:$PATH"
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 cd "$ROOT"

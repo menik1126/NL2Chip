@@ -40,7 +40,7 @@ lean_lib «Examples.YOLOv8» where
   roots := #[`Examples.YOLOv8]
 
 lean_lib «Examples.Arbiter» where
-  roots := #[`Examples.Arbiter]
+  roots := #[`Examples.Arbiter.RoundRobin]
 
 lean_lib «Examples.CDC» where
   roots := #[`Examples.CDC]
@@ -146,13 +146,6 @@ lean_exe «h264-mp4-encoder-test» where
 
 lean_exe «cdc-multi-clock-test» where
   root := `Tests.CDC.MultiClockTest
-  supportInterpreter := true
-
-lean_exe «multidomain-ir-test» where
-  root := `Tests.MultiDomainJITTest
-
-lean_exe «async-fifo-ir-test» where
-  root := `Tests.AsyncFifoJITTest
   supportInterpreter := true
 
 lean_exe «svparser-test» where

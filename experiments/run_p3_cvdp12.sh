@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-MAIN_ROOT="${MAIN_ROOT:-/home/sgli/work/NL2Chip}"
+MAIN_ROOT="${MAIN_ROOT:-$ROOT}"
 KEY_ENV="${KEY_ENV:-${MAIN_ROOT}/key.env}"
 HARNESS="${HARNESS:-anthropic-api}"
 MODEL="${MODEL:-claude-sonnet-4.5}"

@@ -96,12 +96,6 @@ out_path.parent.mkdir(parents=True, exist_ok=True)
 plt.savefig(out_path, bbox_inches="tight")
 print(f"Saved to {out_path}")
 
-# Also save to the copy
-out_path2 = PROJECT_ROOT / "69d7a86af51b3544c54893a8" / "xiongjing" / "sparkle" / "paper" / "img" / "ppa_optimization.pdf"
-if out_path2.parent.exists():
-    plt.savefig(out_path2, bbox_inches="tight")
-    print(f"Saved to {out_path2}")
-
 # Print summary stats
 print(f"\nTotal designs with area changes: {len(trajectories)}")
 print(f"Designs with >5% reduction: {len(improving)}")

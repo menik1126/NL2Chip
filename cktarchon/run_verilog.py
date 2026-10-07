@@ -21,10 +21,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CVDP_HARNESS_PROFILES = ("official", "race-safe-v1")
 CVDP_HARNESS_PROFILE_DEFAULT = "race-safe-v1"
 
+# MAGE checkout used for the MAGE-aligned prompt profile; override with
+# MAGE_PROMPTS_FILE or --mage-prompts-file.
 DEFAULT_MAGE_PROMPTS = Path(
-    "/home/sgli/work/external_baselines/"
-    "MAGE-A-Multi-Agent-Engine-for-Automated-RTL-Code-Generation/"
-    "src/mage/prompts.py"
+    os.environ.get("MAGE_PROMPTS_FILE")
+    or PROJECT_ROOT.parent
+    / "external_baselines"
+    / "MAGE-A-Multi-Agent-Engine-for-Automated-RTL-Code-Generation"
+    / "src" / "mage" / "prompts.py"
 )
 
 MAGE_ALIGNED_RTL_RULES = """## MAGE-Aligned RTL Generation Guidance

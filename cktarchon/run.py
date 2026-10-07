@@ -32,7 +32,7 @@ from .search_strategy import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 from . import public_prompt
-ARCHON_SRC = Path("/home/sgli/work/archon-official/src")
+ARCHON_SRC = Path(os.environ.get("ARCHON_SRC") or PROJECT_ROOT.parent / "archon-official" / "src")
 CVDP_HARNESS_PROFILES = ("official", "race-safe-v1")
 CVDP_HARNESS_PROFILE_DEFAULT = "race-safe-v1"
 
@@ -589,7 +589,7 @@ def run_archon_native_unavailable() -> None:
     except Exception as exc:
         raise RuntimeError(f"Official Archon import failed: {exc}") from exc
     raise RuntimeError(
-        "archon-native harness requested, but this H20 image has no `claude`/`codex` CLI. "
+        "archon-native harness requested, but this host has no `claude`/`codex` CLI. "
         "Use --harness anthropic-api now, or install the native CLI and wire this adapter."
     )
 
