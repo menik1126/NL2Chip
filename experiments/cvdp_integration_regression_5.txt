@@ -1,5 +1,0 @@
-cvdp_copilot_axil_precision_counter_0001
-cvdp_copilot_hamming_code_tx_and_rx_0011
-cvdp_copilot_restoring_division_0001
-cvdp_copilot_square_root_0003
-cvdp_copilot_sync_lifo_0001
