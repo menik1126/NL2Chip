@@ -32,7 +32,7 @@ python3 experiments/baseline_verilog_iterative.py
 python3 -m cktarchon.run --dataset verilogeval
 ```
 
-See `docs/CktArchon_Replacement.md`.
+See `docs/CktArchon.md`.
 
 ## Datasets
 
