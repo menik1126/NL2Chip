@@ -203,7 +203,7 @@ def build_system_prompt(prob_id: str, info: Any, args: argparse.Namespace) -> st
         + contract_rules
         + "- The outer evaluator will run the official compile/simulation harness after you stop.\n"
         + ("- Use the available `grep` and `find` commands for permitted source searches.\n" if public_spec else
-           "- This H20 host may not have `rg`; use `grep` and `find` if you need searches.\n")
+           "- This host may not have `rg`; use `grep` and `find` if you need searches.\n")
     )
     if args.prompt_profile == "mage-aligned":
         examples = load_mage_rtl_examples(Path(args.mage_prompts_file))

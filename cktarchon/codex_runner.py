@@ -523,7 +523,7 @@ class CodexAgentHarnessRunner:
         search_note = (
             "- Use the available `grep` and `find` commands for permitted source searches.\n"
             if self.interface_prompt_policy == "public-spec-v2" else
-            "- Use `grep`/`find` rather than `rg`; `rg` is not installed on this H20 image.\n"
+            "- Use `grep`/`find` rather than `rg`; `rg` may not be installed.\n"
         )
         return (
             self.system_prompt.rstrip()

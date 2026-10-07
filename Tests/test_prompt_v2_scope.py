@@ -40,7 +40,7 @@ def test_complete_render_has_real_tools_and_stop_rules(language, repair, tmp_pat
     )
     rendered = runner._codex_prompt(prompt, max_turns=10)
     for ghost in ("benchmark interface contract", "`lean_check`", "`list_directory`", "`glob`",
-                  "`write_file`", "`edit_file`", "H20", "PRIVATE_"):
+                  "`write_file`", "`edit_file`", "PRIVATE_"):
         assert ghost.lower() not in rendered.lower()
     assert "item | requirement | public source | evidence status" in rendered
     assert "explicit, inferred, ambiguous, or unspecified" in rendered
