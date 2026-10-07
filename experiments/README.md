@@ -36,12 +36,15 @@ See `docs/CktArchon.md`.
 
 ## Datasets
 
-Benchmark data is not tracked in git, except RTLLM, which is vendored. The
-loader in `agent/dataset.py` looks in these places:
+Benchmark data is not tracked in git. The loader in `agent/dataset.py` looks in
+these places:
 
 | Dataset | Location | Setup |
 |---|---|---|
 | `verilogeval` | `verilog-eval/dataset_spec-to-rtl` | `git clone https://github.com/NVlabs/verilog-eval.git`, pinned at `c498220` |
-| `rtllm` | `RTLLM/` | Vendored copy of RTLLM v2.0 (upstream commit `41b2689`) |
+| `rtllm` | `RTLLM/` | `git clone https://github.com/hkust-zhiyao/RTLLM.git && git -C RTLLM checkout 41b2689` |
 | `resbench` | `ResBench/` or `benchmarks/ResBench/` | Override with `RESBENCH_ROOT` |
 | `cvdp` | `cvdp-benchmark-dataset/cvdp_v1.1.0_nonagentic_code_generation_no_commercial.jsonl` | Override with `CVDP_DATASET_FILE` |
+
+RTLLM must stay on `41b2689` (v2.0). Upstream `main` is now v2.1, which changes
+several testbenches and design descriptions, so results are not comparable.

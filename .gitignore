@@ -70,6 +70,7 @@ results_*/
 
 # Benchmark datasets (cloned separately, see experiments/README.md)
 verilog-eval/
+RTLLM/
 ResBench/
 cvdp-benchmark-dataset/
 benchmarks/

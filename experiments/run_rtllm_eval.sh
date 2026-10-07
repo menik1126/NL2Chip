@@ -71,6 +71,7 @@ DATASET_DIR="$PROJECT_ROOT/RTLLM"
 if [[ ! -d "$DATASET_DIR" ]]; then
     echo "错误: 数据集目录不存在: $DATASET_DIR"
     echo "  请先 clone RTLLM: git clone https://github.com/hkust-zhiyao/RTLLM.git"
+    echo "  并固定到 v2.0: git -C RTLLM checkout 41b2689"
     exit 1
 fi
 
