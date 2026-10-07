@@ -33,9 +33,3 @@ python3 -m cktarchon.run --dataset verilogeval
 ```
 
 See `docs/CktArchon_Replacement.md`.
-
-## Rebuttal launchers
-
-H20-oriented scripts live in `experiments/rebuttal/` (Direct Sparkle, Direct SV
-compile-feedback, PPA, WNS, formal contracts). They keep the host paths used in
-the ICLR runs. See `experiments/rebuttal/README.md`.
