@@ -12,7 +12,7 @@ the existing evaluator and result schema.
   - `anthropic-api`: a direct Anthropic tool-use loop with Archon-like JSONL.
   - `codex-agent`: official Archon's `CodexAgent` backend (`codex exec --json`)
     when the host has the Codex CLI installed.
-- Preserve old `results.jsonl` fields for rebuttal analysis:
+- Preserve old `results.jsonl` fields for downstream analysis:
   `compile_pass`, `lint_pass`, `sim_status`, `agent_turns_total`,
   `agent_input_tokens`, `agent_output_tokens`, `agent_tool_counts`,
   `agent_compile_checks`, and elapsed-time fields.

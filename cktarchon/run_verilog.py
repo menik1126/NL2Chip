@@ -383,10 +383,10 @@ def make_runner(args: argparse.Namespace, prob_id: str, role: str, log_base: Pat
         codex_bin=args.codex_bin,
         effort=args.codex_effort,
         sandbox=args.codex_sandbox,
-        # Route the Codex CLI through the explicitly selected OpenLux
-        # gateway. The isolated wrapper validates these settings before it
-        # starts, so do not silently fall back to the native login.
-        base_url_env="OPENLUX_BASE_URL",
+        # Route the Codex CLI through the explicitly selected gateway. The
+        # isolated wrapper validates these settings before it starts, so do
+        # not silently fall back to the native login.
+        base_url_env="CODEX_GATEWAY_BASE_URL",
         key_env="CODEX_GATEWAY_API_KEY",
         idle_timeout_s=args.codex_idle_timeout,
         max_attempts=args.codex_max_attempts,
