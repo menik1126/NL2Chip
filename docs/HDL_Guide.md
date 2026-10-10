@@ -815,9 +815,10 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed development phases and implementat
 
 ## Origin
 
-The HDL is a modified fork of [Sparkle HDL](https://github.com/Verilean/sparkle)
-by Junji Hashimoto ([@junjihashimoto3](https://x.com/junjihashimoto3)). The Lean
-package and module names keep the `Sparkle` prefix.
+CKTLean builds on [Sparkle HDL](https://github.com/Verilean/sparkle) by Junji
+Hashimoto ([@junjihashimoto3](https://x.com/junjihashimoto3)), and we thank the
+Sparkle authors for their contribution. The Lean package and module names keep
+the `Sparkle` prefix.
 
 ## License
 

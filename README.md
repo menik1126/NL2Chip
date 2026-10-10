@@ -11,8 +11,9 @@ Because the intermediate artifact is a Lean program rather than Verilog text,
 ill-typed circuits are rejected before any simulation runs, and the same file
 can carry a specification and a machine-checked proof about the circuit.
 
-The HDL is a modified fork of [Sparkle HDL](https://github.com/Verilean/sparkle).
-Its language reference is in [docs/HDL_Guide.md](docs/HDL_Guide.md).
+CKTLean builds on [Sparkle HDL](https://github.com/Verilean/sparkle), and we
+thank its authors for their contribution. The language reference is in
+[docs/HDL_Guide.md](docs/HDL_Guide.md).
 
 ## How it works
 
@@ -171,15 +172,14 @@ are Lean executables declared in `lakefile.lean`.
 - [docs/CktArchon.md](docs/CktArchon.md): the agent harness
 - [experiments/README.md](experiments/README.md): experiment entry points and datasets
 
-## License and attribution
+## License and acknowledgments
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-The HDL in `Sparkle/` is derived from
-[Sparkle HDL](https://github.com/Verilean/sparkle) by Junji Hashimoto, also
-under Apache 2.0. This repository changes its elaborator, IR and SystemVerilog
-backend and adds an RTL helper library (`Sparkle/Library/RTL.lean`). The
-examples and IP cores under `Examples/` and `IP/` come from Sparkle.
+CKTLean builds on [Sparkle HDL](https://github.com/Verilean/sparkle) by Junji
+Hashimoto, released under Apache 2.0. We thank the Sparkle authors for their
+contribution. The examples and IP cores under `Examples/` and `IP/` come from
+Sparkle.
 
 The benchmarks (VerilogEval, RTLLM, ResBench, CVDP) belong to their respective
 authors and are distributed under their own licenses.
