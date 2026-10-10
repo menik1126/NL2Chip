@@ -9,15 +9,15 @@
     0x04  TXSTATUS - TX status (read-only, bit 0 = ready / not busy)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 4096
 
-namespace Sparkle.Examples.RV32.UART
+namespace cktlean.Examples.RV32.UART
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- Number of cycles the transmitter stays busy after a byte write. -/
 def uartTxCycles : BitVec 5 := 16#5
@@ -100,4 +100,4 @@ def uartSignal {dom : DomainConfig}
 
 #synthesizeVerilog uartSignal
 
-end Sparkle.Examples.RV32.UART
+end cktlean.Examples.RV32.UART

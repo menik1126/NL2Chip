@@ -80,16 +80,16 @@ jobs:
     # ---- Formal Proofs ----
 
     - name: Build ISA Proofs
-      run: lake build Sparkle.Verification.ISAProps
+      run: lake build cktlean.Verification.ISAProps
 
     - name: Run ISA Proof Tests
       run: lake env lean --run Examples/Sparkle16/ISAProofTests.lean
 
     - name: Build CDC Formal Proofs (12 theorems, no sorry)
-      run: lake build Sparkle.Verification.CDCProps
+      run: lake build cktlean.Verification.CDCProps
 
     - name: Build Counter Formal Proofs (verilog! macro + auto-assert)
-      run: lake build Sparkle.Verification.CounterProps
+      run: lake build cktlean.Verification.CounterProps
 
     # ---- Synthesis Tests ----
 

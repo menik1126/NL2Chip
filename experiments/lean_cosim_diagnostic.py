@@ -412,12 +412,12 @@ def write_lean_trace_file(
     const_args = [a for a in entry.args if not a.is_signal]
     arg_exprs: list[str] = []
     parts = [
-        "import Sparkle",
-        "import Sparkle.Compiler.Elab",
+        "import cktlean",
+        "import cktlean.Compiler.Elab",
         "",
-        "open Sparkle.Core.Signal",
-        "open Sparkle.Core.Domain",
-        "open Sparkle.Library.RTL",
+        "open cktlean.Core.Signal",
+        "open cktlean.Core.Domain",
+        "open cktlean.Library.RTL",
         "",
         "namespace LeanCosimDiagnostic",
         "",

@@ -1,6 +1,6 @@
 # Verification-Driven Design Framework
 
-A guide to proving hardware properties alongside implementation in Sparkle.
+A guide to proving hardware properties alongside implementation in cktlean.
 
 ---
 
@@ -201,7 +201,7 @@ or `simp` with unfolding for more complex cases.
 ### File Organization
 
 ```
-Sparkle/Verification/
+cktlean/Verification/
   Basic.lean          -- Foundation: reachability, traces
   Temporal.lean       -- LTL-style temporal operators
   ISAProps.lean       -- ISA encode/decode proofs
@@ -222,7 +222,7 @@ then proves properties.  No cross-file dependencies within Verification/.
 
 ## 6. Worked Example: Round-Robin Arbiter
 
-### Specification (`Sparkle/Verification/ArbiterProps.lean`)
+### Specification (`cktlean/Verification/ArbiterProps.lean`)
 
 A 2-client round-robin arbiter with three states:
 
@@ -309,7 +309,7 @@ each discharged by `simp`.
 
 ## 8. Getting Started
 
-1. **Define a pure state machine** in `Sparkle/Verification/MyModuleProps.lean`
+1. **Define a pure state machine** in `cktlean/Verification/MyModuleProps.lean`
    - Inductive type for states
    - `nextState` transition function
    - Output functions
@@ -323,6 +323,6 @@ each discharged by `simp`.
 
 4. **Build and verify**:
    ```bash
-   lake build Sparkle.Verification.MyModuleProps  # proofs compile = QED
+   lake build cktlean.Verification.MyModuleProps  # proofs compile = QED
    lake build Examples.MyModule                    # synthesis works
    ```

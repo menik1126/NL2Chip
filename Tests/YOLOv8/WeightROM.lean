@@ -5,13 +5,13 @@
   and converting float32 quantization scales to integer mult+shift pairs.
 -/
 
-import Sparkle
+import cktlean
 import Examples.YOLOv8.Types
 
-namespace Sparkle.Examples.YOLOv8.Tests.WeightROM
+namespace cktlean.Examples.YOLOv8.Tests.WeightROM
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- Convert array to init function for Signal.memoryWithInit.
     Addresses beyond the array size return 0. -/
@@ -52,4 +52,4 @@ def scaleToMultShift (scale : Float) : BitVec 16 × BitVec 5 :=
   let shiftBv := BitVec.ofNat 5 bestShift
   (multBv, shiftBv)
 
-end Sparkle.Examples.YOLOv8.Tests.WeightROM
+end cktlean.Examples.YOLOv8.Tests.WeightROM

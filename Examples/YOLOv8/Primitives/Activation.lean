@@ -5,19 +5,19 @@
   - SiLU: x * sigmoid(x) via ROM-based lookup table
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 import Examples.BitNet.SignalHelpers
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 400000
 
-namespace Sparkle.Examples.YOLOv8.Primitives.Activation
+namespace cktlean.Examples.YOLOv8.Primitives.Activation
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -87,4 +87,4 @@ def siluLut {dom : DomainConfig} (x : Signal dom (BitVec 8)) : Signal dom (BitVe
   let shifted := (ashr · ·) <$> product <*> Signal.pure 7#16
   shifted.map (BitVec.extractLsb' 0 8 ·)
 
-end Sparkle.Examples.YOLOv8.Primitives.Activation
+end cktlean.Examples.YOLOv8.Primitives.Activation

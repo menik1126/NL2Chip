@@ -12,19 +12,19 @@
   Reference: ISO 14496-12 (ISOBMFF), ISO 14496-15 (AVC file format)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import IP.Video.H264.FrameEncoderSynth
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 12800000
 
-namespace Sparkle.IP.Video.H264.MP4Encoder
+namespace cktlean.IP.Video.H264.MP4Encoder
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
-open Sparkle.IP.Video.H264.FrameEncoder
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
+open cktlean.IP.Video.H264.FrameEncoder
 
 -- ============================================================================
 -- State definition (~11 registers)
@@ -337,4 +337,4 @@ def h264MP4Encoder {dom : DomainConfig}
 
   bundle2 outByte (bundle2 outValid done)
 
-end Sparkle.IP.Video.H264.MP4Encoder
+end cktlean.IP.Video.H264.MP4Encoder

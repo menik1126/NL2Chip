@@ -4,16 +4,16 @@
   Tests for hardware vector types and HWType operations.
 -/
 
-import Sparkle
+import cktlean
 import LSpec
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.Vector
-open Sparkle.IR.Type
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Vector
+open cktlean.IR.Type
 open LSpec
 
-namespace Sparkle.Test.Array
+namespace cktlean.Test.Array
 
 /--
   Simple register file read: index into a 4-element vector of 8-bit values.
@@ -153,4 +153,4 @@ def arrayTests : IO TestSeq := do
     tests1 ++ tests2 ++ tests3 ++ tests4 ++ tests5 ++ tests6 ++ tests7 ++ tests8 ++ tests9
   )
 
-end Sparkle.Test.Array
+end cktlean.Test.Array

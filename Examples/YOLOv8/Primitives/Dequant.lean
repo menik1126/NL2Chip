@@ -5,18 +5,18 @@
   Also provides INT4 extraction from packed bytes.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 400000
 
-namespace Sparkle.Examples.YOLOv8.Primitives.Dequant
+namespace cktlean.Examples.YOLOv8.Primitives.Dequant
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8
 
 variable {dom : DomainConfig}
 
@@ -64,4 +64,4 @@ def dequantPacked {dom : DomainConfig}
 
 #synthesizeVerilog dequantPacked
 
-end Sparkle.Examples.YOLOv8.Primitives.Dequant
+end cktlean.Examples.YOLOv8.Primitives.Dequant

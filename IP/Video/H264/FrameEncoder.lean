@@ -20,8 +20,8 @@
   Reference: ITU-T H.264 Annex B, Section 7, 8, 9
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import IP.Video.H264.EncoderSynth
 import IP.Video.H264.DecoderSynth
 import IP.Video.H264.CAVLCSynth
@@ -33,14 +33,14 @@ import IP.Video.H264.CAVLC
 set_option maxRecDepth 8192
 set_option maxHeartbeats 12800000
 
-namespace Sparkle.IP.Video.H264.FrameEncoder
+namespace cktlean.IP.Video.H264.FrameEncoder
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
-open Sparkle.IP.Video.H264.EncoderSynth
-open Sparkle.IP.Video.H264.DecoderSynth
-open Sparkle.IP.Video.H264.CAVLCSynth
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
+open cktlean.IP.Video.H264.EncoderSynth
+open cktlean.IP.Video.H264.DecoderSynth
+open cktlean.IP.Video.H264.CAVLCSynth
 
 -- ============================================================================
 -- State definition (~20 registers)
@@ -605,4 +605,4 @@ def h264FrameEncoder {dom : DomainConfig}
 
   bundle2 outByte (bundle2 outValid done)
 
-end Sparkle.IP.Video.H264.FrameEncoder
+end cktlean.IP.Video.H264.FrameEncoder

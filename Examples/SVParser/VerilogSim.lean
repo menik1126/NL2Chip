@@ -21,13 +21,13 @@
 -/
 
 import Tools.SVParser
-import Sparkle.Backend.CppSim
-import Sparkle.Core.JIT
+import cktlean.Backend.CppSim
+import cktlean.Core.JIT
 
 open Tools.SVParser.Parser
 open Tools.SVParser.Lower
-open Sparkle.Backend.CppSim
-open Sparkle.Core.JIT
+open cktlean.Backend.CppSim
+open cktlean.Core.JIT
 
 /-- A simple Verilog memory module with read/write ports -/
 def verilogMemoryModule : String := "

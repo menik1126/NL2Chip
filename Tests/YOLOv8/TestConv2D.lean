@@ -6,11 +6,11 @@
 import LSpec
 import Examples.YOLOv8.Primitives.Conv2DEngine
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Primitives.Conv2DEngine
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Primitives.Conv2DEngine
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestConv2D
+namespace cktlean.Examples.YOLOv8.Tests.TestConv2D
 
 /-- Test single MAC operation: w=2, a=3, bias=0 → dequant(2)=2, 2*3=6 → requant(6,1,0)=6. -/
 def testSingleMAC : IO LSpec.TestSeq := do
@@ -45,4 +45,4 @@ def allTests : IO LSpec.TestSeq := do
   let t2 ← testWithBias
   return LSpec.group "Conv2D MAC Engine" (t1 ++ t2)
 
-end Sparkle.Examples.YOLOv8.Tests.TestConv2D
+end cktlean.Examples.YOLOv8.Tests.TestConv2D

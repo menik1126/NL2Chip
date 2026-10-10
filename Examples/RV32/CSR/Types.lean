@@ -5,7 +5,7 @@
   and CLINT memory map for M-mode and S-mode operation.
 -/
 
-namespace Sparkle.Examples.RV32.CSR
+namespace cktlean.Examples.RV32.CSR
 
 -- ============================================================================
 -- M-mode CSR Addresses (12-bit)
@@ -220,4 +220,4 @@ def PTWState.toBitVec3 : PTWState → BitVec 3
   | .done   => 0b011#3
   | .fault  => 0b100#3
 
-end Sparkle.Examples.RV32.CSR
+end cktlean.Examples.RV32.CSR

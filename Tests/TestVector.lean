@@ -4,15 +4,15 @@
   Tests for hardware vector types and array indexing synthesis.
 -/
 
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.Vector
-open Sparkle.Compiler.Elab
-open Sparkle.Backend.Verilog
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Vector
+open cktlean.Compiler.Elab
+open cktlean.Backend.Verilog
 
-namespace Sparkle.Test.Vector
+namespace cktlean.Test.Vector
 
 /--
   Simple 4-element register file: reads from a vector at an index.
@@ -33,4 +33,4 @@ def vectorLiteral (vec : Signal defaultDomain (HWVector (BitVec 8) 4))
     : Signal defaultDomain (BitVec 8) :=
   vec.map (fun v => v.get ⟨2, by omega⟩)
 
-end Sparkle.Test.Vector
+end cktlean.Test.Vector

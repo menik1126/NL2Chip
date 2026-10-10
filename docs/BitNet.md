@@ -10,8 +10,8 @@ Pure Signal DSL functions compose into a **complete BitNet SoC** — simulate di
 ```lean
 import Examples.BitNet.SoC.Top
 
-open Sparkle.Core.Signal
-open Sparkle.Examples.BitNet.SoC
+open cktlean.Core.Signal
+open cktlean.Examples.BitNet.SoC
 
 -- Build a 2-layer, 4-dimension BitNet SoC as a Signal function
 let cfg : SoCConfig := { archMode := .HardwiredUnrolled, nLayers := 2, dim := 4, ffnDim := 4 }

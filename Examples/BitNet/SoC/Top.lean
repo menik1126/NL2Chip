@@ -10,8 +10,8 @@
      layer index selects weights from ROM via mux tree.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Core
@@ -22,14 +22,14 @@ import Examples.BitNet.Layers.ResidualAdd
 import Examples.BitNet.Layers.ElemMul
 import Examples.BitNet.Layers.FFN
 
-namespace Sparkle.Examples.BitNet.SoC
+namespace cktlean.Examples.BitNet.SoC
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet
-open Sparkle.Examples.BitNet.SignalHelpers
-open Sparkle.Examples.BitNet.BitLinear
-open Sparkle.Examples.BitNet.Layers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet
+open cktlean.Examples.BitNet.SignalHelpers
+open cktlean.Examples.BitNet.BitLinear
+open cktlean.Examples.BitNet.Layers
 
 variable {dom : DomainConfig}
 
@@ -82,4 +82,4 @@ def bitNetSoCSignal (cfg : SoCConfig) (layerWeights : Array LayerWeights)
   | .HardwiredUnrolled => hardwiredSoCSignal cfg layerWeights layerScales x
   | .TimeMultiplexed => timeMultiplexedSoCSignal cfg layerWeights layerScales x
 
-end Sparkle.Examples.BitNet.SoC
+end cktlean.Examples.BitNet.SoC

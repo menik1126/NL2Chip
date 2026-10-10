@@ -11,15 +11,15 @@
     0x80000000 - 0x8001FFFF : DRAM boot region (identity-mapped)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 4096
 
-namespace Sparkle.Examples.RV32.Bus
+namespace cktlean.Examples.RV32.Bus
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- Bus address decoder — Signal DSL.
 
@@ -88,4 +88,4 @@ def busDecoderSignal {dom : DomainConfig}
 
 #synthesizeVerilog busDecoderSignal
 
-end Sparkle.Examples.RV32.Bus
+end cktlean.Examples.RV32.Bus

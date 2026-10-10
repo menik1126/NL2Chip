@@ -13,9 +13,9 @@
 -- Note: In a real setup, these would be properly imported
 -- For now, we'll include the necessary definitions inline
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
-import Sparkle.Data.BitPack
+import cktlean.Core.Signal
+import cktlean.Core.Domain
+import cktlean.Data.BitPack
 
 -- Re-include ISA definitions
 /-- Register identifier (R0-R7) -/
@@ -182,8 +182,8 @@ end SimMemory
 
 namespace Sparkle16
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Domain
 
 /-- CPU execution phase -/
 inductive Phase where

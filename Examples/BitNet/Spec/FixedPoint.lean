@@ -9,7 +9,7 @@
 
 import Examples.BitNet.Config
 
-namespace Sparkle.Examples.BitNet.Spec
+namespace cktlean.Examples.BitNet.Spec
 
 /-- Arithmetic shift right by k is equivalent to signed division by 2^k -/
 theorem asr_eq_div (x : BitVec n) (k : Nat) :
@@ -41,4 +41,4 @@ theorem sext_add_no_overflow (a b : BitVec n) (h : n < m) :
     (aExt + bExt).toInt = a.toInt + b.toInt := by
   sorry  -- Requires sign extension + addition overflow analysis
 
-end Sparkle.Examples.BitNet.Spec
+end cktlean.Examples.BitNet.Spec

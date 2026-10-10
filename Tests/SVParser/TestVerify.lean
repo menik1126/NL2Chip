@@ -10,16 +10,16 @@
 
 import Tools.SVParser
 import Tools.SVParser.Verify
-import Sparkle.Backend.CppSim
+import cktlean.Backend.CppSim
 import LSpec
 
 open Tools.SVParser.Parser
 open Tools.SVParser.Lower
 open Tools.SVParser.Verify
-open Sparkle.Backend.CppSim
+open cktlean.Backend.CppSim
 open LSpec
 
-namespace Sparkle.Tests.SVParser.TestVerify
+namespace cktlean.Tests.SVParser.TestVerify
 
 /-- 8-bit counter with enable — the Verilog module to verify -/
 private def counterVerilog : String := "
@@ -92,4 +92,4 @@ def verifyTests : IO TestSeq := do
   let t2 ← test_generate_lean
   return t1 ++ t2
 
-end Sparkle.Tests.SVParser.TestVerify
+end cktlean.Tests.SVParser.TestVerify

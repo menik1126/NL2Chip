@@ -12,8 +12,8 @@
   All convolutions share a single Conv2DEngine instance.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Config
 import Examples.YOLOv8.Types
 import Examples.YOLOv8.Primitives.Conv2DEngine
@@ -27,11 +27,11 @@ import Examples.YOLOv8.TextEmbedding
 set_option maxRecDepth 16384
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.Examples.YOLOv8.Top
+namespace cktlean.Examples.YOLOv8.Top
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8
 
 /-- Top-level inference pipeline controller.
 
@@ -170,4 +170,4 @@ def yolov8nTop {dom : DomainConfig}
 
 #synthesizeVerilog yolov8nTop
 
-end Sparkle.Examples.YOLOv8.Top
+end cktlean.Examples.YOLOv8.Top

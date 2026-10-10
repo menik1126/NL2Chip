@@ -11,11 +11,11 @@ import IP.Video.H264.Decoder
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-open Sparkle.IP.Video.H264.IntraPred
-open Sparkle.IP.Video.H264.Encoder
-open Sparkle.IP.Video.H264.Decoder
+open cktlean.IP.Video.H264.IntraPred
+open cktlean.IP.Video.H264.Encoder
+open cktlean.IP.Video.H264.Decoder
 
-namespace Sparkle.Tests.Video.H264FrameTest
+namespace cktlean.Tests.Video.H264FrameTest
 
 deriving instance Inhabited for EncoderResult
 
@@ -290,4 +290,4 @@ def allTests : IO LSpec.TestSeq := do
   let t6 ← testPathEquivalence
   return LSpec.group "H.264 Frame-Level" (t1 ++ t2 ++ t3 ++ t4 ++ t5 ++ t6)
 
-end Sparkle.Tests.Video.H264FrameTest
+end cktlean.Tests.Video.H264FrameTest

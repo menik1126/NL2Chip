@@ -7,12 +7,12 @@
   3. Simulation (functional testing)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import LSpec
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 namespace Sparkle16.Test
 
@@ -90,8 +90,8 @@ These tests verify that:
 def synthesizeALU : IO String := do
   -- Set up Lean environment
   let mods : Array Lean.Import := #[
-    { module := `Sparkle },
-    { module := `Sparkle.Compiler.Elab },
+    { module := `cktlean },
+    { module := `cktlean.Compiler.Elab },
     { module := `Tests.Sparkle16.TestALU }
   ]
   let env ← Lean.importModules mods {}  (trustLevel := 1024)
@@ -104,14 +104,14 @@ def synthesizeALU : IO String := do
 
   -- Synthesize the ALU
   let (result, _) ← Lean.Meta.MetaM.toIO
-    (Sparkle.Compiler.Elab.synthesizeCombinational ``Sparkle16.Test.alu)
+    (cktlean.Compiler.Elab.synthesizeCombinational ``Sparkle16.Test.alu)
     coreCtx coreState
 
   -- Extract module from tuple
   let (module, _design) := result
 
   -- Generate Verilog
-  let verilog := Sparkle.Backend.Verilog.toVerilog module
+  let verilog := cktlean.Backend.Verilog.toVerilog module
   return verilog
 
 /-- E2E Test: Verify ALU synthesizes to valid Verilog -/

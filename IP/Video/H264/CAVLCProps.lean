@@ -13,10 +13,10 @@
 import IP.Video.H264.CAVLC
 import IP.Video.H264.CAVLCDecode
 
-namespace Sparkle.IP.Video.H264.CAVLCProps
+namespace cktlean.IP.Video.H264.CAVLCProps
 
-open Sparkle.IP.Video.H264.CAVLC
-open Sparkle.IP.Video.H264.CAVLCDecode
+open cktlean.IP.Video.H264.CAVLC
+open cktlean.IP.Video.H264.CAVLCDecode
 
 -- ============================================================================
 -- Zero block roundtrip
@@ -56,4 +56,4 @@ theorem cavlc_trailing_ones_roundtrip :
     cavlcDecode bs bl = coeffs := by
   native_decide
 
-end Sparkle.IP.Video.H264.CAVLCProps
+end cktlean.IP.Video.H264.CAVLCProps

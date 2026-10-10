@@ -55,7 +55,7 @@ This document tracks the development phases and implementation milestones of Spa
 
 **Result**: Oracle now checks interrupt enable state before timer-compare skip, supports WFI fast-path detection, and has 4 self-contained CI tests that verify accuracy without external firmware.
 
-**Oracle Improvements** (`Sparkle/Core/Oracle.lean`):
+**Oracle Improvements** (`cktlean/Core/Oracle.lean`):
 - **MIE/MTIE guard**: Before timer-compare skip, verifies `MSTATUS.MIE` (bit 3) and `MIE.MTIE` (bit 7) are both set. If either is 0, skip is suppressed — the timer interrupt wouldn't fire anyway.
 - **WFI fast-path**: Optional `wfiWireArrayIdx` triggers immediate skip when WFI instruction is detected (threshold=1 instead of default 50 cycles).
 - **`mkBootOracle`** now enables `checkInterruptEnable := true` by default.
@@ -84,10 +84,10 @@ This document tracks the development phases and implementation milestones of Spa
 
 | File | Theorems | Content |
 |------|----------|---------|
-| `Sparkle/Verification/RV32Props.lean` | 38 | ISA encode/decode roundtrip, field extraction, immediate roundtrip (all 5 formats), ALU algebra |
-| `Sparkle/Verification/PipelineProps.lean` | 26 | Forwarding, hazard detection, flush/NOP, x0 invariance, store-to-load forwarding |
-| `Sparkle/Verification/CSRProps.lean` | 21 | **MSTATUS WPRI bug**, trap/MRET transitions, M-ext edge cases (INT_MIN/−1, div-by-zero) |
-| `Sparkle/Verification/SignalDSLProps.lean` | 17 | Signal DSL ↔ pure spec equivalence (ALU, branch, hazard, register semantics) |
+| `cktlean/Verification/RV32Props.lean` | 38 | ISA encode/decode roundtrip, field extraction, immediate roundtrip (all 5 formats), ALU algebra |
+| `cktlean/Verification/PipelineProps.lean` | 26 | Forwarding, hazard detection, flush/NOP, x0 invariance, store-to-load forwarding |
+| `cktlean/Verification/CSRProps.lean` | 21 | **MSTATUS WPRI bug**, trap/MRET transitions, M-ext edge cases (INT_MIN/−1, div-by-zero) |
+| `cktlean/Verification/SignalDSLProps.lean` | 17 | Signal DSL ↔ pure spec equivalence (ALU, branch, hazard, register semantics) |
 
 **Key Innovation**: Signal DSL `.val` reduction lemmas enable proving properties directly on the synthesizable hardware implementation, not just the pure spec. `@[simp]` lemmas for all Signal combinators (mux, beq, +, -, &, |, ^, <<<, >>>, slt, ult, ashr, register) reduce Signal expressions to pure BitVec computations via `rfl`.
 
@@ -135,7 +135,7 @@ counter.sample 10             -- → [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 | File | Change |
 |------|--------|
-| `Sparkle/Core/Signal.lean` | `Signal.circuit` macro (syntax + macro_rules), unified `loopImpl` with C FFI memoization, `loop` signature `{α : Type}`, `loopMemo` delegates to `loopImpl` |
+| `cktlean/Core/Signal.lean` | `Signal.circuit` macro (syntax + macro_rules), unified `loopImpl` with C FFI memoization, `loop` signature `{α : Type}`, `loopMemo` delegates to `loopImpl` |
 | `Tests/Circuit/SimTest.lean` | Simulation tests: counter [0..9], 2-register pipeline with 1-cycle delay |
 | `lakefile.lean` | Added `circuit-sim-test` exe target |
 | `docs/Troubleshooting_Synthesis.md` | Replaced "Imperative Syntax NOT Supported" with `Signal.circuit` usage guide |
@@ -155,8 +155,8 @@ counter.sample 10             -- → [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 | File | Change |
 |------|--------|
-| `Sparkle/Core/Signal.lean` | Added `HShiftLeft/HShiftRight (BitVec n) (Signal dom (BitVec n))` reverse instances |
-| `Sparkle/Compiler/Elab.lean` | Fixed binary operator early interception: use `extractBitVecLiteral` for constant args in mixed expressions |
+| `cktlean/Core/Signal.lean` | Added `HShiftLeft/HShiftRight (BitVec n) (Signal dom (BitVec n))` reverse instances |
+| `cktlean/Compiler/Elab.lean` | Fixed binary operator early interception: use `extractBitVecLiteral` for constant args in mixed expressions |
 | `IP/Video/H264/IDCTSynth.lean` | 4 lines: `sarBy6 ((· + ·) <$> ... <*> Signal.pure 32#16)` → `sarBy6 (... + 32#16)` |
 | `IP/Video/H264/DecoderSynth.lean` | 8 lines: same sarBy6 pattern replacement |
 | `IP/Video/H264/FrameEncoder.lean` | 5 lines: `(· + ·) <$> x <*> y` → `x + y` and `(· + ·) <$> x <*> Signal.pure 1#4` → `x + 1#4` |
@@ -172,7 +172,7 @@ counter.sample 10             -- → [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 **Result**: The `verilog!` macro now generates `SimInput`, `SimOutput`, `Simulator` structures with typed `step`/`read`/`reset` methods. Port name typos and width mismatches are caught at compile time. Generic `SimTyped.lean` provides reusable infrastructure.
 
 **Files Added**:
-- `Sparkle/Core/SimTyped.lean` — Generic `SimSpec`, `PortSpec`, `generateSimWrappers`
+- `cktlean/Core/SimTyped.lean` — Generic `SimSpec`, `PortSpec`, `generateSimWrappers`
 
 **Files Modified**:
 - `Tools/SVParser/Macro.lean` — Generate SimInput/SimOutput/Simulator/step/read/reset in `verilog!`
@@ -204,12 +204,12 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 **Files Added**:
 - `Tools/SVParser/Macro.lean` — `verilog!` elab command + theorem generation
 - `Tools/SVParser/Verify.lean` — IR→Lean semantic model extraction + `irExprToLean`
-- `Sparkle/Verification/CounterProps.lean` — inline Verilog + 6 proofs + auto-assert demo
+- `cktlean/Verification/CounterProps.lean` — inline Verilog + 6 proofs + auto-assert demo
 
 **Files Modified**:
 - `Tools/SVParser/AST.lean` — `SVStmt.assertStmt`
 - `Tools/SVParser/Parser.lean` — parse `assert(expr);`, preserve bare assert
-- `Sparkle/IR/AST.lean` — `Module.assertions` field
+- `cktlean/IR/AST.lean` — `Module.assertions` field
 - `Tools/SVParser/Lower.lean` — `collectGuardedAsserts`, assertion extraction in `lowerModule`
 
 ## Phase 43: SystemVerilog RTL Parser & PicoRV32 JIT Transpiler (Complete)
@@ -228,7 +228,7 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 | SV Parser | `Tools/SVParser/Parser.lean` | Recursive descent with 12 precedence levels, generate if/else, `$signed` |
 | SV AST | `Tools/SVParser/AST.lean` | SVExpr, SVStmt, SVModule, SVDesign types |
 | SV→IR Lowering | `Tools/SVParser/Lower.lean` | If-Conversion (guarded assignments), generate block evaluation, byte-strobe memory, concat-LHS bit-scatter |
-| CppSim Backend | `Sparkle/Backend/CppSim.lean` | ASR min-32-bit types, tick-ref wire promotion, bitwise NOT via XOR |
+| CppSim Backend | `cktlean/Backend/CppSim.lean` | ASR min-32-bit types, tick-ref wire promotion, bitwise NOT via XOR |
 
 **C Firmware Test Results** (compiled with `riscv32-none-elf-gcc -march=rv32i -O2`):
 
@@ -258,8 +258,8 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 - `firmware/firmware_rv32i.hex` — Compiled firmware hex
 
 **Files Modified**:
-- `Sparkle/Backend/CppSim.lean` — ASR type fix, tick-ref promotion, NOT emission
-- `Sparkle/IR/AST.lean` — `deriving Inhabited` for Expr
+- `cktlean/Backend/CppSim.lean` — ASR type fix, tick-ref promotion, NOT emission
+- `cktlean/IR/AST.lean` — `deriving Inhabited` for Expr
 
 ## Phase 42: Compiler Improvements (Complete)
 
@@ -273,8 +273,8 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 - `Tests/CompilerTests.lean` — 6 synthesis tests for all three improvements
 
 **Files Modified**:
-- `Sparkle/Core/Signal.lean` — Complement instance for BitVec, hw_let macro (2/3/4-tuple)
-- `Sparkle/Compiler/Elab.lean` — Fixed unary primitive dispatch, added binary-op-with-constant lambda handling
+- `cktlean/Core/Signal.lean` — Complement instance for BitVec, hw_let macro (2/3/4-tuple)
+- `cktlean/Compiler/Elab.lean` — Fixed unary primitive dispatch, added binary-op-with-constant lambda handling
 
 ## Phase 41: Lock-Free CDC Infrastructure (Complete)
 
@@ -291,13 +291,13 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 - `c_src/cdc/cdc_test.cpp` — 10M-message correctness + benchmark + rollback tests
 - `c_src/cdc/cdc_example.cpp` — Multi-clock simulation demo
 - `c_src/cdc/Makefile` — Standalone C++20 build
-- `Sparkle/Verification/CDCProps.lean` — 12 formal proofs (SPSC safety + rollback guarantee)
+- `cktlean/Verification/CDCProps.lean` — 12 formal proofs (SPSC safety + rollback guarantee)
 - `Examples/CDC/MultiClockSim.lean` — Signal DSL counter + accumulator with #writeDesign
 - `Tests/CDC/MultiClockTest.lean` — E2E JIT.runCDC test
 
 **Files Modified**:
 - `c_src/sparkle_jit.c` — Added sparkle_jit_run_cdc (dlopen bridge)
-- `Sparkle/Core/JIT.lean` — Added JIT.runCDC FFI binding
+- `cktlean/Core/JIT.lean` — Added JIT.runCDC FFI binding
 - `lakefile.lean` — Added Examples.CDC lib and cdc-multi-clock-test exe
 
 ## Phase 31b: H.264 Frame-Level End-to-End Test (Complete)
@@ -465,7 +465,7 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 
 **Result**: CppSim runs firmware test correctly (47/47 UART words match Verilator, `0xCAFE0000` at cycle 2904). **~170x faster** than Verilator for the firmware test workload. Sustained throughput: 3.6M cycles/sec.
 
-**IR Optimization Pass** (`Sparkle/IR/Optimize.lean`):
+**IR Optimization Pass** (`cktlean/IR/Optimize.lean`):
 - Eliminates nested concat/slice chains from tuple packing/unpacking
 - Recursive `resolveSlice` follows ref aliases, composes slice-of-slice, resolves slice-of-concat
 - Uses `Std.HashMap` for O(1) lookups (critical for 10K+ wire designs)
@@ -473,11 +473,11 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 - Dead-code elimination removes unused wires and assigns
 - Result: 20,543 → 4,919 lines (76% reduction)
 
-**CppSim Backend Enhancements** (`Sparkle/Backend/CppSim.lean`):
+**CppSim Backend Enhancements** (`cktlean/Backend/CppSim.lean`):
 - Wide types (>64-bit): `std::array<uint32_t, N>` declarations, assigns skipped (dead after optimization)
 - No wide-type expressions remain in generated code after IR optimization
 
-**Combined `#writeDesign` Command** (`Sparkle/Compiler/Elab.lean`):
+**Combined `#writeDesign` Command** (`cktlean/Compiler/Elab.lean`):
 - Single `synthesizeHierarchical` call emits both Verilog and optimized CppSim
 - Prevents 2x synthesis overhead from separate commands
 
@@ -487,13 +487,13 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 - UART monitoring, halt detection, timing measurement
 
 **Files Added**:
-- `Sparkle/IR/Optimize.lean` — IR optimization pass (~200 lines)
+- `cktlean/IR/Optimize.lean` — IR optimization pass (~200 lines)
 - `verilator/tb_cppsim.cpp` — CppSim testbench (~150 lines)
 
 **Files Modified**:
-- `Sparkle/Backend/CppSim.lean` — >64-bit type handling, wide assign skip
-- `Sparkle/Compiler/Elab.lean` — `#writeDesign` combined command, imports
-- `Sparkle.lean` — Added `import Sparkle.IR.Optimize`
+- `cktlean/Backend/CppSim.lean` — >64-bit type handling, wide assign skip
+- `cktlean/Compiler/Elab.lean` — `#writeDesign` combined command, imports
+- `cktlean.lean` — Added `import cktlean.IR.Optimize`
 - `Examples/RV32/SoCVerilog.lean` — `#writeDesign` with both output paths
 - `verilator/Makefile` — CppSim build targets
 
@@ -514,11 +514,11 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 **Tests**: 25 tests across 4 modules — counter (10 tests), combo-read memory (5), combinational ops (5), registered memory (3). Verified via `String.containsSubstr` checks on generated C++.
 
 **Files Added**:
-- `Sparkle/Backend/CppSim.lean` — C++ simulation code generator (~280 lines)
+- `cktlean/Backend/CppSim.lean` — C++ simulation code generator (~280 lines)
 - `Tests/TestCppSim.lean` — Test suite (25 tests)
 
 **Files Modified**:
-- `Sparkle.lean` — Added `import Sparkle.Backend.CppSim`
+- `cktlean.lean` — Added `import cktlean.Backend.CppSim`
 - `Tests/AllTests.lean` — Added `import Tests.TestCppSim`, integrated `cppSimTests`
 
 ## Phase 9: Auto-Generate SystemVerilog from SoC.lean (Complete)
@@ -546,10 +546,10 @@ verilog! "module counter8_en (...) assert(cond); endmodule"
 **Result**: `#synthesizeVerilog rv32iSoCSynth` succeeds — 9 modules, 119 registers.
 
 **Files Modified**:
-- `Sparkle/IR/AST.lean` — `comboRead` flag on `Stmt.memory`
-- `Sparkle/IR/Builder.lean` — `emitMemoryComboRead`
-- `Sparkle/Compiler/Elab.lean` — `memoryComboRead` pattern, `unfoldDefinition?` fix
-- `Sparkle/Backend/Verilog.lean` — Combo read codegen
+- `cktlean/IR/AST.lean` — `comboRead` flag on `Stmt.memory`
+- `cktlean/IR/Builder.lean` — `emitMemoryComboRead`
+- `cktlean/Compiler/Elab.lean` — `memoryComboRead` pattern, `unfoldDefinition?` fix
+- `cktlean/Backend/Verilog.lean` — Combo read codegen
 - `Examples/RV32/SoC.lean` — 3 bug fixes, divider integration (117→119 registers)
 - `Examples/RV32/SoCVerilog.lean` — Synthesizable variant with `#synthesizeVerilog`
 - `Examples/RV32/Core.lean` — `mulComputeSignal`, `amoComputeSignal`
@@ -615,9 +615,9 @@ Memory: 26208K/28672K available
 - `Examples/Sparkle16/Memory.lean` - Memory interface
 - `Examples/Sparkle16/Core.lean` - CPU core with state machine
 - `Examples/Sparkle16/ISAProofTests.lean` - ISA correctness tests
-- `Sparkle/Verification/Basic.lean` - Fundamental BitVec lemmas
-- `Sparkle/Verification/ALUProps.lean` - ALU correctness proofs
-- `Sparkle/Verification/ISAProps.lean` - ISA encoding/decoding correctness
+- `cktlean/Verification/Basic.lean` - Fundamental BitVec lemmas
+- `cktlean/Verification/ALUProps.lean` - ALU correctness proofs
+- `cktlean/Verification/ISAProps.lean` - ISA encoding/decoding correctness
 
 ## Phase 6: Primitive Module Support (Complete)
 
@@ -630,7 +630,7 @@ Memory: 26208K/28672K available
 - **Module Instantiation**: Seamless instantiation of primitive modules
 
 **Files Added**:
-- `Sparkle/Primitives.lean` - Primitive module support
+- `cktlean/Primitives.lean` - Primitive module support
 - `Examples/PrimitiveTest.lean` - SRAM and clock gating examples
 
 ## Phase 5: Feedback Loops (Complete)
@@ -657,7 +657,7 @@ Memory: 26208K/28672K available
 - Proper always_ff blocks with reset
 
 **Files Added**:
-- `Sparkle/Backend/Verilog.lean` - SystemVerilog code generator
+- `cktlean/Backend/Verilog.lean` - SystemVerilog code generator
 - `Examples/VerilogTest.lean` - Verilog generation examples
 - `Examples/FullCycle.lean` - Advanced examples (MAC, FIR filter, traffic light, FIFO)
 
@@ -671,7 +671,7 @@ Memory: 26208K/28672K available
 - Automatic clock/reset detection from registers
 
 **Files Added**:
-- `Sparkle/Compiler/Elab.lean` - Metaprogramming compiler
+- `cktlean/Compiler/Elab.lean` - Metaprogramming compiler
 - `Examples/SynthesisTest.lean` - Automatic synthesis examples
 
 ## Phase 2: Netlist IR (Complete)
@@ -683,7 +683,7 @@ Memory: 26208K/28672K available
 - All standard operators (arithmetic, logical, bitwise, comparison, mux, concat, slice)
 
 **Files Added**:
-- `Sparkle/IR/Type.lean`, `Sparkle/IR/AST.lean`, `Sparkle/IR/Builder.lean`
+- `cktlean/IR/Type.lean`, `cktlean/IR/AST.lean`, `cktlean/IR/Builder.lean`
 
 ## Phase 1: Simulation (Complete)
 
@@ -695,4 +695,4 @@ Memory: 26208K/28672K available
 - Functor/Applicative/Monad instances for Signal
 
 **Files Added**:
-- `Sparkle/Core/Domain.lean`, `Sparkle/Core/Signal.lean`, `Sparkle/Data/BitPack.lean`
+- `cktlean/Core/Domain.lean`, `cktlean/Core/Signal.lean`, `cktlean/Data/BitPack.lean`

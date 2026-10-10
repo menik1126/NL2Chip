@@ -5,13 +5,13 @@
   like SRAM, ROM, and clock gating cells that are provided by vendors.
 -/
 
-import Sparkle.IR.Builder
-import Sparkle.Backend.Verilog
+import cktlean.IR.Builder
+import cktlean.Backend.Verilog
 
-open Sparkle.IR.Builder
-open Sparkle.IR.AST
-open Sparkle.IR.Type
-open Sparkle.Backend.Verilog
+open cktlean.IR.Builder
+open cktlean.IR.AST
+open cktlean.IR.Type
+open cktlean.Backend.Verilog
 open CircuitM
 
 /--

@@ -6,16 +6,16 @@
     0b10 → +1 (pass-through), 0b00 → -1 (negate), else → 0.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.BitLinear
+namespace cktlean.Examples.BitNet.BitLinear
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -28,4 +28,4 @@ def dynamicBitLinearSignal (weightCodes : Array (Signal dom (BitVec 2)))
   if decoded.size == 0 then Signal.pure 0
   else adderTree decoded
 
-end Sparkle.Examples.BitNet.BitLinear
+end cktlean.Examples.BitNet.BitLinear

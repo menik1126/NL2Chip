@@ -17,12 +17,12 @@
   Reference: ITU-T H.264 Section 8.3.1.2
 -/
 
-import Sparkle
+import cktlean
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.IP.Video.H264.IntraPred
+namespace cktlean.IP.Video.H264.IntraPred
 
 -- ============================================================================
 -- Types
@@ -196,4 +196,4 @@ private def goldenDDL : Block4x4 :=
   IO.println s!"DC:         {predict 2 testNeighbors == goldenDC}"
   IO.println s!"DDL:        {predict 3 testNeighbors == goldenDDL}"
 
-end Sparkle.IP.Video.H264.IntraPred
+end cktlean.IP.Video.H264.IntraPred

@@ -5,16 +5,16 @@
   Generates: `reg [7:0] mem [0:3];` style Verilog arrays.
 -/
 
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.Vector
-open Sparkle.Compiler.Elab
-open Sparkle.Backend.Verilog
-open Sparkle.IR.AST
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Vector
+open cktlean.Compiler.Elab
+open cktlean.Backend.Verilog
+open cktlean.IR.AST
 
-namespace Sparkle.Examples.VectorTest
+namespace cktlean.Examples.VectorTest
 
 /--
   Simple register file read: index into a 4-element vector of 8-bit values.
@@ -110,4 +110,4 @@ def main : IO Unit := do
   IO.println "  - /tmp/constant_index.v"
   IO.println "  - /tmp/register_file_16.v"
 
-end Sparkle.Examples.VectorTest
+end cktlean.Examples.VectorTest

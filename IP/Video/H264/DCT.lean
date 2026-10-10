@@ -10,17 +10,17 @@
   Reference: ITU-T H.264 Section 8.5.10 (forward), 8.5.12 (inverse)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.IP.Video.H264.DCT
+namespace cktlean.IP.Video.H264.DCT
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- Pure functions (simulation + proof targets)
@@ -291,4 +291,4 @@ def forwardDCTModule {dom : DomainConfig}
   let outData := Signal.pure 0#16  -- placeholder for actual output
   bundleAll! [validOut, outData, done]
 
-end Sparkle.IP.Video.H264.DCT
+end cktlean.IP.Video.H264.DCT

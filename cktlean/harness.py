@@ -925,20 +925,20 @@ def _with_sparkle_prelude(code: str) -> str:
     if stripped.startswith("import "):
         return code
     return (
-        "import Sparkle\n"
-        "import Sparkle.Compiler.Elab\n\n"
-        "open Sparkle.Core.Domain\n"
-        "open Sparkle.Core.Signal\n\n"
-        "open Sparkle.Library.RTL\n\n"
+        "import cktlean\n"
+        "import cktlean.Compiler.Elab\n\n"
+        "open cktlean.Core.Domain\n"
+        "open cktlean.Core.Signal\n\n"
+        "open cktlean.Library.RTL\n\n"
         + code
         + ("\n" if not code.endswith("\n") else "")
     )
 
 
 def _with_repl_opens(code: str) -> str:
-    if "open Sparkle.Library.RTL" in code or code.lstrip().startswith("import "):
+    if "open cktlean.Library.RTL" in code or code.lstrip().startswith("import "):
         return code
-    return "open Sparkle.Library.RTL\n\n" + code
+    return "open cktlean.Library.RTL\n\n" + code
 
 
 def _without_repl_imports(code: str) -> str:

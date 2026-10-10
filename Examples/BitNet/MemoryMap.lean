@@ -7,7 +7,7 @@
 
 import Examples.BitNet.Config
 
-namespace Sparkle.Examples.BitNet
+namespace cktlean.Examples.BitNet
 
 /-- Compute weight ROM address from row index and group index.
     address = row * groupsPerRow + group -/
@@ -34,4 +34,4 @@ def weightRomBytes (cfg : BitLinearConfig) : Nat :=
 def scaleRomWords (cfg : BitLinearConfig) : Nat :=
   cfg.outDim
 
-end Sparkle.Examples.BitNet
+end cktlean.Examples.BitNet

@@ -130,11 +130,11 @@ lake env lean --run Examples/Counter.lean
 ### Your First Circuit: Simple Register
 
 ```lean
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Domain
 
 -- A simple register chain (3 cycles delay)
 def registerChain (input : Signal Domain (BitVec 8)) : Signal Domain (BitVec 8) :=
@@ -488,7 +488,7 @@ Generate full API documentation with doc-gen4:
 
 ```bash
 # Build documentation
-lake -R -Kenv=dev build Sparkle:docs
+lake -R -Kenv=dev build Cktlean:docs
 
 # Open in browser
 open .lake/build/doc/index.html
@@ -628,7 +628,10 @@ Tests include:
 
 ```
 cktlean/
-├── Sparkle/              # CKTLean core library (Lean package name)
+├── cktlean.lean          # Lean root module: import cktlean
+├── cktlean/              # Lean HDL modules and Python agent harness
+│   ├── run.py           # Lean generation agent
+│   ├── run_verilog.py   # Direct-SystemVerilog baseline
 │   ├── Core/            # Signal semantics, domains, and vectors
 │   │   ├── Signal.lean  # Signal DSL: register, memory, loop, mux, ===, hw_cond
 │   │   ├── StateMacro.lean # declare_signal_state: named state accessors
@@ -817,8 +820,9 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed development phases and implementat
 
 CKTLean builds on [Sparkle HDL](https://github.com/Verilean/sparkle) by Junji
 Hashimoto ([@junjihashimoto3](https://x.com/junjihashimoto3)), and we thank the
-Sparkle authors for their contribution. The Lean package and module names keep
-the `Sparkle` prefix.
+Sparkle authors for their contribution. CKTLean's Lean modules and namespaces
+use the `cktlean` prefix. The `Cktlean` Lake library target builds these modules;
+`lake exe cktlean` runs the project executable.
 
 ## License
 

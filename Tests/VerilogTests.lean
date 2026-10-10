@@ -1,12 +1,12 @@
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Tests.TestCircuits
 import LSpec
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Compiler.Elab
-open Sparkle.Backend.Verilog
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Compiler.Elab
+open cktlean.Backend.Verilog
 open Lean.Elab.Command
 open Lean (Name)
 open LSpec
@@ -140,7 +140,7 @@ def main : IO UInt32 := do
 
   -- Import required modules
   let env ← Lean.importModules
-    #[{module := `Sparkle.Compiler.Elab}, {module := `Sparkle.Backend.Verilog}, {module := `Tests.TestCircuits}]
+    #[{module := `cktlean.Compiler.Elab}, {module := `cktlean.Backend.Verilog}, {module := `Tests.TestCircuits}]
     {}
     (trustLevel := 1024)
 

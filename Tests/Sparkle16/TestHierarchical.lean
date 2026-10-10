@@ -5,13 +5,13 @@
   instantiates the ALU as a submodule.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import LSpec
 import Tests.Sparkle16.TestALU
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 namespace Sparkle16.Test
 
@@ -91,8 +91,8 @@ These tests verify that:
 def synthesizeDatapath : IO String := do
   -- Set up Lean environment
   let mods : Array Lean.Import := #[
-    { module := `Sparkle },
-    { module := `Sparkle.Compiler.Elab },
+    { module := `cktlean },
+    { module := `cktlean.Compiler.Elab },
     { module := `Tests.Sparkle16.TestALU },
     { module := `Tests.Sparkle16.TestHierarchical }
   ]
@@ -106,11 +106,11 @@ def synthesizeDatapath : IO String := do
 
   -- Synthesize the datapath (hierarchical)
   let (design, _, _) ← Lean.Meta.MetaM.toIO
-    (Sparkle.Compiler.Elab.synthesizeHierarchical ``Sparkle16.Test.datapath)
+    (cktlean.Compiler.Elab.synthesizeHierarchical ``Sparkle16.Test.datapath)
     coreCtx coreState
 
   -- Generate Verilog for all modules (including ALU)
-  let verilog := Sparkle.Backend.Verilog.toVerilogDesign design
+  let verilog := cktlean.Backend.Verilog.toVerilogDesign design
   return verilog
 
 /-- E2E Test: Verify hierarchical module instantiation -/

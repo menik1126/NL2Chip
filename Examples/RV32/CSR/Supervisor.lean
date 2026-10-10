@@ -7,18 +7,18 @@
   Privilege mode transitions via trap/MRET/SRET.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.RV32.CSR.Types
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.RV32.CSR.Supervisor
+namespace cktlean.Examples.RV32.CSR.Supervisor
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32.CSR
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32.CSR
 
 /-- CSR write value computation helper. -/
 def mkCsrNewVal {dom : DomainConfig}
@@ -179,4 +179,4 @@ def supervisorCsrSignal {dom : DomainConfig}
 
 #synthesizeVerilog supervisorCsrSignal
 
-end Sparkle.Examples.RV32.CSR.Supervisor
+end cktlean.Examples.RV32.CSR.Supervisor

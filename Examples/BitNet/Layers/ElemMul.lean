@@ -4,16 +4,16 @@
   Fixed-point Q16.16 element-wise multiplication: (a × b) >>> 16.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.Layers
+namespace cktlean.Examples.BitNet.Layers
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -28,4 +28,4 @@ def elemMulSignal (a b : Signal dom (BitVec 32)) : Signal dom (BitVec 32) :=
   -- Extract bits [47:16] = ASR 16 + truncate to 32 bits
   prod.map (BitVec.extractLsb' 16 32 ·)
 
-end Sparkle.Examples.BitNet.Layers
+end cktlean.Examples.BitNet.Layers

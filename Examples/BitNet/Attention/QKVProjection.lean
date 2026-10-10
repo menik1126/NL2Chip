@@ -8,19 +8,19 @@
       quantized = QuantizeInt8(scaled, quantShift)
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Scale
 import Examples.BitNet.Attention.Quantize
 
-namespace Sparkle.Examples.BitNet.Attention
+namespace cktlean.Examples.BitNet.Attention
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
-open Sparkle.Examples.BitNet.BitLinear
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
+open cktlean.Examples.BitNet.BitLinear
 
 variable {dom : DomainConfig}
 
@@ -55,4 +55,4 @@ def qkvProjectionSignal
       return results
   (project qWeights qScales, project kWeights kScales, project vWeights vScales)
 
-end Sparkle.Examples.BitNet.Attention
+end cktlean.Examples.BitNet.Attention

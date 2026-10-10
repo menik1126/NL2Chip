@@ -6,11 +6,11 @@
 import LSpec
 import Examples.YOLOv8.Backbone
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Backbone
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Backbone
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestBackbone
+namespace cktlean.Examples.YOLOv8.Tests.TestBackbone
 
 /-- Test initial FSM transition: IDLE → STEM on start. -/
 def testStartTransition : IO LSpec.TestSeq := do
@@ -40,4 +40,4 @@ def allTests : IO LSpec.TestSeq := do
   let t2 ← testStemToStageConv
   return LSpec.group "Backbone Controller" (t1 ++ t2)
 
-end Sparkle.Examples.YOLOv8.Tests.TestBackbone
+end cktlean.Examples.YOLOv8.Tests.TestBackbone

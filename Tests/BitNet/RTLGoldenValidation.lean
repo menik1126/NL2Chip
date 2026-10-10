@@ -14,9 +14,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Tests.RTLGoldenValidation
+namespace cktlean.Examples.BitNet.Tests.RTLGoldenValidation
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 -- ============================================================================
 -- Float32 binary loading (self-contained, no FFI)
@@ -986,4 +986,4 @@ def runAll : IO Unit := do
   else
     IO.println "SOME TESTS FAILED"
 
-end Sparkle.Examples.BitNet.Tests.RTLGoldenValidation
+end cktlean.Examples.BitNet.Tests.RTLGoldenValidation

@@ -2,7 +2,7 @@
   SystemVerilog AST — Synthesizable RTL Subset
 
   Captures Verilog syntax faithfully before semantic lowering to Sparkle IR.
-  Separate from Sparkle.IR.AST to keep a clean parser/compiler boundary.
+  Separate from cktlean.IR.AST to keep a clean parser/compiler boundary.
 
   Supports: module with parameters, input/output/output reg, wire/reg,
   assign, always @(posedge)/always @*, if/else, case/casez,

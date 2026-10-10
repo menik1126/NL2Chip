@@ -6,17 +6,17 @@
   ③ hw_let tuple destructuring macro
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 800000
 
 namespace Tests.CompilerTests
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- Test ①: Bitwise complement ~~~ for BitVec signals

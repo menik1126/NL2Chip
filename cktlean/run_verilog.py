@@ -50,7 +50,7 @@ Generate one synthesizable SystemVerilog module that matches the benchmark contr
 ## Output File
 - Write the candidate to `cktlean_work/<prob_id>/candidate.sv` with the `write_file` or `edit_file` tool.
 - The file must contain complete SystemVerilog source with `module ... endmodule`.
-- Do not write Lean or Sparkle. This is a direct-SystemVerilog baseline.
+- Do not write Lean or cktlean. This is a direct-SystemVerilog baseline.
 
 ## RTL Rules
 - Use SystemVerilog-2012 syntax compatible with Icarus Verilog/cocotb.
@@ -246,7 +246,7 @@ def build_feedback_prompt(
         f"### Structured Simulator / Compiler Feedback\n\n{structured_feedback}\n\n"
         f"### Required Action\n\n"
         f"Overwrite `cktlean_work/{prob_id}/candidate.sv` with the complete corrected SystemVerilog module. "
-        f"Do not output Lean or Sparkle.\n"
+        f"Do not output Lean or cktlean.\n"
     )
 
 

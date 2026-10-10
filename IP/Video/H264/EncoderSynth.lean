@@ -25,8 +25,8 @@
   Reference: ITU-T H.264 Section 7, 8
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import IP.Video.H264.Quant
 import IP.Video.H264.ForwardDCTSynth
 import IP.Video.H264.QuantSynth
@@ -34,14 +34,14 @@ import IP.Video.H264.QuantSynth
 set_option maxRecDepth 8192
 set_option maxHeartbeats 3200000
 
-namespace Sparkle.IP.Video.H264.EncoderSynth
+namespace cktlean.IP.Video.H264.EncoderSynth
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
-open Sparkle.IP.Video.H264.ForwardDCTSynth
-open Sparkle.IP.Video.H264.QuantSynth
-open Sparkle.IP.Video.H264.Quant
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
+open cktlean.IP.Video.H264.ForwardDCTSynth
+open cktlean.IP.Video.H264.QuantSynth
+open cktlean.IP.Video.H264.Quant
 
 -- ============================================================================
 -- State definition (12 registers)
@@ -563,4 +563,4 @@ def encoderPipelineV2 {dom : DomainConfig}
 
   bundleAll! [doneU32, phaseU32, quantReadData]
 
-end Sparkle.IP.Video.H264.EncoderSynth
+end cktlean.IP.Video.H264.EncoderSynth

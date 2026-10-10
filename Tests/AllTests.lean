@@ -1,6 +1,6 @@
-import Sparkle
-import Sparkle.Compiler.Elab
-import Sparkle.Backend.Verilog
+import cktlean
+import cktlean.Compiler.Elab
+import cktlean.Backend.Verilog
 import Tests.TestCircuits
 import Tests.TestArray
 import Tests.TestTemporal
@@ -48,13 +48,13 @@ import Tests.SVParser.TestVerify
 import Tests.Bus.TestAXI4Lite
 import LSpec
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Compiler.Elab
-open Sparkle.Backend.Verilog
-open Sparkle.IR.Type
-open Sparkle.IR.AST
-open Sparkle.IR.Builder
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Compiler.Elab
+open cktlean.Backend.Verilog
+open cktlean.IR.Type
+open cktlean.IR.AST
+open cktlean.IR.Builder
 open Lean (Name)
 open LSpec
 open CircuitM
@@ -313,7 +313,7 @@ def main : IO UInt32 := do
 
   -- Import required modules
   let env ← Lean.importModules
-    #[{module := `Sparkle.Compiler.Elab}, {module := `Sparkle.Backend.Verilog}, {module := `Tests.TestCircuits}]
+    #[{module := `cktlean.Compiler.Elab}, {module := `cktlean.Backend.Verilog}, {module := `Tests.TestCircuits}]
     {}
     (trustLevel := 1024)
 
@@ -334,13 +334,13 @@ def main : IO UInt32 := do
   IO.println "║  BitNet Integration Tests             ║"
   IO.println "╚════════════════════════════════════════╝"
   IO.println ""
-  Sparkle.Examples.BitNet.Tests.BitLinear.runAll
-  Sparkle.Examples.BitNet.Tests.Layers.runAll
-  Sparkle.Examples.BitNet.Tests.Attention.runAll
-  Sparkle.Examples.BitNet.Tests.Comparison.runAll
-  Sparkle.Examples.BitNet.Tests.SoC.runAll
+  cktlean.Examples.BitNet.Tests.BitLinear.runAll
+  cktlean.Examples.BitNet.Tests.Layers.runAll
+  cktlean.Examples.BitNet.Tests.Attention.runAll
+  cktlean.Examples.BitNet.Tests.Comparison.runAll
+  cktlean.Examples.BitNet.Tests.SoC.runAll
   IO.println ""
-  Sparkle.Examples.BitNet.Tests.RTLGoldenValidation.runAll
+  cktlean.Examples.BitNet.Tests.RTLGoldenValidation.runAll
   IO.println ""
 
   -- Run Sparkle16 tests
@@ -348,13 +348,13 @@ def main : IO UInt32 := do
   let sparkle16HierarchicalTests ← Sparkle16.Test.hierarchicalTests
   let sparkle16VCDTests ← Sparkle16.Test.vcdTests
   let sparkle16CoSimTests ← Sparkle16.Test.coSimTests
-  let sparkle16OverflowTests ← Sparkle.Test.Overflow.overflowTests
+  let sparkle16OverflowTests ← cktlean.Test.Overflow.overflowTests
 
   -- Run Array/Vector tests
-  let arrayTests ← Sparkle.Test.Array.arrayTests
+  let arrayTests ← cktlean.Test.Array.arrayTests
 
   -- Run Temporal Logic tests
-  let temporalTests ← Sparkle.Test.Temporal.temporalTests
+  let temporalTests ← cktlean.Test.Temporal.temporalTests
 
   -- YOLOv8 primitive tests
   IO.println ""
@@ -362,12 +362,12 @@ def main : IO UInt32 := do
   IO.println "║  YOLOv8 Primitive Tests               ║"
   IO.println "╚════════════════════════════════════════╝"
   IO.println ""
-  let yolov8DequantTests := Sparkle.Examples.YOLOv8.Tests.TestDequant.allTests
-  let yolov8RequantTests := Sparkle.Examples.YOLOv8.Tests.TestRequantize.allTests
-  let yolov8ActivationTests := Sparkle.Examples.YOLOv8.Tests.TestActivation.allTests
-  let yolov8MaxPoolTests := Sparkle.Examples.YOLOv8.Tests.TestMaxPool.allTests
-  let yolov8Conv2DTests ← Sparkle.Examples.YOLOv8.Tests.TestConv2D.allTests
-  let yolov8UpsampleTests ← Sparkle.Examples.YOLOv8.Tests.TestUpsample.allTests
+  let yolov8DequantTests := cktlean.Examples.YOLOv8.Tests.TestDequant.allTests
+  let yolov8RequantTests := cktlean.Examples.YOLOv8.Tests.TestRequantize.allTests
+  let yolov8ActivationTests := cktlean.Examples.YOLOv8.Tests.TestActivation.allTests
+  let yolov8MaxPoolTests := cktlean.Examples.YOLOv8.Tests.TestMaxPool.allTests
+  let yolov8Conv2DTests ← cktlean.Examples.YOLOv8.Tests.TestConv2D.allTests
+  let yolov8UpsampleTests ← cktlean.Examples.YOLOv8.Tests.TestUpsample.allTests
 
   -- Combine all test suites
   let allTests :=
@@ -391,72 +391,72 @@ def main : IO UInt32 := do
   -- Golden value tests (IO-based, run separately)
   IO.println ""
   IO.println "--- YOLOv8 Golden Value Validation ---"
-  let yolov8GoldenTests ← Sparkle.Examples.YOLOv8.Tests.TestGoldenValues.allTests
+  let yolov8GoldenTests ← cktlean.Examples.YOLOv8.Tests.TestGoldenValues.allTests
   let allTests := allTests ++ yolov8GoldenTests
 
   -- Conv2D golden + end-to-end tests
   IO.println ""
   IO.println "--- YOLOv8 Conv2D Golden + End-to-End ---"
-  let yolov8Conv2DGoldenTests ← Sparkle.Examples.YOLOv8.Tests.TestConv2DGolden.allTests
-  let yolov8EndToEndTests ← Sparkle.Examples.YOLOv8.Tests.TestEndToEnd.allTests
+  let yolov8Conv2DGoldenTests ← cktlean.Examples.YOLOv8.Tests.TestConv2DGolden.allTests
+  let yolov8EndToEndTests ← cktlean.Examples.YOLOv8.Tests.TestEndToEnd.allTests
   let allTests := allTests ++ yolov8Conv2DGoldenTests ++ yolov8EndToEndTests
 
   -- Controller FSM tests
   IO.println ""
   IO.println "--- YOLOv8 Controller FSM Tests ---"
-  let yolov8HeadTests ← Sparkle.Examples.YOLOv8.Tests.TestHead.allTests
-  let yolov8BottleneckTests ← Sparkle.Examples.YOLOv8.Tests.TestBottleneck.allTests
-  let yolov8C2fTests ← Sparkle.Examples.YOLOv8.Tests.TestC2f.allTests
-  let yolov8BackboneTests ← Sparkle.Examples.YOLOv8.Tests.TestBackbone.allTests
-  let yolov8NeckTests ← Sparkle.Examples.YOLOv8.Tests.TestNeck.allTests
+  let yolov8HeadTests ← cktlean.Examples.YOLOv8.Tests.TestHead.allTests
+  let yolov8BottleneckTests ← cktlean.Examples.YOLOv8.Tests.TestBottleneck.allTests
+  let yolov8C2fTests ← cktlean.Examples.YOLOv8.Tests.TestC2f.allTests
+  let yolov8BackboneTests ← cktlean.Examples.YOLOv8.Tests.TestBackbone.allTests
+  let yolov8NeckTests ← cktlean.Examples.YOLOv8.Tests.TestNeck.allTests
   let allTests := allTests ++ yolov8HeadTests ++ yolov8BottleneckTests ++ yolov8C2fTests ++ yolov8BackboneTests ++ yolov8NeckTests
 
   -- C++ Simulation Backend tests
-  let cppSimTests ← Sparkle.Test.CppSim.cppSimTests
+  let cppSimTests ← cktlean.Test.CppSim.cppSimTests
   let allTests := allTests ++ cppSimTests
 
   -- RV32 SoC Flow tests
-  let rv32FlowTests ← Sparkle.Tests.RV32.TestFlow.flowTests
+  let rv32FlowTests ← cktlean.Tests.RV32.TestFlow.flowTests
   let allTests := allTests ++ rv32FlowTests
 
   -- SyncFIFO tests
-  let syncFIFOTests ← Sparkle.Tests.Library.TestSyncFIFO.syncFIFOTests
+  let syncFIFOTests ← cktlean.Tests.Library.TestSyncFIFO.syncFIFOTests
   let allTests := allTests ++ syncFIFOTests
 
   -- CAVLC Encoder tests
   IO.println ""
   IO.println "--- CAVLC Encoder Tests ---"
-  let cavlcTests ← Sparkle.Tests.Video.CAVLCTest.allTests
+  let cavlcTests ← cktlean.Tests.Video.CAVLCTest.allTests
   let allTests := allTests ++ cavlcTests
 
   -- H.264 Pipeline tests
   IO.println ""
   IO.println "--- H.264 Pipeline Tests ---"
-  let dramTests ← Sparkle.Tests.Video.DRAMTest.allTests
-  let dctTests ← Sparkle.Tests.Video.DCTTest.allTests
-  let quantTests ← Sparkle.Tests.Video.QuantTest.allTests
-  let cavlcDecTests ← Sparkle.Tests.Video.CAVLCDecodeTest.allTests
-  let nalTests ← Sparkle.Tests.Video.NALTest.allTests
-  let intraPredTests ← Sparkle.Tests.Video.IntraPredTest.allTests
-  let h264PipelineTests ← Sparkle.Tests.Video.H264PipelineTest.allTests
-  let h264FrameTests ← Sparkle.Tests.Video.H264FrameTest.allTests
-  let h264DecoderSynthTests ← Sparkle.Tests.Video.H264DecoderSynthTest.allTests
-  let h264EncoderSynthTests ← Sparkle.Tests.Video.H264EncoderSynthTest.allTests
+  let dramTests ← cktlean.Tests.Video.DRAMTest.allTests
+  let dctTests ← cktlean.Tests.Video.DCTTest.allTests
+  let quantTests ← cktlean.Tests.Video.QuantTest.allTests
+  let cavlcDecTests ← cktlean.Tests.Video.CAVLCDecodeTest.allTests
+  let nalTests ← cktlean.Tests.Video.NALTest.allTests
+  let intraPredTests ← cktlean.Tests.Video.IntraPredTest.allTests
+  let h264PipelineTests ← cktlean.Tests.Video.H264PipelineTest.allTests
+  let h264FrameTests ← cktlean.Tests.Video.H264FrameTest.allTests
+  let h264DecoderSynthTests ← cktlean.Tests.Video.H264DecoderSynthTest.allTests
+  let h264EncoderSynthTests ← cktlean.Tests.Video.H264EncoderSynthTest.allTests
   let allTests := allTests ++ dramTests ++ dctTests ++ quantTests ++ cavlcDecTests ++ nalTests ++ intraPredTests ++ h264PipelineTests ++ h264FrameTests ++ h264DecoderSynthTests ++ h264EncoderSynthTests
 
   -- Verilog co-simulation tests (parse Verilog → JIT → simulate)
-  let verilogCoSimTests ← Sparkle.Tests.SVParser.TestVerilogCoSim.verilogCoSimTests
+  let verilogCoSimTests ← cktlean.Tests.SVParser.TestVerilogCoSim.verilogCoSimTests
   let allTests := allTests ++ verilogCoSimTests
 
   -- Verilog verification extraction tests
-  let verifyTests ← Sparkle.Tests.SVParser.TestVerify.verifyTests
+  let verifyTests ← cktlean.Tests.SVParser.TestVerify.verifyTests
   let allTests := allTests ++ verifyTests
 
   -- AXI4-Lite bus protocol tests
   IO.println ""
   IO.println "--- AXI4-Lite Bus Protocol Tests ---"
-  let axi4Tests ← Sparkle.Tests.Bus.AXI4Lite.allTests
-  let axi4FullTests ← Sparkle.Tests.Bus.AXI4Lite.fullModuleTests
+  let axi4Tests ← cktlean.Tests.Bus.AXI4Lite.allTests
+  let axi4FullTests ← cktlean.Tests.Bus.AXI4Lite.fullModuleTests
   let allTests := allTests ++ axi4Tests ++ axi4FullTests
 
   lspecIO (Std.HashMap.ofList [("all", [allTests])]) []

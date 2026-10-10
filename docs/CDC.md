@@ -20,7 +20,7 @@ sparkle_jit.c ──dlopen──▶ cdc_runner.so (C++20)
 
 - **Lock-free SPSC queue** (`c_src/cdc/spsc_queue.hpp`): ARM64-optimized, 210M ops/sec, false-sharing prevention
 - **Rollback mechanism** (`c_src/cdc/cdc_rollback.hpp`): Detects timestamp inversions, restores snapshots — queue indices never rolled back
-- **12 formal proofs** (`Sparkle/Verification/CDCProps.lean`): SPSC safety, rollback guarantee, queue index isolation — all proven, no `sorry`
+- **12 formal proofs** (`cktlean/Verification/CDCProps.lean`): SPSC safety, rollback guarantee, queue index isolation — all proven, no `sorry`
 - **JIT integration**: `JIT.runCDC` runs two domains on separate threads from Lean via dlopen bridge
 
 ### Multi-Clock E2E Test

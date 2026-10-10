@@ -7,14 +7,14 @@
   FSM: Idle → WaitWriteResp / WaitReadResp → Idle
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
-namespace Sparkle.IP.Bus.AXI4Lite.Master
+namespace cktlean.IP.Bus.AXI4Lite.Master
 
 -- FSM encoding
 private abbrev stIdle          : BitVec 2 := 0#2
@@ -138,4 +138,4 @@ set_option maxRecDepth 4096
 set_option maxHeartbeats 800000
 #synthesizeVerilog axi4LiteMaster
 
-end Sparkle.IP.Bus.AXI4Lite.Master
+end cktlean.IP.Bus.AXI4Lite.Master

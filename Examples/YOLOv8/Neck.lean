@@ -17,18 +17,18 @@
   This module implements the controller FSM for sequencing.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Config
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Neck
+namespace cktlean.Examples.YOLOv8.Neck
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 private abbrev NeckState := BitVec 4 × BitVec 3 × Bool × Bool × Bool × Bool
 
@@ -164,4 +164,4 @@ def neckControllerSimulate {dom : DomainConfig}
 
 #synthesizeVerilog neckController
 
-end Sparkle.Examples.YOLOv8.Neck
+end cktlean.Examples.YOLOv8.Neck

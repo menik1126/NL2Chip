@@ -7,10 +7,10 @@
   - Functor/Applicative operations (combinational logic)
 -/
 
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- Example: Combinational logic on signals -/
 def testCombinational : IO Unit := do

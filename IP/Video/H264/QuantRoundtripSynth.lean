@@ -13,17 +13,17 @@
   Reference: ITU-T H.264 Table 8-12 (MF), Table 8-13 (V)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.IP.Video.H264.QuantRoundtripSynth
+namespace cktlean.IP.Video.H264.QuantRoundtripSynth
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- State definition (4 registers)
@@ -151,4 +151,4 @@ def quantDequantSynth {dom : DomainConfig}
 
 #writeDesign quantDequantSynth ".lake/build/gen/h264/quant_roundtrip.sv" ".lake/build/gen/h264/quant_roundtrip_cppsim.h"
 
-end Sparkle.IP.Video.H264.QuantRoundtripSynth
+end cktlean.IP.Video.H264.QuantRoundtripSynth

@@ -11,7 +11,7 @@
     lake exe h264-jit-pipeline-test
 -/
 
-import Sparkle.Core.JIT
+import cktlean.Core.JIT
 import IP.Video.H264.Quant
 import IP.Video.H264.DecoderSynth
 import IP.Video.H264.EncoderSynth
@@ -19,13 +19,13 @@ import IP.Video.H264.CAVLCSynth
 import IP.Video.H264.VLCTables
 import IP.Video.H264.CAVLC
 
-open Sparkle.Core.JIT
-open Sparkle.IP.Video.H264.Quant
-open Sparkle.IP.Video.H264.DecoderSynth
-open Sparkle.IP.Video.H264.EncoderSynth
-open Sparkle.IP.Video.H264.VLCTables
-open Sparkle.IP.Video.H264.CAVLC
-open Sparkle.IP.Video.H264.CAVLCSynth
+open cktlean.Core.JIT
+open cktlean.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.DecoderSynth
+open cktlean.IP.Video.H264.EncoderSynth
+open cktlean.IP.Video.H264.VLCTables
+open cktlean.IP.Video.H264.CAVLC
+open cktlean.IP.Video.H264.CAVLCSynth
 
 /-- Resolve a wire index by name, throwing if not found -/
 def resolveWire (handle : JITHandle) (name : String) : IO UInt32 := do

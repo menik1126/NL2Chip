@@ -9,8 +9,8 @@
   At runtime, we compute: score[cls] = dot(visual_features, text_embed[cls])
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Config
 import Examples.YOLOv8.Types
 import Examples.YOLOv8.Primitives.Dequant
@@ -18,11 +18,11 @@ import Examples.YOLOv8.Primitives.Dequant
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.TextEmbedding
+namespace cktlean.Examples.YOLOv8.TextEmbedding
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Primitives.Dequant
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Primitives.Dequant
 
 /-- INT8 dot product engine.
 
@@ -106,4 +106,4 @@ def dotProductEngine {dom : DomainConfig}
 
 #synthesizeVerilog dotProductEngine
 
-end Sparkle.Examples.YOLOv8.TextEmbedding
+end cktlean.Examples.YOLOv8.TextEmbedding

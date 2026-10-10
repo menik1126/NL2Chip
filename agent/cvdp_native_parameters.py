@@ -266,7 +266,7 @@ def format_native_parameter_contract(plan: FiniteParameterPlan) -> str:
     lines = [
         "### Native Parameter Sweep (P3)",
         "",
-        "Emit exactly one generic Sparkle/SystemVerilog design. Do not enumerate sweep values "
+        "Emit exactly one generic cktlean/SystemVerilog design. Do not enumerate sweep values "
         "as concrete Lean aliases. Every listed parameter must remain symbolic in dependent "
         "ports, state, memories, slices, and child instances.",
         "",

@@ -4,12 +4,12 @@
   Tests automatic compilation of Signal.loop (feedback loops) to hardware IR.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.Signal.Signal  -- Open Signal namespace for loop, register, mux
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Signal.Signal  -- Open Signal namespace for loop, register, mux
 
 -- A simple counter: cnt = cnt + 1
 -- The 'loop' primitive gives us access to the 'cnt' wire before it's defined.

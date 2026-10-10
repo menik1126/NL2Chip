@@ -9,11 +9,11 @@
     lake exe rv32-jit-test [jit.cpp] [firmware.hex] [max_cycles]
 -/
 
-import Sparkle.Core.JIT
-import Sparkle.Utils.HexLoader
+import cktlean.Core.JIT
+import cktlean.Utils.HexLoader
 
-open Sparkle.Core.JIT
-open Sparkle.Utils.HexLoader
+open cktlean.Core.JIT
+open cktlean.Utils.HexLoader
 
 /-- Resolve a wire index by name, throwing if not found -/
 def resolveWire (handle : JITHandle) (name : String) : IO UInt32 := do

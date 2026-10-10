@@ -6,7 +6,7 @@
 
 import Examples.YOLOv8.Config
 
-namespace Sparkle.Examples.YOLOv8
+namespace cktlean.Examples.YOLOv8
 
 -- ============================================================================
 -- Core Type Aliases
@@ -86,4 +86,4 @@ def saturatingAddInt8 (a b : BitVec 8) : BitVec 8 :=
 def maxInt8 (a b : BitVec 8) : BitVec 8 :=
   if a.toInt >= b.toInt then a else b
 
-end Sparkle.Examples.YOLOv8
+end cktlean.Examples.YOLOv8

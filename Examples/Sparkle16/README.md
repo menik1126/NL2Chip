@@ -197,7 +197,7 @@ lake env lean --run Examples/Sparkle16/Memory.lean
 
 ## Formal Verification
 
-### Verification Framework (Sparkle/Verification/)
+### Verification Framework (cktlean/Verification/)
 
 #### Basic.lean
 
@@ -225,7 +225,7 @@ Correctness proofs for ALU operations:
 
 **Example:**
 ```lean
-import Sparkle.Verification.ALUProps
+import cktlean.Verification.ALUProps
 
 -- Prove that ADD is correct
 theorem my_add_proof (a b : BitVec 16) :
@@ -247,7 +247,7 @@ ISA correctness proofs for instruction encoding/decoding:
 
 **Example:**
 ```lean
-import Sparkle.Verification.ISAProps
+import cktlean.Verification.ISAProps
 
 -- Prove opcode roundtrip
 example : Opcode.fromBitVec (Opcode.toBitVec Opcode.ADD) = some Opcode.ADD :=
@@ -312,7 +312,7 @@ Examples/Sparkle16/
 ├── ISAProofTests.lean  # ISA correctness proof tests
 └── README.md           # This file
 
-Sparkle/Verification/
+cktlean/Verification/
 ├── Basic.lean          # Fundamental BitVec lemmas
 ├── ALUProps.lean       # ALU correctness proofs
 └── ISAProps.lean       # ISA encoding/decoding correctness
@@ -376,9 +376,9 @@ let beq := Instruction.BEQ ⟨1, by omega⟩ ⟨2, by omega⟩ 5
 ### Verifying ALU
 
 ```lean
-import Sparkle.Verification.ALUProps
+import cktlean.Verification.ALUProps
 
-open Sparkle.Verification.ALUProps
+open cktlean.Verification.ALUProps
 
 -- Prove commutativity
 example (a b : BitVec 16) : aluSpec .ADD a b = aluSpec .ADD b a := by

@@ -8,15 +8,15 @@
   4. Valid persistence (BVALID/RVALID hold until ready)
 -/
 
-import Sparkle
+import cktlean
 import IP.Bus.AXI4Lite.Slave
 import LSpec
 
-namespace Sparkle.Tests.Bus.AXI4Lite
+namespace cktlean.Tests.Bus.AXI4Lite
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.IP.Bus.AXI4Lite.Slave
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.IP.Bus.AXI4Lite.Slave
 open LSpec
 
 /-- Create a stimulus signal from a list of values (repeats last value) -/
@@ -234,5 +234,5 @@ def runMain : IO UInt32 := do
   let fullTests ← fullModuleTests
   lspecIO (Std.HashMap.ofList [("all", [tests ++ fullTests])]) []
 
-end Sparkle.Tests.Bus.AXI4Lite
+end cktlean.Tests.Bus.AXI4Lite
 

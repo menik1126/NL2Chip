@@ -7,7 +7,7 @@
 
 import Examples.BitNet.Config
 
-namespace Sparkle.Examples.BitNet
+namespace cktlean.Examples.BitNet
 
 /-- 256-bit packed ternary word (128 weights × 2 bits) -/
 abbrev PackedWord := BitVec romWordBits
@@ -184,4 +184,4 @@ def weightedVSum (weights : Array Int) (vMatrix : Array (Array Int)) (j : Nat) :
       acc := acc + w * v
     return acc / (2^softmaxFracBits : Int)
 
-end Sparkle.Examples.BitNet
+end cktlean.Examples.BitNet

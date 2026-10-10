@@ -11,14 +11,14 @@
   BRESP/RRESP = 2'b00 (OKAY) always.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
-namespace Sparkle.IP.Bus.AXI4Lite.Slave
+namespace cktlean.IP.Bus.AXI4Lite.Slave
 
 -- FSM encoding
 private abbrev stIdle      : BitVec 2 := 0#2
@@ -134,4 +134,4 @@ set_option maxRecDepth 4096
 set_option maxHeartbeats 800000
 #synthesizeVerilog axi4LiteSlave
 
-end Sparkle.IP.Bus.AXI4Lite.Slave
+end cktlean.IP.Bus.AXI4Lite.Slave

@@ -14,15 +14,15 @@
   - (negative, carry, overflow could be added later)
 -/
 
-import Sparkle.IR.Builder
-import Sparkle.IR.AST
-import Sparkle.Backend.Verilog
+import cktlean.IR.Builder
+import cktlean.IR.AST
+import cktlean.Backend.Verilog
 
 namespace Sparkle16
 
-open Sparkle.IR.Builder
-open Sparkle.IR.AST
-open Sparkle.IR.Type
+open cktlean.IR.Builder
+open cktlean.IR.AST
+open cktlean.IR.Type
 open CircuitM
 
 /-- ALU Operation codes (3-bit) -/
@@ -109,10 +109,10 @@ def aluModule : Module :=
 
 /-- Generate Verilog for the ALU -/
 def generateALUVerilog : IO Unit := do
-  let verilog := Sparkle.Backend.Verilog.toVerilog aluModule
+  let verilog := cktlean.Backend.Verilog.toVerilog aluModule
   IO.println "=== ALU Module Verilog ==="
   IO.println verilog
-  Sparkle.Backend.Verilog.writeVerilogFile aluModule "ALU.sv"
+  cktlean.Backend.Verilog.writeVerilogFile aluModule "ALU.sv"
 
 -- Main: Test and generate Verilog
 def main : IO Unit := do

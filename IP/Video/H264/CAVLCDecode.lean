@@ -15,18 +15,18 @@
   Reference: ITU-T H.264 Section 9.2.1
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import IP.Video.H264.CAVLC
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.IP.Video.H264.CAVLCDecode
+namespace cktlean.IP.Video.H264.CAVLCDecode
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.IP.Video.H264.CAVLC
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.IP.Video.H264.CAVLC
 
 -- ============================================================================
 -- Bitstream reader utility
@@ -265,4 +265,4 @@ def cavlcDecode (buffer : BitVec 64) (bitLen : Nat) : Array Int := Id.run do
   IO.println s!"Original:         {rasterCoeffs}"
   IO.println s!"Match: {decoded == rasterCoeffs}"
 
-end Sparkle.IP.Video.H264.CAVLCDecode
+end cktlean.IP.Video.H264.CAVLCDecode

@@ -12,11 +12,11 @@
     lake exe h264-jit-test
 -/
 
-import Sparkle.Core.JIT
+import cktlean.Core.JIT
 import IP.Video.H264.QuantRoundtripSynth
 
-open Sparkle.Core.JIT
-open Sparkle.IP.Video.H264.QuantRoundtripSynth
+open cktlean.Core.JIT
+open cktlean.IP.Video.H264.QuantRoundtripSynth
 
 /-- Convert signed Int to 16-bit 2's complement (as UInt32 for JIT.setMem) -/
 def intToU16 (v : Int) : UInt32 :=

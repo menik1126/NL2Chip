@@ -6,9 +6,9 @@
 import LSpec
 import IP.Video.H264.Quant
 
-open Sparkle.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.Quant
 
-namespace Sparkle.Tests.Video.QuantTest
+namespace cktlean.Tests.Video.QuantTest
 
 private def testCoeffs : Array Int :=
   #[136, -28, 0, -4, -112, 0, 0, 0, 0, 0, 0, 0, -16, 0, 0, 0]
@@ -50,4 +50,4 @@ def allTests : IO LSpec.TestSeq := do
   let t2 ← testDequant
   return LSpec.group "Quant/Dequant" (t1 ++ t2)
 
-end Sparkle.Tests.Video.QuantTest
+end cktlean.Tests.Video.QuantTest

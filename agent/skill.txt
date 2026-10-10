@@ -193,7 +193,7 @@ top-level-binder error and does not form a P3 generic module.
   with a packed multiply or Lean recursion.
 - Extended-Hamming layouts with overall parity at position zero, indexed
   parity at positions 1, 2, 4, ..., and payload in all other positions have
-  verified generic helpers in `Sparkle.Library.RTL`:
+  verified generic helpers in `cktlean.Library.RTL`:
   `scatterNonPowerOfTwoBits`, `parityByIndexMask`, `placeParityBits`, and
   `gatherNonPowerOfTwoBits`. Keep `DATAW` and `PARITYW` symbolic and compose
   these helpers; do not hard-code the 4-bit/default layout. Use them only when

@@ -14,7 +14,7 @@
     lake exe h264-bitstream-test
 -/
 
-import Sparkle.Core.JIT
+import cktlean.Core.JIT
 import IP.Video.H264.Quant
 import IP.Video.H264.EncoderSynth
 import IP.Video.H264.CAVLCSynth
@@ -24,15 +24,15 @@ import IP.Video.H264.SPSPPSData
 import IP.Video.H264.Encoder
 import IP.Video.H264.NAL
 
-open Sparkle.Core.JIT
-open Sparkle.IP.Video.H264.Quant
-open Sparkle.IP.Video.H264.EncoderSynth
-open Sparkle.IP.Video.H264.CAVLCSynth
-open Sparkle.IP.Video.H264.VLCTables
-open Sparkle.IP.Video.H264.CAVLC
-open Sparkle.IP.Video.H264.SPSPPSData
-open Sparkle.IP.Video.H264.Encoder
-open Sparkle.IP.Video.H264.NAL
+open cktlean.Core.JIT
+open cktlean.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.EncoderSynth
+open cktlean.IP.Video.H264.CAVLCSynth
+open cktlean.IP.Video.H264.VLCTables
+open cktlean.IP.Video.H264.CAVLC
+open cktlean.IP.Video.H264.SPSPPSData
+open cktlean.IP.Video.H264.Encoder
+open cktlean.IP.Video.H264.NAL
 
 /-- Resolve a wire index by name, throwing if not found -/
 private def resolveWire (handle : JITHandle) (name : String) : IO UInt32 := do

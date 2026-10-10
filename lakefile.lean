@@ -1,7 +1,7 @@
 import Lake
 open Lake DSL
 
-package «sparkle» where
+package «cktlean» where
 
 require «doc-gen4» from git
   "https://github.com/leanprover/doc-gen4" @ "main"
@@ -28,7 +28,9 @@ extern_lib «sparkle_jit» pkg := do
   let oJob ← buildLeanO oFile srcJob (weakArgs := #["-O2"])
   buildStaticLib (pkg.buildDir / "c_src" / nameToStaticLib "sparkle_jit") #[oJob]
 
-lean_lib «Sparkle» where
+lean_lib «Cktlean» where
+  -- Share the lowercase module directory with the Python agent harness.
+  roots := #[`cktlean]
 
 lean_lib «Examples.BitNet» where
   roots := #[`Examples.BitNet]
@@ -64,20 +66,20 @@ lean_lib «Tests» where
   -- Test circuits library
 
 @[default_target]
-lean_exe «sparkle» where
+lean_exe «cktlean» where
   root := `Main
 
 lean_exe «verilog-tests» where
   root := `Tests.VerilogTests
   supportInterpreter := true
 
-lean_exe «sparkle-bitnet-verilog-dump» where
-  root := `Tests.BitNet.SparkleBitNetVerilogDump
+lean_exe «cktlean-bitnet-verilog-dump» where
+  root := `Tests.BitNet.CktleanBitNetVerilogDump
 
-lean_exe «sparkle-rv32-sim» where
+lean_exe «cktlean-rv32-sim» where
   root := `Tests.RV32.SimTest
 
-lean_exe «sparkle-rv32-min» where
+lean_exe «cktlean-rv32-min» where
   root := `Tests.RV32.MinTest
 
 lean_exe «rv32-flow-test» where

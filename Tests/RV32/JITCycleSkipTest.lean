@@ -14,13 +14,13 @@
     lake exe rv32-jit-cycle-skip-test [jit.cpp] [firmware.hex]
 -/
 
-import Sparkle.Core.JIT
-import Sparkle.Core.JITLoop
-import Sparkle.Utils.HexLoader
+import cktlean.Core.JIT
+import cktlean.Core.JITLoop
+import cktlean.Utils.HexLoader
 
-open Sparkle.Core.JIT
-open Sparkle.Core.JITLoop
-open Sparkle.Utils.HexLoader
+open cktlean.Core.JIT
+open cktlean.Core.JITLoop
+open cktlean.Utils.HexLoader
 
 /-- Resolve a wire index by name, throwing if not found -/
 def resolveWire (handle : JITHandle) (name : String) : IO UInt32 := do

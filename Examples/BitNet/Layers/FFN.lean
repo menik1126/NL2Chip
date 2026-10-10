@@ -21,8 +21,8 @@
   emitInstance or module wiring needed.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Core
@@ -32,12 +32,12 @@ import Examples.BitNet.Layers.ResidualAdd
 import Examples.BitNet.Layers.ElemMul
 import Examples.BitNet.Layers.RMSNorm
 
-namespace Sparkle.Examples.BitNet.Layers
+namespace cktlean.Examples.BitNet.Layers
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
-open Sparkle.Examples.BitNet.BitLinear
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
+open cktlean.Examples.BitNet.BitLinear
 
 variable {dom : DomainConfig}
 
@@ -82,4 +82,4 @@ def ffnBlockSignal
   let residInput := if activations.size > 0 then activations[0]! else Signal.pure 0#32
   residualAddSignal residInput downScaled
 
-end Sparkle.Examples.BitNet.Layers
+end cktlean.Examples.BitNet.Layers

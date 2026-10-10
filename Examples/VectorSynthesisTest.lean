@@ -4,14 +4,14 @@
   Simple test that synthesizes vector operations to Verilog.
 -/
 
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.Vector
-open Sparkle.Compiler.Elab
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Vector
+open cktlean.Compiler.Elab
 
-namespace Sparkle.Examples.VectorSynthesis
+namespace cktlean.Examples.VectorSynthesis
 
 /--
   Simple register file read: index into a 4-element vector of 8-bit values.
@@ -46,4 +46,4 @@ def registerFile16 (vec : Signal defaultDomain (HWVector (BitVec 16) 8))
 
 #sparkle_synth registerFile16 to "/tmp/vector_register_file_16.v"
 
-end Sparkle.Examples.VectorSynthesis
+end cktlean.Examples.VectorSynthesis

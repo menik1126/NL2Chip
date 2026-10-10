@@ -27,12 +27,12 @@
   Reference: ISO 14496-12 (ISOBMFF), ISO 14496-15 (AVC file format)
 -/
 
-import Sparkle
+import cktlean
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.IP.Video.H264.MP4Mux
+namespace cktlean.IP.Video.H264.MP4Mux
 
 -- ============================================================================
 -- Helpers: big-endian byte writers
@@ -369,4 +369,4 @@ def buildMP4ROMTemplate : Array UInt8 :=
         arr := arr.push mp4.data[i]
     arr
 
-end Sparkle.IP.Video.H264.MP4Mux
+end cktlean.IP.Video.H264.MP4Mux

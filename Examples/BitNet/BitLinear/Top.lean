@@ -5,14 +5,14 @@
   the bitLinearPipelinedSignal function from Core.lean.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.BitLinear.Core
 
-namespace Sparkle.Examples.BitNet.BitLinear
+namespace cktlean.Examples.BitNet.BitLinear
 
 -- bitLinearPipelinedSignal is the primary entry point,
 -- defined in Core.lean and re-exported here for compatibility.
 
-end Sparkle.Examples.BitNet.BitLinear
+end cktlean.Examples.BitNet.BitLinear

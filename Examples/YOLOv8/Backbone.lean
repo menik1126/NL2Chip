@@ -17,8 +17,8 @@
   - Layer sequencing
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Config
 import Examples.YOLOv8.Types
 import Examples.YOLOv8.Blocks.C2f
@@ -27,11 +27,11 @@ import Examples.YOLOv8.Blocks.SPPF
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Backbone
+namespace cktlean.Examples.YOLOv8.Backbone
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8
 
 private abbrev BackboneState := BitVec 4 × BitVec 3 × BitVec 4 × BitVec 20 × Bool × Bool × Bool × Bool
 
@@ -201,4 +201,4 @@ def backboneControllerSimulate {dom : DomainConfig}
 
 #synthesizeVerilog backboneController
 
-end Sparkle.Examples.YOLOv8.Backbone
+end cktlean.Examples.YOLOv8.Backbone

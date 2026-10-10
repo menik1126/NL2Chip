@@ -33,16 +33,16 @@
     Signed overflow (INT_MIN / -1) -> INT_MIN (DIV), 0 (REM)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.RV32.Divider
+namespace cktlean.Examples.RV32.Divider
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- Multi-cycle restoring divider — Signal DSL.
 
@@ -276,4 +276,4 @@ def dividerSignal {dom : DomainConfig}
 
 #synthesizeVerilog dividerSignal
 
-end Sparkle.Examples.RV32.Divider
+end cktlean.Examples.RV32.Divider

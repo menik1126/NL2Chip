@@ -10,9 +10,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Tests.Comparison
+namespace cktlean.Examples.BitNet.Tests.Comparison
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 -- ============================================================================
 -- Q16.16 ↔ Float Conversion Utilities
@@ -184,4 +184,4 @@ def runAll : IO Unit := do
   IO.println ""
   IO.println "=== Comparison tests complete ==="
 
-end Sparkle.Examples.BitNet.Tests.Comparison
+end cktlean.Examples.BitNet.Tests.Comparison

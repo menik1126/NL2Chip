@@ -7,11 +7,11 @@ import LSpec
 import IP.Video.H264.Encoder
 import IP.Video.H264.Decoder
 
-open Sparkle.IP.Video.H264.IntraPred
-open Sparkle.IP.Video.H264.Encoder
-open Sparkle.IP.Video.H264.Decoder
+open cktlean.IP.Video.H264.IntraPred
+open cktlean.IP.Video.H264.Encoder
+open cktlean.IP.Video.H264.Decoder
 
-namespace Sparkle.Tests.Video.H264PipelineTest
+namespace cktlean.Tests.Video.H264PipelineTest
 
 private def testNeighbors : Neighbors :=
   { above := #[100, 100, 100, 100, 100, 100, 100, 100]
@@ -33,7 +33,7 @@ def testConstantBlock : IO LSpec.TestSeq := do
   )
 
 def testEncoderOutput : IO LSpec.TestSeq := do
-  let original : Sparkle.IP.Video.H264.IntraPred.Block4x4 := #[110, 115, 120, 125, 112, 117, 122, 127,
+  let original : cktlean.IP.Video.H264.IntraPred.Block4x4 := #[110, 115, 120, 125, 112, 117, 122, 127,
                                            114, 119, 124, 129, 116, 121, 126, 131]
   let result := encodeBlock original testNeighbors EncoderConfig.default
 
@@ -69,4 +69,4 @@ def allTests : IO LSpec.TestSeq := do
   let t3 ← testSmallFrame
   return LSpec.group "H.264 Pipeline" (t1 ++ t2 ++ t3)
 
-end Sparkle.Tests.Video.H264PipelineTest
+end cktlean.Tests.Video.H264PipelineTest

@@ -6,16 +6,16 @@
   - Verilator simulation
 -/
 
-import Sparkle
-import Sparkle.Verification.CoSim
+import cktlean
+import cktlean.Verification.CoSim
 import LSpec
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Verification.CoSim
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Verification.CoSim
 open LSpec
 
-namespace Sparkle.Test.Overflow
+namespace cktlean.Test.Overflow
 
 /-!
 ## Basic Overflow/Underflow Unit Tests
@@ -134,8 +134,8 @@ def test_overflow_cosim : IO TestSeq := do
 
   -- Set up Lean environment for synthesis
   let mods : Array Lean.Import := #[
-    { module := `Sparkle },
-    { module := `Sparkle.Compiler.Elab },
+    { module := `cktlean },
+    { module := `cktlean.Compiler.Elab },
     { module := `Tests.Sparkle16.TestOverflow }
   ]
   let env ← Lean.importModules mods {} (trustLevel := 1024)
@@ -144,10 +144,10 @@ def test_overflow_cosim : IO TestSeq := do
 
   -- Synthesize adder4
   let (design, _, _) ← Lean.Meta.MetaM.toIO
-    (Sparkle.Compiler.Elab.synthesizeHierarchical ``Sparkle.Test.Overflow.adder4)
+    (cktlean.Compiler.Elab.synthesizeHierarchical ``cktlean.Test.Overflow.adder4)
     coreCtx coreState
 
-  let verilog := Sparkle.Backend.Verilog.toVerilogDesign design
+  let verilog := cktlean.Backend.Verilog.toVerilogDesign design
   IO.FS.writeFile verilogPath verilog
 
   IO.println s!"Generated Verilog: {verilogPath}"
@@ -192,4 +192,4 @@ def overflowTests : IO TestSeq := do
     test_lean_simulation ++
     coSimTests)
 
-end Sparkle.Test.Overflow
+end cktlean.Test.Overflow

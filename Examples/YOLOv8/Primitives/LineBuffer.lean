@@ -8,17 +8,17 @@
   Outputs a sliding 3x3 window of INT8 values.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Primitives.LineBuffer
+namespace cktlean.Examples.YOLOv8.Primitives.LineBuffer
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- 3-row line buffer for 3x3 convolution.
 
@@ -145,4 +145,4 @@ def lineBuffer3x3 {dom : DomainConfig}
     (bundle2 w3out (bundle2 w4out (bundle2 w5out
       (bundle2 w6out (bundle2 w7out (bundle2 w8out validOut))))))))
 
-end Sparkle.Examples.YOLOv8.Primitives.LineBuffer
+end cktlean.Examples.YOLOv8.Primitives.LineBuffer

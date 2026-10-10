@@ -5,7 +5,7 @@
   Input: 160x160x3 RGB image.
 -/
 
-namespace Sparkle.Examples.YOLOv8
+namespace cktlean.Examples.YOLOv8
 
 -- ============================================================================
 -- Input Image Parameters
@@ -162,4 +162,4 @@ structure YoloConfig where
 /-- Default configuration for YOLOv8n -/
 def defaultConfig : YoloConfig := {}
 
-end Sparkle.Examples.YOLOv8
+end cktlean.Examples.YOLOv8

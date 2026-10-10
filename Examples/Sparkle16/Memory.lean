@@ -11,17 +11,17 @@
   - Synchronous write
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.IR.Builder
-import Sparkle.Backend.Verilog
+import cktlean.Core.Signal
+import cktlean.IR.Builder
+import cktlean.Backend.Verilog
 
 namespace Sparkle16
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.IR.Builder
-open Sparkle.IR.AST
-open Sparkle.IR.Type
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.IR.Builder
+open cktlean.IR.AST
+open cktlean.IR.Type
 
 /-- Memory size (256 words) -/
 def memorySize : Nat := 256
@@ -159,14 +159,14 @@ def dataMemoryModule : Module :=
 /-- Generate Verilog for memory modules -/
 def generateMemoryVerilog : IO Unit := do
   IO.println "=== Instruction Memory Module ==="
-  let iMemVerilog := Sparkle.Backend.Verilog.toVerilog instructionMemoryModule
+  let iMemVerilog := cktlean.Backend.Verilog.toVerilog instructionMemoryModule
   IO.println iMemVerilog
-  Sparkle.Backend.Verilog.writeVerilogFile instructionMemoryModule "InstructionMemory.sv"
+  cktlean.Backend.Verilog.writeVerilogFile instructionMemoryModule "InstructionMemory.sv"
 
   IO.println "\n=== Data Memory Module ==="
-  let dMemVerilog := Sparkle.Backend.Verilog.toVerilog dataMemoryModule
+  let dMemVerilog := cktlean.Backend.Verilog.toVerilog dataMemoryModule
   IO.println dMemVerilog
-  Sparkle.Backend.Verilog.writeVerilogFile dataMemoryModule "DataMemory.sv"
+  cktlean.Backend.Verilog.writeVerilogFile dataMemoryModule "DataMemory.sv"
 
 -- Main: Test memory modules
 def main : IO Unit := do

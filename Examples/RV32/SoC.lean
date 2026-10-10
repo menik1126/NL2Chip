@@ -41,9 +41,9 @@
     result is never consumed.
 -/
 
-import Sparkle
-import Sparkle.Core.JITLoop
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Core.JITLoop
+import cktlean.Compiler.Elab
 import Examples.RV32.Core
 import Examples.RV32.Divider
 import Examples.RV32.CSR.Types
@@ -51,13 +51,13 @@ import Examples.RV32.CSR.Types
 set_option maxRecDepth 65536
 set_option maxHeartbeats 16000000
 
-namespace Sparkle.Examples.RV32.SoC
+namespace cktlean.Examples.RV32.SoC
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32
-open Sparkle.Examples.RV32
-open Sparkle.Examples.RV32.CSR
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32
+open cktlean.Examples.RV32
+open cktlean.Examples.RV32.CSR
 
 def nopInst : BitVec 32 := 0x00000013#32
 
@@ -1578,8 +1578,8 @@ def rv32iSoCDebugFull {dom : DomainConfig}
 -- Note: JIT.getOutput doesn't work because the CppSim backend skips
 -- >64-bit packed output assignments. Use JIT.getWire with named wires instead.
 
-open Sparkle.Core.JIT
-open Sparkle.Core.JITLoop
+open cktlean.Core.JIT
+open cktlean.Core.JITLoop
 
 /-- Wire names for SoC output observation.
     These correspond to the values computed in rv32iSoCSynth and are stable
@@ -1656,4 +1656,4 @@ def rv32iSoCJITRun
   JIT.run handle cycles wireIndices callback
   JIT.destroy handle
 
-end Sparkle.Examples.RV32.SoC
+end cktlean.Examples.RV32.SoC

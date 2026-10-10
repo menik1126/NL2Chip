@@ -5,19 +5,19 @@
   Uses a 1-line buffer and signed comparison.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 import Examples.BitNet.SignalHelpers
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 400000
 
-namespace Sparkle.Examples.YOLOv8.Primitives.MaxPool
+namespace cktlean.Examples.YOLOv8.Primitives.MaxPool
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -48,4 +48,4 @@ def maxPool2x2 {dom : DomainConfig}
 
 #synthesizeVerilog maxPool2x2
 
-end Sparkle.Examples.YOLOv8.Primitives.MaxPool
+end cktlean.Examples.YOLOv8.Primitives.MaxPool

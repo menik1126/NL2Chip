@@ -7,20 +7,20 @@
     3. Output projection: ternary BitLinear + scale
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Scale
 import Examples.BitNet.Attention.Quantize
 import Examples.BitNet.Attention.Top
 
-namespace Sparkle.Examples.BitNet.Attention
+namespace cktlean.Examples.BitNet.Attention
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
-open Sparkle.Examples.BitNet.BitLinear
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
+open cktlean.Examples.BitNet.BitLinear
 
 variable {dom : DomainConfig}
 
@@ -83,4 +83,4 @@ def multiHeadAttentionSignal
       outputs := outputs.push scaled
     return outputs
 
-end Sparkle.Examples.BitNet.Attention
+end cktlean.Examples.BitNet.Attention

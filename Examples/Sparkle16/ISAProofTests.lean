@@ -2,13 +2,13 @@
   ISA Correctness Proofs - Test Examples
 
   This file demonstrates the ISA correctness theorems from
-  Sparkle/Verification/ISAProps.lean
+  cktlean/Verification/ISAProps.lean
 -/
 
-import Sparkle.Verification.ISAProps
+import cktlean.Verification.ISAProps
 
-open Sparkle.Verification.ISAProps
-open Sparkle.Verification.ISAProps.Instruction
+open cktlean.Verification.ISAProps
+open cktlean.Verification.ISAProps.Instruction
 
 -- Test: Opcode encoding/decoding roundtrip
 example : Opcode.fromBitVec (Opcode.toBitVec Opcode.ADD) = some Opcode.ADD :=

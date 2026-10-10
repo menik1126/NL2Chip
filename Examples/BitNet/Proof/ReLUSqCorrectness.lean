@@ -5,9 +5,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Proof
+namespace cktlean.Examples.BitNet.Proof
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 theorem relu_sq_negative :
     reluSquared (BitVec.ofInt 32 (-0x10000)) = BitVec.ofNat 32 0 := by
@@ -33,4 +33,4 @@ theorem relu_sq_nonneg_minus2 :
     reluSquared (BitVec.ofInt 32 (-0x20000)) = BitVec.ofNat 32 0 := by
   native_decide
 
-end Sparkle.Examples.BitNet.Proof
+end cktlean.Examples.BitNet.Proof

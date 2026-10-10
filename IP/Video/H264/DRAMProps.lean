@@ -12,9 +12,9 @@
 
 import IP.Video.H264.DRAMInterface
 
-namespace Sparkle.IP.Video.H264.DRAMProps
+namespace cktlean.IP.Video.H264.DRAMProps
 
-open Sparkle.IP.Video.H264.DRAMInterface
+open cktlean.IP.Video.H264.DRAMInterface
 
 -- ============================================================================
 -- Read-after-write
@@ -68,4 +68,4 @@ theorem read_deterministic (s : DRAMState) (addr : BitVec 24) :
     s.read addr = s.read addr := by
   rfl
 
-end Sparkle.IP.Video.H264.DRAMProps
+end cktlean.IP.Video.H264.DRAMProps

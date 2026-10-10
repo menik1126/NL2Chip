@@ -1,7 +1,7 @@
 /-
   SystemVerilog AST → Sparkle IR Lowering
 
-  Converts parsed SV AST into Sparkle's native IR (Sparkle.IR.AST),
+  Converts parsed SV AST into Sparkle's native IR (cktlean.IR.AST),
   enabling JIT execution without Verilator.
 
   Key transformations:
@@ -13,12 +13,12 @@
 
 import Tools.SVParser.AST
 import Tools.SVParser.Parser
-import Sparkle.IR.AST
-import Sparkle.IR.Type
+import cktlean.IR.AST
+import cktlean.IR.Type
 
 open Tools.SVParser.AST
-open Sparkle.IR.AST
-open Sparkle.IR.Type
+open cktlean.IR.AST
+open cktlean.IR.Type
 
 namespace Tools.SVParser.Lower
 

@@ -15,15 +15,15 @@
   - Asynchronous reads (combinational)
 -/
 
-import Sparkle.IR.Builder
-import Sparkle.IR.AST
-import Sparkle.Backend.Verilog
+import cktlean.IR.Builder
+import cktlean.IR.AST
+import cktlean.Backend.Verilog
 
 namespace Sparkle16
 
-open Sparkle.IR.Builder
-open Sparkle.IR.AST
-open Sparkle.IR.Type
+open cktlean.IR.Builder
+open cktlean.IR.AST
+open cktlean.IR.Type
 open CircuitM
 
 /--
@@ -180,10 +180,10 @@ def registerFileModule : Module :=
 
 /-- Generate Verilog for the Register File -/
 def generateRegFileVerilog : IO Unit := do
-  let verilog := Sparkle.Backend.Verilog.toVerilog registerFileModule
+  let verilog := cktlean.Backend.Verilog.toVerilog registerFileModule
   IO.println "=== Register File Verilog ==="
   IO.println verilog
-  Sparkle.Backend.Verilog.writeVerilogFile registerFileModule "RegisterFile.sv"
+  cktlean.Backend.Verilog.writeVerilogFile registerFileModule "RegisterFile.sv"
 
 -- Main: Test and generate Verilog
 def main : IO Unit := do

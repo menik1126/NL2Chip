@@ -10,13 +10,13 @@
   Shows 10-100x speedup for common CPU patterns.
 -/
 
-import Sparkle.Core.OptimizedSim
-import Sparkle.Verification.Temporal
+import cktlean.Core.OptimizedSim
+import cktlean.Verification.Temporal
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.OptimizedSim
-open Sparkle.Verification.Temporal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.OptimizedSim
+open cktlean.Verification.Temporal
 
 /-!
 ## Sparkle-16 CPU State

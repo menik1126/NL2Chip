@@ -10,16 +10,16 @@
   Uses syncFIFOSim (loopMemo-backed) to avoid stack overflow.
 -/
 
-import Sparkle
-import Sparkle.Library.Queue.SyncFIFO
+import cktlean
+import cktlean.Library.Queue.SyncFIFO
 import LSpec
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Library.Queue.SyncFIFO
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Library.Queue.SyncFIFO
 open LSpec
 
-namespace Sparkle.Tests.Library.TestSyncFIFO
+namespace cktlean.Tests.Library.TestSyncFIFO
 
 /-- Helper: extract enqReady (first 32-bit field) -/
 private def getEnqReady (output : Signal defaultDomain (BitVec 32 × BitVec 32 × BitVec 32))
@@ -104,4 +104,4 @@ def syncFIFOTests : IO TestSeq := do
       )
     )
 
-end Sparkle.Tests.Library.TestSyncFIFO
+end cktlean.Tests.Library.TestSyncFIFO

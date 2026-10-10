@@ -21,11 +21,11 @@
   has no direct Sparkle equivalent).
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- D flip-flop: delays input by one clock cycle. -/
 def prob031_dff {dom : DomainConfig}

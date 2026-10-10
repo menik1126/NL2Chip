@@ -23,17 +23,17 @@
     DONE (5)     → result ready
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Blocks.C2f
+namespace cktlean.Examples.YOLOv8.Blocks.C2f
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 private abbrev C2fState := BitVec 3 × BitVec 4 × BitVec 4 × Bool × Bool
 
@@ -147,4 +147,4 @@ def c2fControllerSimulate {dom : DomainConfig}
 
 #synthesizeVerilog c2fController
 
-end Sparkle.Examples.YOLOv8.Blocks.C2f
+end cktlean.Examples.YOLOv8.Blocks.C2f

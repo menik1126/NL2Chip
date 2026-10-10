@@ -5,9 +5,9 @@
   SizedExpr removed (CircuitM-specific).
 -/
 
-namespace Sparkle.Examples.BitNet.BitLinear
+namespace cktlean.Examples.BitNet.BitLinear
 
 /-- The bit-width rule for signed addition: max(n,m) + 1 -/
 def addBitWidth (a b : Nat) : Nat := max a b + 1
 
-end Sparkle.Examples.BitNet.BitLinear
+end cktlean.Examples.BitNet.BitLinear

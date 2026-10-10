@@ -14,11 +14,11 @@
   endmodule
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- NOT gate: inverts a 1-bit input signal. -/
 def prob005_notgate {dom : DomainConfig}

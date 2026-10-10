@@ -7,17 +7,17 @@
 -/
 
 import Tools.SVParser
-import Sparkle.Backend.Verilog
-import Sparkle.Backend.CppSim
-import Sparkle.Core.JIT
+import cktlean.Backend.Verilog
+import cktlean.Backend.CppSim
+import cktlean.Core.JIT
 
 open Tools.SVParser.AST
 open Tools.SVParser.Parser
 open Tools.SVParser.Lower
-open Sparkle.IR.AST
-open Sparkle.Backend.Verilog
-open Sparkle.Backend.CppSim
-open Sparkle.Core.JIT
+open cktlean.IR.AST
+open cktlean.Backend.Verilog
+open cktlean.Backend.CppSim
+open cktlean.Core.JIT
 
 def containsSubstr (s sub : String) : Bool :=
   (s.splitOn sub).length > 1

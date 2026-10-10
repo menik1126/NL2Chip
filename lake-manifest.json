@@ -71,5 +71,5 @@
    "inputRev": "main",
    "inherited": true,
    "configFile": "lakefile.lean"}],
- "name": "sparkle",
+ "name": "cktlean",
  "lakeDir": ".lake"}

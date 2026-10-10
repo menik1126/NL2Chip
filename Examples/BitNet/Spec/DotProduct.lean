@@ -8,9 +8,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Spec
+namespace cktlean.Examples.BitNet.Spec
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 /-- The maximum absolute value of an INT8 dot product element contribution.
     |q_i × k_i| ≤ 128 × 128 = 16384 -/
@@ -47,4 +47,4 @@ theorem dot_empty :
     int8DotProduct #[] #[] = 0 := by
   native_decide
 
-end Sparkle.Examples.BitNet.Spec
+end cktlean.Examples.BitNet.Spec

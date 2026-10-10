@@ -14,17 +14,17 @@
   Reference: ITU-T H.264 Section 7.3.1, B.1
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 3200000
 
-namespace Sparkle.IP.Video.H264.NALSynth
+namespace cktlean.IP.Video.H264.NALSynth
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- State definition (8 registers)
@@ -186,4 +186,4 @@ def nalStreamModule {dom : DomainConfig}
 
 #writeDesign nalStreamModule ".lake/build/gen/h264/nal_stream.sv" ".lake/build/gen/h264/nal_stream_cppsim.h"
 
-end Sparkle.IP.Video.H264.NALSynth
+end cktlean.IP.Video.H264.NALSynth

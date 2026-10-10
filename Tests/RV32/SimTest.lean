@@ -10,12 +10,12 @@
 -/
 
 import Examples.RV32.SoC
-import Sparkle.Utils.HexLoader
+import cktlean.Utils.HexLoader
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32.SoC
-open Sparkle.Utils.HexLoader
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32.SoC
+open cktlean.Utils.HexLoader
 
 def defaultDom : DomainConfig := domain50MHz
 

@@ -23,13 +23,13 @@ import IP.Video.H264.NAL
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.IP.Video.H264.Encoder
+namespace cktlean.IP.Video.H264.Encoder
 
-open Sparkle.IP.Video.H264.IntraPred
-open Sparkle.IP.Video.H264.DCT
-open Sparkle.IP.Video.H264.Quant
-open Sparkle.IP.Video.H264.CAVLC
-open Sparkle.IP.Video.H264.NAL
+open cktlean.IP.Video.H264.IntraPred
+open cktlean.IP.Video.H264.DCT
+open cktlean.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.CAVLC
+open cktlean.IP.Video.H264.NAL
 
 -- ============================================================================
 -- Encoder configuration
@@ -230,4 +230,4 @@ def nCToTableSelect (nC : Nat) : Nat :=
   IO.println s!"Reconstructed: {result.reconstructed}"
   IO.println s!"NAL unit length: {result.nalUnit.length} bytes"
 
-end Sparkle.IP.Video.H264.Encoder
+end cktlean.IP.Video.H264.Encoder

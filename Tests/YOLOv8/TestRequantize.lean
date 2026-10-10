@@ -7,11 +7,11 @@ import LSpec
 import Examples.YOLOv8.Primitives.Requantize
 import Examples.YOLOv8.Types
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Primitives.Requantize
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Primitives.Requantize
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestRequantize
+namespace cktlean.Examples.YOLOv8.Tests.TestRequantize
 
 /-- Test basic requantization: positive accumulator. -/
 def testPositiveRequant : LSpec.TestSeq :=
@@ -56,4 +56,4 @@ def allTests : LSpec.TestSeq :=
     testZeroRequant
   )
 
-end Sparkle.Examples.YOLOv8.Tests.TestRequantize
+end cktlean.Examples.YOLOv8.Tests.TestRequantize

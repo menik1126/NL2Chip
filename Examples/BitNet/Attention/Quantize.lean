@@ -5,16 +5,16 @@
   Arithmetic shift right by `quantShift`, then clamp to [-128, 127].
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.Attention
+namespace cktlean.Examples.BitNet.Attention
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -47,4 +47,4 @@ def quantizeInt8Signal (quantShift : Nat) (x : Signal dom (BitVec 32))
   Signal.mux noOverflow lower8
     (Signal.mux isNegSign (Signal.pure 0x80#8) (Signal.pure 0x7F#8))
 
-end Sparkle.Examples.BitNet.Attention
+end cktlean.Examples.BitNet.Attention

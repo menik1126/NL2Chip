@@ -4,11 +4,11 @@
   Shows how proven temporal properties enable simulation optimization.
 -/
 
-import Sparkle.Core.OptimizedSim
+import cktlean.Core.OptimizedSim
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.OptimizedSim
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.OptimizedSim
 
 /-!
 ## Example: Reset Sequence Optimization

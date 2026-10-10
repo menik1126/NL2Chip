@@ -5,9 +5,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Proof
+namespace cktlean.Examples.BitNet.Proof
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 theorem elem_mul_1_times_1 :
     elemMul (BitVec.ofNat 32 0x10000) (BitVec.ofNat 32 0x10000)
@@ -39,4 +39,4 @@ theorem elem_mul_neg_neg :
     = BitVec.ofNat 32 0x60000 := by
   native_decide
 
-end Sparkle.Examples.BitNet.Proof
+end cktlean.Examples.BitNet.Proof

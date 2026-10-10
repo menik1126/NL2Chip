@@ -11,21 +11,21 @@
 
 import Examples.BitNet.Config
 import Examples.BitNet.Types
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Core
 import Examples.BitNet.BitLinear.Dynamic
 import Examples.BitNet.SoC.Top
 
-namespace Sparkle.Examples.BitNet.Tests.SoC
+namespace cktlean.Examples.BitNet.Tests.SoC
 
-open Sparkle.Examples.BitNet
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
-open Sparkle.Examples.BitNet.BitLinear
-open Sparkle.Examples.BitNet.SoC
+open cktlean.Examples.BitNet
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
+open cktlean.Examples.BitNet.BitLinear
+open cktlean.Examples.BitNet.SoC
 
 /-- Simple test harness -/
 def check (name : String) (cond : Bool) : IO Unit := do
@@ -188,4 +188,4 @@ def runAll : IO Unit := do
   IO.println ""
   IO.println "=== All SoC tests complete ==="
 
-end Sparkle.Examples.BitNet.Tests.SoC
+end cktlean.Examples.BitNet.Tests.SoC

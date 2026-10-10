@@ -4,13 +4,13 @@
   Shows how to manually build memory primitives using the IR builder.
 -/
 
-import Sparkle.IR.Builder
-import Sparkle.Backend.Verilog
+import cktlean.IR.Builder
+import cktlean.Backend.Verilog
 
-open Sparkle.IR.AST
-open Sparkle.IR.Builder
-open Sparkle.IR.Type
-open Sparkle.Backend.Verilog
+open cktlean.IR.AST
+open cktlean.IR.Builder
+open cktlean.IR.Type
+open cktlean.Backend.Verilog
 
 /-!
 ## Example: 256-byte RAM

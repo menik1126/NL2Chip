@@ -4,10 +4,10 @@
   Tests Phase 1 functionality: Signal simulation, registers, combinational logic
 -/
 
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- Test 1: Pure combinational logic -/
 def testCombinational : IO Unit := do

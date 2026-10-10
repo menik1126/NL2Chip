@@ -5,7 +5,7 @@
   Reference: refs/hesper/Hesper/Layers/BitLinear.lean (i2_s group-128 format)
 -/
 
-namespace Sparkle.Examples.BitNet
+namespace cktlean.Examples.BitNet
 
 /-- BitNet b1.58 1B model parameters -/
 def hiddenDim : Nat := 2048
@@ -65,12 +65,12 @@ structure BitLinearConfig where
 
 namespace BitLinearConfig
 
-def groupsPerRow (c : BitLinearConfig) : Nat := Sparkle.Examples.BitNet.groupsPerRow c.inDim
-def romDepth (c : BitLinearConfig) : Nat := Sparkle.Examples.BitNet.romDepth c.outDim c.inDim
-def romAddrBits (c : BitLinearConfig) : Nat := Sparkle.Examples.BitNet.romAddrBits c.outDim c.inDim
-def scaleAddrBits (c : BitLinearConfig) : Nat := Sparkle.Examples.BitNet.scaleAddrBits c.outDim
-def actAddrBits (c : BitLinearConfig) : Nat := Sparkle.Examples.BitNet.actAddrBits c.inDim
-def groupCntBits (c : BitLinearConfig) : Nat := Sparkle.Examples.BitNet.groupCntBits c.inDim
+def groupsPerRow (c : BitLinearConfig) : Nat := cktlean.Examples.BitNet.groupsPerRow c.inDim
+def romDepth (c : BitLinearConfig) : Nat := cktlean.Examples.BitNet.romDepth c.outDim c.inDim
+def romAddrBits (c : BitLinearConfig) : Nat := cktlean.Examples.BitNet.romAddrBits c.outDim c.inDim
+def scaleAddrBits (c : BitLinearConfig) : Nat := cktlean.Examples.BitNet.scaleAddrBits c.outDim
+def actAddrBits (c : BitLinearConfig) : Nat := cktlean.Examples.BitNet.actAddrBits c.inDim
+def groupCntBits (c : BitLinearConfig) : Nat := cktlean.Examples.BitNet.groupCntBits c.inDim
 
 end BitLinearConfig
 
@@ -118,4 +118,4 @@ def attnOut : BitLinearConfig := { inDim := hiddenDim, outDim := hiddenDim }
 def ffnGateUp : BitLinearConfig := { inDim := hiddenDim, outDim := ffnDim }
 def ffnDown : BitLinearConfig := { inDim := ffnDim, outDim := hiddenDim }
 
-end Sparkle.Examples.BitNet
+end cktlean.Examples.BitNet

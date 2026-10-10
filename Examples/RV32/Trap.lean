@@ -7,17 +7,17 @@
   is ≤ S, the trap is routed to the S-mode handler instead of M-mode.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.RV32.CSR.Types
 
 set_option maxRecDepth 4096
 
-namespace Sparkle.Examples.RV32.Trap
+namespace cktlean.Examples.RV32.Trap
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32.CSR
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32.CSR
 
 /-- CSR write value computation helper.
     Given current value and write data, compute new value based on funct3.
@@ -133,4 +133,4 @@ def trapDelegSignal {dom : DomainConfig}
 
 #synthesizeVerilog trapDelegSignal
 
-end Sparkle.Examples.RV32.Trap
+end cktlean.Examples.RV32.Trap

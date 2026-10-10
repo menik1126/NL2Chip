@@ -10,7 +10,7 @@
   - Harvard architecture (separate instruction/data memory)
 -/
 
-import Sparkle.Data.BitPack
+import cktlean.Data.BitPack
 
 namespace Sparkle16
 

@@ -17,11 +17,11 @@
   endmodule
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- 2-to-1 multiplexer: sel=true selects b, sel=false selects a. -/
 def prob022_mux2to1 {dom : DomainConfig}

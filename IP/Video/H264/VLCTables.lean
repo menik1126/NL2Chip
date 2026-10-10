@@ -15,9 +15,9 @@ import IP.Video.H264.CAVLC
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.IP.Video.H264.VLCTables
+namespace cktlean.IP.Video.H264.VLCTables
 
-open Sparkle.IP.Video.H264.CAVLC
+open cktlean.IP.Video.H264.CAVLC
 
 -- ============================================================================
 -- Pack VLC entry: (length << 16) | code
@@ -120,4 +120,4 @@ def buildCoeffTokenTableFull : Array UInt32 := Id.run do
   let ctFull := buildCoeffTokenTableFull
   IO.println s!"coeff_token full table: {ctFull.size} entries (expected 272)"
 
-end Sparkle.IP.Video.H264.VLCTables
+end cktlean.IP.Video.H264.VLCTables

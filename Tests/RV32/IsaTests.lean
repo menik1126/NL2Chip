@@ -13,9 +13,9 @@
 
 import Examples.RV32.Types
 
-namespace Sparkle.Examples.RV32.Tests.IsaTests
+namespace cktlean.Examples.RV32.Tests.IsaTests
 
-open Sparkle.Examples.RV32
+open cktlean.Examples.RV32
 
 /-- Simple test harness -/
 def check (name : String) (cond : Bool) : IO Unit := do
@@ -482,13 +482,13 @@ theorem alu_sll_zero (a : BitVec 32) : aluCompute .SLL a 0#32 = a := by
 
 end FormalProofs
 
-end Sparkle.Examples.RV32.Tests.IsaTests
+end cktlean.Examples.RV32.Tests.IsaTests
 
 -- ============================================================================
 -- Main entry point
 -- ============================================================================
 
-open Sparkle.Examples.RV32.Tests.IsaTests in
+open cktlean.Examples.RV32.Tests.IsaTests in
 def main : IO Unit := do
   IO.println "=== RV32I ISA Verification Tests ==="
   testOpcodeEncoding

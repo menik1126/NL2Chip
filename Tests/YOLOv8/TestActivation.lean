@@ -5,11 +5,11 @@
 import LSpec
 import Examples.YOLOv8.Primitives.Activation
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Primitives.Activation
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Primitives.Activation
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestActivation
+namespace cktlean.Examples.YOLOv8.Tests.TestActivation
 
 /-- Test ReLU: positive values pass through. -/
 def testReluPositive : LSpec.TestSeq :=
@@ -52,4 +52,4 @@ def allTests : LSpec.TestSeq :=
     )
   )
 
-end Sparkle.Examples.YOLOv8.Tests.TestActivation
+end cktlean.Examples.YOLOv8.Tests.TestActivation

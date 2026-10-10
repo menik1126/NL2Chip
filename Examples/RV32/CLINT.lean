@@ -10,17 +10,17 @@
     0xBFF8-BFFC  MTIME       - Timer counter (64-bit)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.RV32.CSR.Types
 
 set_option maxRecDepth 4096
 
-namespace Sparkle.Examples.RV32.CLINT
+namespace cktlean.Examples.RV32.CLINT
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32.CSR
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32.CSR
 
 /-- CLINT — Signal DSL.
 
@@ -110,4 +110,4 @@ def clintSignal {dom : DomainConfig}
 
 #synthesizeVerilog clintSignal
 
-end Sparkle.Examples.RV32.CLINT
+end cktlean.Examples.RV32.CLINT

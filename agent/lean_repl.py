@@ -2,7 +2,7 @@
 Lean 4 REPL client — persistent process with JSON protocol.
 
 Wraps `lake exe repl` (leanprover-community/repl) to provide fast incremental
-Lean compilation. The prelude (import Sparkle + opens) is loaded once and cached
+Lean compilation. The prelude (import cktlean + opens) is loaded once and cached
 as `env=0`; subsequent code is verified incrementally against that env.
 
 Thread-safety: each LeanREPL instance manages its own subprocess. For concurrent
@@ -24,11 +24,11 @@ from dataclasses import dataclass, field
 LAKE_PATH = os.environ.get("LAKE_PATH", os.path.expanduser("~/.elan/bin/lake"))
 
 SPARKLE_PRELUDE = """\
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 """
 
 # Default timeout for a single REPL command (seconds)
@@ -305,7 +305,7 @@ class LeanREPL:
         """Verify Lean code incrementally against the cached prelude env.
 
         This is the main entry point for the agent. The code should NOT include
-        `import Sparkle` or `open` statements — those are in the prelude.
+        `import cktlean` or `open` statements — those are in the prelude.
 
         Args:
             code: Lean 4 code to verify (definitions, #synthesizeVerilog, etc.)
@@ -355,8 +355,8 @@ class LeanREPL:
         stripped_lines = []
         for line in content.splitlines():
             stripped = line.strip()
-            if stripped in ("import Sparkle", "import Sparkle.Compiler.Elab",
-                            "open Sparkle.Core.Domain", "open Sparkle.Core.Signal",
+            if stripped in ("import cktlean", "import cktlean.Compiler.Elab",
+                            "open cktlean.Core.Domain", "open cktlean.Core.Signal",
                             ""):
                 continue
             stripped_lines.append(line)

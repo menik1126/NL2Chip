@@ -12,9 +12,9 @@
 
 import IP.Video.H264.IntraPred
 
-namespace Sparkle.IP.Video.H264.IntraPredProps
+namespace cktlean.IP.Video.H264.IntraPredProps
 
-open Sparkle.IP.Video.H264.IntraPred
+open cktlean.IP.Video.H264.IntraPred
 
 -- ============================================================================
 -- Golden value verification (compile-time)
@@ -61,4 +61,4 @@ theorem residual_roundtrip_concrete :
     reconstruct predicted residual = original := by
   native_decide
 
-end Sparkle.IP.Video.H264.IntraPredProps
+end cktlean.IP.Video.H264.IntraPredProps

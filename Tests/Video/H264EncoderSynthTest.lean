@@ -24,15 +24,15 @@ import LSpec
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.Tests.Video.H264EncoderSynthTest
+namespace cktlean.Tests.Video.H264EncoderSynthTest
 
 open LSpec
-open Sparkle.IP.Video.H264.ForwardDCTSynth
-open Sparkle.IP.Video.H264.QuantSynth
-open Sparkle.IP.Video.H264.EncoderSynth
-open Sparkle.IP.Video.H264.DecoderSynth
-open Sparkle.IP.Video.H264.DCT
-open Sparkle.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.ForwardDCTSynth
+open cktlean.IP.Video.H264.QuantSynth
+open cktlean.IP.Video.H264.EncoderSynth
+open cktlean.IP.Video.H264.DecoderSynth
+open cktlean.IP.Video.H264.DCT
+open cktlean.IP.Video.H264.Quant
 
 -- ============================================================================
 -- Test data
@@ -141,4 +141,4 @@ def allTests : IO TestSeq := do
     group "Encoder-Decoder Roundtrip" testRoundtrip
   )
 
-end Sparkle.Tests.Video.H264EncoderSynthTest
+end cktlean.Tests.Video.H264EncoderSynthTest

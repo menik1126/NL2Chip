@@ -5,9 +5,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Proof
+namespace cktlean.Examples.BitNet.Proof
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 theorem exp_zero_is_one : expQ8_24 0 = (2^softmaxFracBits : Nat) := by
   native_decide
@@ -38,4 +38,4 @@ theorem exp_sum_fits_27 :
     4 * (2^softmaxFracBits : Nat) < 2^27 := by
   native_decide
 
-end Sparkle.Examples.BitNet.Proof
+end cktlean.Examples.BitNet.Proof

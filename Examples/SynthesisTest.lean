@@ -5,10 +5,10 @@
   to hardware IR automatically.
 -/
 
-import Sparkle.Compiler.Elab
-import Sparkle.Backend.Verilog
+import cktlean.Compiler.Elab
+import cktlean.Backend.Verilog
 
-open Sparkle.Compiler.Elab
+open cktlean.Compiler.Elab
 
 /-- Test 1: Simple constant function -/
 def constCircuit : BitVec 8 :=

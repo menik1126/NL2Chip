@@ -8,8 +8,8 @@
   For simulation testing, call Signal functions directly with Signal.pure inputs.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Core
@@ -31,8 +31,8 @@ import Examples.BitNet.Attention.Top
 import Examples.BitNet.SoC.Top
 
 -- Re-export all BitNet modules for convenient access
-open Sparkle.Examples.BitNet
-open Sparkle.Examples.BitNet.Layers
-open Sparkle.Examples.BitNet.BitLinear
-open Sparkle.Examples.BitNet.Attention
-open Sparkle.Examples.BitNet.SoC
+open cktlean.Examples.BitNet
+open cktlean.Examples.BitNet.Layers
+open cktlean.Examples.BitNet.BitLinear
+open cktlean.Examples.BitNet.Attention
+open cktlean.Examples.BitNet.SoC

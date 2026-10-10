@@ -9,9 +9,9 @@
 
 import Examples.YOLOv8.Types
 
-namespace Sparkle.Examples.YOLOv8.Tests.GoldenLoader
+namespace cktlean.Examples.YOLOv8.Tests.GoldenLoader
 
-open Sparkle.Examples.YOLOv8
+open cktlean.Examples.YOLOv8
 
 -- ============================================================================
 -- Binary File Loading
@@ -163,4 +163,4 @@ def printReport (report : TestReport) : IO Unit := do
   IO.println s!"    Cosine similarity: {report.cosSim}"
   IO.println s!"    Status:            {if report.passed then "PASS" else "FAIL"}"
 
-end Sparkle.Examples.YOLOv8.Tests.GoldenLoader
+end cktlean.Examples.YOLOv8.Tests.GoldenLoader

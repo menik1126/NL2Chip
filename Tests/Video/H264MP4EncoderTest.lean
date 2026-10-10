@@ -15,7 +15,7 @@
     lake build h264-mp4-encoder-test && lake exe h264-mp4-encoder-test
 -/
 
-import Sparkle.Core.JIT
+import cktlean.Core.JIT
 import IP.Video.H264.Quant
 import IP.Video.H264.MP4EncoderSynth
 import IP.Video.H264.VLCTables
@@ -23,13 +23,13 @@ import IP.Video.H264.CAVLCSynth
 import IP.Video.H264.SPSPPSData
 import IP.Video.H264.MP4Mux
 
-open Sparkle.Core.JIT
-open Sparkle.IP.Video.H264.Quant
-open Sparkle.IP.Video.H264.MP4Encoder
-open Sparkle.IP.Video.H264.VLCTables
-open Sparkle.IP.Video.H264.CAVLCSynth
-open Sparkle.IP.Video.H264.SPSPPSData
-open Sparkle.IP.Video.H264.MP4Mux
+open cktlean.Core.JIT
+open cktlean.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.MP4Encoder
+open cktlean.IP.Video.H264.VLCTables
+open cktlean.IP.Video.H264.CAVLCSynth
+open cktlean.IP.Video.H264.SPSPPSData
+open cktlean.IP.Video.H264.MP4Mux
 
 -- ============================================================================
 -- Helpers

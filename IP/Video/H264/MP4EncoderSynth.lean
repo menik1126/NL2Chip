@@ -7,18 +7,18 @@
     lake build IP.Video.H264.MP4EncoderSynth
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import IP.Video.H264.MP4Encoder
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 25600000
 
-namespace Sparkle.IP.Video.H264.MP4EncoderSynth
+namespace cktlean.IP.Video.H264.MP4EncoderSynth
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.IP.Video.H264.MP4Encoder
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.IP.Video.H264.MP4Encoder
 
 -- ============================================================================
 -- Generate SystemVerilog + CppSim + JIT
@@ -26,4 +26,4 @@ open Sparkle.IP.Video.H264.MP4Encoder
 
 #writeDesign h264MP4Encoder ".lake/build/gen/h264/mp4_encoder.sv" ".lake/build/gen/h264/mp4_encoder_cppsim.h"
 
-end Sparkle.IP.Video.H264.MP4EncoderSynth
+end cktlean.IP.Video.H264.MP4EncoderSynth

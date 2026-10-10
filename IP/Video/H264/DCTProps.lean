@@ -15,9 +15,9 @@
 
 import IP.Video.H264.DCT
 
-namespace Sparkle.IP.Video.H264.DCTProps
+namespace cktlean.IP.Video.H264.DCTProps
 
-open Sparkle.IP.Video.H264.DCT
+open cktlean.IP.Video.H264.DCT
 
 -- ============================================================================
 -- Zero preservation
@@ -49,4 +49,4 @@ theorem forwardDCT_golden2 :
     = #[2, 9, 0, -3, 12, -9, 18, -37, 2, 3, 4, 39, 6, -2, 14, 14] := by
   native_decide
 
-end Sparkle.IP.Video.H264.DCTProps
+end cktlean.IP.Video.H264.DCTProps

@@ -2,7 +2,7 @@
   Round-Robin Arbiter — Signal DSL Implementation
 
   Synthesizable 2-client round-robin arbiter mirroring the proven spec
-  in Sparkle.Verification.ArbiterProps.
+  in cktlean.Verification.ArbiterProps.
 
   State encoding (BitVec 2):
     0 = Idle, 1 = GrantA, 2 = GrantB
@@ -14,14 +14,14 @@
     - Round-robin alternation on contention (Fairness)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
-import Sparkle.Verification.ArbiterProps
+import cktlean
+import cktlean.Compiler.Elab
+import cktlean.Verification.ArbiterProps
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
-namespace Sparkle.Examples.Arbiter.RoundRobin
+namespace cktlean.Examples.Arbiter.RoundRobin
 
 -- State encoding constants
 private abbrev stIdle   : BitVec 2 := 0#2
@@ -90,7 +90,7 @@ def arbiterGrantB {dom : DomainConfig}
 
 /-! ## Simulation Test -/
 
-open Sparkle.Verification.ArbiterProps in
+open cktlean.Verification.ArbiterProps in
 /-- Run a quick simulation to verify behavior matches spec -/
 def simTest : IO Unit := do
   IO.println "=== Round-Robin Arbiter Simulation ==="
@@ -123,4 +123,4 @@ def simTest : IO Unit := do
 
 #eval simTest
 
-end Sparkle.Examples.Arbiter.RoundRobin
+end cktlean.Examples.Arbiter.RoundRobin

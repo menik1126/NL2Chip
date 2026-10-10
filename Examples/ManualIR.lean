@@ -5,11 +5,11 @@
   using the CircuitM monad.
 -/
 
-import Sparkle.IR.Builder
+import cktlean.IR.Builder
 
-open Sparkle.IR.Type
-open Sparkle.IR.AST
-open Sparkle.IR.Builder
+open cktlean.IR.Type
+open cktlean.IR.AST
+open cktlean.IR.Builder
 open CircuitM
 
 /-- Example 1: Half Adder -/

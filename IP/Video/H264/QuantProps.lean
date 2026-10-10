@@ -11,9 +11,9 @@
 
 import IP.Video.H264.Quant
 
-namespace Sparkle.IP.Video.H264.QuantProps
+namespace cktlean.IP.Video.H264.QuantProps
 
-open Sparkle.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.Quant
 
 -- ============================================================================
 -- Dequantization of zero
@@ -46,4 +46,4 @@ theorem dequant_zero_block :
     = Array.replicate 16 (0 : Int) := by
   native_decide
 
-end Sparkle.IP.Video.H264.QuantProps
+end cktlean.IP.Video.H264.QuantProps

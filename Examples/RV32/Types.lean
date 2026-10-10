@@ -5,7 +5,7 @@
   for the RISC-V RV32I base integer instruction set (unprivileged).
 -/
 
-namespace Sparkle.Examples.RV32
+namespace cktlean.Examples.RV32
 
 -- ============================================================================
 -- Constants
@@ -404,4 +404,4 @@ structure EX_WB_Reg where
   ctrl      : ControlSignals
   deriving Repr, BEq
 
-end Sparkle.Examples.RV32
+end cktlean.Examples.RV32

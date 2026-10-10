@@ -5,16 +5,16 @@
   Uses 33-bit intermediate to detect overflow via top 2 bits.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.Layers
+namespace cktlean.Examples.BitNet.Layers
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -42,4 +42,4 @@ def residualAddSignal (a b : Signal dom (BitVec 32)) : Signal dom (BitVec 32) :=
   Signal.mux negOvf (Signal.pure maxNeg)
     (Signal.mux posOvf (Signal.pure maxPos) low32)
 
-end Sparkle.Examples.BitNet.Layers
+end cktlean.Examples.BitNet.Layers

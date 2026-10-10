@@ -5,9 +5,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Proof
+namespace cktlean.Examples.BitNet.Proof
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 theorem dot_1x1_pos :
     int8DotProduct #[BitVec.ofInt 8 1] #[BitVec.ofInt 8 1] = 1 := by
@@ -87,4 +87,4 @@ theorem quantize_neg_one :
     = BitVec.ofInt 8 (-64) := by
   native_decide
 
-end Sparkle.Examples.BitNet.Proof
+end cktlean.Examples.BitNet.Proof

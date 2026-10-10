@@ -4,13 +4,13 @@
   Tests Phase 2 (IR) and Phase 4 (Verilog) functionality
 -/
 
-import Sparkle.IR.Builder
-import Sparkle.Backend.Verilog
+import cktlean.IR.Builder
+import cktlean.Backend.Verilog
 
-open Sparkle.IR.Type
-open Sparkle.IR.AST
-open Sparkle.IR.Builder
-open Sparkle.Backend.Verilog
+open cktlean.IR.Type
+open cktlean.IR.AST
+open cktlean.IR.Builder
+open cktlean.Backend.Verilog
 open CircuitM
 
 /-- Test 1: Module with only inputs and outputs -/

@@ -7,10 +7,10 @@ import LSpec
 import IP.Video.H264.CAVLC
 import IP.Video.H264.CAVLCDecode
 
-open Sparkle.IP.Video.H264.CAVLC
-open Sparkle.IP.Video.H264.CAVLCDecode
+open cktlean.IP.Video.H264.CAVLC
+open cktlean.IP.Video.H264.CAVLCDecode
 
-namespace Sparkle.Tests.Video.CAVLCDecodeTest
+namespace cktlean.Tests.Video.CAVLCDecodeTest
 
 def testZeroRoundtrip : IO LSpec.TestSeq := do
   -- All-zero block should encode to a short code and decode back to zeros
@@ -87,4 +87,4 @@ def allTests : IO LSpec.TestSeq := do
   let t5 ← testTrailingOnesRoundtrip
   return LSpec.group "CAVLC Decode" (t1 ++ t2 ++ t3 ++ t4 ++ t5)
 
-end Sparkle.Tests.Video.CAVLCDecodeTest
+end cktlean.Tests.Video.CAVLCDecodeTest

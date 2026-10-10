@@ -30,17 +30,17 @@
     42 prevStoreData  : BitVec 32    43 prevStoreEn    : Bool
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.RV32.Core
 
 set_option maxRecDepth 16384
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.RV32
+namespace cktlean.Examples.RV32
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 -- NOP instruction = ADDI x0, x0, 0
 def nopInst : BitVec 32 := 0x00000013#32
@@ -311,4 +311,4 @@ def rv32iCore {dom : DomainConfig}
 -- Test synthesis of the pipeline core
 #synthesizeVerilog rv32iCore
 
-end Sparkle.Examples.RV32
+end cktlean.Examples.RV32

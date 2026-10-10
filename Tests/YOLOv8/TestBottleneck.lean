@@ -6,11 +6,11 @@
 import LSpec
 import Examples.YOLOv8.Blocks.Bottleneck
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Blocks.Bottleneck
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Blocks.Bottleneck
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestBottleneck
+namespace cktlean.Examples.YOLOv8.Tests.TestBottleneck
 
 /-- Test FSM transitions with convDone pulses. -/
 def testFSMTransitions : IO LSpec.TestSeq := do
@@ -41,4 +41,4 @@ def allTests : IO LSpec.TestSeq := do
   let t1 ← testFSMTransitions
   return LSpec.group "Bottleneck Controller" t1
 
-end Sparkle.Examples.YOLOv8.Tests.TestBottleneck
+end cktlean.Examples.YOLOv8.Tests.TestBottleneck

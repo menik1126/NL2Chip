@@ -5,15 +5,15 @@
   and datapath modules. Generated VCD files can be viewed in GTKWave.
 -/
 
-import Sparkle
-import Sparkle.Backend.VCD
+import cktlean
+import cktlean.Backend.VCD
 import LSpec
 import Tests.Sparkle16.TestALU
 import Tests.Sparkle16.TestHierarchical
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Backend.VCD
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Backend.VCD
 open LSpec
 
 namespace Sparkle16.Test

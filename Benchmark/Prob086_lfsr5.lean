@@ -34,11 +34,11 @@
   Signal.map with BitVec extraction and concatenation.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- 5-bit Galois LFSR with taps at positions 5 and 3.
     Shifts right; tapped bits XOR with q[0]. Sync reset to 1. -/

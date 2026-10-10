@@ -13,18 +13,18 @@
   detection head computation across all three scales.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Config
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Head
+namespace cktlean.Examples.YOLOv8.Head
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 private abbrev HeadState := BitVec 4 × BitVec 2 × Bool × BitVec 2 × Bool × Bool
 
@@ -166,4 +166,4 @@ def headControllerSimulate {dom : DomainConfig}
 
 #synthesizeVerilog headController
 
-end Sparkle.Examples.YOLOv8.Head
+end cktlean.Examples.YOLOv8.Head

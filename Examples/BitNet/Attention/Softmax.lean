@@ -10,16 +10,16 @@
     6. Normalize: weight_i = exp_i × recip >> 24
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.Attention
+namespace cktlean.Examples.BitNet.Attention
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -108,4 +108,4 @@ def softmaxSignal (scores : Array (Signal dom (BitVec 32)))
 
     return weights
 
-end Sparkle.Examples.BitNet.Attention
+end cktlean.Examples.BitNet.Attention

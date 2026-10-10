@@ -11,13 +11,13 @@
     lake exe cdc-multi-clock-test
 -/
 
-import Sparkle.Core.JIT
-import Sparkle.Core.SimTyped
+import cktlean.Core.JIT
+import cktlean.Core.SimTyped
 
 -- Import the synthesis module to ensure generated files exist
 import Examples.CDC.MultiClockSim
 
-open Sparkle.Core.JIT
+open cktlean.Core.JIT
 
 -- ============================================================================
 -- Type-safe wrappers for DomainA and DomainB

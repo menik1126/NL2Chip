@@ -11,7 +11,7 @@
 import Lean
 import Tools.SVParser
 import Tools.SVParser.Verify
-import Sparkle.Core.JIT
+import cktlean.Core.JIT
 
 open Lean Elab Command Term Meta
 open Tools.SVParser.Parser
@@ -97,7 +97,7 @@ elab "verilog!" src:str : command => do
 
       -- 5. Type-safe JIT simulation wrappers
 
-      elabStr "open Sparkle.Core.JIT"
+      elabStr "open cktlean.Core.JIT"
 
       -- SimInput (same fields as Input — both from non-clk input ports)
       let simInputFields := String.intercalate "\n" <|

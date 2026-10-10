@@ -6,9 +6,9 @@
 import LSpec
 import IP.Video.H264.IntraPred
 
-open Sparkle.IP.Video.H264.IntraPred
+open cktlean.IP.Video.H264.IntraPred
 
-namespace Sparkle.Tests.Video.IntraPredTest
+namespace cktlean.Tests.Video.IntraPredTest
 
 private def testN : Neighbors :=
   { above := #[10, 20, 30, 40, 50, 60, 70, 80]
@@ -68,4 +68,4 @@ def allTests : IO LSpec.TestSeq := do
   let t3 ← testModeDecision
   return LSpec.group "Intra Prediction" (t1 ++ t2 ++ t3)
 
-end Sparkle.Tests.Video.IntraPredTest
+end cktlean.Tests.Video.IntraPredTest

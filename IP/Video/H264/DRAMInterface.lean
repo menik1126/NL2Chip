@@ -14,18 +14,18 @@
   Address space: 16M words × 32-bit (24-bit address, 64MB total)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Std.Data.HashMap
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.IP.Video.H264.DRAMInterface
+namespace cktlean.IP.Video.H264.DRAMInterface
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- Pure DRAM Model (for simulation and proofs)
@@ -151,4 +151,4 @@ def coeffBufBase : BitVec 24 := 0x800000#24
 /-- Reconstruction buffer base address -/
 def reconBufBase : BitVec 24 := 0xC00000#24
 
-end Sparkle.IP.Video.H264.DRAMInterface
+end cktlean.IP.Video.H264.DRAMInterface

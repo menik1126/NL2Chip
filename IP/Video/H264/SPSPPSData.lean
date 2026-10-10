@@ -12,12 +12,12 @@
   Reference: ITU-T H.264 Section 7.3.2.1 (SPS), 7.3.2.2 (PPS)
 -/
 
-import Sparkle
+import cktlean
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.IP.Video.H264.SPSPPSData
+namespace cktlean.IP.Video.H264.SPSPPSData
 
 -- ============================================================================
 -- SPS (Sequence Parameter Set) NAL unit
@@ -157,4 +157,4 @@ def mbHeaderBitLen : Nat := 22
   IO.println s!"IDR NAL header: {idrSliceNALHeader.size} bytes"
   IO.println s!"MB header: {mbHeaderBits.size} bytes ({mbHeaderBitLen} bits)"
 
-end Sparkle.IP.Video.H264.SPSPPSData
+end cktlean.IP.Video.H264.SPSPPSData

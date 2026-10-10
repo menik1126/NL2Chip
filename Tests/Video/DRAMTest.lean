@@ -6,9 +6,9 @@
 import LSpec
 import IP.Video.H264.DRAMInterface
 
-open Sparkle.IP.Video.H264.DRAMInterface
+open cktlean.IP.Video.H264.DRAMInterface
 
-namespace Sparkle.Tests.Video.DRAMTest
+namespace cktlean.Tests.Video.DRAMTest
 
 def testPureModel : IO LSpec.TestSeq := do
   -- Read-after-write
@@ -57,4 +57,4 @@ def allTests : IO LSpec.TestSeq := do
   let t2 ← testSimModel
   return LSpec.group "DRAM Interface" (t1 ++ t2)
 
-end Sparkle.Tests.Video.DRAMTest
+end cktlean.Tests.Video.DRAMTest

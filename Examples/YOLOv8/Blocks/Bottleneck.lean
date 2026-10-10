@@ -11,18 +11,18 @@
   This module coordinates two sequential ConvBnSiLU blocks via an FSM.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 import Examples.YOLOv8.Blocks.ConvBnSiLU
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Blocks.Bottleneck
+namespace cktlean.Examples.YOLOv8.Blocks.Bottleneck
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 declare_signal_state BottleneckState
   | fsmReg      : BitVec 2   := 0#2
@@ -128,4 +128,4 @@ def bottleneckControllerSimulate {dom : DomainConfig}
 
 #synthesizeVerilog bottleneckController
 
-end Sparkle.Examples.YOLOv8.Blocks.Bottleneck
+end cktlean.Examples.YOLOv8.Blocks.Bottleneck

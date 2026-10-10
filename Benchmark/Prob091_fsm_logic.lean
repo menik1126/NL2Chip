@@ -5,11 +5,11 @@
   FSM state output logic for one-hot encoded FSM.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- FSM state output logic: computes Y1 and Y3 based on current state and input -/
 def prob091_fsm_logic {dom : DomainConfig}

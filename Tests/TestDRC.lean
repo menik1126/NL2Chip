@@ -1,7 +1,7 @@
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-!
 # DRC Tests — Registered Output Check

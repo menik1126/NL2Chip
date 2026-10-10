@@ -12,12 +12,12 @@ import LSpec
 import Tests.YOLOv8.GoldenLoader
 import Examples.YOLOv8.Primitives.Dequant
 
-open Sparkle.Examples.YOLOv8.Tests.GoldenLoader
-open Sparkle.Examples.YOLOv8.Primitives.Dequant
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Examples.YOLOv8.Tests.GoldenLoader
+open cktlean.Examples.YOLOv8.Primitives.Dequant
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestGoldenValues
+namespace cktlean.Examples.YOLOv8.Tests.TestGoldenValues
 
 def goldenDir : String := "Tests/yolo-golden"
 
@@ -137,4 +137,4 @@ def allTests : IO LSpec.TestSeq := do
     LSpec.group "Metrics" (t6 ++ t7)
   )
 
-end Sparkle.Examples.YOLOv8.Tests.TestGoldenValues
+end cktlean.Examples.YOLOv8.Tests.TestGoldenValues

@@ -5,17 +5,17 @@
   to produce 2x resolution output. Uses FSM with counters.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Primitives.Upsample
+namespace cktlean.Examples.YOLOv8.Primitives.Upsample
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 variable {dom : DomainConfig}
 
@@ -92,4 +92,4 @@ def upsample2xSimulate {dom : DomainConfig}
 
 #synthesizeVerilog upsample2x
 
-end Sparkle.Examples.YOLOv8.Primitives.Upsample
+end cktlean.Examples.YOLOv8.Primitives.Upsample

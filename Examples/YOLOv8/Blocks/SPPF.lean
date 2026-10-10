@@ -11,17 +11,17 @@
   This module implements the controller FSM.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Blocks.SPPF
+namespace cktlean.Examples.YOLOv8.Blocks.SPPF
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 private abbrev SPPFState := BitVec 3 × BitVec 2 × Bool × Bool
 
@@ -129,4 +129,4 @@ def sppfControllerSimulate {dom : DomainConfig}
 
 #synthesizeVerilog sppfController
 
-end Sparkle.Examples.YOLOv8.Blocks.SPPF
+end cktlean.Examples.YOLOv8.Blocks.SPPF

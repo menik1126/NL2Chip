@@ -16,17 +16,17 @@
   Reference: ITU-T H.264 Section 9.2.1
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 6400000
 
-namespace Sparkle.IP.Video.H264.CAVLCSynth
+namespace cktlean.IP.Video.H264.CAVLCSynth
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- State definition (~30 registers)
@@ -766,4 +766,4 @@ def cavlcSynthModule {dom : DomainConfig}
 
 #writeDesign cavlcSynthModule ".lake/build/gen/h264/cavlc_synth.sv" ".lake/build/gen/h264/cavlc_synth_cppsim.h"
 
-end Sparkle.IP.Video.H264.CAVLCSynth
+end cktlean.IP.Video.H264.CAVLCSynth

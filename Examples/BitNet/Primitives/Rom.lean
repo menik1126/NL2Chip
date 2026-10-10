@@ -1,11 +1,11 @@
-import Sparkle.IR.Builder
+import cktlean.IR.Builder
 import Examples.BitNet.Config
 
-namespace Sparkle.Examples.BitNet.Primitives
+namespace cktlean.Examples.BitNet.Primitives
 
-open Sparkle.IR.Builder
-open Sparkle.IR.AST
-open Sparkle.IR.Type
+open cktlean.IR.Builder
+open cktlean.IR.AST
+open cktlean.IR.Type
 
 def mkWeightROM (cfg : BitLinearConfig) : Module :=
   let name := s!"WeightROM_{cfg.outDim}x{cfg.inDim}"
@@ -15,4 +15,4 @@ def mkScaleROM (cfg : BitLinearConfig) : Module :=
   let name := s!"ScaleROM_{cfg.outDim}"
   mkROMPrimitive name cfg.scaleAddrBits scaleTotalBits
 
-end Sparkle.Examples.BitNet.Primitives
+end cktlean.Examples.BitNet.Primitives

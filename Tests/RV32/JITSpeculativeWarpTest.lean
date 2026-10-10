@@ -10,13 +10,13 @@
     lake exe rv32-jit-speculative-warp-test [jit.cpp] [max_cycles]
 -/
 
-import Sparkle.Core.JIT
-import Sparkle.Core.JITLoop
+import cktlean.Core.JIT
+import cktlean.Core.JITLoop
 import Examples.RV32.SoC
 
-open Sparkle.Core.JIT
-open Sparkle.Core.JITLoop
-open Sparkle.Examples.RV32.SoC
+open cktlean.Core.JIT
+open cktlean.Core.JITLoop
+open cktlean.Examples.RV32.SoC
 
 def toHex32 (v : Nat) : String :=
   let hexStr := String.ofList (Nat.toDigits 16 v)

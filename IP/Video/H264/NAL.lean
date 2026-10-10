@@ -9,12 +9,12 @@
   Reference: ITU-T H.264 Section 7.3.1, 7.4.1
 -/
 
-import Sparkle
+import cktlean
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.IP.Video.H264.NAL
+namespace cktlean.IP.Video.H264.NAL
 
 -- ============================================================================
 -- NAL unit types (H.264 Table 7-1)
@@ -121,4 +121,4 @@ def nalParsePayload (nalUnit : List (BitVec 8)) : List (BitVec 8) :=
   IO.println s!"Packed: {packed.map (fun (b : BitVec 8) => b.toNat)}"
   IO.println s!"Roundtrip: {payload == parsed}"
 
-end Sparkle.IP.Video.H264.NAL
+end cktlean.IP.Video.H264.NAL

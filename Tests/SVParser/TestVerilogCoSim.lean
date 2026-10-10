@@ -6,17 +6,17 @@
 -/
 
 import Tools.SVParser
-import Sparkle.Backend.CppSim
-import Sparkle.Core.JIT
+import cktlean.Backend.CppSim
+import cktlean.Core.JIT
 import LSpec
 
 open Tools.SVParser.Parser
 open Tools.SVParser.Lower
-open Sparkle.Backend.CppSim
-open Sparkle.Core.JIT
+open cktlean.Backend.CppSim
+open cktlean.Core.JIT
 open LSpec
 
-namespace Sparkle.Tests.SVParser.TestVerilogCoSim
+namespace cktlean.Tests.SVParser.TestVerilogCoSim
 
 /-- Simple 8-bit counter module in Verilog -/
 private def counterVerilog : String := "
@@ -150,4 +150,4 @@ def verilogCoSimTests : IO TestSeq := do
   let t3 ← test_memory_multi_addr
   return t1 ++ t2 ++ t3
 
-end Sparkle.Tests.SVParser.TestVerilogCoSim
+end cktlean.Tests.SVParser.TestVerilogCoSim

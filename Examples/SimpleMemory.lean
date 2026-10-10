@@ -5,10 +5,10 @@
   This example shows a 256-byte memory with write and read operations.
 -/
 
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-!
 ## Example 1: Simple 256-byte Memory

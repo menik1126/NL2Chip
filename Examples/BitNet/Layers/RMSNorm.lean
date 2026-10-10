@@ -8,16 +8,16 @@
   using Signal.loop for hardware synthesis.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.Layers
+namespace cktlean.Examples.BitNet.Layers
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -92,4 +92,4 @@ def rmsNormSignal (xs : Array (Signal dom (BitVec 32)))
         outputs := outputs.push result
     return outputs
 
-end Sparkle.Examples.BitNet.Layers
+end cktlean.Examples.BitNet.Layers

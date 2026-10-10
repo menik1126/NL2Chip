@@ -10,10 +10,10 @@ import LSpec
 import Examples.YOLOv8.Types
 import Tests.YOLOv8.GoldenLoader
 
-open Sparkle.Examples.YOLOv8
-open Sparkle.Examples.YOLOv8.Tests.GoldenLoader
+open cktlean.Examples.YOLOv8
+open cktlean.Examples.YOLOv8.Tests.GoldenLoader
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestEndToEnd
+namespace cktlean.Examples.YOLOv8.Tests.TestEndToEnd
 
 def goldenDir : String := "Tests/yolo-golden"
 
@@ -86,4 +86,4 @@ def allTests : IO LSpec.TestSeq := do
     LSpec.group "Arithmetic" (t2 ++ t3 ++ t4)
   )
 
-end Sparkle.Examples.YOLOv8.Tests.TestEndToEnd
+end cktlean.Examples.YOLOv8.Tests.TestEndToEnd

@@ -43,13 +43,13 @@ Produce one Lean file that compiles, synthesizes SystemVerilog with the synthesi
 
 ## File Template
 ```lean
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.Circuit
-open Sparkle.Library.RTL
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Circuit
+open cktlean.Library.RTL
 
 /-- <one-line description> -/
 def <target_module> {dom : DomainConfig}
@@ -81,7 +81,7 @@ def <target_module> {dom : DomainConfig}
 - Constants: use `N#W` directly with Signal operators or `Signal.pure (N#W)`.
 
 ## RTL Helpers
-Use helpers from `Sparkle.Library.RTL` when they match the task:
+Use helpers from `cktlean.Library.RTL` when they match the task:
 - `slice x lo` with a type annotation for the result width.
 - `trunc x`, `zext x`.
 - `bit x i`, `bitBool x i`.
@@ -571,9 +571,9 @@ def build_system_prompt(
         + "- `dff init next` takes a plain initial payload, never a `Signal`: use `dff 0#W next` or `dff (0#A, 0#B) next`, not `dff (Signal.pure ...) next`.\n"
         + "- Lean product types associate to the right. For a result declared `Signal dom (A x B x C)`, build `bundle2 a (bundle2 b c)` (or `bundleAll! [a, b, c]`); `bundle2 (bundle2 a b) c` has the wrong type.\n"
         + "- For packed `BitVec` outputs, prefer explicit `++` concatenation of sized Signal operands. Do not use `bundleAll!` to build a packed bit-vector result.\n"
-        + "- For native parameterized pointer or address widths, use clog2 DEPTH from Sparkle.Library.RTL in BitVec types; it has ceiling-log2 semantics and emits SystemVerilog $clog2(DEPTH). Do not use Lean Nat.log2 for a SystemVerilog address width.\n"
+        + "- For native parameterized pointer or address widths, use clog2 DEPTH from cktlean.Library.RTL in BitVec types; it has ceiling-log2 semantics and emits SystemVerilog $clog2(DEPTH). Do not use Lean Nat.log2 for a SystemVerilog address width.\n"
 
-        + "- For RTL bit manipulation, use `Sparkle.Library.RTL` helpers such as `bit`, `slice`, `zext`, and `trunc` when a local checked example confirms the expected type.\n"
+        + "- For RTL bit manipulation, use `cktlean.Library.RTL` helpers such as `bit`, `slice`, `zext`, and `trunc` when a local checked example confirms the expected type.\n"
         + "- Do not leave placeholders such as `sorry`, `admit`, or dummy zero outputs in the synthesized implementation.\n"
         + "- Do not modify benchmark sources, Sparkle library code, or other Generated files.\n"
         + "- Stop once the generated Lean file compiles; the CKTLean evaluator will run Verilog extraction, lint, and simulation.\n"

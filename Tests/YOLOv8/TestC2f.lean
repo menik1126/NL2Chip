@@ -6,11 +6,11 @@
 import LSpec
 import Examples.YOLOv8.Blocks.C2f
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Blocks.C2f
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Blocks.C2f
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestC2f
+namespace cktlean.Examples.YOLOv8.Tests.TestC2f
 
 /-- Test FSM with 2 bottlenecks. -/
 def testFSMWithTwoBottlenecks : IO LSpec.TestSeq := do
@@ -39,4 +39,4 @@ def allTests : IO LSpec.TestSeq := do
   let t1 ← testFSMWithTwoBottlenecks
   return LSpec.group "C2f Controller" t1
 
-end Sparkle.Examples.YOLOv8.Tests.TestC2f
+end cktlean.Examples.YOLOv8.Tests.TestC2f

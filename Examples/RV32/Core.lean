@@ -11,17 +11,17 @@
   the full pipeline in Step 3.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.RV32.Types
 
 set_option maxRecDepth 4096
 
-namespace Sparkle.Examples.RV32
+namespace cktlean.Examples.RV32
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32
 
 -- ============================================================================
 -- ALU (Combinational)
@@ -548,4 +548,4 @@ def amoComputeSignal {dom : DomainConfig}
   let result := Signal.mux isSwap rs2Val result
   result
 
-end Sparkle.Examples.RV32
+end cktlean.Examples.RV32

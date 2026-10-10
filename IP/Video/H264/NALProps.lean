@@ -11,9 +11,9 @@
 
 import IP.Video.H264.NAL
 
-namespace Sparkle.IP.Video.H264.NALProps
+namespace cktlean.IP.Video.H264.NALProps
 
-open Sparkle.IP.Video.H264.NAL
+open cktlean.IP.Video.H264.NAL
 
 -- ============================================================================
 -- Roundtrip proofs (verified on concrete inputs via native_decide)
@@ -49,4 +49,4 @@ theorem nal_type_preserved :
     nalType = NAL_SPS := by
   native_decide
 
-end Sparkle.IP.Video.H264.NALProps
+end cktlean.IP.Video.H264.NALProps

@@ -15,17 +15,17 @@
     lake exe rv32-jit-loop-test [jit.cpp] [firmware.hex] [max_cycles]
 -/
 
-import Sparkle.Core.JIT
-import Sparkle.Core.JITLoop
-import Sparkle.Utils.HexLoader
+import cktlean.Core.JIT
+import cktlean.Core.JITLoop
+import cktlean.Utils.HexLoader
 import Examples.RV32.SoC
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.JIT
-open Sparkle.Core.JITLoop
-open Sparkle.Utils.HexLoader
-open Sparkle.Examples.RV32.SoC
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.JIT
+open cktlean.Core.JITLoop
+open cktlean.Utils.HexLoader
+open cktlean.Examples.RV32.SoC
 
 def toHex32 (v : Nat) : String :=
   let hexStr := String.ofList (Nat.toDigits 16 v)

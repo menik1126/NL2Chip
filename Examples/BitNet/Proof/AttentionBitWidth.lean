@@ -4,9 +4,9 @@
 
 import Examples.BitNet.Config
 
-namespace Sparkle.Examples.BitNet.Proof
+namespace cktlean.Examples.BitNet.Proof
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 theorem int8_product_fits_16 : 128 * 128 < (2^15 : Nat) := by
   native_decide
@@ -29,4 +29,4 @@ theorem dot64_width : productBits + ceilLog2 headDim = 22 := by
 theorem quant_shift10_range : (2 * (2^16 : Nat)) / 2^10 = 128 := by
   native_decide
 
-end Sparkle.Examples.BitNet.Proof
+end cktlean.Examples.BitNet.Proof

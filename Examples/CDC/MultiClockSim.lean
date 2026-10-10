@@ -15,19 +15,19 @@
   4. Reports messages sent/received and rollback count
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
-import Sparkle.Core.JIT
+import cktlean
+import cktlean.Compiler.Elab
+import cktlean.Core.JIT
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 800000
 
 namespace Examples.CDC.MultiClockSim
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
-open Sparkle.Core.JIT
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
+open cktlean.Core.JIT
 
 -- ============================================================================
 -- DomainA: 8-bit counter (Fast Producer)

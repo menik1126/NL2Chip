@@ -2,7 +2,7 @@
   Verilog → Lean Verification File Generator
 
   Parses Verilog source, extracts a semantic model, and writes
-  a Lean file to `Sparkle/Verification/Generated/` that can be
+  a Lean file to `cktlean/Verification/Generated/` that can be
   imported by proof files.
 -/
 
@@ -40,8 +40,8 @@ def main : IO UInt32 := do
     return 1
   | some m =>
     let leanSrc := moduleToLean m
-    let outPath := "Sparkle/Verification/Generated/Counter8.lean"
-    IO.FS.createDirAll "Sparkle/Verification/Generated"
+    let outPath := "cktlean/Verification/Generated/Counter8.lean"
+    IO.FS.createDirAll "cktlean/Verification/Generated"
     IO.FS.writeFile outPath leanSrc
     IO.println s!"Generated: {outPath}"
     return 0

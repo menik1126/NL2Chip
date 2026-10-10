@@ -8,15 +8,15 @@
   Uses Sparkle16 ALU and datapath as test subjects.
 -/
 
-import Sparkle
-import Sparkle.Verification.CoSim
+import cktlean
+import cktlean.Verification.CoSim
 import LSpec
 import Tests.Sparkle16.TestALU
 import Tests.Sparkle16.TestHierarchical
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Verification.CoSim
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Verification.CoSim
 open LSpec
 
 namespace Sparkle16.Test
@@ -42,8 +42,8 @@ def test_generate_alu_verilog : IO TestSeq := do
 
   -- Set up Lean environment
   let mods : Array Lean.Import := #[
-    { module := `Sparkle },
-    { module := `Sparkle.Compiler.Elab },
+    { module := `cktlean },
+    { module := `cktlean.Compiler.Elab },
     { module := `Tests.Sparkle16.TestALU }
   ]
   let env ← Lean.importModules mods {} (trustLevel := 1024)
@@ -52,10 +52,10 @@ def test_generate_alu_verilog : IO TestSeq := do
 
   -- Synthesize and generate Verilog
   let (design, _, _) ← Lean.Meta.MetaM.toIO
-    (Sparkle.Compiler.Elab.synthesizeHierarchical ``Sparkle16.Test.alu)
+    (cktlean.Compiler.Elab.synthesizeHierarchical ``Sparkle16.Test.alu)
     coreCtx coreState
 
-  let verilog := Sparkle.Backend.Verilog.toVerilogDesign design
+  let verilog := cktlean.Backend.Verilog.toVerilogDesign design
   IO.FS.writeFile verilogPath verilog
 
   -- Read file to verify generation

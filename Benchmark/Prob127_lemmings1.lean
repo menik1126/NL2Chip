@@ -49,11 +49,11 @@
   areset modeled as synchronous reset via mux.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 -- State encoding
 private abbrev stWL : BitVec 1 := 0#1  -- Walking Left

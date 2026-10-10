@@ -300,13 +300,13 @@ theorem reset_stable : always (next 10) (counter == 0) := by
 ## Implementation Architecture
 
 ```
-Sparkle/Verification/Temporal.lean
+cktlean/Verification/Temporal.lean
 ├── Core LTL Operators (always, eventually, next, until)
 ├── Derived Operators (implies, release, stableFor)
 ├── Proof Helpers (temporal induction tactics)
 └── Oracle Interface (for future simulator integration)
 
-Future: Sparkle/Core/OptimizedSim.lean
+Future: cktlean/Core/OptimizedSim.lean
 ├── Temporal Oracle Registry
 ├── Cycle Skipping Engine
 └── Proof Validation

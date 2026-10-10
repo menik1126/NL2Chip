@@ -5,5 +5,5 @@ import LSpec
 open LSpec
 
 def main : IO UInt32 := do
-  let tests ← Sparkle.Tests.RV32.TestFlow.flowTests
+  let tests ← cktlean.Tests.RV32.TestFlow.flowTests
   lspecIO (Std.HashMap.ofList [("rv32-flow", [tests])]) []

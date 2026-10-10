@@ -9,11 +9,11 @@
     Verilog → [SVParser] → IR Module → [extractModel] → SemanticModel → [generateLean] → .lean source
 -/
 
-import Sparkle.IR.AST
-import Sparkle.IR.Type
+import cktlean.IR.AST
+import cktlean.IR.Type
 
-open Sparkle.IR.AST
-open Sparkle.IR.Type
+open cktlean.IR.AST
+open cktlean.IR.Type
 
 namespace Tools.SVParser.Verify
 

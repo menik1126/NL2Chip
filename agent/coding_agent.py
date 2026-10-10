@@ -120,7 +120,7 @@ CODING_TOOLS = [
         "description": (
             "Instantly verify Lean 4 code using the persistent REPL. "
             "Much faster than `lake build` (~0.1s vs ~10s). "
-            "The Sparkle prelude (import Sparkle, open Signal/Domain) is already loaded. "
+            "The Sparkle prelude (import cktlean, open Signal/Domain) is already loaded. "
             "Send ONLY the def/theorem/#synthesizeVerilog code — do NOT include import/open lines. "
             "Returns compilation result: errors, warnings, and generated Verilog (if any). "
             "Use this INSTEAD of `bash lake build` for checking Lean code during development."
@@ -131,7 +131,7 @@ CODING_TOOLS = [
                 "code": {
                     "type": "string",
                     "description": (
-                        "Lean 4 code to verify. Do NOT include 'import Sparkle' or 'open' lines — "
+                        "Lean 4 code to verify. Do NOT include 'import cktlean' or 'open' lines — "
                         "those are pre-loaded. Just the definitions and #synthesizeVerilog command."
                     ),
                 },

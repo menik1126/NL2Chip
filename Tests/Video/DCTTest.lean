@@ -6,9 +6,9 @@
 import LSpec
 import IP.Video.H264.DCT
 
-open Sparkle.IP.Video.H264.DCT
+open cktlean.IP.Video.H264.DCT
 
-namespace Sparkle.Tests.Video.DCTTest
+namespace cktlean.Tests.Video.DCTTest
 
 private def testBlock1 : Block4x4 :=
   #[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -56,4 +56,4 @@ def allTests : IO LSpec.TestSeq := do
   let t2 ← testInverseDCT
   return LSpec.group "DCT/IDCT" (t1 ++ t2)
 
-end Sparkle.Tests.Video.DCTTest
+end cktlean.Tests.Video.DCTTest

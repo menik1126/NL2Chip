@@ -20,13 +20,13 @@ import IP.Video.H264.NAL
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.IP.Video.H264.Decoder
+namespace cktlean.IP.Video.H264.Decoder
 
-open Sparkle.IP.Video.H264.IntraPred
-open Sparkle.IP.Video.H264.DCT
-open Sparkle.IP.Video.H264.Quant
-open Sparkle.IP.Video.H264.CAVLCDecode
-open Sparkle.IP.Video.H264.NAL
+open cktlean.IP.Video.H264.IntraPred
+open cktlean.IP.Video.H264.DCT
+open cktlean.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.CAVLCDecode
+open cktlean.IP.Video.H264.NAL
 
 -- ============================================================================
 -- Decoder configuration
@@ -171,4 +171,4 @@ def qualityScore (a b : IntraPred.Block4x4) : Nat :=
   IO.println s!"All-same decoded:  {decoded2}"
   IO.println s!"All-same quality (MSE, 0=perfect): {score2}"
 
-end Sparkle.IP.Video.H264.Decoder
+end cktlean.IP.Video.H264.Decoder

@@ -13,17 +13,17 @@
   Reference: ITU-T H.264 Section 9.2.1
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.IP.Video.H264.CAVLC
+namespace cktlean.IP.Video.H264.CAVLC
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- State definition (20 registers)
@@ -675,4 +675,4 @@ def cavlcEncoderSimulate
   let result2 := cavlcEncodeFull #[0, 3, -1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] (nC := 3)
   IO.println s!"nC=3 Bitstream: 0x{String.ofList (Nat.toDigits 16 result2.1.toNat)} ({result2.2} bits)"
 
-end Sparkle.IP.Video.H264.CAVLC
+end cktlean.IP.Video.H264.CAVLC

@@ -50,14 +50,19 @@ natural-language spec
 
 | Path | Contents |
 |---|---|
-| `Sparkle/`, `Sparkle.lean`, `c_src/` | The HDL: Signal DSL, elaborator, IR, SystemVerilog backend, verification library |
-| `cktlean/` | Agent harness: `run.py` (Lean flow), `run_verilog.py` (direct-SystemVerilog baseline), tools, path guard, prompts |
+| `cktlean/` | Lean HDL subdirectories (`Core/`, `Compiler/`, `Backend/`, etc.) and Python agent harness (`run.py`, `run_verilog.py`, tools, prompts) |
+| `cktlean.lean`, `c_src/` | Lean root module and C/C++ simulation runtime |
 | `agent/` | `evaluator.py` (scoring and backend flow), `dataset.py` (benchmark loaders), `lean_repl.py`, `orfs_runner.py`, `search.py` (PPA optimization and architecture exploration) |
 | `experiments/` | Benchmark runners, baselines and post-hoc backend evaluation |
 | `Tests/` | Python tests for the pipeline (`test_*.py`) and Lean tests for the HDL |
 | `Generated/` | Where the agent writes Lean files; contents are not tracked |
 | `Examples/`, `IP/`, `Tools/`, `firmware/`, `verilator/`, `hw/` | HDL examples and IP cores inherited from Sparkle |
 | `docs/` | HDL guide, harness notes and IP documentation |
+
+Lean designs use `import cktlean` and namespaces such as
+`cktlean.Core.Signal`. The Lake library target is `Cktlean`; the executable
+is `cktlean` (`lake exe cktlean`). The Python entry point remains
+`python -m cktlean.run`.
 
 ## Requirements
 

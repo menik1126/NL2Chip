@@ -8,16 +8,16 @@
   - V[i][j]: INT8 (8-bit), sign-extended to 32 bits
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.Attention
+namespace cktlean.Examples.BitNet.Attention
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -64,4 +64,4 @@ def scoreVMulSignal
       outputs := outputs.push (weightedVElementSignal weights vColumn)
     return outputs
 
-end Sparkle.Examples.BitNet.Attention
+end cktlean.Examples.BitNet.Attention

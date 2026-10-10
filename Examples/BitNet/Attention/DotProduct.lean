@@ -8,16 +8,16 @@
     4. Scale by 1/sqrt(d_k) via arithmetic right shift
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.Attention
+namespace cktlean.Examples.BitNet.Attention
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -40,4 +40,4 @@ def dotProductSignal (qs ks : Array (Signal dom (BitVec 8))) (dkShift : Nat)
     Signal.ashrC sum (BitVec.ofNat 32 dkShift)
   else sum
 
-end Sparkle.Examples.BitNet.Attention
+end cktlean.Examples.BitNet.Attention

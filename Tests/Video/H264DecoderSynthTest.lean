@@ -22,13 +22,13 @@ import LSpec
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.Tests.Video.H264DecoderSynthTest
+namespace cktlean.Tests.Video.H264DecoderSynthTest
 
 open LSpec
-open Sparkle.IP.Video.H264.DequantSynth
-open Sparkle.IP.Video.H264.IDCTSynth
-open Sparkle.IP.Video.H264.ReconstructSynth
-open Sparkle.IP.Video.H264.DecoderSynth
+open cktlean.IP.Video.H264.DequantSynth
+open cktlean.IP.Video.H264.IDCTSynth
+open cktlean.IP.Video.H264.ReconstructSynth
+open cktlean.IP.Video.H264.DecoderSynth
 
 -- ============================================================================
 -- Test data
@@ -137,4 +137,4 @@ def allTests : IO TestSeq := do
     group "Zero Block" testZeroBlock
   )
 
-end Sparkle.Tests.Video.H264DecoderSynthTest
+end cktlean.Tests.Video.H264DecoderSynthTest

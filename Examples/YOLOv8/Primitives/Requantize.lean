@@ -6,17 +6,17 @@
   No runtime division required.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 400000
 
-namespace Sparkle.Examples.YOLOv8.Primitives.Requantize
+namespace cktlean.Examples.YOLOv8.Primitives.Requantize
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 variable {dom : DomainConfig}
 
@@ -68,4 +68,4 @@ def requantize {dom : DomainConfig}
 
 #synthesizeVerilog requantize
 
-end Sparkle.Examples.YOLOv8.Primitives.Requantize
+end cktlean.Examples.YOLOv8.Primitives.Requantize

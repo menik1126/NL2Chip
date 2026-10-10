@@ -4,11 +4,11 @@
   Tests Phase 3 metaprogramming compilation functionality.
 -/
 
-import Sparkle.Compiler.Elab
-import Sparkle.Backend.Verilog
+import cktlean.Compiler.Elab
+import cktlean.Backend.Verilog
 
-open Sparkle.Compiler.Elab
-open Sparkle.Backend.Verilog
+open cktlean.Compiler.Elab
+open cktlean.Backend.Verilog
 
 /-- Test function 1: Constant -/
 def testConst : BitVec 8 := 42#8

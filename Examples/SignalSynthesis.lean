@@ -4,12 +4,12 @@
   Tests automatic compilation of Signal primitives (register, mux) to hardware IR.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.Signal.Signal  -- Open Signal namespace for register, mux
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Signal.Signal  -- Open Signal namespace for register, mux
 
 -- Test 1: Simple Register
 -- This should generate a module with:

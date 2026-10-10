@@ -12,18 +12,18 @@
   FSM: IDLE → TLB_LOOKUP → PTW_WALK → DONE/FAULT
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.RV32.CSR.Types
 
 set_option maxRecDepth 16384
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.Examples.RV32.MMU
+namespace cktlean.Examples.RV32.MMU
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32.CSR
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32.CSR
 
 /-- MMU top-level — Signal DSL.
 
@@ -379,4 +379,4 @@ def mmuTopSignal {dom : DomainConfig}
 
 #synthesizeVerilog mmuTopSignal
 
-end Sparkle.Examples.RV32.MMU
+end cktlean.Examples.RV32.MMU

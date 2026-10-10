@@ -6,11 +6,11 @@
 import LSpec
 import Examples.YOLOv8.Neck
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Neck
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Neck
 
-namespace Sparkle.Examples.YOLOv8.Tests.TestNeck
+namespace cktlean.Examples.YOLOv8.Tests.TestNeck
 
 /-- Test initial FPN start: IDLE → FPN_UPSAMPLE. -/
 def testFPNStart : IO LSpec.TestSeq := do
@@ -45,4 +45,4 @@ def allTests : IO LSpec.TestSeq := do
   let t2 ← testFPNSequence
   return LSpec.group "Neck Controller" (t1 ++ t2)
 
-end Sparkle.Examples.YOLOv8.Tests.TestNeck
+end cktlean.Examples.YOLOv8.Tests.TestNeck

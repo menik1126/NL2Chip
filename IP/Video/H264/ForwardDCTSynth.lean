@@ -17,17 +17,17 @@
   Reference: ITU-T H.264 Section 8.5.10
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
 set_option maxRecDepth 8192
 set_option maxHeartbeats 1600000
 
-namespace Sparkle.IP.Video.H264.ForwardDCTSynth
+namespace cktlean.IP.Video.H264.ForwardDCTSynth
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Core.StateMacro
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.StateMacro
 
 -- ============================================================================
 -- State definition (8 registers)
@@ -238,4 +238,4 @@ def fwdDCTModule {dom : DomainConfig}
 
 #writeDesign fwdDCTModule ".lake/build/gen/h264/fwd_dct.sv" ".lake/build/gen/h264/fwd_dct_cppsim.h"
 
-end Sparkle.IP.Video.H264.ForwardDCTSynth
+end cktlean.IP.Video.H264.ForwardDCTSynth

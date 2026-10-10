@@ -10,11 +10,11 @@
   - Register with enable (Signal.registerWithEnable)
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 -- ============================================================================
 -- Test 1: Shift Left (<<<)

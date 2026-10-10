@@ -5,8 +5,8 @@
   into a complete single-head attention pipeline.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Scale
@@ -16,11 +16,11 @@ import Examples.BitNet.Attention.QKVProjection
 import Examples.BitNet.Attention.Softmax
 import Examples.BitNet.Attention.ScoreVMul
 
-namespace Sparkle.Examples.BitNet.Attention
+namespace cktlean.Examples.BitNet.Attention
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -80,4 +80,4 @@ def fullAttentionHeadSignal
   -- Score-V multiply
   scoreVMulSignal weights vCache config.headDim
 
-end Sparkle.Examples.BitNet.Attention
+end cktlean.Examples.BitNet.Attention

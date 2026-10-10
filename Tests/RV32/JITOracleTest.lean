@@ -9,17 +9,17 @@
     lake exe rv32-jit-oracle-test [jit.cpp] [firmware.hex] [max_cycles]
 -/
 
-import Sparkle.Core.JIT
-import Sparkle.Core.JITLoop
-import Sparkle.Core.Oracle
-import Sparkle.Utils.HexLoader
+import cktlean.Core.JIT
+import cktlean.Core.JITLoop
+import cktlean.Core.Oracle
+import cktlean.Utils.HexLoader
 import Examples.RV32.SoC
 
-open Sparkle.Core.JIT
-open Sparkle.Core.JITLoop
-open Sparkle.Core.Oracle
-open Sparkle.Utils.HexLoader
-open Sparkle.Examples.RV32.SoC
+open cktlean.Core.JIT
+open cktlean.Core.JITLoop
+open cktlean.Core.Oracle
+open cktlean.Utils.HexLoader
+open cktlean.Examples.RV32.SoC
 
 def toHex32 (v : Nat) : String :=
   let hexStr := String.ofList (Nat.toDigits 16 v)

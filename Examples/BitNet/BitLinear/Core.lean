@@ -6,16 +6,16 @@
   This module provides the top-level BitLinear function.
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.Config
 import Examples.BitNet.SignalHelpers
 
-namespace Sparkle.Examples.BitNet.BitLinear
+namespace cktlean.Examples.BitNet.BitLinear
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
 
 variable {dom : DomainConfig}
 
@@ -27,4 +27,4 @@ def bitLinearPipelinedSignal (weights : Array Int)
     : Signal dom (BitVec n) :=
   bitLinearSignal weights activations
 
-end Sparkle.Examples.BitNet.BitLinear
+end cktlean.Examples.BitNet.BitLinear

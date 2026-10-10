@@ -12,8 +12,8 @@
 
 import Examples.BitNet.Config
 import Examples.BitNet.Types
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Scale
 import Examples.BitNet.Layers.ReLUSq
@@ -22,14 +22,14 @@ import Examples.BitNet.Layers.ElemMul
 import Examples.BitNet.Layers.RMSNorm
 import Examples.BitNet.Layers.FFN
 
-namespace Sparkle.Examples.BitNet.Tests.Layers
+namespace cktlean.Examples.BitNet.Tests.Layers
 
-open Sparkle.Examples.BitNet
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
-open Sparkle.Examples.BitNet.BitLinear
-open Sparkle.Examples.BitNet.Layers
+open cktlean.Examples.BitNet
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
+open cktlean.Examples.BitNet.BitLinear
+open cktlean.Examples.BitNet.Layers
 
 /-- Simple test harness -/
 def check (name : String) (cond : Bool) : IO Unit := do
@@ -325,4 +325,4 @@ def runAll : IO Unit := do
   IO.println ""
   IO.println "=== All FFN layer tests complete ==="
 
-end Sparkle.Examples.BitNet.Tests.Layers
+end cktlean.Examples.BitNet.Tests.Layers

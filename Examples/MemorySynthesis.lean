@@ -4,14 +4,14 @@
   Demonstrates Verilog generation for memory primitives.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
-import Sparkle.Backend.Verilog
+import cktlean
+import cktlean.Compiler.Elab
+import cktlean.Backend.Verilog
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Compiler.Elab
-open Sparkle.Backend.Verilog
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Compiler.Elab
+open cktlean.Backend.Verilog
 open Lean
 
 /-!
@@ -36,7 +36,7 @@ def main : IO Unit := do
   initSearchPath (← findSysroot)
 
   let env ← importModules
-    #[{module := `Sparkle.Compiler.Elab}]
+    #[{module := `cktlean.Compiler.Elab}]
     {}
     (trustLevel := 1024)
 

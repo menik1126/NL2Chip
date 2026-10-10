@@ -512,7 +512,7 @@ def test_path_guard_blocks_shell_file_discovery_and_peer_modules(tmp_path: Path)
     assert guard.bash_access_error("cat Generated/prob_a.lean")
     assert guard.bash_access_error("lake build Generated.prob_b")
     assert guard.bash_access_error("lake build Generated.prob_a") is None
-    assert guard.bash_access_error("lake build Sparkle") is None
+    assert guard.bash_access_error("lake build Cktlean") is None
 
 
 class _CompleteLeanResult:
@@ -628,7 +628,7 @@ def test_harness_bash_subprocess_does_not_receive_secret_environment(
         return SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
 
     monkeypatch.setattr("cktlean.harness.subprocess.run", fake_run)
-    assert runner._bash("lake build Sparkle") == "ok\n"
+    assert runner._bash("lake build Cktlean") == "ok\n"
     assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
 
 
@@ -643,7 +643,7 @@ def test_harness_autosaves_complete_inline_lean_check(
 
     target = tmp_path / "Generated" / "prob_a.lean"
     assert target.exists()
-    assert target.read_text(encoding="utf-8").startswith("import Sparkle\n")
+    assert target.read_text(encoding="utf-8").startswith("import cktlean\n")
     assert "#synthesizeVerilog prob_a" in target.read_text(encoding="utf-8")
     assert "auto_saved_candidate" in runner.log_path.read_text(encoding="utf-8")
 
@@ -654,17 +654,17 @@ def test_inline_lean_check_strips_file_imports_only_for_cached_repl(
 ):
     runner = _anthropic_runner(tmp_path, monkeypatch)
     source = (
-        "import Sparkle\n"
-        "import Sparkle.Compiler.Elab\n\n"
-        "open Sparkle.Core.Signal\n\n"
+        "import cktlean\n"
+        "import cktlean.Compiler.Elab\n\n"
+        "open cktlean.Core.Signal\n\n"
         "def prob_a := 1\n"
         "#synthesizeVerilog prob_a\n"
     )
 
     runner._lean_check_code(source)
 
-    assert "import Sparkle" not in runner.lean_repl.last_code
-    assert "open Sparkle.Core.Signal" in runner.lean_repl.last_code
+    assert "import cktlean" not in runner.lean_repl.last_code
+    assert "open cktlean.Core.Signal" in runner.lean_repl.last_code
     assert (tmp_path / "Generated" / "prob_a.lean").read_text(encoding="utf-8") == source
 
 
@@ -709,7 +709,7 @@ def test_harness_path_check_updates_compile_safe_candidate(
     runner._tool_sequence = 4
     runner._write_file(
         "Generated/prob_a.lean",
-        "import Sparkle\n\ndef prob_a := 2\n#synthesizeVerilog prob_a\n",
+        "import cktlean\n\ndef prob_a := 2\n#synthesizeVerilog prob_a\n",
     )
     runner._tool_sequence = 5
     runner._lean_check(path="Generated/prob_a.lean")
@@ -731,7 +731,7 @@ def test_harness_seeds_existing_compile_safe_candidate(
     target = tmp_path / "Generated" / "prob_a.lean"
     target.parent.mkdir(parents=True)
     target.write_text(
-        "import Sparkle\n\ndef prob_a := 1\n#synthesizeVerilog prob_a\n",
+        "import cktlean\n\ndef prob_a := 1\n#synthesizeVerilog prob_a\n",
         encoding="utf-8",
     )
 

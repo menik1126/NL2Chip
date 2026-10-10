@@ -4,18 +4,18 @@
   Tests that the CppSim backend generates correct C++ code from IR modules.
 -/
 
-import Sparkle.Backend.CppSim
-import Sparkle.IR.AST
-import Sparkle.IR.Type
-import Sparkle.IR.Builder
+import cktlean.Backend.CppSim
+import cktlean.IR.AST
+import cktlean.IR.Type
+import cktlean.IR.Builder
 import LSpec
 
-namespace Sparkle.Test.CppSim
+namespace cktlean.Test.CppSim
 
-open Sparkle.Backend.CppSim
-open Sparkle.IR.AST
-open Sparkle.IR.Type
-open Sparkle.IR.Builder
+open cktlean.Backend.CppSim
+open cktlean.IR.AST
+open cktlean.IR.Type
+open cktlean.IR.Builder
 open CircuitM
 open LSpec
 
@@ -123,4 +123,4 @@ def cppSimTests : IO TestSeq := do
     )
   )
 
-end Sparkle.Test.CppSim
+end cktlean.Test.CppSim

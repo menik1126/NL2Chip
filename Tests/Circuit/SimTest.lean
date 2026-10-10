@@ -1,7 +1,7 @@
-import Sparkle
+import cktlean
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 -- Signal.circuit works for both synthesis AND simulation (single macro)
 def counterCircuit : Signal defaultDomain (BitVec 8) :=

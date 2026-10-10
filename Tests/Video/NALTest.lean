@@ -6,9 +6,9 @@
 import LSpec
 import IP.Video.H264.NAL
 
-open Sparkle.IP.Video.H264.NAL
+open cktlean.IP.Video.H264.NAL
 
-namespace Sparkle.Tests.Video.NALTest
+namespace cktlean.Tests.Video.NALTest
 
 def testRoundtrip : IO LSpec.TestSeq := do
   -- Simple payload
@@ -50,4 +50,4 @@ def allTests : IO LSpec.TestSeq := do
   let t2 ← testNALHeader
   return LSpec.group "NAL Unit" (t1 ++ t2)
 
-end Sparkle.Tests.Video.NALTest
+end cktlean.Tests.Video.NALTest

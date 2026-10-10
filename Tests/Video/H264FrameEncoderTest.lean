@@ -15,7 +15,7 @@
     lake build h264-frame-encoder-test && lake exe h264-frame-encoder-test
 -/
 
-import Sparkle.Core.JIT
+import cktlean.Core.JIT
 import IP.Video.H264.Quant
 import IP.Video.H264.FrameEncoderSynth
 import IP.Video.H264.VLCTables
@@ -25,15 +25,15 @@ import IP.Video.H264.MP4Mux
 import IP.Video.H264.Encoder
 import IP.Video.H264.CAVLC
 
-open Sparkle.Core.JIT
-open Sparkle.IP.Video.H264.Quant
-open Sparkle.IP.Video.H264.FrameEncoder
-open Sparkle.IP.Video.H264.VLCTables
-open Sparkle.IP.Video.H264.CAVLCSynth
-open Sparkle.IP.Video.H264.SPSPPSData
-open Sparkle.IP.Video.H264.MP4Mux
-open Sparkle.IP.Video.H264.Encoder
-open Sparkle.IP.Video.H264.CAVLC
+open cktlean.Core.JIT
+open cktlean.IP.Video.H264.Quant
+open cktlean.IP.Video.H264.FrameEncoder
+open cktlean.IP.Video.H264.VLCTables
+open cktlean.IP.Video.H264.CAVLCSynth
+open cktlean.IP.Video.H264.SPSPPSData
+open cktlean.IP.Video.H264.MP4Mux
+open cktlean.IP.Video.H264.Encoder
+open cktlean.IP.Video.H264.CAVLC
 
 -- ============================================================================
 -- Helpers

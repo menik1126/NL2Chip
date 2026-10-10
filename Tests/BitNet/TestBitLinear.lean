@@ -13,20 +13,20 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 import Examples.BitNet.MemoryMap
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 import Examples.BitNet.SignalHelpers
 import Examples.BitNet.BitLinear.Core
 import Examples.BitNet.BitLinear.Top
 import Examples.BitNet.BitLinear.Dynamic
 
-namespace Sparkle.Examples.BitNet.Tests.BitLinear
+namespace cktlean.Examples.BitNet.Tests.BitLinear
 
-open Sparkle.Examples.BitNet
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
-open Sparkle.Examples.BitNet.SignalHelpers
-open Sparkle.Examples.BitNet.BitLinear
+open cktlean.Examples.BitNet
+open cktlean.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Examples.BitNet.SignalHelpers
+open cktlean.Examples.BitNet.BitLinear
 
 /-- Simple test harness -/
 def check (name : String) (cond : Bool) : IO Unit := do
@@ -249,4 +249,4 @@ def runAll : IO Unit := do
   testDynamicBitLinearSignal
   IO.println "=== Tests complete ==="
 
-end Sparkle.Examples.BitNet.Tests.BitLinear
+end cktlean.Examples.BitNet.Tests.BitLinear

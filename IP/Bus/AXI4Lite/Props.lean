@@ -15,7 +15,7 @@
   no cross-library dependencies.
 -/
 
-namespace Sparkle.IP.Bus.AXI4Lite.Props
+namespace cktlean.IP.Bus.AXI4Lite.Props
 
 /-- AXI4-Lite slave FSM states -/
 inductive SlaveState where
@@ -192,4 +192,4 @@ theorem no_data_loss_read (i : SlaveInputs) (h : i.rready) :
     awready (slaveNextState ReadResp i) = true := by
   simp [slaveNextState, h, awready]
 
-end Sparkle.IP.Bus.AXI4Lite.Props
+end cktlean.IP.Bus.AXI4Lite.Props

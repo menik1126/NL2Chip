@@ -43,7 +43,7 @@ Thumbs.db
 
 # Planning documents
 plans/
-Sparkle/Verification/Generated/
+cktlean/Verification/Generated/
 Examples/CDC/gen/
 verilator/generated_soc_jit.cpp
 

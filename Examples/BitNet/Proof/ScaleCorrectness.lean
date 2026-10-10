@@ -5,9 +5,9 @@
 import Examples.BitNet.Config
 import Examples.BitNet.Types
 
-namespace Sparkle.Examples.BitNet.Proof
+namespace cktlean.Examples.BitNet.Proof
 
-open Sparkle.Examples.BitNet
+open cktlean.Examples.BitNet
 
 /-- The scale multiplication spec computes correctly for 1.0 × 1.0 -/
 theorem scale_1_0_times_1_0 :
@@ -39,4 +39,4 @@ theorem scale_neg_acc : fixedPointScale
     = BitVec.ofInt 32 (-0x10000) := by
   native_decide
 
-end Sparkle.Examples.BitNet.Proof
+end cktlean.Examples.BitNet.Proof

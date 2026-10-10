@@ -15,18 +15,18 @@
   A thin SV wrapper (rv32i_soc_wrapper.sv) unpacks these into named ports
   matching the Verilator testbench interface (tb_soc.cpp).
 -/
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.RV32.SoC
 
 set_option maxRecDepth 65536
 set_option maxHeartbeats 64000000
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.RV32.SoC
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.RV32.SoC
 
-namespace Sparkle.Examples.RV32.SoCVerilog
+namespace cktlean.Examples.RV32.SoCVerilog
 
 /-- RV32I SoC for Verilog synthesis.
 
@@ -79,4 +79,4 @@ def rv32iSoCSynth {dom : DomainConfig}
 
 #writeDesign rv32iSoCSynth "verilator/generated_soc.sv" "verilator/generated_soc_cppsim.h" SoCOutput.wireNames
 
-end Sparkle.Examples.RV32.SoCVerilog
+end cktlean.Examples.RV32.SoCVerilog

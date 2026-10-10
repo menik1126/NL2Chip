@@ -25,11 +25,11 @@
   we use Signal.register for each stage.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- 8-bit positive edge detector: output is high for one cycle after
     each bit transitions from 0 to 1. -/

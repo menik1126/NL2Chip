@@ -9,11 +9,11 @@
 import LSpec
 import IP.Video.H264.CAVLC
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.IP.Video.H264.CAVLC
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.IP.Video.H264.CAVLC
 
-namespace Sparkle.Tests.Video.CAVLCTest
+namespace cktlean.Tests.Video.CAVLCTest
 
 -- Golden reference values (from current cavlcEncodeFull output)
 private def goldenBitstream64 : BitVec 64 := 0x0B9BA00000000000#64
@@ -136,4 +136,4 @@ def allTests : IO LSpec.TestSeq := do
   let t3 ← testDoneSignal
   return LSpec.group "CAVLC Encoder" (t1 ++ t2 ++ t3)
 
-end Sparkle.Tests.Video.CAVLCTest
+end cktlean.Tests.Video.CAVLCTest

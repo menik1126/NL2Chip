@@ -26,8 +26,8 @@
     - needAct:   request next activation from buffer
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 import Examples.YOLOv8.Primitives.Dequant
 import Examples.YOLOv8.Primitives.Requantize
@@ -35,12 +35,12 @@ import Examples.YOLOv8.Primitives.Requantize
 set_option maxRecDepth 8192
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.Primitives.Conv2DEngine
+namespace cktlean.Examples.YOLOv8.Primitives.Conv2DEngine
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Examples.YOLOv8.Primitives.Dequant
-open Sparkle.Examples.YOLOv8.Primitives.Requantize
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Examples.YOLOv8.Primitives.Dequant
+open cktlean.Examples.YOLOv8.Primitives.Requantize
 
 private abbrev Conv2DState := BitVec 32 × BitVec 16 × BitVec 2 × BitVec 8 × Bool
 
@@ -158,4 +158,4 @@ def conv2DEngineSimulate {dom : DomainConfig}
 
 #synthesizeVerilog conv2DEngine
 
-end Sparkle.Examples.YOLOv8.Primitives.Conv2DEngine
+end cktlean.Examples.YOLOv8.Primitives.Conv2DEngine

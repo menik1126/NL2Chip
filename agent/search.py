@@ -1397,7 +1397,7 @@ def build_user_message(
             f"- The evaluator expects the generated SystemVerilog top module to be `{design_name}`.\n"
             f"- Use port names and widths exactly as specified by the problem statement.\n"
             f"- Preserve reset polarity and cycle latency exactly; these testbenches often check protocol timing.\n"
-            f"- Prefer Sparkle.Library.RTL helpers for bit slices, reset muxes, registers, memories, and register files.\n"
+            f"- Prefer cktlean.Library.RTL helpers for bit slices, reset muxes, registers, memories, and register files.\n"
             f"- Read `Benchmark/RTLIdioms.lean` if the task has memory, packed fields, priority logic, or generate-like bit operations.\n"
         )
     interface_contract = format_benchmark_interface_contract(info)
@@ -1421,11 +1421,11 @@ def build_user_message(
         file_template = (
             "The file should use this P0 structure (replace placeholders with the full interface):\n"
             "```lean\n"
-            "import Sparkle\n"
-            "import Sparkle.Compiler.Elab\n\n"
-            "open Sparkle.Core.Domain\n"
-            "open Sparkle.Core.Signal\n"
-            "open Sparkle.Library.RTL\n\n"
+            "import cktlean\n"
+            "import cktlean.Compiler.Elab\n\n"
+            "open cktlean.Core.Domain\n"
+            "open cktlean.Core.Signal\n"
+            "open cktlean.Library.RTL\n\n"
             f"def {lean_identifier(design_name)}_core {{dom : DomainConfig}} "
             "{<parameters> : Nat} (<inputs>) : <output_type> :=\n"
             "  <shared implementation>\n\n"
@@ -1446,11 +1446,11 @@ def build_user_message(
         file_template = (
             "The file must use one native generic design (replace placeholders with the full interface):\n"
             "```lean\n"
-            "import Sparkle\n"
-            "import Sparkle.Compiler.Elab\n\n"
-            "open Sparkle.Core.Domain\n"
-            "open Sparkle.Core.Signal\n"
-            "open Sparkle.Library.RTL\n\n"
+            "import cktlean\n"
+            "import cktlean.Compiler.Elab\n\n"
+            "open cktlean.Core.Domain\n"
+            "open cktlean.Core.Signal\n"
+            "open cktlean.Library.RTL\n\n"
             f"def {func_name} {{dom : DomainConfig}} {binder_text}\n"
             "    (<parameter-dependent inputs>) : <parameter-dependent output type> :=\n"
             "  <generic implementation>\n\n"
@@ -1462,11 +1462,11 @@ def build_user_message(
         file_template = (
             "The file must follow this exact structure:\n"
             "```lean\n"
-            "import Sparkle\n"
-            "import Sparkle.Compiler.Elab\n\n"
-            "open Sparkle.Core.Domain\n"
-            "open Sparkle.Core.Signal\n\n"
-            "open Sparkle.Library.RTL\n\n"
+            "import cktlean\n"
+            "import cktlean.Compiler.Elab\n\n"
+            "open cktlean.Core.Domain\n"
+            "open cktlean.Core.Signal\n\n"
+            "open cktlean.Library.RTL\n\n"
             "/-- <description> -/\n"
             f"def {func_name} {{dom : DomainConfig}}\n"
             "    (<inputs>) : <output_type> :=\n"
@@ -2415,7 +2415,7 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
             "Do not recover by writing separate `NUM_DICE = 2`/`3` branches or by hard-coding "
             "a two- or three-lane concat: that freezes the default elaboration case. For one "
             "value replicated across parameter-controlled packed lanes, import "
-            "`Sparkle.Library.RTL` and use `repeatVector (N := NUM_DICE) value`; it lowers "
+            "`cktlean.Library.RTL` and use `repeatVector (N := NUM_DICE) value`; it lowers "
             "to a native SystemVerilog generate-for loop. It cannot create distinct indexed "
             "per-lane state, so do not pretend it implements a parameter-indexed map."
         )
@@ -2433,7 +2433,7 @@ def lean_repair_playbook(diagnostics: list[dict] | None) -> str:
         )
     if "unsupported_symbolic_clog2" in codes:
         hints.append(
-            "For a parameter-derived ceiling-log2 width, import `Sparkle.Library.RTL` and write "
+            "For a parameter-derived ceiling-log2 width, import `cktlean.Library.RTL` and write "
             "`clog2 DEPTH` directly in the `BitVec` type (or bind `let PTR_W := clog2 DEPTH`). "
             "Do not spell it as `if ... then ... else Nat.log2 ...`: Lean expands that into "
             "`Decidable.rec`, which cannot be preserved as a symbolic RTL dimension. "

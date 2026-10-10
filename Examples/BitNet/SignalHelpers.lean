@@ -8,13 +8,13 @@
   - Max-tree (signed comparator tree)
 -/
 
-import Sparkle.Core.Signal
-import Sparkle.Core.Domain
+import cktlean.Core.Signal
+import cktlean.Core.Domain
 
-namespace Sparkle.Examples.BitNet.SignalHelpers
+namespace cktlean.Examples.BitNet.SignalHelpers
 
-open Sparkle.Core.Signal
-open Sparkle.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Core.Domain
 
 variable {dom : DomainConfig}
 
@@ -165,4 +165,4 @@ def dynamicMACStage (weightCodes : Array (Signal dom (BitVec 2)))
       results := results.push decoded
   return results
 
-end Sparkle.Examples.BitNet.SignalHelpers
+end cktlean.Examples.BitNet.SignalHelpers

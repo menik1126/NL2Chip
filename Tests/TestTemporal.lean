@@ -7,16 +7,16 @@
   so we test by verifying signal behaviors that would support the properties.
 -/
 
-import Sparkle
-import Sparkle.Verification.Temporal
+import cktlean
+import cktlean.Verification.Temporal
 import LSpec
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
-open Sparkle.Verification.Temporal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
+open cktlean.Verification.Temporal
 open LSpec
 
-namespace Sparkle.Test.Temporal
+namespace cktlean.Test.Temporal
 
 /-!
 ## Test Signals
@@ -193,4 +193,4 @@ def temporalTests : IO TestSeq := do
     group "Temporal Oracle" tests6
   )
 
-end Sparkle.Test.Temporal
+end cktlean.Test.Temporal

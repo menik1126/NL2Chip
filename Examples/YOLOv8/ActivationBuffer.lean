@@ -6,17 +6,17 @@
   The `bufferSel` signal swaps banks between layers.
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 import Examples.YOLOv8.Types
 
 set_option maxRecDepth 4096
 set_option maxHeartbeats 800000
 
-namespace Sparkle.Examples.YOLOv8.ActivationBuffer
+namespace cktlean.Examples.YOLOv8.ActivationBuffer
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 /-- Ping-pong double buffer for activation data.
 
@@ -51,4 +51,4 @@ def activationDoubleBuffer {dom : DomainConfig}
 
 #synthesizeVerilog activationDoubleBuffer
 
-end Sparkle.Examples.YOLOv8.ActivationBuffer
+end cktlean.Examples.YOLOv8.ActivationBuffer

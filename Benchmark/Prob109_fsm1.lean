@@ -39,11 +39,11 @@
   for explicit areset signals, mux-based modeling is the DSL pattern).
 -/
 
-import Sparkle
-import Sparkle.Compiler.Elab
+import cktlean
+import cktlean.Compiler.Elab
 
-open Sparkle.Core.Domain
-open Sparkle.Core.Signal
+open cktlean.Core.Domain
+open cktlean.Core.Signal
 
 -- State encoding
 private abbrev stA : BitVec 1 := 0#1
