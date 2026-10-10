@@ -52,7 +52,7 @@ from cvdp_native_parameters import (
 from cvdp_harness_adapter import infer_cvdp_reset_polarities
 from lean_repl import LeanREPLPool
 from report import generate_report
-from cktarchon.diagnostics import format_lean_diagnostics
+from cktlean.diagnostics import format_lean_diagnostics
 
 from rich.console import Console, Group
 from rich.live import Live

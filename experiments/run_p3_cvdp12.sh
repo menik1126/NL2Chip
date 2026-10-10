@@ -101,4 +101,4 @@ case "${HARNESS}" in
         ;;
 esac
 
-exec "${PYTHON_BIN}" -m cktarchon.run "${COMMON_ARGS[@]}"
+exec "${PYTHON_BIN}" -m cktlean.run "${COMMON_ARGS[@]}"

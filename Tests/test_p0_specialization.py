@@ -798,7 +798,7 @@ def test_cvdp_docker_timeout_always_cleans_up(
 
 
 def test_required_module_harness_does_not_save_partial_family(tmp_path: Path):
-    from cktarchon.harness import AnthropicHarnessRunner
+    from cktlean.harness import AnthropicHarnessRunner
 
     runner = object.__new__(AnthropicHarnessRunner)
     runner.required_verilog_modules = ("p0_w3", "p0_w5")

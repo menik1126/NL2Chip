@@ -64,7 +64,7 @@ siliconcrew/
 # Pipeline outputs
 Generated/*
 !Generated/README.md
-cktarchon_work/
+cktlean_work/
 results/
 results_*/
 

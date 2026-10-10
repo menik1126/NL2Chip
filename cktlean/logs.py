@@ -117,7 +117,7 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
 
 
 def parse_agent_log(path: Path) -> AgentStats:
-    """Parse cktarchon/Archon-like JSONL into legacy NL2Chip counters."""
+    """Parse cktlean/Archon-like JSONL into legacy NL2Chip counters."""
     stats = AgentStats()
     if not path.exists():
         return stats
@@ -152,7 +152,7 @@ def parse_agent_log(path: Path) -> AgentStats:
             tool_input = str(row.get("input") or row.get("command") or "")
             if name_l == "lean_check":
                 stats.compile_checks += 1
-            elif name_l == "bash" and ("lake" in tool_input or "cktarchon.tools lean-check" in tool_input):
+            elif name_l == "bash" and ("lake" in tool_input or "cktlean.tools lean-check" in tool_input):
                 stats.compile_checks += 1
         elif event in {"session_meta", "thread.started"}:
             stats.session_id = row.get("session_id") or row.get("thread_id") or stats.session_id
@@ -160,9 +160,9 @@ def parse_agent_log(path: Path) -> AgentStats:
             stats.set_usage(normalize_token_usage(_row_usage(row)))
             stats.recovered_usage_sessions += 1
             recovered_usage = True
-        elif event == "cktarchon_budget_exceeded":
+        elif event == "cktlean_budget_exceeded":
             budget_exceeded = True
-        elif event == "cktarchon_token_accounting_incomplete":
+        elif event == "cktlean_token_accounting_incomplete":
             stats.token_accounting_complete = False
         elif event == "session_end":
             if row.get("runner") == "codex":
@@ -199,7 +199,7 @@ def parse_agent_log(path: Path) -> AgentStats:
             if not is_codex:
                 stats.turns = max(stats.turns, reported)
     if is_codex:
-        # CktArchon's Codex budget counts model text decisions and tool calls.
+        # CKTLean's Codex budget counts model text decisions and tool calls.
         # Archon's num_items also includes reasoning items, so using it would
         # report a different unit from the one enforced by the watcher.
         stats.turns = codex_action_events or codex_reported_turns

@@ -21,7 +21,7 @@ thank its authors for their contribution. The language reference is in
 natural-language spec
         │
         ▼
-  agent (cktarchon)  ──writes──▶  Generated/<prob_id>.lean
+  agent (cktlean)  ──writes──▶  Generated/<prob_id>.lean
         ▲                                │
         │ compiler diagnostics           ▼
         └───────────────────────  Lean type-check (lean_check)
@@ -51,7 +51,7 @@ natural-language spec
 | Path | Contents |
 |---|---|
 | `Sparkle/`, `Sparkle.lean`, `c_src/` | The HDL: Signal DSL, elaborator, IR, SystemVerilog backend, verification library |
-| `cktarchon/` | Agent harness: `run.py` (Lean flow), `run_verilog.py` (direct-SystemVerilog baseline), tools, path guard, prompts |
+| `cktlean/` | Agent harness: `run.py` (Lean flow), `run_verilog.py` (direct-SystemVerilog baseline), tools, path guard, prompts |
 | `agent/` | `evaluator.py` (scoring and backend flow), `dataset.py` (benchmark loaders), `lean_repl.py`, `orfs_runner.py`, `search.py` (PPA optimization and architecture exploration) |
 | `experiments/` | Benchmark runners, baselines and post-hoc backend evaluation |
 | `Tests/` | Python tests for the pipeline (`test_*.py`) and Lean tests for the HDL |
@@ -91,13 +91,13 @@ Benchmark datasets are downloaded separately. See the
 Generate and evaluate one benchmark with the Lean flow:
 
 ```bash
-uv run python -m cktarchon.run --dataset verilogeval \
+uv run python -m cktlean.run --dataset verilogeval \
   --results-dir results/verilogeval --workers 4
 ```
 
 `--dataset` is one of `verilogeval`, `rtllm`, `resbench`, `cvdp` or `realbench`.
 
-Each invocation creates `cktarchon_run_<timestamp>/` under `--results-dir` with:
+Each invocation creates `cktlean_run_<timestamp>/` under `--results-dir` with:
 
 - `results.jsonl`: one row per problem (`compile_pass`, `lint_pass`,
   `sim_status`, turn and token counts)
@@ -109,7 +109,7 @@ Commonly used options:
 
 | Option | Effect |
 |---|---|
-| `--harness {anthropic-api,codex-agent}` | Which agent loop to run. See [docs/CktArchon.md](docs/CktArchon.md) |
+| `--harness {anthropic-api,codex-agent}` | Which agent loop to run. See [docs/cktlean.md](docs/cktlean.md) |
 | `--model`, `--max-turns` | Model and per-problem turn budget |
 | `--sim-feedback --feedback-mode compile-only` | Extra repair rounds that see compiler output but no simulation results |
 | `--problem-file`, `--filter`, `--limit` | Run a subset |
@@ -121,7 +121,7 @@ A full-budget configuration with the Codex-agent harness and compile-only
 feedback:
 
 ```bash
-uv run python -m cktarchon.run --dataset verilogeval \
+uv run python -m cktlean.run --dataset verilogeval \
   --results-dir results/verilogeval --workers 4 \
   --harness codex-agent --model "$MODEL" --codex-effort ultra \
   --codex-bin "$CODEX_BIN" --archon-src "$ARCHON_SRC" \
@@ -140,7 +140,7 @@ uv run python -m cktarchon.run --dataset verilogeval \
 The same harness can write SystemVerilog directly instead of Lean:
 
 ```bash
-uv run python -m cktarchon.run_verilog --dataset verilogeval --workers 4
+uv run python -m cktlean.run_verilog --dataset verilogeval --workers 4
 ```
 
 `experiments/baseline_verilog.py` is a single-shot baseline with no tools, and
@@ -150,7 +150,7 @@ runners.
 
 ### Backend evaluation
 
-Pass `--synth`, `--pnr`, `--drc` or `--lvs` to `cktarchon.run`, or evaluate a
+Pass `--synth`, `--pnr`, `--drc` or `--lvs` to `cktlean.run`, or evaluate a
 finished run afterwards with `experiments/main_backend_posthoc.py`.
 
 ## Tests
@@ -169,7 +169,7 @@ are Lean executables declared in `lakefile.lean`.
 - [docs/SignalDSL_Syntax.md](docs/SignalDSL_Syntax.md): Signal DSL syntax reference
 - [docs/Verification_Framework.md](docs/Verification_Framework.md): writing specifications and proofs
 - [docs/Troubleshooting_Synthesis.md](docs/Troubleshooting_Synthesis.md): common synthesis errors
-- [docs/CktArchon.md](docs/CktArchon.md): the agent harness
+- [docs/cktlean.md](docs/cktlean.md): the agent harness
 - [experiments/README.md](experiments/README.md): experiment entry points and datasets
 
 ## License and acknowledgments

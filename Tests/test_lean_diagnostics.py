@@ -8,14 +8,14 @@ from types import SimpleNamespace
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "agent"))
 
-from cktarchon.diagnostics import (  # noqa: E402
+from cktlean.diagnostics import (  # noqa: E402
     build_lean_diagnostics,
     format_lean_diagnostics,
     lean_diagnostic_signature,
     parse_lean_error_text,
 )
 from dataset import ProblemInfo  # noqa: E402
-from cktarchon.harness import AnthropicHarnessRunner  # noqa: E402
+from cktlean.harness import AnthropicHarnessRunner  # noqa: E402
 from evaluator import _record_lean_compile_failure  # noqa: E402
 from search import (  # noqa: E402
     build_compact_repair_prompt,

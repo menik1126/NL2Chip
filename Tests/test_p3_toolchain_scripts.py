@@ -46,7 +46,7 @@ def test_cvdp12_runner_supports_native_codex_without_api_key(tmp_path: Path):
 
     assert completed.returncode == 0, completed.stderr
     args = completed.stdout.splitlines()
-    assert args[:3] == ["-m", "cktarchon.run", "--dataset"]
+    assert args[:3] == ["-m", "cktlean.run", "--dataset"]
     assert args[args.index("--harness") + 1] == "codex-agent"
     assert args[args.index("--model") + 1] == "gpt-5.6-sol"
     assert args[args.index("--codex-effort") + 1] == "ultra"

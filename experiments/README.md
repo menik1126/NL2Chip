@@ -5,18 +5,18 @@ trees, and API keys are not in git.
 
 ## Archon Verilog baseline (direct SystemVerilog)
 
-This is the CktArchon harness writing `candidate.sv` instead of Lean:
+This is the CKTLean harness writing `candidate.sv` instead of Lean:
 
 ```bash
 # wrapper
-experiments/run_archon_verilog.sh --dataset verilogeval --workers 4
+experiments/run_cktlean_verilog.sh --dataset verilogeval --workers 4
 
 # equivalent
-python3 -m cktarchon.run_verilog --dataset verilogeval --workers 4
+python3 -m cktlean.run_verilog --dataset verilogeval --workers 4
 ```
 
 Datasets: `verilogeval`, `rtllm`, `resbench`, `cvdp`, `realbench`.
-Outputs go under `results/archon_verilog_run_*`.
+Outputs go under `results/cktlean_verilog_run_*`.
 
 The older one-shot VerilogEval-style baseline (no Archon tools) is still:
 
@@ -26,13 +26,13 @@ python3 experiments/baseline_verilog.py
 python3 experiments/baseline_verilog_iterative.py
 ```
 
-## CKTLean / CktArchon (Lean → Verilog)
+## CKTLean (Lean → Verilog)
 
 ```bash
-python3 -m cktarchon.run --dataset verilogeval
+python3 -m cktlean.run --dataset verilogeval
 ```
 
-See `docs/CktArchon.md`.
+See `docs/cktlean.md`.
 
 ## Datasets
 

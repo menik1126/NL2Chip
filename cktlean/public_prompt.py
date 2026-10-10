@@ -81,7 +81,7 @@ def public_packet(info: Any) -> str:
 def generation_prompt(prob_id: str, info: Any, language: str) -> str:
     if language not in {"lean", "verilog"}:
         raise ValueError(language)
-    target = f"Generated/{prob_id}.lean" if language == "lean" else f"cktarchon_work/{prob_id}/candidate.sv"
+    target = f"Generated/{prob_id}.lean" if language == "lean" else f"cktlean_work/{prob_id}/candidate.sv"
     rules = (
         "Write one complete Sparkle HDL / Lean 4 design. For public parameter-dependent widths or depths, "
         "retain top-level Nat binders and use #synthesizeParameterizedVerilog (or its Design form for hierarchy) "

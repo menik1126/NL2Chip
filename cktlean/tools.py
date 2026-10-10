@@ -68,7 +68,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="CktArchon utility tools")
+    p = argparse.ArgumentParser(description="CKTLean utility tools")
     sub = p.add_subparsers(dest="cmd", required=True)
     lean = sub.add_parser("lean-check")
     lean.add_argument("path")

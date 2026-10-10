@@ -15,7 +15,7 @@ ProgressKey = tuple[Any, ...]
 ProgressKeyFn = Callable[[dict | None], ProgressKey]
 
 
-SELF_TEST_TOP = "cktarchon_self_test"
+SELF_TEST_TOP = "cktlean_self_test"
 
 
 @dataclass(frozen=True)
@@ -107,7 +107,7 @@ A concise behavioral plan covering normal cases, boundary values, reset polarity
 </test_plan>
 
 <testbench_sv>
-A complete standalone SystemVerilog self-test whose top module is `{SELF_TEST_TOP}` and which instantiates `{design_name}` exactly according to the public interface contract. For sequential checks, avoid races with nonblocking assignments: sample after the NBA update (for example, add a small delay after `@(posedge clock)` or check on the following `negedge clock`). Print the first failure with cycle/time, inputs, expected output, and actual output. Print `CKTARCHON_SELF_TEST_PASS` on success or `CKTARCHON_SELF_TEST_FAIL` on failure. Keep the test deterministic and bounded. Do not include a replacement DUT implementation.
+A complete standalone SystemVerilog self-test whose top module is `{SELF_TEST_TOP}` and which instantiates `{design_name}` exactly according to the public interface contract. For sequential checks, avoid races with nonblocking assignments: sample after the NBA update (for example, add a small delay after `@(posedge clock)` or check on the following `negedge clock`). Print the first failure with cycle/time, inputs, expected output, and actual output. Print `CKTLEAN_SELF_TEST_PASS` on success or `CKTLEAN_SELF_TEST_FAIL` on failure. Keep the test deterministic and bounded. Do not include a replacement DUT implementation.
 </testbench_sv>
 
 The generated testbench is advisory and will be validated separately. Do not wrap either section in Markdown fences.
@@ -338,9 +338,9 @@ def run_generated_self_test(
     output = (ran.stdout or "") + (ran.stderr or "")
     (work_dir / "run_output.txt").write_text(output, encoding="utf-8")
     detail = output[-8000:] or "(self-test produced no output)"
-    if "CKTARCHON_SELF_TEST_FAIL" in output:
+    if "CKTLEAN_SELF_TEST_FAIL" in output:
         status = "fail"
-    elif "CKTARCHON_SELF_TEST_PASS" in output and ran.returncode == 0:
+    elif "CKTLEAN_SELF_TEST_PASS" in output and ran.returncode == 0:
         status = "pass"
     else:
         status = "inconclusive"

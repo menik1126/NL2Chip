@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from cktarchon import public_prompt, run
-from cktarchon.logs import AgentStats
+from cktlean import public_prompt, run
+from cktlean.logs import AgentStats
 from structural_checker import check_public_structure, public_progress_key
 
 

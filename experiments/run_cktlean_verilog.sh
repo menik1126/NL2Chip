@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CktArchon direct-SystemVerilog baseline (not Lean/Sparkle).
+# CKTLean direct-SystemVerilog baseline (not Lean/Sparkle).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -8,4 +8,4 @@ if [[ -f "$ROOT/.venv/bin/activate" ]]; then
   source "$ROOT/.venv/bin/activate"
 fi
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -m cktarchon.run_verilog "$@"
+exec python3 -m cktlean.run_verilog "$@"

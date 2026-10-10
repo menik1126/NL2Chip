@@ -107,7 +107,7 @@ def _add_legacy_agent_path() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CktArchon: Archon-style NL2Chip benchmark runner")
+    p = argparse.ArgumentParser(description="CKTLean: Archon-style NL2Chip benchmark runner")
     p.add_argument("--dataset", default="cvdp", choices=["verilogeval", "rtllm", "resbench", "cvdp", "realbench"])
     p.add_argument(
         "--cvdp-harness-profile",
@@ -551,8 +551,8 @@ def build_system_prompt(
     return (
         generation_skill.rstrip()
         + skill_section
-        + "\n\n## CktArchon harness rules\n"
-        + f"- You are running under the Archon-style CktArchon harness for `{prob_id}`.\n"
+        + "\n\n## CKTLean harness rules\n"
+        + f"- You are running under the Archon-style CKTLean harness for `{prob_id}`.\n"
         + (f"- Write only `Generated/{prob_id}.lean`.\n" if public_spec else
            f"- Write only `Generated/{prob_id}.lean` using the `write_file`/`edit_file` tools.\n")
         + design_rule
@@ -576,7 +576,7 @@ def build_system_prompt(
         + "- For RTL bit manipulation, use `Sparkle.Library.RTL` helpers such as `bit`, `slice`, `zext`, and `trunc` when a local checked example confirms the expected type.\n"
         + "- Do not leave placeholders such as `sorry`, `admit`, or dummy zero outputs in the synthesized implementation.\n"
         + "- Do not modify benchmark sources, Sparkle library code, or other Generated files.\n"
-        + "- Stop once the generated Lean file compiles; the CktArchon evaluator will run Verilog extraction, lint, and simulation.\n"
+        + "- Stop once the generated Lean file compiles; the CKTLean evaluator will run Verilog extraction, lint, and simulation.\n"
     )
 
 
@@ -1090,7 +1090,7 @@ def write_public_repair_state(
     structural_issues: list[dict[str, Any]],
 ) -> str:
     """Persist and return a public-safe per-problem repair state summary."""
-    state_dir = PROJECT_ROOT / "cktarchon_work" / prob_id
+    state_dir = PROJECT_ROOT / "cktlean_work" / prob_id
     state_dir.mkdir(parents=True, exist_ok=True)
     target = f"Generated/{prob_id}.lean"
     candidate_exists = bool(current_code.strip())
@@ -2018,7 +2018,7 @@ def process_problem(
                     "prob_id": prob_id,
                     "event": "public_repair_state",
                     "iteration": sim_iter,
-                    "path": f"cktarchon_work/{prob_id}/repair_state.md",
+                    "path": f"cktlean_work/{prob_id}/repair_state.md",
                 })
                 repair_instruction = repair_instruction + "\n\n" + repair_state
             compact_prompt = public_prompt.repair_prompt(
@@ -2408,13 +2408,13 @@ def main() -> None:
         raise SystemExit("No problems selected")
 
     results_base = Path(args.results_dir).resolve()
-    run_dir = results_base / f"cktarchon_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = results_base / f"cktlean_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (PROJECT_ROOT / "Generated").mkdir(exist_ok=True)
 
     num_workers = max(1, args.workers)
     print(
-        f"[cktarchon] problems={len(problems)} model={model_alias(args.model)} "
+        f"[cktlean] problems={len(problems)} model={model_alias(args.model)} "
         f"harness={args.harness} cvdp_harness_profile={args.cvdp_harness_profile} "
         f"workers={num_workers} run_dir={run_dir}"
     )
@@ -2424,7 +2424,7 @@ def main() -> None:
             from lean_repl import LeanREPLPool
             pool = LeanREPLPool(size=num_workers, project_dir=PROJECT_ROOT)
         except Exception as exc:
-            print(f"[cktarchon] Lean REPL unavailable, falling back to lake build: {exc}")
+            print(f"[cktlean] Lean REPL unavailable, falling back to lake build: {exc}")
             pool = None
     else:
         pool = None

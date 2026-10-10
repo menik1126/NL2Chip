@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from cktarchon.codex_runner import CodexAgentHarnessRunner
-from cktarchon.env import ensure_runtime_env, model_alias
-from cktarchon.harness import AnthropicHarnessRunner, PathGuard
-from cktarchon.logs import append_jsonl, normalize_token_usage, parse_agent_log
-from cktarchon.run import (
+from cktlean.codex_runner import CodexAgentHarnessRunner
+from cktlean.env import ensure_runtime_env, model_alias
+from cktlean.harness import AnthropicHarnessRunner, PathGuard
+from cktlean.logs import append_jsonl, normalize_token_usage, parse_agent_log
+from cktlean.run import (
     agent_visible_problem_info,
     already_done,
     build_fresh_candidate_prompt,
@@ -28,12 +28,12 @@ from cktarchon.run import (
     parse_args,
     runner_turn_limit,
 )
-from cktarchon.run_verilog import (
+from cktlean.run_verilog import (
     is_feedback_repairable,
     make_runner as make_verilog_runner,
     parse_args as parse_verilog_args,
 )
-from cktarchon.search_strategy import (
+from cktlean.search_strategy import (
     CandidateTracker,
     TurnBudget,
     build_self_test_planner_prompt,
@@ -41,7 +41,7 @@ from cktarchon.search_strategy import (
     run_generated_self_test,
     validate_self_test_guide,
 )
-from cktarchon.responses_chat_proxy import (
+from cktlean.responses_chat_proxy import (
     chat_response_to_responses_events,
     events_to_sse,
     responses_request_to_chat_request,
@@ -413,7 +413,7 @@ def test_runtime_env_prioritizes_guarded_iverilog_wrapper(monkeypatch: pytest.Mo
     guarded_bin = str(Path.home() / ".local" / "bin")
     original_exists = Path.exists
     monkeypatch.setattr(
-        "cktarchon.env.Path.exists",
+        "cktlean.env.Path.exists",
         lambda path: str(path) in {raw_iverilog_bin, guarded_bin} or original_exists(path),
     )
     monkeypatch.setenv("PATH", f"{raw_iverilog_bin}:/usr/bin")
@@ -433,7 +433,7 @@ def test_runtime_env_replaces_stale_host_specific_lake_path(
     local_lake.chmod(0o755)
     monkeypatch.setenv("LAKE_PATH", "/home/other-host/.elan/bin/lake")
     monkeypatch.setattr(
-        "cktarchon.env.shutil.which",
+        "cktlean.env.shutil.which",
         lambda name, path=None: str(local_lake) if name == "lake" else None,
     )
 
@@ -466,7 +466,7 @@ def test_evaluator_retries_infrastructure_without_model_turns(
             }
 
     evaluator = FakeEvaluator()
-    monkeypatch.setattr("cktarchon.run.time.sleep", lambda _: None)
+    monkeypatch.setattr("cktlean.run.time.sleep", lambda _: None)
 
     result = evaluate_with_infrastructure_retries(
         evaluator,
@@ -485,7 +485,7 @@ def test_evaluator_retries_infrastructure_without_model_turns(
 def test_path_guard_allows_only_problem_outputs(tmp_path: Path):
     guard = PathGuard(tmp_path, "prob_a")
     assert guard.is_write_allowed("Generated/prob_a.lean")
-    assert guard.is_write_allowed("cktarchon_work/prob_a/notes.json")
+    assert guard.is_write_allowed("cktlean_work/prob_a/notes.json")
     assert not guard.is_write_allowed("Generated/prob_b.lean")
     assert not guard.is_write_allowed("agent/search.py")
 
@@ -497,9 +497,9 @@ def test_path_guard_hides_peer_artifacts_and_credentials(tmp_path: Path):
     assert guard.is_read_allowed("Generated/prob_a.lean")
     assert guard.is_read_allowed("Generated/prob_a_helper.lean")
     assert not guard.is_read_allowed("Generated/prob_b.lean")
-    assert guard.is_read_allowed("cktarchon_work")
-    assert guard.is_read_allowed("cktarchon_work/prob_a/notes.txt")
-    assert not guard.is_read_allowed("cktarchon_work/prob_b/notes.txt")
+    assert guard.is_read_allowed("cktlean_work")
+    assert guard.is_read_allowed("cktlean_work/prob_a/notes.txt")
+    assert not guard.is_read_allowed("cktlean_work/prob_b/notes.txt")
     assert not guard.is_read_allowed("key.env")
     assert not guard.is_read_allowed(".git/config")
     assert guard.is_read_allowed("docs/SignalDSL_Syntax.md")
@@ -548,8 +548,8 @@ class _LeanOnlyCompleteRepl:
 
 
 def _anthropic_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AnthropicHarnessRunner:
-    monkeypatch.setattr("cktarchon.harness.ensure_runtime_env", lambda: None)
-    monkeypatch.setattr("cktarchon.harness.anthropic.Anthropic", lambda **_: object())
+    monkeypatch.setattr("cktlean.harness.ensure_runtime_env", lambda: None)
+    monkeypatch.setattr("cktlean.harness.anthropic.Anthropic", lambda **_: object())
     return AnthropicHarnessRunner(
         project_root=tmp_path,
         prob_id="prob_a",
@@ -627,7 +627,7 @@ def test_harness_bash_subprocess_does_not_receive_secret_environment(
         captured.update(kwargs)
         return SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
 
-    monkeypatch.setattr("cktarchon.harness.subprocess.run", fake_run)
+    monkeypatch.setattr("cktlean.harness.subprocess.run", fake_run)
     assert runner._bash("lake build Sparkle") == "ok\n"
     assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
 
@@ -805,7 +805,7 @@ def test_parse_agent_log(tmp_path: Path):
 def test_parse_codex_archon_log(tmp_path: Path):
     log = tmp_path / "codex.jsonl"
     append_jsonl(log, {"event": "session_meta", "session_id": "thread-1"})
-    append_jsonl(log, {"event": "tool_call", "tool": "Bash", "input": {"command": "python -m cktarchon.tools lean-check Generated/prob.lean"}})
+    append_jsonl(log, {"event": "tool_call", "tool": "Bash", "input": {"command": "python -m cktlean.tools lean-check Generated/prob.lean"}})
     append_jsonl(log, {"event": "turn_usage", "input_tokens": 7, "cache_read_input_tokens": 3, "output_tokens": 2})
     append_jsonl(log, {"event": "session_end", "num_turns": 4, "input_tokens_total": 10, "output_tokens": 2})
     stats = parse_agent_log(log)
@@ -850,7 +850,7 @@ def test_codex_budget_stop_without_recovered_usage_is_marked_incomplete(
     log = tmp_path / "codex-incomplete.jsonl"
     append_jsonl(log, {"event": "session_start", "runner": "codex"})
     append_jsonl(log, {"event": "tool_call", "tool": "Edit", "input": {}})
-    append_jsonl(log, {"event": "cktarchon_budget_exceeded"})
+    append_jsonl(log, {"event": "cktlean_budget_exceeded"})
     append_jsonl(
         log,
         {
@@ -937,7 +937,7 @@ def test_anthropic_cache_usage_is_counted_once(tmp_path: Path):
 
 def test_codex_runner_fails_loud_without_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("ARCHON_CODEX_BIN", raising=False)
-    monkeypatch.setattr("cktarchon.codex_runner.shutil.which", lambda _: None)
+    monkeypatch.setattr("cktlean.codex_runner.shutil.which", lambda _: None)
     runner = CodexAgentHarnessRunner(
         project_root=tmp_path,
         prob_id="prob_a",
@@ -960,16 +960,16 @@ def test_codex_prompt_points_to_lean_check(tmp_path: Path):
         system_prompt="system",
     )
     prompt = runner._codex_prompt("problem", max_turns=80)
-    assert ".venv/bin/python -m cktarchon.tools lean-check Generated/prob_a.lean" in prompt
+    assert ".venv/bin/python -m cktlean.tools lean-check Generated/prob_a.lean" in prompt
     assert "Only edit `Generated/prob_a.lean`" in prompt
     assert "Never read prior benchmark candidates or run artifacts" in prompt
     assert "experiments/p3_replay_candidates" in prompt
-    assert "Final CktArchon override" in prompt
+    assert "Final CKTLean override" in prompt
     assert "Do not run simulation, pytest, cocotb, or a final `lake build` after lean-check succeeds" in prompt
 
 
 def test_codex_runner_wraps_cli_for_execution_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("cktarchon.codex_runner.shutil.which", lambda _: "/usr/sbin/runuser")
+    monkeypatch.setattr("cktlean.codex_runner.shutil.which", lambda _: "/usr/sbin/runuser")
     runner = CodexAgentHarnessRunner(
         project_root=tmp_path,
         prob_id="prob_a",
@@ -1013,8 +1013,8 @@ def test_codex_native_direct_verilog_prompt_and_environment(
     monkeypatch: pytest.MonkeyPatch,
 ):
     for name in (
-        "CKTARCHON_CODEX_BASE_URL",
-        "CKTARCHON_CODEX_API_KEY",
+        "CKTLEAN_CODEX_BASE_URL",
+        "CKTLEAN_CODEX_API_KEY",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "ANTHROPIC_API_KEY",
@@ -1037,15 +1037,15 @@ def test_codex_native_direct_verilog_prompt_and_environment(
     prompt = runner._codex_prompt("problem", max_turns=10)
     env = runner._build_agent_env({})
 
-    assert "cktarchon_work/prob_a/candidate.sv" in prompt
+    assert "cktlean_work/prob_a/candidate.sv" in prompt
     assert "Generated/prob_a.lean" not in prompt
     assert "lean-check" not in prompt
     assert "Do not run simulation, pytest, cocotb" in prompt
     assert "only feedback allowed by the selected feedback mode" in prompt
     assert not runner._should_auto_proxy()
     for name in (
-        "CKTARCHON_CODEX_BASE_URL",
-        "CKTARCHON_CODEX_API_KEY",
+        "CKTLEAN_CODEX_BASE_URL",
+        "CKTLEAN_CODEX_API_KEY",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "ANTHROPIC_API_KEY",
@@ -1074,7 +1074,7 @@ def test_codex_budget_watcher_sets_cancel(tmp_path: Path):
     runner._watch_turn_budget(2, cancel)
 
     assert cancel.is_set()
-    assert "cktarchon_budget_exceeded" in runner.log_path.read_text(encoding="utf-8")
+    assert "cktlean_budget_exceeded" in runner.log_path.read_text(encoding="utf-8")
 
 
 def test_codex_runner_recovers_usage_from_persistent_rollout(tmp_path: Path):
@@ -1121,7 +1121,7 @@ def test_codex_runner_recovers_usage_from_persistent_rollout(tmp_path: Path):
         runner.log_path,
         {"event": "session_meta", "session_id": "thread-usage"},
     )
-    append_jsonl(runner.log_path, {"event": "cktarchon_budget_exceeded"})
+    append_jsonl(runner.log_path, {"event": "cktlean_budget_exceeded"})
     append_jsonl(
         runner.log_path,
         {
@@ -1224,12 +1224,12 @@ def test_parse_self_test_guide_requires_named_top():
         """
 <test_plan>Check zero and maximum input.</test_plan>
 <testbench_sv>
-module cktarchon_self_test; initial $display("CKTARCHON_SELF_TEST_PASS"); endmodule
+module cktlean_self_test; initial $display("CKTLEAN_SELF_TEST_PASS"); endmodule
 </testbench_sv>
 """
     )
     assert guide.test_plan == "Check zero and maximum input."
-    assert "module cktarchon_self_test" in guide.testbench_sv
+    assert "module cktlean_self_test" in guide.testbench_sv
 
     invalid = parse_self_test_guide(
         "<test_plan>plan</test_plan><testbench_sv>module wrong; endmodule</testbench_sv>"
@@ -1242,7 +1242,7 @@ def test_self_test_validation_enforces_contract_reset_polarity():
         """
 <test_plan>Check reset.</test_plan>
 <testbench_sv>
-module cktarchon_self_test;
+module cktlean_self_test;
 logic rst;
 dut top(.rst(rst));
 initial begin rst = 1; #1; rst = 0; end
@@ -1264,7 +1264,7 @@ def test_self_test_validation_blocks_file_or_process_access():
         """
 <test_plan>Check input.</test_plan>
 <testbench_sv>
-module cktarchon_self_test;
+module cktlean_self_test;
 logic a, y;
 dut top(.a(a), .y(y));
 initial begin $readmemh("secret.hex", mem); end
@@ -1286,7 +1286,7 @@ def test_self_test_validation_accepts_parameterized_dut_instance():
         """
 <test_plan>Check a parameterized DUT.</test_plan>
 <testbench_sv>
-module cktarchon_self_test;
+module cktlean_self_test;
 logic clock;
 fifo_policy #(
   .NWAYS(4),
@@ -1315,12 +1315,12 @@ The actual buggy RTL behavior is to be verified. Test passes if RTL behavior
 matches the actual buggy implementation.
 </test_plan>
 <testbench_sv>
-module cktarchon_self_test;
+module cktlean_self_test;
 logic access;
 dut top(.access(access));
 initial begin
   $display("expected increment on a hit (bug)");
-  $display("CKTARCHON_SELF_TEST_PASS");
+  $display("CKTLEAN_SELF_TEST_PASS");
 end
 endmodule
 </testbench_sv>
@@ -1435,14 +1435,14 @@ def test_generated_self_test_runs_in_isolated_directory(tmp_path: Path):
     )
     (sim_dir / "src" / "hidden_test.py").write_text("secret oracle", encoding="utf-8")
     tb = """
-module cktarchon_self_test;
+module cktlean_self_test;
   logic a;
   logic y;
   dut d(.a(a), .y(y));
   initial begin
     a = 1'b1; #1;
-    if (y !== 1'b1) $display("CKTARCHON_SELF_TEST_FAIL");
-    else $display("CKTARCHON_SELF_TEST_PASS");
+    if (y !== 1'b1) $display("CKTLEAN_SELF_TEST_FAIL");
+    else $display("CKTLEAN_SELF_TEST_PASS");
     $finish;
   end
 endmodule
@@ -1531,8 +1531,8 @@ def test_responses_request_omits_parallel_tools_without_tools():
 
 
 def test_responses_request_injects_workspace_tool_for_codex_gateway(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CKTARCHON_INJECT_CODEX_CHAT_TOOLS", "1")
-    monkeypatch.setenv("CKTARCHON_CHAT_TOOL_REASONING_EFFORT", "none")
+    monkeypatch.setenv("CKTLEAN_INJECT_CODEX_CHAT_TOOLS", "1")
+    monkeypatch.setenv("CKTLEAN_CHAT_TOOL_REASONING_EFFORT", "none")
 
     chat = responses_request_to_chat_request(
         {"model": "gpt-5.6-sol", "input": "write the candidate"}
@@ -1574,7 +1574,7 @@ def test_responses_request_requires_an_initial_workspace_tool_call():
 
 
 def test_responses_request_user_assistant_only_mode(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CKTARCHON_CHAT_USER_ASSISTANT_ONLY", "1")
+    monkeypatch.setenv("CKTLEAN_CHAT_USER_ASSISTANT_ONLY", "1")
     body = {
         "model": "claude-sonnet-4-5-20250929",
         "instructions": "system prompt",

@@ -1,6 +1,6 @@
-# CktArchon harness
+# CKTLean harness
 
-`cktarchon/` runs the generation agent. It owns the agent loop, the tools the
+`cktlean/` runs the generation agent. It owns the agent loop, the tools the
 agent may call and the files it may touch; scoring stays in
 `agent/evaluator.py`.
 
@@ -28,7 +28,7 @@ A direct Anthropic tool-use loop.
 - Tools: `read_file`, `write_file`, `edit_file`, `grep`, `glob`,
   `list_directory`, `bash` and `lean_check`.
 - A `PathGuard` limits writes to `Generated/<prob_id>.lean`,
-  `Generated/<prob_id>_*.lean` and `cktarchon_work/<prob_id>/**`.
+  `Generated/<prob_id>_*.lean` and `cktlean_work/<prob_id>/**`.
 - `lean_check(code=...)` checks a snippet; `lean_check(path=...)` checks a file.
 - Events are written as JSONL under `logs/<prob_id>/generate.jsonl`.
 - Transient provider failures are retried with the `SPARKLE_API_MAX_RETRIES`,
@@ -42,21 +42,21 @@ Runs the Codex CLI through Archon's `CodexAgent`, which normalizes
 - Needs an Archon checkout (`ARCHON_SRC` or `--archon-src`) and the Codex CLI
   (`--codex-bin` or `ARCHON_CODEX_BIN`). It fails loudly if either is missing.
 - Codex gets Lean feedback by running
-  `.venv/bin/python -m cktarchon.tools lean-check Generated/<prob_id>.lean`.
+  `.venv/bin/python -m cktlean.tools lean-check Generated/<prob_id>.lean`.
   Once that succeeds it is told to stop and let the evaluator run simulation.
 - Any existing `Generated/<prob_id>.lean` is moved to
   `run_dir/preexisting_generated/` before generation, so output from an earlier
   run cannot be scored as a new result.
 - The Codex CLI has no turn limit, so the wrapper counts normalized `text` and
   `tool_call` events and cancels the session when `--max-turns` is exhausted,
-  logging `cktarchon_budget_exceeded`.
+  logging `cktlean_budget_exceeded`.
 - If Codex is cancelled after it has written the Lean file, that file is still
   evaluated and the row records the `agent_error`.
 
 ## Responses-to-Chat proxy
 
 The Codex CLI speaks the `/v1/responses` API. When the model provider only
-offers `/v1/chat/completions`, `cktarchon/responses_chat_proxy.py` bridges the
+offers `/v1/chat/completions`, `cktlean/responses_chat_proxy.py` bridges the
 two:
 
 - converts Responses requests into chat-completions requests;
@@ -73,21 +73,21 @@ It starts automatically when no Codex gateway is configured. Pass
 Check the installation without calling a model:
 
 ```bash
-python -m py_compile cktarchon/*.py
-python -m pytest Tests/test_cktarchon.py -q
+python -m py_compile cktlean/*.py
+python -m pytest Tests/test_cktlean.py -q
 ```
 
 Score Lean files that already exist in `Generated/`:
 
 ```bash
-python -m cktarchon.run --dataset cvdp --problem-file ids.txt \
+python -m cktlean.run --dataset cvdp --problem-file ids.txt \
   --eval-only --no-repl --results-dir results/eval_only
 ```
 
 Run the Codex-agent harness:
 
 ```bash
-python -m cktarchon.run --dataset cvdp --harness codex-agent \
+python -m cktlean.run --dataset cvdp --harness codex-agent \
   --model "$MODEL" --codex-bin "$CODEX_BIN" --archon-src "$ARCHON_SRC" \
   --max-turns 80 --workers 1 \
   --results-dir results/codex_cvdp --resume --resume-mode completed

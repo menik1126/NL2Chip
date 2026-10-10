@@ -51,7 +51,7 @@ from parameter_backends import (
     run_ppa_parameter_policy,
 )
 from orfs_runner import run_docker_command
-from cktarchon.diagnostics import (
+from cktlean.diagnostics import (
     build_lean_diagnostics,
     format_lean_diagnostics,
     lean_diagnostic_signature,

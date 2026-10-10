@@ -48,7 +48,7 @@ VERILOG_ARCHON_SKILL = """You are an expert hardware designer using an Archon-st
 Generate one synthesizable SystemVerilog module that matches the benchmark contract and passes the external compile/simulation harness.
 
 ## Output File
-- Write the candidate to `cktarchon_work/<prob_id>/candidate.sv` with the `write_file` or `edit_file` tool.
+- Write the candidate to `cktlean_work/<prob_id>/candidate.sv` with the `write_file` or `edit_file` tool.
 - The file must contain complete SystemVerilog source with `module ... endmodule`.
 - Do not write Lean or Sparkle. This is a direct-SystemVerilog baseline.
 
@@ -63,7 +63,7 @@ Generate one synthesizable SystemVerilog module that matches the benchmark contr
 ## Workflow
 1. Read the problem and benchmark interface contract.
 2. Optionally inspect small context files mentioned in the prompt.
-3. Write a complete candidate to `cktarchon_work/<prob_id>/candidate.sv`.
+3. Write a complete candidate to `cktlean_work/<prob_id>/candidate.sv`.
 4. If feedback is provided, repair the same file using the simulator/compile diagnostics.
 5. Stop after the candidate file is written.
 """
@@ -77,7 +77,7 @@ def _add_agent_paths() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CktArchon baseline: Codex-native direct SystemVerilog generation")
+    p = argparse.ArgumentParser(description="CKTLean baseline: Codex-native direct SystemVerilog generation")
     p.add_argument("--dataset", default="cvdp", choices=["verilogeval", "rtllm", "resbench", "cvdp", "realbench"])
     p.add_argument(
         "--cvdp-harness-profile",
@@ -198,7 +198,7 @@ def build_system_prompt(prob_id: str, info: Any, args: argparse.Namespace) -> st
         generation_skill.rstrip()
         + "\n\n## Harness Rules\n"
         + f"- Problem ID: `{prob_id}`.\n"
-        + f"- Required candidate path: `cktarchon_work/{prob_id}/candidate.sv`.\n"
+        + f"- Required candidate path: `cktlean_work/{prob_id}/candidate.sv`.\n"
         + f"- Required top module name: `{info.design_name}`.\n"
         + contract_rules
         + "- The outer evaluator will run the official compile/simulation harness after you stop.\n"
@@ -227,7 +227,7 @@ def build_initial_prompt(prob_id: str, info: Any, dataset_name: str) -> str:
         f"{contract_section}"
         f"### Task\n\n"
         f"Generate the complete direct SystemVerilog implementation. "
-        f"Write it to `cktarchon_work/{prob_id}/candidate.sv` and then stop.\n"
+        f"Write it to `cktlean_work/{prob_id}/candidate.sv` and then stop.\n"
     )
 
 
@@ -245,7 +245,7 @@ def build_feedback_prompt(
         f"### Natural Language Specification\n\n{truncate(info.prompt_text, 30000, keep='head')}\n\n"
         f"### Structured Simulator / Compiler Feedback\n\n{structured_feedback}\n\n"
         f"### Required Action\n\n"
-        f"Overwrite `cktarchon_work/{prob_id}/candidate.sv` with the complete corrected SystemVerilog module. "
+        f"Overwrite `cktlean_work/{prob_id}/candidate.sv` with the complete corrected SystemVerilog module. "
         f"Do not output Lean or Sparkle.\n"
     )
 
@@ -294,7 +294,7 @@ def normalize_sv(info: Any, code: str, dataset_name: str) -> str:
 
 
 def candidate_path(prob_id: str) -> Path:
-    return PROJECT_ROOT / "cktarchon_work" / prob_id / "candidate.sv"
+    return PROJECT_ROOT / "cktlean_work" / prob_id / "candidate.sv"
 
 
 def load_candidate(prob_id: str, info: Any, dataset_name: str, log_path: Path) -> tuple[str | None, str]:
@@ -336,7 +336,7 @@ def eval_candidate(dataset_name: str, ds: Any, info: Any, code: str | None, run_
             "compile_pass": False,
             "sim_status": "gen_error",
             "sim_mismatches": -1,
-            "detail": "No module...endmodule candidate found in cktarchon_work file or assistant log.",
+            "detail": "No module...endmodule candidate found in cktlean_work file or assistant log.",
         }
     return eval_direct_verilog(dataset_name, ds, info, code, run_dir, iter_idx)
 
@@ -550,7 +550,7 @@ def process_problem(prob_id: str, *, args: argparse.Namespace, ds: Any, run_dir:
         "prob_id": prob_id,
         "dataset": args.dataset,
         "model": model_alias(args.model),
-        "harness": "cktarchon-codex-native-verilog",
+        "harness": "cktlean-codex-native-verilog",
         "model_transport": "codex-native-login",
         "interface_prompt_policy": getattr(args, "interface_prompt_policy", "legacy"),
         "cvdp_harness_profile": args.cvdp_harness_profile,
@@ -648,7 +648,7 @@ def main() -> None:
     problems = discover_problems(args, ds)
     run_parent = Path(args.results_dir).resolve()
     run_parent.mkdir(parents=True, exist_ok=True)
-    run_dir = run_parent / f"archon_verilog_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = run_parent / f"cktlean_verilog_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict[str, Any]] = []
@@ -656,7 +656,7 @@ def main() -> None:
     results_path = run_dir / "results.jsonl"
     num_workers = max(1, args.workers)
     print(
-        f"CktArchon-Verilog: {len(problems)} problems, model={model_alias(args.model)}, "
+        f"CKTLean-Verilog: {len(problems)} problems, model={model_alias(args.model)}, "
         f"transport=codex-native-login, effort={args.codex_effort}, "
         f"cvdp_harness_profile={args.cvdp_harness_profile}, workers={num_workers}, "
         f"run_dir={run_dir}",
@@ -680,7 +680,7 @@ def main() -> None:
                 "prob_id": prob_id,
                 "dataset": args.dataset,
                 "model": model_alias(args.model),
-                "harness": "cktarchon-codex-native-verilog",
+                "harness": "cktlean-codex-native-verilog",
                 "model_transport": "codex-native-login",
                 "cvdp_harness_profile": args.cvdp_harness_profile,
                 "agent_error": f"{type(exc).__name__}: {exc}",

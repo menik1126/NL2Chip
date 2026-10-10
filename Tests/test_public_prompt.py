@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from cktarchon import public_prompt as pp
-from cktarchon import run, run_verilog
-from cktarchon import codex_runner
+from cktlean import public_prompt as pp
+from cktlean import run, run_verilog
+from cktlean import codex_runner
 
 
 def info():

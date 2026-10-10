@@ -53,11 +53,11 @@ TOOL_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 
 
 class RequestTimeoutError(TimeoutError):
-    """Raised by the outer CktArchon API watchdog."""
+    """Raised by the outer CKTLean API watchdog."""
 
 
 def _raise_request_timeout(signum: int, frame: Any) -> None:
-    raise RequestTimeoutError("Anthropic messages.create exceeded cktarchon api_timeout")
+    raise RequestTimeoutError("Anthropic messages.create exceeded cktlean api_timeout")
 
 
 def _error_text(exc: Exception) -> str:
@@ -260,10 +260,10 @@ class PathGuard:
                 f"Generated/{self.prob_id}_*.lean",
             )
             return any(fnmatch.fnmatch(normalized, pattern) for pattern in allowed)
-        if normalized == "cktarchon_work":
+        if normalized == "cktlean_work":
             return True
-        if normalized.startswith("cktarchon_work/"):
-            own_root = f"cktarchon_work/{self.prob_id}"
+        if normalized.startswith("cktlean_work/"):
+            own_root = f"cktlean_work/{self.prob_id}"
             return normalized == own_root or normalized.startswith(own_root + "/")
         return True
 
@@ -271,7 +271,7 @@ class PathGuard:
         if not self.is_read_allowed(rel_path):
             raise PermissionError(
                 f"Read denied for {rel_path}. Concurrent task artifacts and credential files are isolated; "
-                f"only Generated/{self.prob_id}.lean and cktarchon_work/{self.prob_id}/ are visible in shared output directories."
+                f"only Generated/{self.prob_id}.lean and cktlean_work/{self.prob_id}/ are visible in shared output directories."
             )
         return self.resolve(rel_path)
 
@@ -280,7 +280,7 @@ class PathGuard:
         allowed = [
             f"Generated/{self.prob_id}.lean",
             f"Generated/{self.prob_id}_*.lean",
-            f"cktarchon_work/{self.prob_id}/**",
+            f"cktlean_work/{self.prob_id}/**",
             *self.extra_write_globs,
         ]
         return any(fnmatch.fnmatch(normalized, pat) for pat in allowed)
@@ -288,7 +288,7 @@ class PathGuard:
     def require_write_allowed(self, rel_path: str) -> Path:
         if not self.is_write_allowed(rel_path):
             raise PermissionError(
-                f"Write denied for {rel_path}. Allowed outputs are Generated/{self.prob_id}.lean and cktarchon_work/{self.prob_id}/."
+                f"Write denied for {rel_path}. Allowed outputs are Generated/{self.prob_id}.lean and cktlean_work/{self.prob_id}/."
             )
         return self.resolve(rel_path)
 
@@ -299,7 +299,7 @@ class PathGuard:
                 "Use read_file, grep, glob, or list_directory; those tools hide artifacts from other tasks."
             )
         for match in re.finditer(
-            r"(?<![A-Za-z0-9_])(?:\./)?(?:Generated|cktarchon_work)/[^\s;&|()\"']+",
+            r"(?<![A-Za-z0-9_])(?:\./)?(?:Generated|cktlean_work)/[^\s;&|()\"']+",
             command,
         ):
             rel_path = match.group(0).removeprefix("./").rstrip(",:")
@@ -516,7 +516,7 @@ class AnthropicHarnessRunner:
             return "Error: empty command"
         blocked = re.compile(r"\b(rm\s+-rf|git\s+reset|git\s+checkout|pkill|killall|sudo|scp|ssh)\b")
         if blocked.search(command):
-            return "Error: command rejected by cktarchon safety policy"
+            return "Error: command rejected by cktlean safety policy"
         if access_error := self.guard.bash_access_error(command):
             return f"Error: {access_error}"
         subprocess_env = {
@@ -713,7 +713,7 @@ class AnthropicHarnessRunner:
                 return self._format_lean_result(result)
             except Exception as exc:
                 return f"Error: REPL failed: {type(exc).__name__}: {exc}"
-        temp_rel = f"cktarchon_work/{self.prob_id}/lean_check.lean"
+        temp_rel = f"cktlean_work/{self.prob_id}/lean_check.lean"
         temp_path = self.guard.require_write_allowed(temp_rel)
         temp_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path.write_text(_with_sparkle_prelude(code), encoding="utf-8")

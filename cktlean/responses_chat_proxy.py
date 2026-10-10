@@ -14,8 +14,8 @@ from typing import Any, Iterator
 from urllib.parse import urlparse
 
 
-DEFAULT_BASE_URL_ENV = "CKTARCHON_CODEX_BASE_URL"
-DEFAULT_KEY_ENV = "CKTARCHON_CODEX_API_KEY"
+DEFAULT_BASE_URL_ENV = "CKTLEAN_CODEX_BASE_URL"
+DEFAULT_KEY_ENV = "CKTLEAN_CODEX_API_KEY"
 
 
 def _content_to_text(content: Any) -> str:
@@ -199,12 +199,12 @@ def responses_request_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
         "messages": responses_input_to_messages(
             body.get("input"),
             body.get("instructions"),
-            user_assistant_only=_truthy_env("CKTARCHON_CHAT_USER_ASSISTANT_ONLY"),
+            user_assistant_only=_truthy_env("CKTLEAN_CHAT_USER_ASSISTANT_ONLY"),
         ),
         "stream": False,
     }
     tools = responses_tools_to_chat_tools(body.get("tools"))
-    if not tools and _truthy_env("CKTARCHON_INJECT_CODEX_CHAT_TOOLS"):
+    if not tools and _truthy_env("CKTLEAN_INJECT_CODEX_CHAT_TOOLS"):
         tools = injected_workspace_tools()
     if tools:
         request["tools"] = tools
@@ -230,7 +230,7 @@ def responses_request_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
     if tools and body.get("parallel_tool_calls") is not None:
         request["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
     tool_reasoning_effort = os.environ.get(
-        "CKTARCHON_CHAT_TOOL_REASONING_EFFORT", ""
+        "CKTLEAN_CHAT_TOOL_REASONING_EFFORT", ""
     ).strip()
     if tools and tool_reasoning_effort:
         request["reasoning_effort"] = tool_reasoning_effort
@@ -308,7 +308,7 @@ def events_to_sse(events: list[dict[str, Any]]) -> bytes:
 
 
 def upstream_chat_url_from_env() -> str:
-    explicit = os.environ.get("CKTARCHON_UPSTREAM_CHAT_URL")
+    explicit = os.environ.get("CKTLEAN_UPSTREAM_CHAT_URL")
     if explicit:
         return explicit
     base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.openai.com/v1"
@@ -494,7 +494,7 @@ def start_proxy(host: str = "127.0.0.1", port: int = 0, timeout_s: float = 300.0
     )
     server = _ProxyHTTPServer((host, port), _ProxyHandler)
     server.proxy = proxy
-    thread = threading.Thread(target=server.serve_forever, name="cktarchon-responses-chat-proxy", daemon=True)
+    thread = threading.Thread(target=server.serve_forever, name="cktlean-responses-chat-proxy", daemon=True)
     thread.start()
     actual_port = server.server_address[1]
     return ProxyHandle(server=server, thread=thread, base_url=f"http://{host}:{actual_port}/v1")

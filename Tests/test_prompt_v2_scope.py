@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cktarchon import codex_runner, public_prompt as pp, run, run_verilog
+from cktlean import codex_runner, public_prompt as pp, run, run_verilog
 
 
 def public_info():
@@ -49,7 +49,7 @@ def test_complete_render_has_real_tools_and_stop_rules(language, repair, tmp_pat
     assert "extra compiler calls solely for the inventory" in rendered
     assert rendered.count(pp.public_packet(info)) == 1
     if language == "lean":
-        assert ".venv/bin/python -m cktarchon.tools lean-check Generated/sample.lean" in rendered
+        assert ".venv/bin/python -m cktlean.tools lean-check Generated/sample.lean" in rendered
         assert "reports success, stop immediately" in rendered
         assert "Do not perform extra Verilog review" in rendered
     else:

@@ -82,7 +82,7 @@ class CodexAgentHarnessRunner:
                 append_jsonl(
                     self.log_path,
                     {
-                        "event": "cktarchon_proxy",
+                        "event": "cktlean_proxy",
                         "runner": "codex-agent",
                         "prob_id": self.prob_id,
                         "detail": "started local Responses-to-Chat proxy for Codex CLI",
@@ -93,7 +93,7 @@ class CodexAgentHarnessRunner:
             if codex_bin:
                 raw["bin"] = codex_bin
             descriptor = HarnessDescriptor(
-                name="cktarchon-codex",
+                name="cktlean-codex",
                 runner="codex",
                 model=self.model,
                 effort=self.effort,
@@ -124,7 +124,7 @@ class CodexAgentHarnessRunner:
             monitor = threading.Thread(
                 target=self._watch_turn_budget,
                 args=(max_turns, cancel_event),
-                name=f"cktarchon-codex-budget-{self.prob_id}",
+                name=f"cktlean-codex-budget-{self.prob_id}",
                 daemon=True,
             )
             monitor.start()
@@ -148,14 +148,14 @@ class CodexAgentHarnessRunner:
         if not ok:
             if self._budget_exceeded_logged():
                 append_jsonl(self.log_path, {
-                    "event": "cktarchon_budget_stop",
+                    "event": "cktlean_budget_stop",
                     "runner": "codex-agent",
                     "prob_id": self.prob_id,
-                    "detail": f"official Archon CodexAgent stopped after CktArchon max-turns budget {max_turns}",
+                    "detail": f"official Archon CodexAgent stopped after CKTLean max-turns budget {max_turns}",
                 })
                 return stats
             append_jsonl(self.log_path, {
-                "event": "cktarchon_error",
+                "event": "cktlean_error",
                 "runner": "codex-agent",
                 "prob_id": self.prob_id,
                 "detail": "official Archon CodexAgent returned non-zero",
@@ -170,7 +170,7 @@ class CodexAgentHarnessRunner:
             yield None
             return
         account = pwd.getpwnam(self.execution_user)
-        work = self.project_root / "cktarchon_work"
+        work = self.project_root / "cktlean_work"
         work.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix=".codex-final-", dir=work))
         os.chown(temporary, account.pw_uid, account.pw_gid)
@@ -271,7 +271,7 @@ class CodexAgentHarnessRunner:
             )
             return
         finally:
-            keep = str(env.get("CKTARCHON_KEEP_CODEX_ROLLOUT", "")).lower()
+            keep = str(env.get("CKTLEAN_KEEP_CODEX_ROLLOUT", "")).lower()
             if keep not in {"1", "true", "yes", "on"}:
                 try:
                     rollout.unlink()
@@ -349,7 +349,7 @@ class CodexAgentHarnessRunner:
         append_jsonl(
             self.log_path,
             {
-                "event": "cktarchon_token_accounting_incomplete",
+                "event": "cktlean_token_accounting_incomplete",
                 "runner": "codex-agent",
                 "prob_id": self.prob_id,
                 "detail": detail,
@@ -418,7 +418,7 @@ class CodexAgentHarnessRunner:
     def _budget_exceeded_logged(self) -> bool:
         try:
             for line in self.log_path.read_text(errors="replace").splitlines():
-                if '"event": "cktarchon_budget_exceeded"' in line:
+                if '"event": "cktlean_budget_exceeded"' in line:
                     return True
         except OSError:
             return False
@@ -428,7 +428,7 @@ class CodexAgentHarnessRunner:
         """Cancel Codex once the normalized Archon event budget is exhausted.
 
         Official Archon's CodexAgent exposes idle and retry supervision, but
-        Codex CLI has no native max-turn flag. CktArchon treats assistant text
+        Codex CLI has no native max-turn flag. CKTLean treats assistant text
         plus tool-call events as the comparable action budget for NL2Chip
         experiments. Tool results are excluded because they are environment
         feedback rather than extra model decisions.
@@ -458,7 +458,7 @@ class CodexAgentHarnessRunner:
                     append_jsonl(
                         self.log_path,
                         {
-                            "event": "cktarchon_budget_exceeded",
+                            "event": "cktlean_budget_exceeded",
                             "runner": "codex-agent",
                             "prob_id": self.prob_id,
                             "max_turns": max_turns,
@@ -472,7 +472,7 @@ class CodexAgentHarnessRunner:
 
     def _codex_prompt(self, prompt: str, *, max_turns: int) -> str:
         if self.direct_verilog:
-            target = f"cktarchon_work/{self.prob_id}/candidate.sv"
+            target = f"cktlean_work/{self.prob_id}/candidate.sv"
             public_only_note = (
                 "- Public-only evaluation is enabled. Hidden CVDP harnesses, "
                 "expected traces, and evaluator data are not available to you; "
@@ -487,7 +487,7 @@ class CodexAgentHarnessRunner:
                 + f"- Target action budget: about {max_turns} tool/model steps; "
                 f"stop once `{target}` is a complete synthesizable SystemVerilog module.\n"
                 + f"- Only edit `{target}` and scratch files under "
-                f"`cktarchon_work/{self.prob_id}/`.\n"
+                f"`cktlean_work/{self.prob_id}/`.\n"
                 + "- Do not read prior benchmark candidates or run artifacts, "
                 "including `results*`, `preexisting_generated`, or another task's "
                 "candidate. They are evaluation leakage, not examples.\n"
@@ -497,7 +497,7 @@ class CodexAgentHarnessRunner:
                 "only feedback allowed by the selected feedback mode.\n\n"
                 + "## NL2Chip problem prompt\n"
                 + prompt
-                + "\n\n## Final CktArchon override\n"
+                + "\n\n## Final CKTLean override\n"
                 + f"- The final answer should be brief. Ensure `{target}` contains "
                 "the complete implementation before stopping.\n"
             )
@@ -507,7 +507,7 @@ class CodexAgentHarnessRunner:
             for name in self.required_verilog_modules
         )
         lean_check_command = (
-            ".venv/bin/python -m cktarchon.tools lean-check "
+            ".venv/bin/python -m cktlean.tools lean-check "
             f"Generated/{self.prob_id}.lean{required_args}"
         )
         public_only_note = (
@@ -530,17 +530,17 @@ class CodexAgentHarnessRunner:
             + public_only_note
             + "\n\n## Codex-agent execution notes\n"
             + f"- Target action budget: about {max_turns} tool/model steps; stop once `Generated/{self.prob_id}.lean` compiles.\n"
-            + f"- Only edit `Generated/{self.prob_id}.lean` and scratch files under `cktarchon_work/{self.prob_id}/`.\n"
+            + f"- Only edit `Generated/{self.prob_id}.lean` and scratch files under `cktlean_work/{self.prob_id}/`.\n"
             + compiler_tool_note
             + f"- For Lean feedback, run `{lean_check_command}` from the repository root.\n"
-            + "- `cktarchon.tools lean-check` checks the file path argument only; it does not read candidate code from stdin. Write the target file before checking it.\n"
+            + "- `cktlean.tools lean-check` checks the file path argument only; it does not read candidate code from stdin. Write the target file before checking it.\n"
             + search_note
             + "- Never read prior benchmark candidates or run artifacts, including `experiments/p3_replay_candidates`, `results*`, `preexisting_generated`, candidate snapshots, or another task's `Generated/cvdp_*` file. They are evaluation leakage, not examples.\n"
             + "- Leave benchmark, Sparkle, evaluator, and harness files unchanged.\n"
             + "- Do not run simulation, pytest, cocotb, or a final `lake build` after lean-check succeeds; the outer evaluator does that.\n\n"
             + "## NL2Chip problem prompt\n"
             + prompt
-            + "\n\n## Final CktArchon override\n"
+            + "\n\n## Final CKTLean override\n"
             + f"- The final answer should be brief. After `{lean_check_command}` reports success, stop immediately.\n"
             + "- Do not perform extra Verilog review, simulation, pytest, cocotb, synthesis, or PPA checks inside CodexAgent.\n"
             + "- These instructions override any earlier generic workflow text that asks for final Verilog inspection.\n"
